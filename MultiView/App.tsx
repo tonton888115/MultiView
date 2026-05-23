@@ -9,6 +9,7 @@ import {
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import AddStreamModal from './src/components/AddStreamModal';
+import ChatPanel from './src/components/ChatPanel';
 import Grid from './src/components/Grid';
 import SettingsModal from './src/components/SettingsModal';
 import { DEFAULT_SETTINGS } from './src/config';
@@ -19,6 +20,7 @@ import {
   saveStreams,
 } from './src/storage';
 import { Platform, Settings, Stream } from './src/types';
+import { buildChatUrl } from './src/url';
 
 function genId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -31,6 +33,7 @@ function AppInner() {
   const [body, setBody] = useState({ width: 0, height: 0 });
   const [addVisible, setAddVisible] = useState(false);
   const [settingsVisible, setSettingsVisible] = useState(false);
+  const [chatTarget, setChatTarget] = useState<{ stream: Stream; url: string } | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -63,6 +66,16 @@ function AppInner() {
     saveSettings(next);
     setSettingsVisible(false);
   }, []);
+
+  const openChat = useCallback(
+    (stream: Stream) => {
+      const url = buildChatUrl(stream, settings);
+      if (url) {
+        setChatTarget({ stream, url });
+      }
+    },
+    [settings],
+  );
 
   const onBodyLayout = (e: LayoutChangeEvent) => {
     const { width, height } = e.nativeEvent.layout;
@@ -117,6 +130,7 @@ function AppInner() {
               width={body.width}
               height={body.height}
               onRemove={removeStream}
+              onOpenChat={openChat}
             />
           )
         )}
@@ -133,6 +147,11 @@ function AppInner() {
         settings={settings}
         onClose={() => setSettingsVisible(false)}
         onSave={onSaveSettings}
+      />
+      <ChatPanel
+        stream={chatTarget?.stream ?? null}
+        url={chatTarget?.url ?? null}
+        onClose={() => setChatTarget(null)}
       />
     </SafeAreaView>
   );

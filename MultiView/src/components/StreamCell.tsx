@@ -15,10 +15,12 @@ interface Props {
   url: string;
   width: number;
   height: number;
+  canChat: boolean;
+  onOpenChat: () => void;
   onRemove: () => void;
 }
 
-function StreamCell({ stream, url, width, height, onRemove }: Props) {
+function StreamCell({ stream, url, width, height, canChat, onOpenChat, onRemove }: Props) {
   const webRef = useRef<WebView>(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
@@ -74,6 +76,11 @@ function StreamCell({ stream, url, width, height, onRemove }: Props) {
           <Text style={{ color: info.color }}>● </Text>
           {info.label} / {stream.channel}
         </Text>
+        {canChat && (
+          <TouchableOpacity hitSlop={6} onPress={onOpenChat} style={styles.iconBtn}>
+            <Text style={styles.chatIcon}>💬</Text>
+          </TouchableOpacity>
+        )}
         <TouchableOpacity hitSlop={8} onPress={onRemove} style={styles.close}>
           <Text style={styles.closeText}>×</Text>
         </TouchableOpacity>
@@ -112,6 +119,13 @@ const styles = StyleSheet.create({
     borderTopWidth: 2,
   },
   label: { flex: 1, color: '#eee', fontSize: 11, fontWeight: '600' },
+  iconBtn: {
+    width: 26,
+    height: 26,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  chatIcon: { fontSize: 13 },
   close: {
     width: 26,
     height: 26,

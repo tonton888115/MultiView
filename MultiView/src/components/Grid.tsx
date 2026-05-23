@@ -2,7 +2,7 @@ import React from 'react';
 import { StyleSheet, View } from 'react-native';
 import { computeGrid } from '../layout';
 import { Settings, Stream } from '../types';
-import { buildPlayerUrl } from '../url';
+import { buildChatUrl, buildPlayerUrl } from '../url';
 import StreamCell from './StreamCell';
 
 interface Props {
@@ -11,9 +11,17 @@ interface Props {
   width: number;
   height: number;
   onRemove: (id: string) => void;
+  onOpenChat: (stream: Stream) => void;
 }
 
-export default function Grid({ streams, settings, width, height, onRemove }: Props) {
+export default function Grid({
+  streams,
+  settings,
+  width,
+  height,
+  onRemove,
+  onOpenChat,
+}: Props) {
   const { rows } = computeGrid(streams.length, width > height);
   const perRow = Math.max(1, Math.ceil(streams.length / rows));
 
@@ -35,6 +43,7 @@ export default function Grid({ streams, settings, width, height, onRemove }: Pro
               if (!url) {
                 return null;
               }
+              const chatUrl = buildChatUrl(stream, settings);
               return (
                 <StreamCell
                   key={stream.id}
@@ -42,6 +51,8 @@ export default function Grid({ streams, settings, width, height, onRemove }: Pro
                   url={url}
                   width={cellW}
                   height={rowHeight}
+                  canChat={!!chatUrl}
+                  onOpenChat={() => onOpenChat(stream)}
                   onRemove={() => onRemove(stream.id)}
                 />
               );

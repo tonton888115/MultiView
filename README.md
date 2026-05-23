@@ -29,12 +29,12 @@ APP/                       ← git リポジトリのルート
 
 ## 対応状況
 
-| サービス | 映像 | 弾幕(コメント) |
-|---|---|---|
-| Twitch | ✅ | ✅ そのまま動く (匿名チャット受信) |
-| Kick | ✅ | ⚠️ Cloudflare Worker (任意) が必要な場合あり |
-| ツイキャス | ✅ | ⚠️ best-effort / Worker 推奨 |
-| ニコ生 | △ 番組ページを直接表示 | ニコ生純正のコメント表示を使用 (独自弾幕は非対応) |
+| サービス | 映像 | 弾幕(受信) | コメント送信(入力) |
+|---|---|---|---|
+| Twitch | ✅ | ✅ 匿名で受信 | ✅ 公式チャット埋め込み(ログイン) |
+| Kick | ✅ | ⚠️ Worker任意 | ✅ ネイティブchatパネル(ログイン) ／ 将来API |
+| ツイキャス | ✅ | ⚠️ best-effort | ✅ ネイティブページ(ログイン) ／ 将来API |
+| ニコ生 | △ 番組ページを直接表示 | 純正コメント | ✅ 番組ページ内で入力 |
 
 > ニコ生のライブは公式の iframe 埋め込みが無く、コメントも Protobuf ストリーミングのため、
 > v1 では番組ページ (`live.nicovideo.jp/watch/lv...`) をそのまま開きます。純正プレイヤーの
@@ -44,17 +44,18 @@ APP/                       ← git リポジトリのルート
 
 ## セットアップ手順
 
-### 1. GitHub に push
+### 1. GitHub に push (作成済み)
+
+リポジトリは作成・push 済みです → **https://github.com/tonton888115/MultiView** (public)。
+以後の変更は次でOK:
 
 ```powershell
 git add -A
-git commit -m "MultiView 初期コミット"
-git remote add origin https://github.com/<ユーザー名>/<リポジトリ名>.git
-git push -u origin main
+git commit -m "変更内容"
+git push
 ```
 
-> **リポジトリは public 推奨**。public なら GitHub Actions の macOS ビルドが無料です
-> (private は macOS 分が 10 倍消費されます)。
+> public なので GitHub Actions の macOS ビルドは無料です(private は macOS 分が 10 倍消費)。
 
 ### 2. GitHub Pages を有効化
 
@@ -62,8 +63,8 @@ git push -u origin main
 - **Source**: Deploy from a branch
 - **Branch**: `main` / フォルダ `/docs` → Save
 
-数分後、`https://<ユーザー名>.github.io/<リポジトリ名>/` で公開されます。
-`https://<ユーザー名>.github.io/<リポジトリ名>/` を開いて動作確認ページが出れば OK。
+数分後、**https://tonton888115.github.io/MultiView/** で公開されます。
+そのURLを開いて動作確認ページが出れば OK。
 
 ### 3. 未署名 IPA をビルド
 
@@ -90,7 +91,7 @@ git push -u origin main
 初回起動時、アプリの **⚙ 設定** を開き、**GitHub Pages のベース URL** を入力:
 
 ```
-https://<ユーザー名>.github.io/<リポジトリ名>
+https://tonton888115.github.io/MultiView
 ```
 
 (末尾の `/player.html` は不要)。保存すると配信を追加できるようになります。
@@ -121,6 +122,24 @@ Kick の `chatroom_id` 取得やツイキャスのコメント取得は CORS で
 - 各セル右上の **×** で削除。配信リストと設定は端末に保存されます。
 - 同時視聴は **4 画面程度**が快適です (iOS の WebView 制約)。
 - 音声は全画面ミュート起動。聞きたい配信をタップしてプレイヤー側でミュート解除してください。
+
+---
+
+## コメント入力 (送信)
+
+各セル右上の **💬** で、その配信のチャットを開いて投稿できます(初回はログインが必要)。
+
+- **Twitch**: 公式チャットが開き、ログインすればそのまま投稿可能。
+- **Kick / ツイキャス**: ネイティブのページが開きます。ログインすると各サイトの入力欄から投稿できます。WebView 内のログインは保持されます。
+- **ニコ生**: 配信セル自体が番組ページなので、ログインすればセル内で直接コメントできます(💬 は表示されません)。
+
+> モバイルの Twitch 埋め込みチャットはログインで不調になることがあります。その場合はチャット下部の「Twitch で開く」を使ってください。
+
+### (フェーズ2) アプリ内の統一入力欄から API 送信
+
+Kick / ツイキャスを「アプリ内の 1 つの入力欄」から送信する方式は、各サービスでの
+**OAuth アプリ登録(client ID 取得)** が前提です。client ID を用意できれば有効化します
+(Kick = OAuth2.1 PKCE、ツイキャス = OAuth2.0)。
 
 ---
 
