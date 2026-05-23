@@ -1,0 +1,10 @@
+# Logs / local
+*.log
+npm-install.log
+
+# Dependencies (also covered by MultiView/.gitignore)
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db

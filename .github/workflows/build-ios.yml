@@ -1,0 +1,73 @@
+name: Build iOS (unsigned IPA)
+
+# Produces an UNSIGNED .ipa as a downloadable artifact.
+# Install it on your iPhone with Sideloadly (it re-signs with your free Apple ID).
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'MultiView/**'
+      - '.github/workflows/build-ios.yml'
+
+concurrency:
+  group: build-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: MultiView
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Install Ruby gems (CocoaPods)
+        run: bundle install
+
+      - name: Pod install
+        working-directory: MultiView/ios
+        run: bundle exec pod install
+
+      - name: Build unsigned app
+        working-directory: MultiView/ios
+        run: |
+          xcodebuild \
+            -workspace MultiView.xcworkspace \
+            -scheme MultiView \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ONLY_ACTIVE_ARCH=NO \
+            clean build
+
+      - name: Package into .ipa
+        working-directory: MultiView/ios/build/Build/Products/Release-iphoneos
+        run: |
+          mkdir -p Payload
+          cp -R MultiView.app Payload/
+          zip -qry MultiView.ipa Payload
+          ls -lh MultiView.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MultiView-unsigned-ipa
+          path: MultiView/ios/build/Build/Products/Release-iphoneos/MultiView.ipa
+          if-no-files-found: error
+          retention-days: 14
