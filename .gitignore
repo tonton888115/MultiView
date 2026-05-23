@@ -2,6 +2,9 @@
 *.log
 npm-install.log
 
+# Build artifacts
+*.ipa
+
 # Dependencies (also covered by MultiView/.gitignore)
 node_modules/
 
