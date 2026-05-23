@@ -22,7 +22,15 @@ export async function saveStreams(streams: Stream[]): Promise<void> {
 export async function loadSettings(): Promise<Settings> {
   try {
     const raw = await AsyncStorage.getItem(STORAGE_KEYS.settings);
-    return raw ? { ...DEFAULT_SETTINGS, ...JSON.parse(raw) } : DEFAULT_SETTINGS;
+    if (!raw) {
+      return DEFAULT_SETTINGS;
+    }
+    const parsed = JSON.parse(raw);
+    return {
+      ...DEFAULT_SETTINGS,
+      ...parsed,
+      danmaku: { ...DEFAULT_SETTINGS.danmaku, ...(parsed.danmaku || {}) },
+    };
   } catch {
     return DEFAULT_SETTINGS;
   }

@@ -2,7 +2,6 @@ import React from 'react';
 import { StyleSheet, View } from 'react-native';
 import { computeGrid } from '../layout';
 import { Settings, Stream } from '../types';
-import { buildChatUrl, buildPlayerUrl } from '../url';
 import StreamCell from './StreamCell';
 
 interface Props {
@@ -10,22 +9,14 @@ interface Props {
   settings: Settings;
   width: number;
   height: number;
-  onRemove: (id: string) => void;
-  onOpenChat: (stream: Stream) => void;
+  onFocus: (stream: Stream) => void;
+  onRemove: (stream: Stream) => void;
 }
 
-export default function Grid({
-  streams,
-  settings,
-  width,
-  height,
-  onRemove,
-  onOpenChat,
-}: Props) {
+export default function Grid({ streams, settings, width, height, onFocus, onRemove }: Props) {
   const { rows } = computeGrid(streams.length, width > height);
   const perRow = Math.max(1, Math.ceil(streams.length / rows));
 
-  // Split into rows; each row's cells stretch to fill the width (no empty gaps).
   const chunks: Stream[][] = [];
   for (let i = 0; i < streams.length; i += perRow) {
     chunks.push(streams.slice(i, i + perRow));
@@ -38,25 +29,17 @@ export default function Grid({
         const cellW = Math.floor(width / rowStreams.length);
         return (
           <View key={ri} style={[styles.row, { height: rowHeight }]}>
-            {rowStreams.map(stream => {
-              const url = buildPlayerUrl(stream, settings);
-              if (!url) {
-                return null;
-              }
-              const chatUrl = buildChatUrl(stream, settings);
-              return (
-                <StreamCell
-                  key={stream.id}
-                  stream={stream}
-                  url={url}
-                  width={cellW}
-                  height={rowHeight}
-                  canChat={!!chatUrl}
-                  onOpenChat={() => onOpenChat(stream)}
-                  onRemove={() => onRemove(stream.id)}
-                />
-              );
-            })}
+            {rowStreams.map(stream => (
+              <StreamCell
+                key={stream.id}
+                stream={stream}
+                settings={settings}
+                width={cellW}
+                height={rowHeight}
+                onFocus={onFocus}
+                onRemove={onRemove}
+              />
+            ))}
           </View>
         );
       })}

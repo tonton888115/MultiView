@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   StyleSheet,
@@ -8,23 +8,24 @@ import {
 } from 'react-native';
 import { WebView } from 'react-native-webview';
 import { platformInfo } from '../config';
-import { Stream } from '../types';
+import { Settings, Stream } from '../types';
+import { streamSource } from '../url';
 
 interface Props {
   stream: Stream;
-  url: string;
+  settings: Settings;
   width: number;
   height: number;
-  canChat: boolean;
-  onOpenChat: () => void;
-  onRemove: () => void;
+  onFocus: (stream: Stream) => void;
+  onRemove: (stream: Stream) => void;
 }
 
-function StreamCell({ stream, url, width, height, canChat, onOpenChat, onRemove }: Props) {
+function StreamCell({ stream, settings, width, height, onFocus, onRemove }: Props) {
   const webRef = useRef<WebView>(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
   const info = platformInfo(stream.platform);
+  const source = useMemo(() => streamSource(stream, settings), [stream, settings]);
 
   return (
     <View style={[styles.cell, { width, height }]}>
@@ -47,7 +48,7 @@ function StreamCell({ stream, url, width, height, canChat, onOpenChat, onRemove 
       ) : (
         <WebView
           ref={webRef}
-          source={{ uri: url }}
+          source={source}
           style={styles.web}
           originWhitelist={['*']}
           javaScriptEnabled
@@ -55,7 +56,7 @@ function StreamCell({ stream, url, width, height, canChat, onOpenChat, onRemove 
           allowsInlineMediaPlayback
           mediaPlaybackRequiresUserAction={false}
           allowsFullscreenVideo
-          allowsProtectedMedia
+          sharedCookiesEnabled
           setSupportMultipleWindows={false}
           onLoadEnd={() => setLoading(false)}
           onError={() => {
@@ -76,12 +77,10 @@ function StreamCell({ stream, url, width, height, canChat, onOpenChat, onRemove 
           <Text style={{ color: info.color }}>● </Text>
           {info.label} / {stream.channel}
         </Text>
-        {canChat && (
-          <TouchableOpacity hitSlop={6} onPress={onOpenChat} style={styles.iconBtn}>
-            <Text style={styles.chatIcon}>💬</Text>
-          </TouchableOpacity>
-        )}
-        <TouchableOpacity hitSlop={8} onPress={onRemove} style={styles.close}>
+        <TouchableOpacity hitSlop={6} onPress={() => onFocus(stream)} style={styles.iconBtn}>
+          <Text style={styles.icon}>⛶</Text>
+        </TouchableOpacity>
+        <TouchableOpacity hitSlop={8} onPress={() => onRemove(stream)} style={styles.iconBtn}>
           <Text style={styles.closeText}>×</Text>
         </TouchableOpacity>
       </View>
@@ -119,26 +118,10 @@ const styles = StyleSheet.create({
     borderTopWidth: 2,
   },
   label: { flex: 1, color: '#eee', fontSize: 11, fontWeight: '600' },
-  iconBtn: {
-    width: 26,
-    height: 26,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  chatIcon: { fontSize: 13 },
-  close: {
-    width: 26,
-    height: 26,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
+  iconBtn: { width: 26, height: 26, alignItems: 'center', justifyContent: 'center' },
+  icon: { color: '#fff', fontSize: 13 },
   closeText: { color: '#fff', fontSize: 18, lineHeight: 20 },
-  fallback: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 12,
-  },
+  fallback: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 12 },
   fallbackText: { color: '#eee', fontSize: 13, fontWeight: '600', textAlign: 'center' },
   fallbackSub: { color: '#888', fontSize: 11, marginTop: 4 },
   reloadBtn: {

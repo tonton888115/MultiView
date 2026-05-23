@@ -1,50 +1,44 @@
+import { WEBVIEW_BASE_URL } from './config';
+import {
+  buildPlayerHtml,
+  buildTwitchChatHtml,
+  buildYouTubeChatHtml,
+  playerConfigFor,
+} from './playerHtml';
 import { Settings, Stream } from './types';
 
-// Builds the URL loaded into a stream cell's WebView.
-// - niconico live can't be iframe-embedded, so we load its watch page directly.
-// - everything else goes through the GitHub Pages player.html (embed + danmaku).
-export function buildPlayerUrl(stream: Stream, settings: Settings): string | null {
+export type CellSource = { uri: string } | { html: string; baseUrl: string };
+
+const parentHost = WEBVIEW_BASE_URL.replace(/^https?:\/\//, '');
+
+// WebView source for a stream's video cell.
+// - niconico: load the watch page directly (no iframe embed exists for live)
+// - others: bundled player HTML (embed + danmaku), no external hosting needed
+export function streamSource(stream: Stream, settings: Settings): CellSource {
   const channel = stream.channel.trim();
-
   if (stream.platform === 'niconico') {
-    return `https://live.nicovideo.jp/watch/${encodeURIComponent(channel)}`;
+    return { uri: `https://live.nicovideo.jp/watch/${encodeURIComponent(channel)}` };
   }
-
-  const base = settings.baseUrl.trim().replace(/\/+$/, '');
-  if (!base) {
-    return null;
-  }
-  const parts = [
-    `platform=${encodeURIComponent(stream.platform)}`,
-    `channel=${encodeURIComponent(channel)}`,
-    `chat=${settings.showChat ? '1' : '0'}`,
-  ];
-  if (settings.proxyUrl.trim()) {
-    parts.push(`proxy=${encodeURIComponent(settings.proxyUrl.trim())}`);
-  }
-  return `${base}/player.html?${parts.join('&')}`;
+  return {
+    html: buildPlayerHtml(playerConfigFor(stream, settings)),
+    baseUrl: WEBVIEW_BASE_URL,
+  };
 }
 
-// URL for the per-stream chat panel (with comment input). Returns null when the
-// platform has no separate chat surface.
-// - twitch: official chat embed via our Pages wrapper (needs parent domain)
-// - kick / twitcasting: load the native page; login + input happen in their own UI
-// - niconico: the video cell already loads the full watch page (input is there)
-export function buildChatUrl(stream: Stream, settings: Settings): string | null {
+// WebView source for the inline chat (with input). Returns null when the platform
+// has no separate chat surface (niconico's cell is already the full watch page).
+export function chatSource(stream: Stream): CellSource | null {
   const channel = stream.channel.trim();
   switch (stream.platform) {
-    case 'twitch': {
-      const base = settings.baseUrl.trim().replace(/\/+$/, '');
-      return base ? `${base}/chat.html?channel=${encodeURIComponent(channel)}` : null;
-    }
+    case 'twitch':
+      return { html: buildTwitchChatHtml(channel, parentHost), baseUrl: WEBVIEW_BASE_URL };
+    case 'youtube':
+      return { html: buildYouTubeChatHtml(channel, parentHost), baseUrl: WEBVIEW_BASE_URL };
     case 'kick':
-      return `https://kick.com/${encodeURIComponent(channel)}`;
+      return { uri: `https://kick.com/${encodeURIComponent(channel)}` };
     case 'twitcasting':
-      return `https://twitcasting.tv/${encodeURIComponent(channel)}`;
-    case 'niconico':
-      return null;
+      return { uri: `https://twitcasting.tv/${encodeURIComponent(channel)}` };
     default:
       return null;
   }
 }
-
