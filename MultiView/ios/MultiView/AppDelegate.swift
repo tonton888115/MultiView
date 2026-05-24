@@ -289,6 +289,7 @@ final class NiconicoNativePlayerView: UIView {
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
   private let settings: AppSettings
+  private var watchPageURL: URL?
   private var laneCursor = 0
 
   init(stream: StreamItem, settings: AppSettings) {
@@ -349,6 +350,7 @@ final class NiconicoNativePlayerView: UIView {
       showStatus("番組IDが不正です")
       return
     }
+    watchPageURL = url
     var request = URLRequest(url: url)
     request.setValue(NiconicoNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
     pageTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
@@ -400,6 +402,7 @@ final class NiconicoNativePlayerView: UIView {
           "quality": "abr",
           "protocol": "hls",
           "latency": "low",
+          "accessRightMethod": "single_cookie",
           "chasePlay": false
         ],
         "room": [
@@ -490,7 +493,10 @@ final class NiconicoNativePlayerView: UIView {
   private func play(hlsURL: URL) {
     DispatchQueue.main.async {
       self.statusLabel.isHidden = true
-      let item = AVPlayerItem(url: hlsURL)
+      let asset = AVURLAsset(url: hlsURL, options: [
+        "AVURLAssetHTTPHeaderFieldsKey": self.niconicoPlaybackHeaders()
+      ])
+      let item = AVPlayerItem(asset: asset)
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
           DispatchQueue.main.async {
@@ -514,6 +520,19 @@ final class NiconicoNativePlayerView: UIView {
       self.player.volume = self.settings.playAudio ? 1 : 0
       self.player.play()
     }
+  }
+
+  private func niconicoPlaybackHeaders() -> [String: String] {
+    var headers = [
+      "User-Agent": NiconicoNativePlayerView.userAgent,
+      "Referer": watchPageURL?.absoluteString ?? "https://live.nicovideo.jp/",
+      "Origin": "https://live.nicovideo.jp"
+    ]
+    let cookieURL = URL(string: "https://live.nicovideo.jp/")!
+    if let cookies = HTTPCookieStorage.shared.cookies(for: cookieURL), !cookies.isEmpty {
+      headers["Cookie"] = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+    }
+    return headers
   }
 
   private func startNDGRComments(viewURI: String) {
@@ -1404,7 +1423,6 @@ final class SettingsController: UITableViewController {
     tableView.backgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.04, alpha: 1)
     tableView.separatorColor = UIColor.white.withAlphaComponent(0.12)
     tableView.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
-    tableView.setEditing(true, animated: false)
   }
 
   func reload() {
@@ -1480,33 +1498,34 @@ final class SettingsController: UITableViewController {
       let slider = UISlider()
       slider.frame = CGRect(x: 0, y: 0, width: 150, height: 32)
       slider.tag = indexPath.row
-      slider.addAction(UIAction { [weak self] action in
+      slider.addAction(UIAction { [weak self, weak cell] action in
         guard let slider = action.sender as? UISlider else { return }
         self?.updateDanmakuSetting(row: slider.tag, value: slider.value)
+        cell.textLabel?.text = self?.danmakuTitle(row: slider.tag)
       }, for: .valueChanged)
       switch indexPath.row {
       case 4:
-        cell.textLabel?.text = "文字サイズ \(Int(AppState.shared.settings.danmakuFontSize))"
+        cell.textLabel?.text = danmakuTitle(row: indexPath.row)
         slider.minimumValue = 12
         slider.maximumValue = 40
         slider.value = Float(AppState.shared.settings.danmakuFontSize)
       case 5:
-        cell.textLabel?.text = "速度 \(Int((AppState.shared.settings.danmakuSpeed / 0.13) * 100))%"
+        cell.textLabel?.text = danmakuTitle(row: indexPath.row)
         slider.minimumValue = 0.05
         slider.maximumValue = 0.3
         slider.value = Float(AppState.shared.settings.danmakuSpeed)
       case 6:
-        cell.textLabel?.text = "透過度 \(Int(AppState.shared.settings.danmakuOpacity * 100))%"
+        cell.textLabel?.text = danmakuTitle(row: indexPath.row)
         slider.minimumValue = 0.3
         slider.maximumValue = 1
         slider.value = Float(AppState.shared.settings.danmakuOpacity)
       case 7:
-        cell.textLabel?.text = "最大行数 \(AppState.shared.settings.danmakuMaxLines == 0 ? "自動" : String(AppState.shared.settings.danmakuMaxLines))"
+        cell.textLabel?.text = danmakuTitle(row: indexPath.row)
         slider.minimumValue = 0
         slider.maximumValue = 20
         slider.value = Float(AppState.shared.settings.danmakuMaxLines)
       default:
-        cell.textLabel?.text = "最大文字数 \(AppState.shared.settings.danmakuMaxLength == 0 ? "無制限" : String(AppState.shared.settings.danmakuMaxLength))"
+        cell.textLabel?.text = danmakuTitle(row: indexPath.row)
         slider.minimumValue = 0
         slider.maximumValue = 200
         slider.value = Float(AppState.shared.settings.danmakuMaxLength)
@@ -1515,6 +1534,16 @@ final class SettingsController: UITableViewController {
     } else if indexPath.section == 1 {
       let platform = platforms[indexPath.row]
       cell.textLabel?.text = platform.label
+      let control = UISegmentedControl(items: ["↑", "↓"])
+      control.frame = CGRect(x: 0, y: 0, width: 82, height: 30)
+      control.setEnabled(indexPath.row > 0, forSegmentAt: 0)
+      control.setEnabled(indexPath.row < platforms.count - 1, forSegmentAt: 1)
+      control.addAction(UIAction { [weak self] action in
+        guard let control = action.sender as? UISegmentedControl else { return }
+        self?.movePlatform(at: indexPath.row, direction: control.selectedSegmentIndex == 0 ? -1 : 1)
+        control.selectedSegmentIndex = UISegmentedControl.noSegment
+      }, for: .valueChanged)
+      cell.accessoryView = control
     } else {
       cell.textLabel?.text = "配信を手動追加"
       cell.accessoryType = .disclosureIndicator
@@ -1524,7 +1553,7 @@ final class SettingsController: UITableViewController {
   }
 
   override func tableView(_ tableView: UITableView, canMoveRowAt indexPath: IndexPath) -> Bool {
-    indexPath.section == 1
+    false
   }
 
   override func tableView(_ tableView: UITableView, editingStyleForRowAt indexPath: IndexPath) -> UITableViewCell.EditingStyle {
@@ -1568,6 +1597,34 @@ final class SettingsController: UITableViewController {
       return
     }
     AppState.shared.settings = settings
+  }
+
+  private func danmakuTitle(row: Int) -> String {
+    let settings = AppState.shared.settings
+    switch row {
+    case 4:
+      return "文字サイズ \(Int(settings.danmakuFontSize))"
+    case 5:
+      return "速度 \(Int((settings.danmakuSpeed / 0.13) * 100))%"
+    case 6:
+      return "透過度 \(Int(settings.danmakuOpacity * 100))%"
+    case 7:
+      return "最大行数 \(settings.danmakuMaxLines == 0 ? "自動" : String(settings.danmakuMaxLines))"
+    case 8:
+      return "最大文字数 \(settings.danmakuMaxLength == 0 ? "無制限" : String(settings.danmakuMaxLength))"
+    default:
+      return ""
+    }
+  }
+
+  private func movePlatform(at index: Int, direction: Int) {
+    let destination = index + direction
+    guard platforms.indices.contains(index), platforms.indices.contains(destination) else { return }
+    var settings = AppState.shared.settings
+    let moved = settings.platformOrder.remove(at: index)
+    settings.platformOrder.insert(moved, at: destination)
+    AppState.shared.settings = settings
+    tableView.reloadSections(IndexSet(integer: 1), with: .automatic)
   }
 
   private func editProxy() {
