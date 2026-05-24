@@ -19,18 +19,19 @@
   #msg { position:absolute; left:0; right:0; bottom:0; color:#bbb;
     background:rgba(0,0,0,0.6); font-family:sans-serif; font-size:12px; padding:6px 10px;
     z-index:11; text-align:center; }
-  #start { position:fixed; inset:0; z-index:20; display:flex; align-items:center; justify-content:center;
-    background:rgba(0,0,0,0.18); color:#fff; border:0; font:700 14px -apple-system,BlinkMacSystemFont,sans-serif; }
-  #start span { padding:10px 14px; border-radius:18px; background:rgba(18,24,32,0.72);
-    border:1px solid rgba(255,255,255,0.25); }
-  body.clean #start { display:none; }
+  #start { position:fixed; left:50%; bottom:16px; transform:translateX(-50%); z-index:20;
+    display:flex; align-items:center; justify-content:center;
+    background:transparent; color:#fff; border:0; font:700 13px -apple-system,BlinkMacSystemFont,sans-serif; }
+  #start span { padding:9px 16px; border-radius:18px; background:rgba(18,24,32,0.82);
+    border:1px solid rgba(255,255,255,0.3); }
+  #start.hidden { display:none; }
 </style>
 </head>
 <body>
 <div id="player"></div>
 <div id="danmaku"></div>
 <div id="msg" style="display:none"></div>
-<button id="start"><span>タップして再生</span></button>
+<button id="start" class="hidden"><span>🔊 音声をオン</span></button>
 <script>
 (function () {
   'use strict';
@@ -56,8 +57,7 @@
   var danmakuEl = document.getElementById('danmaku');
   var msgEl = document.getElementById('msg');
   var startEl = document.getElementById('start');
-  var showStartOverlay = P.get('start') !== '0';
-  if (!showStartOverlay) startEl.style.display = 'none';
+  var showAudioButton = audioOn && P.get('start') !== '0';
   var frameEl = null;
   function showMsg(t) { msgEl.textContent = t; msgEl.style.display = 'block'; }
   function viaProxy(u) { return proxy ? proxy + encodeURIComponent(u) : u; }
@@ -82,12 +82,11 @@
   // ---- embed ----
   function embedUrl() {
     var ch = encodeURIComponent(serviceChannel());
-    var muted = audioOn ? 'false' : 'true';
     var muteNum = audioOn ? '0' : '1';
-    if (platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&' + parentParams() + '&muted=' + muted + '&autoplay=true&playsinline=true';
+    if (platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&' + parentParams() + '&muted=true&autoplay=true&playsinline=true';
     if (platform === 'kick') return 'https://player.kick.com/' + ch + '?autoplay=true&muted=' + ((!audioOn || volume <= 0) ? 'true' : 'false');
     if (platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=' + muteNum + '&playsinline=1&enablejsapi=1&origin=' + encodeURIComponent(location.origin) + '&vq=' + (quality === 'economy' ? 'small' : 'hd720');
-    if (platform === 'twitcasting') return 'https://twitcasting.tv/' + ch + '/embeddedplayer/live?auto_play=true';
+    if (platform === 'twitcasting') return 'https://twitcasting.tv/' + ch + '/embeddedplayer/live?auto_play=true&default_mute=true';
     return '';
   }
   function mountPlayer() {
@@ -156,27 +155,22 @@
       try { data = JSON.parse(data); } catch (e) {}
     }
     if (data && data.type === 'volume') applyVolume(data.volume);
-    if (data && data.type === 'play') startPlayback();
+    if (data && data.type === 'play') enableAudio();
   });
-  function startPlayback() {
+  function enableAudio() {
     if (!frameEl) return;
-    document.body.classList.add('clean');
+    audioOn = true;
+    if (volume <= 0) volume = 1;
     sendPlayCommand();
     applyVolume(volume);
-    var src = frameEl.src;
-    frameEl.src = 'about:blank';
-    setTimeout(function () {
-      frameEl.src = src;
-      setTimeout(function () {
-        sendPlayCommand();
-        applyVolume(volume);
-      }, 800);
-    }, 40);
-    startEl.style.display = 'none';
+    startEl.classList.add('hidden');
   }
-  if (showStartOverlay) {
-    startEl.addEventListener('click', startPlayback);
-    startEl.addEventListener('touchend', function (e) { e.preventDefault(); startPlayback(); }, { passive: false });
+  window.MultiViewEnableAudio = enableAudio;
+  window.MultiViewApplyVolume = applyVolume;
+  if (showAudioButton) {
+    startEl.classList.remove('hidden');
+    startEl.addEventListener('click', enableAudio);
+    startEl.addEventListener('touchend', function (e) { e.preventDefault(); enableAudio(); }, { passive: false });
   }
 
   // ---- filter ----
