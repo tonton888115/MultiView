@@ -31,7 +31,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
   private func configureAudioSession() {
     let session = AVAudioSession.sharedInstance()
-    try? session.setCategory(.playback, mode: .moviePlayback, options: [])
+    try? session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
     try? session.setActive(true)
   }
 }
@@ -281,6 +281,9 @@ final class NiconicoNativePlayerView: UIView {
   private let statusLabel = UILabel()
   private var pageTask: URLSessionDataTask?
   private var socketTask: URLSessionWebSocketTask?
+  private var keepSeatTimer: Timer?
+  private var itemStatusObservation: NSKeyValueObservation?
+  private var itemFailedObserver: NSObjectProtocol?
   private let settings: AppSettings
 
   init(stream: StreamItem, settings: AppSettings) {
@@ -313,8 +316,14 @@ final class NiconicoNativePlayerView: UIView {
   }
 
   deinit {
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    keepSeatTimer?.invalidate()
     pageTask?.cancel()
     socketTask?.cancel(with: .goingAway, reason: nil)
+    if let itemFailedObserver {
+      NotificationCenter.default.removeObserver(itemFailedObserver)
+    }
   }
 
   override func layoutSubviews() {
@@ -401,18 +410,20 @@ final class NiconicoNativePlayerView: UIView {
     socketTask?.receive { [weak self] result in
       guard let self else { return }
       switch result {
-      case .success(.string(let text)):
-        self.handleSocketText(text)
-        self.receiveNext()
-      case .success(.data(let data)):
-        if let text = String(data: data, encoding: .utf8) {
+      case .success(let message):
+        switch message {
+        case .string(let text):
           self.handleSocketText(text)
+        case .data(let data):
+          if let text = String(data: data, encoding: .utf8) {
+            self.handleSocketText(text)
+          }
+        @unknown default:
+          break
         }
         self.receiveNext()
       case .failure(let error):
         self.showStatus("ニコ生WebSocket切断: \(error.localizedDescription)")
-      case .success:
-        self.receiveNext()
       }
     }
   }
@@ -423,7 +434,12 @@ final class NiconicoNativePlayerView: UIView {
           let type = json["type"] as? String else { return }
     if type == "ping" {
       send(["type": "pong"])
-      send(["type": "keepSeat"])
+      return
+    }
+    if type == "seat",
+       let payload = json["data"] as? [String: Any],
+       let interval = payload["keepIntervalSec"] as? TimeInterval {
+      startKeepSeatTimer(interval: interval)
       return
     }
     if type == "stream",
@@ -432,8 +448,23 @@ final class NiconicoNativePlayerView: UIView {
        let uri = URL(string: uriString) {
       play(hlsURL: uri)
     }
+    if type == "error",
+       let payload = json["data"] as? [String: Any],
+       let code = payload["code"] as? String {
+      showStatus("ニコ生エラー: \(code)")
+    }
     if type == "disconnect" {
       showStatus("ニコ生から切断されました")
+    }
+  }
+
+  private func startKeepSeatTimer(interval: TimeInterval) {
+    DispatchQueue.main.async {
+      self.keepSeatTimer?.invalidate()
+      self.keepSeatTimer = Timer.scheduledTimer(withTimeInterval: max(5, interval), repeats: true) { [weak self] _ in
+        self?.send(["type": "keepSeat"])
+      }
+      self.send(["type": "keepSeat"])
     }
   }
 
@@ -441,6 +472,24 @@ final class NiconicoNativePlayerView: UIView {
     DispatchQueue.main.async {
       self.statusLabel.isHidden = true
       let item = AVPlayerItem(url: hlsURL)
+      self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+        if item.status == .failed {
+          DispatchQueue.main.async {
+            self?.showStatus(item.error?.localizedDescription ?? "ニコ生の再生に失敗しました")
+          }
+        }
+      }
+      if let itemFailedObserver = self.itemFailedObserver {
+        NotificationCenter.default.removeObserver(itemFailedObserver)
+      }
+      self.itemFailedObserver = NotificationCenter.default.addObserver(
+        forName: .AVPlayerItemFailedToPlayToEndTime,
+        object: item,
+        queue: .main
+      ) { [weak self] notification in
+        let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
+        self?.showStatus(error?.localizedDescription ?? "ニコ生の再生が停止しました")
+      }
       self.player.replaceCurrentItem(with: item)
       self.player.isMuted = !self.settings.playAudio
       self.player.volume = self.settings.playAudio ? 1 : 0
