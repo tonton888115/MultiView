@@ -77,6 +77,10 @@ protocol PlaybackResumable: AnyObject {
   func resumePlayback()
 }
 
+protocol PlaybackStoppable: AnyObject {
+  func stopPlayback()
+}
+
 final class PlaybackCoordinator {
   static let shared = PlaybackCoordinator()
   private let views = NSHashTable<AnyObject>.weakObjects()
@@ -267,8 +271,9 @@ final class MainTabController: UITabBarController, AppStateDelegate {
   }
 }
 
-final class PlayerWebView: WKWebView, PlaybackResumable {
+final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable {
   private let playAudio: Bool
+  private var isStopped = false
 
   init(stream: StreamItem, settings: AppSettings) {
     playAudio = settings.playAudio
@@ -316,6 +321,7 @@ final class PlayerWebView: WKWebView, PlaybackResumable {
   }
 
   func resumePlayback() {
+    guard !isStopped else { return }
     let shouldMute = playAudio ? "false" : "true"
     let script = """
     (function(){
@@ -333,6 +339,20 @@ final class PlayerWebView: WKWebView, PlaybackResumable {
     })();
     """
     evaluateJavaScript(script)
+  }
+
+  func stopPlayback() {
+    isStopped = true
+    stopLoading()
+    evaluateJavaScript("""
+    document.querySelectorAll('video,audio').forEach(function(media){
+      try { media.pause(); media.src = ''; media.load(); } catch(e) {}
+    });
+    document.querySelectorAll('iframe').forEach(function(frame){
+      try { frame.src = 'about:blank'; } catch(e) {}
+    });
+    """)
+    loadHTMLString("", baseURL: nil)
   }
 
   private static let niconicoPopupBlockerScript = """
@@ -356,7 +376,7 @@ final class PlayerWebView: WKWebView, PlaybackResumable {
 
 }
 
-final class NiconicoNativePlayerView: UIView, PlaybackResumable {
+final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable {
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
   private let danmakuView = UIView()
@@ -372,6 +392,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable {
   private let settings: AppSettings
   private let channel: String
   private var isLoading = false
+  private var isStopped = false
   private var watchPageURL: URL?
   private var laneCursor = 0
 
@@ -411,15 +432,28 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable {
   }
 
   deinit {
+    stopPlayback()
+  }
+
+  func stopPlayback() {
+    isStopped = true
     player.pause()
     player.replaceCurrentItem(with: nil)
     keepSeatTimer?.invalidate()
+    keepSeatTimer = nil
     ndgrCommentTask?.cancel()
+    ndgrCommentTask = nil
     segmentTasks.values.forEach { $0.cancel() }
+    segmentTasks.removeAll()
+    activeSegmentURIs.removeAll()
     pageTask?.cancel()
+    pageTask = nil
     socketTask?.cancel(with: .goingAway, reason: nil)
+    socketTask = nil
+    itemStatusObservation = nil
     if let itemFailedObserver {
       NotificationCenter.default.removeObserver(itemFailedObserver)
+      self.itemFailedObserver = nil
     }
   }
 
@@ -430,6 +464,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable {
   }
 
   func resumePlayback() {
+    guard !isStopped else { return }
     let session = AVAudioSession.sharedInstance()
     try? session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
     try? session.setActive(true)
@@ -446,6 +481,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable {
   }
 
   private func load(channel: String) {
+    guard !isStopped else { return }
     guard !isLoading else { return }
     let programId = channel.trimmingCharacters(in: .whitespacesAndNewlines)
     guard let url = URL(string: "https://live.nicovideo.jp/watch/\(programId)") else {
@@ -599,6 +635,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable {
 
   private func play(hlsURL: URL) {
     DispatchQueue.main.async {
+      guard !self.isStopped else { return }
       self.statusLabel.isHidden = true
       let asset = AVURLAsset(url: hlsURL, options: [
         "AVURLAssetHTTPHeaderFieldsKey": self.niconicoPlaybackHeaders()
@@ -972,8 +1009,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable {
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
-final class MultiPlayerWebView: WKWebView, PlaybackResumable {
+final class MultiPlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable {
   private let playAudio: Bool
+  private var isStopped = false
 
   init(streams: [StreamItem], settings: AppSettings) {
     playAudio = settings.playAudio
@@ -1017,6 +1055,7 @@ final class MultiPlayerWebView: WKWebView, PlaybackResumable {
   }
 
   func resumePlayback() {
+    guard !isStopped else { return }
     let shouldMute = playAudio ? "false" : "true"
     let script = """
     (function(){
@@ -1035,6 +1074,20 @@ final class MultiPlayerWebView: WKWebView, PlaybackResumable {
     """
     evaluateJavaScript(script)
   }
+
+  func stopPlayback() {
+    isStopped = true
+    stopLoading()
+    evaluateJavaScript("""
+    document.querySelectorAll('video,audio').forEach(function(media){
+      try { media.pause(); media.src = ''; media.load(); } catch(e) {}
+    });
+    document.querySelectorAll('iframe').forEach(function(frame){
+      try { frame.src = 'about:blank'; } catch(e) {}
+    });
+    """)
+    loadHTMLString("", baseURL: nil)
+  }
 }
 
 final class ViewingController: UIViewController {
@@ -1051,7 +1104,7 @@ final class ViewingController: UIViewController {
 
   func reload() {
     guard isViewLoaded else { return }
-    stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+    clearStack()
     let streams = AppState.shared.streams
     if streams.isEmpty {
       stack.addArrangedSubview(emptyView())
@@ -1069,6 +1122,19 @@ final class ViewingController: UIViewController {
       return
     }
     addUnifiedPlayer(streams)
+  }
+
+  private func clearStack() {
+    stack.arrangedSubviews.forEach { view in
+      stopPlayback(in: view)
+      stack.removeArrangedSubview(view)
+      view.removeFromSuperview()
+    }
+  }
+
+  private func stopPlayback(in view: UIView) {
+    (view as? PlaybackStoppable)?.stopPlayback()
+    view.subviews.forEach { stopPlayback(in: $0) }
   }
 
   private func configureScroll() {
@@ -1463,7 +1529,7 @@ final class RankingController: BrowserSourceController {
     .kick: Source(label: "Kick", url: URL(string: "https://ikioi-ranking.com/v/kick")!, host: "ikioi-ranking.com"),
     .twitch: Source(label: "Twitch", url: URL(string: "https://ikioi-ranking.com/v/twitch")!, host: "ikioi-ranking.com"),
     .youtube: Source(label: "YouTube", url: URL(string: "https://ikioi-ranking.com/v/youtube")!, host: "ikioi-ranking.com"),
-    .niconico: Source(label: "ニコ生", url: URL(string: "https://ikioi-ranking.com/v/niconama")!, host: "ikioi-ranking.com"),
+    .niconico: Source(label: "ニコ生", url: URL(string: "https://ikioi-ranking.com/category/nico_user")!, host: "ikioi-ranking.com"),
     .twitcasting: Source(label: "ツイキャス", url: URL(string: "https://ikioi-ranking.com/v/twitcasting")!, host: "ikioi-ranking.com")
   ]
 
@@ -1589,6 +1655,19 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
   private func parseStream(_ url: URL) -> (StreamPlatform, String)? {
     let host = url.host?.replacingOccurrences(of: "www.", with: "").lowercased() ?? ""
     let parts = url.path.split(separator: "/").map(String.init)
+    if host == "live-info.soraweb.net",
+       let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems {
+      if let link = items.first(where: { $0.name == "link" })?.value,
+         let linkedURL = URL(string: link),
+         let parsed = parseStream(linkedURL) {
+        return parsed
+      }
+      if let site = items.first(where: { $0.name == "site" })?.value,
+         site == "nico",
+         let liveNo = items.first(where: { $0.name == "liveNo" })?.value {
+        return (.niconico, liveNo.hasPrefix("lv") ? liveNo : "lv\(liveNo)")
+      }
+    }
     if host == "kick.com", let first = parts.first, !["browse", "following", "search", "categories"].contains(first) {
       return (.kick, first)
     }
