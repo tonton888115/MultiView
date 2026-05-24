@@ -675,6 +675,10 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       case .failure(let error):
         self.socketTask = nil
         self.showStatus("ニコ生WebSocket切断: \(error.localizedDescription)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+          guard let self, !self.isStopped else { return }
+          self.load(channel: self.channel)
+        }
       }
     }
   }
@@ -714,6 +718,10 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     if type == "disconnect" {
       socketTask = nil
       showStatus("ニコ生から切断されました")
+      DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+        guard let self, !self.isStopped else { return }
+        self.load(channel: self.channel)
+      }
     }
   }
 
@@ -777,6 +785,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private func startNDGRComments(viewURI: String) {
     guard settings.showChat else { return }
     ndgrCommentTask?.cancel()
+    segmentTasks.values.forEach { $0.cancel() }
+    segmentTasks.removeAll()
+    activeSegmentURIs.removeAll()
     ndgrCommentTask = Task { [weak self] in
       guard let self else { return }
       await self.streamNDGRView(viewURI: viewURI)
@@ -846,7 +857,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       let task = Task {
         do {
           var request = URLRequest(url: url)
-          request.setValue(NiconicoNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
+          self.niconicoPlaybackHeaders().forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
           let (bytes, response) = try await URLSession.shared.bytes(for: request)
           if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw NSError(
@@ -1406,7 +1417,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       socketTask?.send(.string(#"{"event":"pusher:pong","data":{}}"#)) { _ in }
       return
     }
-    guard event == "App\\Events\\ChatMessageEvent" else { return }
+    guard event.contains("ChatMessage") else { return }
     let payloadData: Data?
     if let raw = json["data"] as? String {
       payloadData = raw.data(using: .utf8)
@@ -1417,7 +1428,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     }
     guard let payloadData,
           let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
-          let content = payload["content"] as? String else { return }
+          let content = (payload["content"] as? String) ?? (payload["message"] as? String) else { return }
     emitDanmaku(Self.kickPlain(content))
   }
 
@@ -1480,11 +1491,18 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
        let id = chatroom["id"] {
       chatroomID = Self.stringValue(id)
     }
+    if chatroomID == nil {
+      chatroomID = Self.stringValue(json["chatroom_id"] ?? json["chatroomId"])
+    }
     if chatroomID == nil,
        let livestream = json["livestream"] as? [String: Any],
        let chatroom = livestream["chatroom"] as? [String: Any],
        let id = chatroom["id"] {
       chatroomID = Self.stringValue(id)
+    }
+    if chatroomID == nil,
+       let livestream = json["livestream"] as? [String: Any] {
+      chatroomID = Self.stringValue(livestream["chatroom_id"] ?? livestream["chatroomId"])
     }
     return (hlsURL, chatroomID)
   }
@@ -1710,7 +1728,6 @@ final class ViewingController: UIViewController {
   }
 
   private func addUnifiedPlayer(_ streams: [StreamItem]) {
-    addCloseBar(streams)
     let web = MultiPlayerWebView(streams: streams, settings: AppState.shared.settings)
     let host = UIView()
     host.backgroundColor = .black
@@ -1731,7 +1748,6 @@ final class ViewingController: UIViewController {
     let native = streams.filter { $0.platform == .niconico || $0.platform == .kick }
     let embeddable = streams.filter { $0.platform != .niconico && $0.platform != .kick }
     if !embeddable.isEmpty {
-      addCloseBar(embeddable)
       let web = MultiPlayerWebView(streams: embeddable, settings: AppState.shared.settings)
       let host = UIView()
       host.backgroundColor = .black
@@ -1740,50 +1756,78 @@ final class ViewingController: UIViewController {
       host.addSubview(web)
       stack.addArrangedSubview(host)
       let rows = AppState.shared.settings.layoutMode == .grid ? ceil(Double(embeddable.count) / 2.0) : Double(embeddable.count)
+      let heightMultiplier = AppState.shared.settings.layoutMode == .grid ? CGFloat(rows) * 9 / 32 : CGFloat(rows) * 9 / 16
       NSLayoutConstraint.activate([
         web.topAnchor.constraint(equalTo: host.topAnchor),
         web.leadingAnchor.constraint(equalTo: host.leadingAnchor),
         web.trailingAnchor.constraint(equalTo: host.trailingAnchor),
         web.bottomAnchor.constraint(equalTo: host.bottomAnchor),
-        host.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: CGFloat(rows) * 9 / 16),
-        host.heightAnchor.constraint(greaterThanOrEqualToConstant: embeddable.count == 1 ? 220 : 360)
+        host.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: heightMultiplier),
+        host.heightAnchor.constraint(greaterThanOrEqualToConstant: embeddable.count == 1 ? 220 : 180)
       ])
     }
     if !native.isEmpty {
-      addCloseBar(native)
-      native.forEach { addStackedCell($0) }
+      addCells(native)
     }
+  }
+
+  private func addCells(_ streams: [StreamItem]) {
+    if AppState.shared.settings.layoutMode == .grid {
+      addGrid(streams)
+      return
+    }
+    streams.forEach { addStackedCell($0) }
   }
 
   private func addPlaybackBar() {
     let host = UIView()
     host.translatesAutoresizingMaskIntoConstraints = false
 
-    let button = UIButton(type: .system)
-    button.setImage(UIImage(systemName: "play.fill"), for: .normal)
-    button.setTitle(" 全て再生", for: .normal)
-    button.tintColor = .white
-    button.setTitleColor(.white, for: .normal)
-    button.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
-    button.backgroundColor = UIColor.systemGreen.withAlphaComponent(0.85)
-    button.layer.cornerRadius = 16
-    button.contentEdgeInsets = UIEdgeInsets(top: 7, left: 12, bottom: 7, right: 14)
-    button.addAction(UIAction { _ in
+    let row = UIStackView()
+    row.axis = .horizontal
+    row.spacing = 8
+    row.alignment = .center
+    row.distribution = .fill
+    row.translatesAutoresizingMaskIntoConstraints = false
+    host.addSubview(row)
+
+    let playButton = playbackButton(title: " 全て再生", icon: "play.fill", color: .systemGreen) {
       PlaybackCoordinator.shared.resumeAll()
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
         PlaybackCoordinator.shared.resumeAll()
       }
-    }, for: .touchUpInside)
-    button.translatesAutoresizingMaskIntoConstraints = false
-    host.addSubview(button)
+    }
+    let reloadButton = playbackButton(title: " 自動更新", icon: "arrow.clockwise", color: .systemBlue) { [weak self] in
+      self?.reload()
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        PlaybackCoordinator.shared.resumeAll()
+      }
+    }
+    row.addArrangedSubview(playButton)
+    row.addArrangedSubview(reloadButton)
 
     stack.addArrangedSubview(host)
     NSLayoutConstraint.activate([
       host.heightAnchor.constraint(equalToConstant: 38),
-      button.centerYAnchor.constraint(equalTo: host.centerYAnchor),
-      button.trailingAnchor.constraint(equalTo: host.trailingAnchor),
-      button.heightAnchor.constraint(equalToConstant: 34)
+      row.centerYAnchor.constraint(equalTo: host.centerYAnchor),
+      row.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+      playButton.heightAnchor.constraint(equalToConstant: 34),
+      reloadButton.heightAnchor.constraint(equalToConstant: 34)
     ])
+  }
+
+  private func playbackButton(title: String, icon: String, color: UIColor, action: @escaping () -> Void) -> UIButton {
+    let button = UIButton(type: .system)
+    button.setImage(UIImage(systemName: icon), for: .normal)
+    button.setTitle(title, for: .normal)
+    button.tintColor = .white
+    button.setTitleColor(.white, for: .normal)
+    button.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
+    button.backgroundColor = color.withAlphaComponent(0.85)
+    button.layer.cornerRadius = 16
+    button.contentEdgeInsets = UIEdgeInsets(top: 7, left: 12, bottom: 7, right: 14)
+    button.addAction(UIAction { _ in action() }, for: .touchUpInside)
+    return button
   }
 
   private func addCloseBar(_ streams: [StreamItem]) {
@@ -2221,7 +2265,7 @@ final class FollowingController: BrowserSourceController {
     .twitch: Source(label: "Twitch", url: URL(string: "https://m.twitch.tv/directory/following")!, host: "twitch.tv"),
     .youtube: Source(label: "YouTube", url: URL(string: "https://m.youtube.com/feed/subscriptions")!, host: "youtube.com"),
     .kick: Source(label: "Kick", url: URL(string: "https://kick.com/following")!, host: "kick.com"),
-    .niconico: Source(label: "ニコ生", url: URL(string: "https://live.nicovideo.jp/")!, host: "live.nicovideo.jp"),
+    .niconico: Source(label: "ニコ生", url: URL(string: "https://live.nicovideo.jp/follow")!, host: "live.nicovideo.jp"),
     .twitcasting: Source(label: "ツイキャス", url: URL(string: "https://twitcasting.tv/")!, host: "twitcasting.tv")
   ]
 
