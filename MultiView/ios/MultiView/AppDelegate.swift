@@ -278,13 +278,18 @@ final class PlayerWebView: WKWebView {
 final class NiconicoNativePlayerView: UIView {
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
+  private let danmakuView = UIView()
   private let statusLabel = UILabel()
   private var pageTask: URLSessionDataTask?
   private var socketTask: URLSessionWebSocketTask?
+  private var ndgrCommentTask: Task<Void, Never>?
+  private var segmentTasks: [String: Task<Void, Never>] = [:]
+  private var activeSegmentURIs = Set<String>()
   private var keepSeatTimer: Timer?
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
   private let settings: AppSettings
+  private var laneCursor = 0
 
   init(stream: StreamItem, settings: AppSettings) {
     self.settings = settings
@@ -294,6 +299,10 @@ final class NiconicoNativePlayerView: UIView {
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     layer.addSublayer(playerLayer)
+
+    danmakuView.isUserInteractionEnabled = false
+    danmakuView.clipsToBounds = true
+    addSubview(danmakuView)
 
     statusLabel.text = "ニコ生を読み込み中"
     statusLabel.textColor = .white.withAlphaComponent(0.72)
@@ -319,6 +328,8 @@ final class NiconicoNativePlayerView: UIView {
     player.pause()
     player.replaceCurrentItem(with: nil)
     keepSeatTimer?.invalidate()
+    ndgrCommentTask?.cancel()
+    segmentTasks.values.forEach { $0.cancel() }
     pageTask?.cancel()
     socketTask?.cancel(with: .goingAway, reason: nil)
     if let itemFailedObserver {
@@ -329,6 +340,7 @@ final class NiconicoNativePlayerView: UIView {
   override func layoutSubviews() {
     super.layoutSubviews()
     playerLayer.frame = bounds
+    danmakuView.frame = bounds
   }
 
   private func load(channel: String) {
@@ -442,6 +454,13 @@ final class NiconicoNativePlayerView: UIView {
       startKeepSeatTimer(interval: interval)
       return
     }
+    if type == "messageServer",
+       let payload = json["data"] as? [String: Any],
+       let viewURI = payload["viewUri"] as? String,
+       !viewURI.isEmpty {
+      startNDGRComments(viewURI: viewURI)
+      return
+    }
     if type == "stream",
        let payload = json["data"] as? [String: Any],
        let uriString = payload["uri"] as? String,
@@ -495,6 +514,129 @@ final class NiconicoNativePlayerView: UIView {
       self.player.volume = self.settings.playAudio ? 1 : 0
       self.player.play()
     }
+  }
+
+  private func startNDGRComments(viewURI: String) {
+    guard settings.showChat else { return }
+    ndgrCommentTask?.cancel()
+    ndgrCommentTask = Task { [weak self] in
+      await self?.streamNDGRView(viewURI: viewURI)
+    }
+  }
+
+  private func streamNDGRView(viewURI: String) async {
+    var nextAt: String? = "now"
+    while !Task.isCancelled {
+      let requestAt = nextAt
+      guard var components = URLComponents(string: viewURI) else { return }
+      if let requestAt {
+        var items = components.queryItems ?? []
+        items.append(URLQueryItem(name: "at", value: requestAt))
+        components.queryItems = items
+      }
+      guard let url = components.url else { return }
+      nextAt = nil
+      do {
+        for try await message in protobufMessages(from: url) {
+          if let segmentURI = parseNDGRSegmentURI(fromChunkedEntry: message), !activeSegmentURIs.contains(segmentURI) {
+            activeSegmentURIs.insert(segmentURI)
+            let task = Task { [weak self] in
+              await self?.streamNDGRSegment(uri: segmentURI)
+            }
+            segmentTasks[segmentURI] = task
+          }
+          if let at = parseNDGRNextAt(fromChunkedEntry: message) {
+            nextAt = String(at)
+          }
+        }
+      } catch {
+        if Task.isCancelled || error is CancellationError {
+          return
+        }
+        nextAt = requestAt ?? "now"
+        showStatus("ニコ生コメント取得失敗: \(error.localizedDescription)")
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        continue
+      }
+      if nextAt == nil {
+        break
+      }
+    }
+  }
+
+  private func streamNDGRSegment(uri: String) async {
+    defer {
+      activeSegmentURIs.remove(uri)
+      segmentTasks.removeValue(forKey: uri)
+    }
+    guard let url = URL(string: uri) else { return }
+    do {
+      for try await message in protobufMessages(from: url) {
+        if let text = parseNDGRCommentText(fromChunkedMessage: message) {
+          emitDanmaku(text)
+        }
+      }
+    } catch {
+      showStatus("ニコ生コメント受信失敗: \(error.localizedDescription)")
+    }
+  }
+
+  private func protobufMessages(from url: URL) -> AsyncThrowingStream<Data, Error> {
+    AsyncThrowingStream { continuation in
+      let task = Task {
+        do {
+          var request = URLRequest(url: url)
+          request.setValue(NiconicoNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
+          let (bytes, response) = try await URLSession.shared.bytes(for: request)
+          if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw NSError(
+              domain: "NiconicoNativePlayerView",
+              code: http.statusCode,
+              userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"]
+            )
+          }
+          let reader = LengthDelimitedProtobufReader()
+          for try await byte in bytes {
+            for message in reader.append(byte) {
+              continuation.yield(message)
+            }
+          }
+          continuation.finish()
+        } catch {
+          continuation.finish(throwing: error)
+        }
+      }
+      continuation.onTermination = { _ in task.cancel() }
+    }
+  }
+
+  private func parseNDGRSegmentURI(fromChunkedEntry data: Data) -> String? {
+    for field in protobufFields(data) where field.number == 1 {
+      for segmentField in protobufFields(field.data) where segmentField.number == 3 {
+        return String(data: segmentField.data, encoding: .utf8)
+      }
+    }
+    return nil
+  }
+
+  private func parseNDGRNextAt(fromChunkedEntry data: Data) -> Int64? {
+    for field in protobufFields(data) where field.number == 4 {
+      for nextField in protobufFields(field.data) where nextField.number == 1 {
+        return Int64(exactly: nextField.varint)
+      }
+    }
+    return nil
+  }
+
+  private func parseNDGRCommentText(fromChunkedMessage data: Data) -> String? {
+    for field in protobufFields(data) where field.number == 2 {
+      for messageField in protobufFields(field.data) where messageField.number == 1 || messageField.number == 20 {
+        for chatField in protobufFields(messageField.data) where chatField.number == 1 {
+          return String(data: chatField.data, encoding: .utf8)
+        }
+      }
+    }
+    return nil
   }
 
   private func parseWatchData(from html: String) throws -> (webSocketURL: URL, frontendId: String?) {
@@ -567,6 +709,129 @@ final class NiconicoNativePlayerView: UIView {
       }
     }
     return output
+  }
+
+  private struct ProtobufField {
+    let number: Int
+    let data: Data
+    let varint: UInt64
+  }
+
+  private func protobufFields(_ data: Data) -> [ProtobufField] {
+    var fields: [ProtobufField] = []
+    var offset = 0
+    while offset < data.count, let key = readVarint(data, offset: &offset) {
+      let number = Int(key >> 3)
+      let wireType = Int(key & 0x07)
+      switch wireType {
+      case 0:
+        guard let value = readVarint(data, offset: &offset) else { return fields }
+        fields.append(ProtobufField(number: number, data: Data(), varint: value))
+      case 1:
+        guard offset + 8 <= data.count else { return fields }
+        offset += 8
+      case 2:
+        guard let length = readVarint(data, offset: &offset) else { return fields }
+        guard length <= UInt64(Int.max) else { return fields }
+        let end = offset + Int(length)
+        guard end <= data.count else { return fields }
+        fields.append(ProtobufField(number: number, data: data.subdata(in: offset..<end), varint: 0))
+        offset = end
+      case 5:
+        guard offset + 4 <= data.count else { return fields }
+        offset += 4
+      default:
+        return fields
+      }
+    }
+    return fields
+  }
+
+  private func readVarint(_ data: Data, offset: inout Int) -> UInt64? {
+    var result: UInt64 = 0
+    var shift: UInt64 = 0
+    while offset < data.count, shift < 64 {
+      let byte = data[offset]
+      offset += 1
+      result |= UInt64(byte & 0x7f) << shift
+      if byte & 0x80 == 0 {
+        return result
+      }
+      shift += 7
+    }
+    return nil
+  }
+
+  private final class LengthDelimitedProtobufReader {
+    private var buffer: [UInt8] = []
+
+    func append(_ byte: UInt8) -> [Data] {
+      buffer.append(byte)
+      var messages: [Data] = []
+      while let message = nextMessage() {
+        messages.append(message)
+      }
+      return messages
+    }
+
+    private func nextMessage() -> Data? {
+      var offset = 0
+      var length = 0
+      var shift = 0
+      while offset < buffer.count {
+        let byte = buffer[offset]
+        length |= Int(byte & 0x7f) << shift
+        offset += 1
+        if byte & 0x80 == 0 {
+          guard buffer.count >= offset + length else { return nil }
+          let payload = Data(buffer[offset..<(offset + length)])
+          buffer.removeFirst(offset + length)
+          return payload
+        }
+        shift += 7
+        if shift > 28 { return nil }
+      }
+      return nil
+    }
+  }
+
+  private func emitDanmaku(_ text: String) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    if settings.danmakuMaxLength > 0, trimmed.count > settings.danmakuMaxLength {
+      return
+    }
+    DispatchQueue.main.async {
+      guard self.danmakuView.bounds.height > 0, self.danmakuView.bounds.width > 0 else { return }
+      let fontSize = CGFloat(self.settings.danmakuFontSize)
+      let lineHeight = fontSize + 8
+      let maxLines = self.settings.danmakuMaxLines > 0
+        ? self.settings.danmakuMaxLines
+        : max(1, Int(self.danmakuView.bounds.height / lineHeight))
+      let label = UILabel()
+      label.text = trimmed
+      label.font = .systemFont(ofSize: fontSize, weight: .bold)
+      label.textColor = UIColor.white.withAlphaComponent(self.settings.danmakuOpacity)
+      label.layer.shadowColor = UIColor.black.cgColor
+      label.layer.shadowRadius = 2
+      label.layer.shadowOpacity = 1
+      label.layer.shadowOffset = CGSize(width: 1, height: 1)
+      label.sizeToFit()
+      let lane = self.laneCursor % maxLines
+      self.laneCursor += 1
+      let y = CGFloat(lane) * lineHeight + 6
+      let startX = self.danmakuView.bounds.width + 12
+      label.frame.origin = CGPoint(x: startX, y: y)
+      self.danmakuView.addSubview(label)
+      let travel = startX + label.bounds.width + 24
+      let pixelsPerSecond = max(35, self.danmakuView.bounds.width * CGFloat(self.settings.danmakuSpeed))
+      let duration = TimeInterval(travel / pixelsPerSecond)
+      UIView.animate(withDuration: duration, delay: 0, options: [.curveLinear]) {
+        label.frame.origin.x = -label.bounds.width - 12
+      } completion: { _ in
+        label.removeFromSuperview()
+      }
+    }
   }
 
   private func showStatus(_ text: String) {
