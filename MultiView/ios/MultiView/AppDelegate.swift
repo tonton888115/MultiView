@@ -463,6 +463,7 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
 }
 
 final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+  private let stream: StreamItem
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
   private let danmakuView = UIView()
@@ -475,6 +476,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var keepSeatTimer: Timer?
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
+  private var fallbackWebView: PlayerWebView?
   private let settings: AppSettings
   private let channel: String
   private var playbackVolume: Float
@@ -484,6 +486,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var laneCursor = 0
 
   init(stream: StreamItem, settings: AppSettings) {
+    self.stream = stream
     self.settings = settings
     self.channel = stream.channel
     self.playbackVolume = StreamVolumeStore.volume(for: stream)
@@ -539,6 +542,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     pageTask = nil
     socketTask?.cancel(with: .goingAway, reason: nil)
     socketTask = nil
+    fallbackWebView?.stopPlayback()
+    fallbackWebView?.removeFromSuperview()
+    fallbackWebView = nil
     itemStatusObservation = nil
     if let itemFailedObserver {
       NotificationCenter.default.removeObserver(itemFailedObserver)
@@ -557,6 +563,10 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     let session = AVAudioSession.sharedInstance()
     try? session.setCategory(.playback, mode: .default, options: [])
     try? session.setActive(true)
+    if let fallbackWebView {
+      fallbackWebView.resumePlayback()
+      return
+    }
     if player.currentItem == nil {
       if isLoading || socketTask != nil {
         return
@@ -572,14 +582,16 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
     player.volume = settings.playAudio ? playbackVolume : 0
+    fallbackWebView?.setPlaybackVolume(playbackVolume)
   }
 
   private func load(channel: String) {
     guard !isStopped else { return }
     guard !isLoading else { return }
+    guard fallbackWebView == nil else { return }
     let programId = channel.trimmingCharacters(in: .whitespacesAndNewlines)
     guard let url = URL(string: "https://live.nicovideo.jp/watch/\(programId)") else {
-      showStatus("番組IDが不正です")
+      installFallback("番組IDが不正です")
       return
     }
     watchPageURL = url
@@ -591,18 +603,18 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       self.pageTask = nil
       self.isLoading = false
       if let error {
-        self.showStatus("ニコ生ページ取得失敗: \(error.localizedDescription)")
+        self.installFallback("ニコ生ページ取得失敗: \(error.localizedDescription)")
         return
       }
       guard let data, let html = String(data: data, encoding: .utf8) else {
-        self.showStatus("ニコ生ページを読めません")
+        self.installFallback("ニコ生ページを読めません")
         return
       }
       do {
         let watch = try self.parseWatchData(from: html)
         self.connect(webSocketURL: watch.webSocketURL, frontendId: watch.frontendId)
       } catch {
-        self.showStatus("ニコ生の再生情報を取得できません")
+        self.installFallback("ニコ生の再生情報を取得できません")
       }
     }
     pageTask?.resume()
@@ -616,7 +628,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       components?.queryItems = items
     }
     guard let url = components?.url else {
-      showStatus("ニコ生WebSocket URLが不正です")
+      installFallback("ニコ生WebSocket URLが不正です")
       return
     }
     var request = URLRequest(url: url)
@@ -674,7 +686,11 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         self.receiveNext()
       case .failure(let error):
         self.socketTask = nil
-        self.showStatus("ニコ生WebSocket切断: \(error.localizedDescription)")
+        if self.player.currentItem == nil {
+          self.installFallback("ニコ生WebSocket切断: \(error.localizedDescription)")
+          return
+        }
+        self.showStatus("ニコ生WebSocket再接続中: \(error.localizedDescription)")
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
           guard let self, !self.isStopped else { return }
           self.load(channel: self.channel)
@@ -717,7 +733,11 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
     if type == "disconnect" {
       socketTask = nil
-      showStatus("ニコ生から切断されました")
+      if player.currentItem == nil {
+        installFallback("ニコ生から切断されました")
+        return
+      }
+      showStatus("ニコ生へ再接続中")
       DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
         guard let self, !self.isStopped else { return }
         self.load(channel: self.channel)
@@ -780,6 +800,37 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       headers["Cookie"] = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
     }
     return headers
+  }
+
+  private func installFallback(_ reason: String) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil else { return }
+      self.showStatus(reason)
+      self.player.pause()
+      self.player.replaceCurrentItem(with: nil)
+      self.socketTask?.cancel(with: .goingAway, reason: nil)
+      self.socketTask = nil
+      self.ndgrCommentTask?.cancel()
+      self.ndgrCommentTask = nil
+      self.segmentTasks.values.forEach { $0.cancel() }
+      self.segmentTasks.removeAll()
+      self.activeSegmentURIs.removeAll()
+      self.statusLabel.isHidden = true
+      let web = PlayerWebView(stream: self.stream, settings: self.settings)
+      web.setPlaybackVolume(self.playbackVolume)
+      web.translatesAutoresizingMaskIntoConstraints = false
+      self.insertSubview(web, belowSubview: self.danmakuView)
+      NSLayoutConstraint.activate([
+        web.topAnchor.constraint(equalTo: self.topAnchor),
+        web.leadingAnchor.constraint(equalTo: self.leadingAnchor),
+        web.trailingAnchor.constraint(equalTo: self.trailingAnchor),
+        web.bottomAnchor.constraint(equalTo: self.bottomAnchor)
+      ])
+      self.fallbackWebView = web
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+        web.resumePlayback()
+      }
+    }
   }
 
   private func startNDGRComments(viewURI: String) {
@@ -2468,7 +2519,7 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
       return (.youtube, first)
     }
     if host.contains("live.nicovideo.jp"), parts.count >= 2, parts[0] == "watch" {
-      return (.niconico, parts[1])
+      return (.niconico, parts.dropFirst().joined(separator: "/"))
     }
     if host == "twitcasting.tv", let first = parts.first, first != "search" {
       return (.twitcasting, first)
