@@ -70,7 +70,7 @@
     var muted = audioOn ? 'false' : 'true';
     var muteNum = audioOn ? '0' : '1';
     if (platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&parent=' + host + '&muted=' + muted + '&autoplay=true';
-    if (platform === 'kick') return 'https://player.kick.cx/' + ch;
+    if (platform === 'kick') return 'https://player.kick.com/' + ch + '?autoplay=true&muted=' + ((!audioOn || volume <= 0) ? 'true' : 'false');
     if (platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=' + muteNum + '&playsinline=1&enablejsapi=1&origin=' + encodeURIComponent(location.origin);
     if (platform === 'twitcasting') return 'https://twitcasting.tv/' + ch + '/embeddedplayer/live?auto_play=true';
     return '';

@@ -1096,6 +1096,7 @@ final class MultiPlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable,
     var components = URLComponents(string: "https://tonton888115.github.io/MultiView/multiview.html")!
     components.queryItems = [
       URLQueryItem(name: "streams", value: encodedStreams),
+      URLQueryItem(name: "volumes", value: Self.encodedVolumes(for: streams)),
       URLQueryItem(name: "layout", value: settings.layoutMode.rawValue),
       URLQueryItem(name: "audio", value: settings.playAudio ? "1" : "0"),
       URLQueryItem(name: "chat", value: settings.showChat ? "1" : "0"),
@@ -1108,12 +1109,6 @@ final class MultiPlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable,
     ]
     if let url = components.url {
       load(URLRequest(url: url))
-      DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-        streams.forEach { self?.setStreamVolume(StreamVolumeStore.volume(for: $0), for: $0) }
-      }
-      DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-        streams.forEach { self?.setStreamVolume(StreamVolumeStore.volume(for: $0), for: $0) }
-      }
     }
   }
 
@@ -1173,6 +1168,15 @@ final class MultiPlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable,
 
   private static func streamKey(for stream: StreamItem) -> String {
     "\(stream.platform.rawValue):\(stream.channel.lowercased())"
+  }
+
+  private static func encodedVolumes(for streams: [StreamItem]) -> String {
+    streams
+      .map {
+        let key = streamKey(for: $0).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? streamKey(for: $0)
+        return "\(key)=\(StreamVolumeStore.volume(for: $0))"
+      }
+      .joined(separator: ",")
   }
 
   private static func jsString(_ text: String) -> String {
@@ -1267,7 +1271,6 @@ final class ViewingController: UIViewController {
     host.translatesAutoresizingMaskIntoConstraints = false
     web.translatesAutoresizingMaskIntoConstraints = false
     host.addSubview(web)
-    addVolumeStack(for: streams, to: host, web: web)
     stack.addArrangedSubview(host)
     NSLayoutConstraint.activate([
       web.topAnchor.constraint(equalTo: host.topAnchor),
@@ -1289,7 +1292,6 @@ final class ViewingController: UIViewController {
       host.translatesAutoresizingMaskIntoConstraints = false
       web.translatesAutoresizingMaskIntoConstraints = false
       host.addSubview(web)
-      addVolumeStack(for: embeddable, to: host, web: web)
       stack.addArrangedSubview(host)
       let rows = AppState.shared.settings.layoutMode == .grid ? ceil(Double(embeddable.count) / 2.0) : Double(embeddable.count)
       NSLayoutConstraint.activate([
@@ -1302,27 +1304,6 @@ final class ViewingController: UIViewController {
       ])
     }
     niconico.forEach { addStackedCell($0) }
-  }
-
-  private func addVolumeStack(for streams: [StreamItem], to host: UIView, web: MultiPlayerWebView) {
-    let controls = UIStackView()
-    controls.axis = .vertical
-    controls.spacing = 8
-    controls.distribution = .fillEqually
-    controls.translatesAutoresizingMaskIntoConstraints = false
-    host.addSubview(controls)
-    streams.forEach { stream in
-      let volume = VolumeOverlay(stream: stream) { value in
-        web.setStreamVolume(value, for: stream)
-      }
-      controls.addArrangedSubview(volume)
-    }
-    NSLayoutConstraint.activate([
-      controls.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -10),
-      controls.topAnchor.constraint(equalTo: host.topAnchor, constant: 10),
-      controls.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -10),
-      controls.widthAnchor.constraint(equalToConstant: 42)
-    ])
   }
 
   private func addCloseBar(_ streams: [StreamItem]) {

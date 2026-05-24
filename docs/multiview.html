@@ -13,6 +13,17 @@
     border:1px solid rgba(255,255,255,0.16); }
   body.grid .cell { width:calc(50vw - 16px); }
   .cell iframe { position:absolute; inset:0; width:100%; height:100%; border:0; background:#000; }
+  .vol {
+    position:absolute; right:8px; top:50%; z-index:5; width:38px; height:min(62%, 220px);
+    transform:translateY(-50%); border-radius:19px; background:rgba(28,32,34,0.72);
+    border:1px solid rgba(255,255,255,0.14); backdrop-filter:blur(10px);
+    display:flex; align-items:center; justify-content:center;
+  }
+  .vol input {
+    width:calc(min(62vw, 210px)); height:28px; transform:rotate(-90deg);
+    accent-color:#52ff21;
+  }
+  .vol svg { position:absolute; bottom:10px; width:18px; height:18px; fill:#fff; pointer-events:none; }
   #audioStart { position:fixed; right:10px; bottom:10px; z-index:4; padding:10px 14px; border-radius:18px;
     border:1px solid rgba(255,255,255,0.25); background:rgba(18,24,32,0.76); color:#fff;
     font:700 13px -apple-system,BlinkMacSystemFont,sans-serif; }
@@ -36,6 +47,7 @@
   var ml = P.get('ml') || '0';
   var mlen = P.get('mlen') || '0';
   var raw = P.get('streams') || '';
+  var rawVolumes = P.get('volumes') || '';
   document.body.className = layout === 'grid' ? 'grid' : 'stacked';
 
   function parseStreams() {
@@ -63,13 +75,34 @@
   function keyOf(s) {
     return s.platform + ':' + String(s.channel).toLowerCase();
   }
+  function parseVolumes() {
+    var out = {};
+    rawVolumes.split(',').forEach(function (part) {
+      var i = part.lastIndexOf('=');
+      if (i <= 0) return;
+      var key = decodeURIComponent(part.slice(0, i));
+      var value = Math.max(0, Math.min(1, Number(part.slice(i + 1)) || 0));
+      out[key] = value;
+    });
+    return out;
+  }
   var grid = document.getElementById('grid');
   var audioStart = document.getElementById('audioStart');
+  var volumes = parseVolumes();
   function applyVolume(key, volume) {
     var v = Math.max(0, Math.min(1, Number(volume) || 0));
+    volumes[key] = v;
     Array.prototype.forEach.call(document.querySelectorAll('iframe[data-key]'), function (frame) {
       if (frame.getAttribute('data-key') !== key) return;
       try { frame.contentWindow.postMessage({ type:'volume', volume:v }, '*'); } catch (e) {}
+      var platform = frame.getAttribute('data-platform');
+      if (platform === 'kick') {
+        var muted = v <= 0 || !audioOn;
+        if (frame.getAttribute('data-muted') !== String(muted)) {
+          frame.setAttribute('data-muted', String(muted));
+          frame.src = frame.getAttribute('data-base-src') + (muted ? '?muted=true&autoplay=true' : '?muted=false&autoplay=true');
+        }
+      }
     });
   }
   window.addEventListener('message', function (event) {
@@ -103,9 +136,28 @@
     iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute('playsinline', 'true');
     iframe.setAttribute('scrolling', 'no');
-    iframe.setAttribute('data-key', keyOf(s));
+    var key = keyOf(s);
+    iframe.setAttribute('data-key', key);
+    iframe.setAttribute('data-platform', s.platform);
+    if (s.platform === 'kick') {
+      iframe.setAttribute('data-base-src', 'https://player.kick.com/' + encodeURIComponent(s.channel));
+      iframe.setAttribute('data-muted', String((volumes[key] || 1) <= 0 || !audioOn));
+    }
     cell.appendChild(iframe);
+    var control = document.createElement('label');
+    control.className = 'vol';
+    var range = document.createElement('input');
+    range.type = 'range';
+    range.min = '0';
+    range.max = '1';
+    range.step = '0.01';
+    range.value = String(volumes[key] == null ? 1 : volumes[key]);
+    range.addEventListener('input', function () { applyVolume(key, range.value); });
+    control.appendChild(range);
+    control.insertAdjacentHTML('beforeend', '<svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 4V5L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12zm-2.5-8.7v2.06A7.5 7.5 0 0 1 18.5 12a7.5 7.5 0 0 1-4.5 6.64v2.06A9.5 9.5 0 0 0 20.5 12 9.5 9.5 0 0 0 14 3.3z"/></svg>');
+    cell.appendChild(control);
     grid.appendChild(cell);
+    setTimeout(function () { applyVolume(key, range.value); }, 900);
   });
 })();
 </script>
