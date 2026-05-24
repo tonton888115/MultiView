@@ -38,6 +38,11 @@
   var audioOn = P.get('audio') === '1';
   var chatOn = P.get('chat') !== '0';
   var proxy = P.get('proxy') || '';
+  var fs = P.get('fs') || '20';
+  var sp = P.get('sp') || '0.13';
+  var op = P.get('op') || '0.9';
+  var ml = P.get('ml') || '0';
+  var mlen = P.get('mlen') || '0';
   var raw = P.get('streams') || '';
   document.body.className = layout === 'grid' ? 'grid' : 'stacked';
 
@@ -57,7 +62,13 @@
     return 'https://tonton888115.github.io/MultiView/player.html?platform=' + encodeURIComponent(s.platform) +
       '&channel=' + ch +
       '&chat=' + (chatOn ? '1' : '0') +
-      '&fs=20&sp=0.13&op=0.9&ml=0&mlen=0&audio=' + (audioOn ? '1' : '0') +
+      '&fs=' + encodeURIComponent(fs) +
+      '&sp=' + encodeURIComponent(sp) +
+      '&op=' + encodeURIComponent(op) +
+      '&ml=' + encodeURIComponent(ml) +
+      '&mlen=' + encodeURIComponent(mlen) +
+      '&start=0' +
+      '&audio=' + (audioOn ? '1' : '0') +
       (proxy ? '&proxy=' + encodeURIComponent(proxy) : '');
   }
   function label(s) {

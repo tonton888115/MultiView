@@ -89,12 +89,17 @@ struct AppSettings: Codable {
   var proxyUrl = ""
   var playAudio = true
   var layoutMode: LayoutMode = .stacked
+  var danmakuFontSize = 20.0
+  var danmakuSpeed = 0.13
+  var danmakuOpacity = 0.9
+  var danmakuMaxLines = 0
+  var danmakuMaxLength = 0
   var platformOrder = StreamPlatform.allCases
 }
 
 enum Store {
   private static let streamsKey = "native.streams.v1"
-  private static let settingsKey = "native.settings.v3"
+  private static let settingsKey = "native.settings.v4"
 
   static func loadStreams() -> [StreamItem] {
     guard let data = UserDefaults.standard.data(forKey: streamsKey),
@@ -211,6 +216,9 @@ final class PlayerWebView: WKWebView {
     let config = WKWebViewConfiguration()
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
+    if stream.platform == .niconico {
+      config.userContentController.addUserScript(WKUserScript(source: PlayerWebView.niconicoPopupBlockerScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+    }
     super.init(frame: .zero, configuration: config)
     isOpaque = false
     backgroundColor = .black
@@ -233,11 +241,11 @@ final class PlayerWebView: WKWebView {
       URLQueryItem(name: "platform", value: stream.platform.rawValue),
       URLQueryItem(name: "channel", value: stream.channel),
       URLQueryItem(name: "chat", value: settings.showChat ? "1" : "0"),
-      URLQueryItem(name: "fs", value: "20"),
-      URLQueryItem(name: "sp", value: "0.13"),
-      URLQueryItem(name: "op", value: "0.9"),
-      URLQueryItem(name: "ml", value: "0"),
-      URLQueryItem(name: "mlen", value: "0"),
+      URLQueryItem(name: "fs", value: String(settings.danmakuFontSize)),
+      URLQueryItem(name: "sp", value: String(settings.danmakuSpeed)),
+      URLQueryItem(name: "op", value: String(settings.danmakuOpacity)),
+      URLQueryItem(name: "ml", value: String(settings.danmakuMaxLines)),
+      URLQueryItem(name: "mlen", value: String(settings.danmakuMaxLength)),
       URLQueryItem(name: "audio", value: settings.playAudio ? "1" : "0"),
       URLQueryItem(name: "proxy", value: settings.proxyUrl.trimmingCharacters(in: .whitespacesAndNewlines))
     ]
@@ -245,6 +253,25 @@ final class PlayerWebView: WKWebView {
       load(URLRequest(url: url))
     }
   }
+
+  private static let niconicoPopupBlockerScript = """
+  (function(){
+    function hideComfortPopup(){
+      var words = ['快適視聴してみませんか', '快適視聴', 'プレミアム会員'];
+      var nodes = Array.prototype.slice.call(document.querySelectorAll('[role="dialog"], dialog, [class*="modal"], [class*="Modal"], [class*="popup"], [class*="Popup"], [class*="overlay"], [class*="Overlay"]'));
+      nodes.forEach(function (node) {
+        var text = node.innerText || node.textContent || '';
+        if (words.some(function (word) { return text.indexOf(word) !== -1; })) {
+          node.style.setProperty('display', 'none', 'important');
+          node.style.setProperty('visibility', 'hidden', 'important');
+          node.style.setProperty('pointer-events', 'none', 'important');
+        }
+      });
+    }
+    hideComfortPopup();
+    new MutationObserver(hideComfortPopup).observe(document.documentElement, { childList:true, subtree:true });
+  })();
+  """
 
 }
 
@@ -275,7 +302,12 @@ final class MultiPlayerWebView: WKWebView {
       URLQueryItem(name: "layout", value: settings.layoutMode.rawValue),
       URLQueryItem(name: "audio", value: settings.playAudio ? "1" : "0"),
       URLQueryItem(name: "chat", value: settings.showChat ? "1" : "0"),
-      URLQueryItem(name: "proxy", value: settings.proxyUrl.trimmingCharacters(in: .whitespacesAndNewlines))
+      URLQueryItem(name: "proxy", value: settings.proxyUrl.trimmingCharacters(in: .whitespacesAndNewlines)),
+      URLQueryItem(name: "fs", value: String(settings.danmakuFontSize)),
+      URLQueryItem(name: "sp", value: String(settings.danmakuSpeed)),
+      URLQueryItem(name: "op", value: String(settings.danmakuOpacity)),
+      URLQueryItem(name: "ml", value: String(settings.danmakuMaxLines)),
+      URLQueryItem(name: "mlen", value: String(settings.danmakuMaxLength))
     ]
     if let url = components.url {
       load(URLRequest(url: url))
@@ -838,7 +870,7 @@ final class SettingsController: UITableViewController {
 
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     switch section {
-    case 0: return 4
+    case 0: return 9
     case 1: return platforms.count
     default: return 1
     }
@@ -893,11 +925,47 @@ final class SettingsController: UITableViewController {
         AppState.shared.settings = settings
       }, for: .valueChanged)
       cell.accessoryView = toggle
-    } else if indexPath.section == 0 {
+    } else if indexPath.section == 0 && indexPath.row == 3 {
       cell.textLabel?.text = "CORSプロキシ"
       cell.detailTextLabel?.text = nil
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
+    } else if indexPath.section == 0 {
+      let slider = UISlider()
+      slider.frame = CGRect(x: 0, y: 0, width: 150, height: 32)
+      slider.tag = indexPath.row
+      slider.addAction(UIAction { [weak self] action in
+        guard let slider = action.sender as? UISlider else { return }
+        self?.updateDanmakuSetting(row: slider.tag, value: slider.value)
+      }, for: .valueChanged)
+      switch indexPath.row {
+      case 4:
+        cell.textLabel?.text = "文字サイズ \(Int(AppState.shared.settings.danmakuFontSize))"
+        slider.minimumValue = 12
+        slider.maximumValue = 40
+        slider.value = Float(AppState.shared.settings.danmakuFontSize)
+      case 5:
+        cell.textLabel?.text = "速度 \(Int((AppState.shared.settings.danmakuSpeed / 0.13) * 100))%"
+        slider.minimumValue = 0.05
+        slider.maximumValue = 0.3
+        slider.value = Float(AppState.shared.settings.danmakuSpeed)
+      case 6:
+        cell.textLabel?.text = "透過度 \(Int(AppState.shared.settings.danmakuOpacity * 100))%"
+        slider.minimumValue = 0.3
+        slider.maximumValue = 1
+        slider.value = Float(AppState.shared.settings.danmakuOpacity)
+      case 7:
+        cell.textLabel?.text = "最大行数 \(AppState.shared.settings.danmakuMaxLines == 0 ? "自動" : String(AppState.shared.settings.danmakuMaxLines))"
+        slider.minimumValue = 0
+        slider.maximumValue = 20
+        slider.value = Float(AppState.shared.settings.danmakuMaxLines)
+      default:
+        cell.textLabel?.text = "最大文字数 \(AppState.shared.settings.danmakuMaxLength == 0 ? "無制限" : String(AppState.shared.settings.danmakuMaxLength))"
+        slider.minimumValue = 0
+        slider.maximumValue = 200
+        slider.value = Float(AppState.shared.settings.danmakuMaxLength)
+      }
+      cell.accessoryView = slider
     } else if indexPath.section == 1 {
       let platform = platforms[indexPath.row]
       cell.textLabel?.text = platform.label
@@ -935,6 +1003,25 @@ final class SettingsController: UITableViewController {
     } else if indexPath.section == 2 {
       present(AddStreamController(), animated: true)
     }
+  }
+
+  private func updateDanmakuSetting(row: Int, value: Float) {
+    var settings = AppState.shared.settings
+    switch row {
+    case 4:
+      settings.danmakuFontSize = Double(round(value))
+    case 5:
+      settings.danmakuSpeed = Double(value)
+    case 6:
+      settings.danmakuOpacity = Double(value)
+    case 7:
+      settings.danmakuMaxLines = Int(round(value))
+    case 8:
+      settings.danmakuMaxLength = Int(round(value / 10) * 10)
+    default:
+      return
+    }
+    AppState.shared.settings = settings
   }
 
   private func editProxy() {

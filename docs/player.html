@@ -54,6 +54,8 @@
   var danmakuEl = document.getElementById('danmaku');
   var msgEl = document.getElementById('msg');
   var startEl = document.getElementById('start');
+  var showStartOverlay = P.get('start') !== '0';
+  if (!showStartOverlay) startEl.style.display = 'none';
   var frameEl = null;
   function showMsg(t) { msgEl.textContent = t; msgEl.style.display = 'block'; }
   function viaProxy(u) { return proxy ? proxy + encodeURIComponent(u) : u; }
@@ -92,8 +94,10 @@
     setTimeout(function () { frameEl.src = src; }, 40);
     startEl.style.display = 'none';
   }
-  startEl.addEventListener('click', startPlayback);
-  startEl.addEventListener('touchend', function (e) { e.preventDefault(); startPlayback(); }, { passive: false });
+  if (showStartOverlay) {
+    startEl.addEventListener('click', startPlayback);
+    startEl.addEventListener('touchend', function (e) { e.preventDefault(); startPlayback(); }, { passive: false });
+  }
 
   // ---- filter ----
   function blocked(text, user) {
