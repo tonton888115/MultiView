@@ -23,6 +23,7 @@
     background:rgba(0,0,0,0.18); color:#fff; border:0; font:700 14px -apple-system,BlinkMacSystemFont,sans-serif; }
   #start span { padding:10px 14px; border-radius:18px; background:rgba(18,24,32,0.72);
     border:1px solid rgba(255,255,255,0.25); }
+  body.clean #start { display:none; }
 </style>
 </head>
 <body>
@@ -85,6 +86,7 @@
   }
   function startPlayback() {
     if (!frameEl) return;
+    document.body.classList.add('clean');
     var src = frameEl.src;
     frameEl.src = 'about:blank';
     setTimeout(function () { frameEl.src = src; }, 40);

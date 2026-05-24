@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>MultiView</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; min-height:100%; background:#000; color:#fff; }
+  body { font-family:-apple-system,BlinkMacSystemFont,sans-serif; overflow-y:auto; -webkit-overflow-scrolling:touch; }
+  #grid { display:flex; flex-direction:column; gap:10px; padding:10px; box-sizing:border-box; }
+  body.grid #grid { flex-direction:row; flex-wrap:wrap; align-content:flex-start; justify-content:center; }
+  .cell { position:relative; width:100%; aspect-ratio:16/9; background:#000; overflow:hidden; border-radius:14px;
+    border:1px solid rgba(255,255,255,0.16); }
+  body.grid .cell { width:calc(50vw - 16px); }
+  .cell iframe { position:absolute; inset:0; width:100%; height:100%; border:0; background:#000; }
+  .bar { position:absolute; z-index:2; left:8px; right:8px; top:8px; height:30px; display:flex; align-items:center;
+    padding:0 10px; box-sizing:border-box; border-radius:14px; background:rgba(18,24,32,0.58);
+    border:1px solid rgba(255,255,255,0.18); font-size:12px; font-weight:700; pointer-events:none; }
+  body.clean .bar, body.clean #hint { display:none; }
+  #hint { position:sticky; top:0; z-index:3; margin:0; padding:8px 10px; color:#ddd;
+    background:rgba(0,0,0,0.72); font-size:12px; text-align:center; }
+</style>
+</head>
+<body>
+<p id="hint">プレイヤーをタップして再生 / ミュート解除</p>
+<div id="grid"></div>
+<script>
+(function () {
+  'use strict';
+  var P = new URLSearchParams(location.search);
+  var layout = P.get('layout') || 'stacked';
+  var audioOn = P.get('audio') === '1';
+  var raw = P.get('streams') || '';
+  document.body.className = layout === 'grid' ? 'grid' : 'stacked';
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function parseStreams() {
+    return raw.split(',').map(function (part) {
+      var i = part.indexOf(':');
+      if (i <= 0) return null;
+      return { platform: part.slice(0, i), channel: decodeURIComponent(part.slice(i + 1)) };
+    }).filter(Boolean);
+  }
+  function embedUrl(s) {
+    var ch = encodeURIComponent(s.channel);
+    var muted = audioOn ? 'false' : 'true';
+    var muteNum = audioOn ? '0' : '1';
+    if (s.platform === 'kick') return 'https://player.kick.cx/' + ch;
+    if (s.platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&parent=' + location.hostname + '&muted=' + muted + '&autoplay=true';
+    if (s.platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=' + muteNum + '&playsinline=1';
+    if (s.platform === 'twitcasting') return 'https://twitcasting.tv/' + ch + '/embeddedplayer/live?auto_play=true';
+    if (s.platform === 'niconico') return 'https://live.nicovideo.jp/watch/' + ch;
+    return '';
+  }
+  function label(s) {
+    var names = { kick:'Kick', twitch:'Twitch', youtube:'YouTube', niconico:'ニコ生', twitcasting:'ツイキャス' };
+    return (names[s.platform] || s.platform) + ' / ' + s.channel;
+  }
+  var grid = document.getElementById('grid');
+  document.addEventListener('touchstart', function () { document.body.classList.add('clean'); }, { once:true, passive:true });
+  document.addEventListener('click', function () { document.body.classList.add('clean'); }, { once:true });
+  parseStreams().forEach(function (s) {
+    var src = embedUrl(s);
+    if (!src) return;
+    var cell = document.createElement('div');
+    cell.className = 'cell';
+    cell.innerHTML = '<div class="bar">' + esc(label(s)) + '</div>';
+    var iframe = document.createElement('iframe');
+    iframe.src = src;
+    iframe.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
+    iframe.setAttribute('allowfullscreen', 'true');
+    iframe.setAttribute('playsinline', 'true');
+    iframe.setAttribute('scrolling', 'no');
+    cell.appendChild(iframe);
+    grid.appendChild(cell);
+  });
+})();
+</script>
+</body>
+</html>

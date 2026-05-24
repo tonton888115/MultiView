@@ -10,7 +10,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
-    try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [])
+    try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
     try? AVAudioSession.sharedInstance().setActive(true)
     window = UIWindow(frame: UIScreen.main.bounds)
     window?.rootViewController = MainTabController()
@@ -231,6 +231,39 @@ final class PlayerWebView: WKWebView {
 
 }
 
+final class MultiPlayerWebView: WKWebView {
+  init(streams: [StreamItem], settings: AppSettings) {
+    let config = WKWebViewConfiguration()
+    config.allowsInlineMediaPlayback = true
+    config.mediaTypesRequiringUserActionForPlayback = []
+    super.init(frame: .zero, configuration: config)
+    isOpaque = false
+    backgroundColor = .black
+    scrollView.backgroundColor = .black
+    scrollView.contentInsetAdjustmentBehavior = .never
+    load(streams: streams, settings: settings)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  private func load(streams: [StreamItem], settings: AppSettings) {
+    let encodedStreams = streams
+      .map { "\($0.platform.rawValue):\($0.channel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.channel)" }
+      .joined(separator: ",")
+    var components = URLComponents(string: "https://tonton888115.github.io/MultiView/multiview.html")!
+    components.queryItems = [
+      URLQueryItem(name: "streams", value: encodedStreams),
+      URLQueryItem(name: "layout", value: settings.layoutMode.rawValue),
+      URLQueryItem(name: "audio", value: settings.playAudio ? "1" : "0")
+    ]
+    if let url = components.url {
+      load(URLRequest(url: url))
+    }
+  }
+}
+
 final class ViewingController: UIViewController {
   private let scrollView = UIScrollView()
   private let stack = UIStackView()
@@ -259,15 +292,10 @@ final class ViewingController: UIViewController {
       return
     }
     if streams.count == 1 {
-      stack.addArrangedSubview(FocusedStreamView(stream: streams[0], onClose: nil))
+      addUnifiedPlayer(streams)
       return
     }
-    let settings = AppState.shared.settings
-    if settings.layoutMode == .grid {
-      addGrid(streams)
-    } else {
-      streams.forEach { addStackedCell($0) }
-    }
+    addUnifiedPlayer(streams)
   }
 
   private func configureScroll() {
@@ -297,6 +325,13 @@ final class ViewingController: UIViewController {
     stack.addArrangedSubview(cell)
     cell.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: 9 / 16).isActive = true
     cell.heightAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
+  }
+
+  private func addUnifiedPlayer(_ streams: [StreamItem]) {
+    let web = MultiPlayerWebView(streams: streams, settings: AppState.shared.settings)
+    web.translatesAutoresizingMaskIntoConstraints = false
+    stack.addArrangedSubview(web)
+    web.heightAnchor.constraint(equalTo: view.safeAreaLayoutGuide.heightAnchor).isActive = true
   }
 
   private func addGrid(_ streams: [StreamItem]) {
