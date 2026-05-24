@@ -47,6 +47,7 @@
   var layout = P.get('layout') || 'stacked';
   var audioOn = P.get('audio') === '1';
   var chatOn = P.get('chat') !== '0';
+  var quality = P.get('quality') || 'high';
   var proxy = P.get('proxy') || '';
   var fs = P.get('fs') || '20';
   var sp = P.get('sp') || '0.13';
@@ -77,6 +78,7 @@
       '&mlen=' + encodeURIComponent(mlen) +
       '&start=0' +
       '&audio=' + (audioOn ? '1' : '0') +
+      '&quality=' + encodeURIComponent(quality) +
       (proxy ? '&proxy=' + encodeURIComponent(proxy) : '');
   }
   function keyOf(s) {

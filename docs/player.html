@@ -39,6 +39,7 @@
   var channel = P.get('channel') || '';
   var chatOn = P.get('chat') !== '0';
   var audioOn = P.get('audio') === '1';
+  var quality = P.get('quality') || 'high';
   var volume = Math.max(0, Math.min(1, parseFloat(P.get('vol') || '1') || 0));
   var proxy = P.get('proxy') || '';
   var D = {
@@ -85,7 +86,7 @@
     var muteNum = audioOn ? '0' : '1';
     if (platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&' + parentParams() + '&muted=' + muted + '&autoplay=true&playsinline=true';
     if (platform === 'kick') return 'https://player.kick.com/' + ch + '?autoplay=true&muted=' + ((!audioOn || volume <= 0) ? 'true' : 'false');
-    if (platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=' + muteNum + '&playsinline=1&enablejsapi=1&origin=' + encodeURIComponent(location.origin);
+    if (platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=' + muteNum + '&playsinline=1&enablejsapi=1&origin=' + encodeURIComponent(location.origin) + '&vq=' + (quality === 'economy' ? 'small' : 'hd720');
     if (platform === 'twitcasting') return 'https://twitcasting.tv/' + ch + '/embeddedplayer/live?auto_play=true';
     return '';
   }
@@ -136,6 +137,15 @@
         args: []
       }), '*');
     } catch (e) {}
+    if (platform === 'twitch') {
+      try {
+        frameEl.contentWindow.postMessage(JSON.stringify({
+          event: 'command',
+          func: 'setQuality',
+          args: [quality === 'economy' ? '160p30' : 'auto']
+        }), '*');
+      } catch (e3) {}
+    }
     try {
       frameEl.contentWindow.postMessage({ type: 'play' }, '*');
     } catch (e2) {}

@@ -1,6 +1,7 @@
 import UIKit
 import WebKit
 import AVFoundation
+import Network
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -185,17 +186,90 @@ enum LayoutMode: String, Codable {
   case grid
 }
 
+enum PlaybackQuality: String, Codable {
+  case high
+  case economy
+
+  var label: String {
+    switch self {
+    case .high: return "高画質"
+    case .economy: return "エコノミー"
+    }
+  }
+
+  var preferredPeakBitRate: Double {
+    switch self {
+    case .high: return 0
+    case .economy: return 900_000
+    }
+  }
+
+  var niconicoQuality: String {
+    switch self {
+    case .high: return "abr"
+    case .economy: return "low"
+    }
+  }
+}
+
 struct AppSettings: Codable {
   var showChat = true
   var proxyUrl = ""
   var playAudio = true
   var layoutMode: LayoutMode = .stacked
+  var wifiQuality: PlaybackQuality = .high
+  var mobileQuality: PlaybackQuality = .economy
   var danmakuFontSize = 20.0
   var danmakuSpeed = 0.13
   var danmakuOpacity = 0.9
   var danmakuMaxLines = 0
   var danmakuMaxLength = 0
   var platformOrder = StreamPlatform.allCases
+
+  init() {}
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    showChat = try container.decodeIfPresent(Bool.self, forKey: .showChat) ?? true
+    proxyUrl = try container.decodeIfPresent(String.self, forKey: .proxyUrl) ?? ""
+    playAudio = try container.decodeIfPresent(Bool.self, forKey: .playAudio) ?? true
+    layoutMode = try container.decodeIfPresent(LayoutMode.self, forKey: .layoutMode) ?? .stacked
+    wifiQuality = try container.decodeIfPresent(PlaybackQuality.self, forKey: .wifiQuality) ?? .high
+    mobileQuality = try container.decodeIfPresent(PlaybackQuality.self, forKey: .mobileQuality) ?? .economy
+    danmakuFontSize = try container.decodeIfPresent(Double.self, forKey: .danmakuFontSize) ?? 20
+    danmakuSpeed = try container.decodeIfPresent(Double.self, forKey: .danmakuSpeed) ?? 0.13
+    danmakuOpacity = try container.decodeIfPresent(Double.self, forKey: .danmakuOpacity) ?? 0.9
+    danmakuMaxLines = try container.decodeIfPresent(Int.self, forKey: .danmakuMaxLines) ?? 0
+    danmakuMaxLength = try container.decodeIfPresent(Int.self, forKey: .danmakuMaxLength) ?? 0
+    platformOrder = try container.decodeIfPresent([StreamPlatform].self, forKey: .platformOrder) ?? StreamPlatform.allCases
+  }
+}
+
+final class NetworkQuality {
+  static let shared = NetworkQuality()
+  private let monitor = NWPathMonitor()
+  private let queue = DispatchQueue(label: "MultiView.NetworkQuality")
+  private var currentPath: NWPath?
+
+  private init() {
+    monitor.pathUpdateHandler = { [weak self] path in
+      self?.queue.async {
+        self?.currentPath = path
+      }
+    }
+    monitor.start(queue: queue)
+  }
+
+  func activeQuality(settings: AppSettings) -> PlaybackQuality {
+    var path: NWPath?
+    queue.sync {
+      path = currentPath ?? monitor.currentPath
+    }
+    if path?.usesInterfaceType(.cellular) == true || path?.isExpensive == true {
+      return settings.mobileQuality
+    }
+    return settings.wifiQuality
+  }
 }
 
 enum Store {
@@ -390,6 +464,7 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
       URLQueryItem(name: "ml", value: String(settings.danmakuMaxLines)),
       URLQueryItem(name: "mlen", value: String(settings.danmakuMaxLength)),
       URLQueryItem(name: "audio", value: settings.playAudio ? "1" : "0"),
+      URLQueryItem(name: "quality", value: NetworkQuality.shared.activeQuality(settings: settings).rawValue),
       URLQueryItem(name: "vol", value: String(StreamVolumeStore.volume(for: stream))),
       URLQueryItem(name: "proxy", value: settings.proxyUrl.trimmingCharacters(in: .whitespacesAndNewlines))
     ]
@@ -646,7 +721,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       "type": "startWatching",
       "data": [
         "stream": [
-          "quality": "abr",
+          "quality": NetworkQuality.shared.activeQuality(settings: settings).niconicoQuality,
           "protocol": "hls",
           "latency": "low",
           "accessRightMethod": "single_cookie",
@@ -764,6 +839,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       ])
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+      item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
           DispatchQueue.main.async {
@@ -1326,6 +1402,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       ])
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+      item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
           DispatchQueue.main.async {
@@ -1607,6 +1684,7 @@ final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResum
       URLQueryItem(name: "volumes", value: Self.encodedVolumes(for: streams)),
       URLQueryItem(name: "layout", value: settings.layoutMode.rawValue),
       URLQueryItem(name: "audio", value: settings.playAudio ? "1" : "0"),
+      URLQueryItem(name: "quality", value: NetworkQuality.shared.activeQuality(settings: settings).rawValue),
       URLQueryItem(name: "chat", value: settings.showChat ? "1" : "0"),
       URLQueryItem(name: "proxy", value: settings.proxyUrl.trimmingCharacters(in: .whitespacesAndNewlines)),
       URLQueryItem(name: "fs", value: String(settings.danmakuFontSize)),
@@ -2580,7 +2658,7 @@ final class SettingsController: UITableViewController {
 
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     switch section {
-    case 0: return 9
+    case 0: return 11
     case 1: return platforms.count
     case 2: return 3
     default: return 1
@@ -2638,6 +2716,20 @@ final class SettingsController: UITableViewController {
       }, for: .valueChanged)
       cell.accessoryView = toggle
     } else if indexPath.section == 0 && indexPath.row == 3 {
+      cell.textLabel?.text = "Wi-Fi時の画質"
+      cell.accessoryView = qualityControl(selected: AppState.shared.settings.wifiQuality) { quality in
+        var settings = AppState.shared.settings
+        settings.wifiQuality = quality
+        AppState.shared.settings = settings
+      }
+    } else if indexPath.section == 0 && indexPath.row == 4 {
+      cell.textLabel?.text = "モバイル通信時の画質"
+      cell.accessoryView = qualityControl(selected: AppState.shared.settings.mobileQuality) { quality in
+        var settings = AppState.shared.settings
+        settings.mobileQuality = quality
+        AppState.shared.settings = settings
+      }
+    } else if indexPath.section == 0 && indexPath.row == 5 {
       cell.textLabel?.text = "CORSプロキシ"
       cell.detailTextLabel?.text = nil
       cell.accessoryType = .disclosureIndicator
@@ -2700,9 +2792,9 @@ final class SettingsController: UITableViewController {
   }
 
   override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-    if indexPath.section == 0 && indexPath.row == 3 {
+    if indexPath.section == 0 && indexPath.row == 5 {
       editProxy()
-    } else if indexPath.section == 0 && (4...8).contains(indexPath.row) {
+    } else if indexPath.section == 0 && (6...10).contains(indexPath.row) {
       editDanmakuValue(row: indexPath.row)
     } else if indexPath.section == 2 {
       handleKickOAuthRow(indexPath.row)
@@ -2714,19 +2806,29 @@ final class SettingsController: UITableViewController {
   private func danmakuTitle(row: Int) -> String {
     let settings = AppState.shared.settings
     switch row {
-    case 4:
-      return "文字サイズ \(Int(settings.danmakuFontSize))"
-    case 5:
-      return "速度 \(Int((settings.danmakuSpeed / 0.13) * 100))%"
     case 6:
-      return "透過度 \(Int(settings.danmakuOpacity * 100))%"
+      return "文字サイズ \(Int(settings.danmakuFontSize))"
     case 7:
-      return "最大行数 \(settings.danmakuMaxLines == 0 ? "自動" : String(settings.danmakuMaxLines))"
+      return "速度 \(Int((settings.danmakuSpeed / 0.13) * 100))%"
     case 8:
+      return "透過度 \(Int(settings.danmakuOpacity * 100))%"
+    case 9:
+      return "最大行数 \(settings.danmakuMaxLines == 0 ? "自動" : String(settings.danmakuMaxLines))"
+    case 10:
       return "最大文字数 \(settings.danmakuMaxLength == 0 ? "無制限" : String(settings.danmakuMaxLength))"
     default:
       return ""
     }
+  }
+
+  private func qualityControl(selected: PlaybackQuality, onChange: @escaping (PlaybackQuality) -> Void) -> UISegmentedControl {
+    let control = UISegmentedControl(items: [PlaybackQuality.high.label, PlaybackQuality.economy.label])
+    control.selectedSegmentIndex = selected == .high ? 0 : 1
+    control.addAction(UIAction { action in
+      guard let control = action.sender as? UISegmentedControl else { return }
+      onChange(control.selectedSegmentIndex == 0 ? .high : .economy)
+    }, for: .valueChanged)
+    return control
   }
 
   private func editDanmakuValue(row: Int) {
@@ -2735,23 +2837,23 @@ final class SettingsController: UITableViewController {
     let title: String
     let message: String
     switch row {
-    case 4:
+    case 6:
       title = "文字サイズ"
       current = String(Int(settings.danmakuFontSize))
       message = "12〜40"
-    case 5:
+    case 7:
       title = "速度"
       current = String(Int((settings.danmakuSpeed / 0.13) * 100))
       message = "100が標準"
-    case 6:
+    case 8:
       title = "透過度"
       current = String(Int(settings.danmakuOpacity * 100))
       message = "30〜100"
-    case 7:
+    case 9:
       title = "最大行数"
       current = String(settings.danmakuMaxLines)
       message = "0で自動"
-    case 8:
+    case 10:
       title = "最大文字数"
       current = String(settings.danmakuMaxLength)
       message = "0で無制限"
@@ -2770,15 +2872,15 @@ final class SettingsController: UITableViewController {
       guard let raw = alert.textFields?.first?.text, let value = Double(raw) else { return }
       var settings = AppState.shared.settings
       switch row {
-      case 4:
-        settings.danmakuFontSize = min(40, max(12, value.rounded()))
-      case 5:
-        settings.danmakuSpeed = min(300, max(20, value)) / 100 * 0.13
       case 6:
-        settings.danmakuOpacity = min(100, max(30, value)) / 100
+        settings.danmakuFontSize = min(40, max(12, value.rounded()))
       case 7:
-        settings.danmakuMaxLines = min(20, max(0, Int(value.rounded())))
+        settings.danmakuSpeed = min(300, max(20, value)) / 100 * 0.13
       case 8:
+        settings.danmakuOpacity = min(100, max(30, value)) / 100
+      case 9:
+        settings.danmakuMaxLines = min(20, max(0, Int(value.rounded())))
+      case 10:
         settings.danmakuMaxLength = min(500, max(0, Int(value.rounded())))
       default:
         return
