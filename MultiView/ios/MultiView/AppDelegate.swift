@@ -1,5 +1,6 @@
 import UIKit
 import WebKit
+import AVFoundation
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -9,6 +10,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
+    try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [])
+    try? AVAudioSession.sharedInstance().setActive(true)
     window = UIWindow(frame: UIScreen.main.bounds)
     window?.rootViewController = MainTabController()
     window?.makeKeyAndVisible()
@@ -67,14 +70,14 @@ enum LayoutMode: String, Codable {
 struct AppSettings: Codable {
   var showChat = true
   var proxyUrl = ""
-  var playAudio = true
+  var playAudio = false
   var layoutMode: LayoutMode = .stacked
   var platformOrder = StreamPlatform.allCases
 }
 
 enum Store {
   private static let streamsKey = "native.streams.v1"
-  private static let settingsKey = "native.settings.v1"
+  private static let settingsKey = "native.settings.v2"
 
   static func loadStreams() -> [StreamItem] {
     guard let data = UserDefaults.standard.data(forKey: streamsKey),
@@ -191,9 +194,6 @@ final class PlayerWebView: WKWebView {
     let config = WKWebViewConfiguration()
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
-    if stream.platform == .niconico {
-      config.userContentController.addUserScript(WKUserScript(source: PlayerWebView.niconicoCleanerScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
-    }
     super.init(frame: .zero, configuration: config)
     isOpaque = false
     backgroundColor = .black
@@ -229,28 +229,6 @@ final class PlayerWebView: WKWebView {
     }
   }
 
-  private static let niconicoCleanerScript = """
-  (function(){
-    var css = `
-      header, nav, footer, aside,
-      [class*="Header"], [class*="header"], [class*="Navigation"], [class*="Side"],
-      [class*="ProgramInformation"],
-      [class*="Akashic"], [class*="ichiba"], [class*="ranking"] {
-        display: none !important;
-      }
-      html, body { background:#000 !important; margin:0 !important; overflow:hidden !important; }
-      video, canvas, iframe { max-width:100vw !important; max-height:100vh !important; }
-      [class*="Player"], [class*="player"], [id*="player"] {
-        position: fixed !important; inset: 0 !important; width:100vw !important; height:100vh !important;
-        z-index: 2147483647 !important; background:#000 !important;
-      }
-    `;
-    var style = document.getElementById('mv-nico-cleaner') || document.createElement('style');
-    style.id = 'mv-nico-cleaner';
-    style.textContent = css;
-    document.documentElement.appendChild(style);
-  })();
-  """
 }
 
 final class ViewingController: UIViewController {

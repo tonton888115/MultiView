@@ -19,12 +19,17 @@
   #msg { position:absolute; left:0; right:0; bottom:0; color:#bbb;
     background:rgba(0,0,0,0.6); font-family:sans-serif; font-size:12px; padding:6px 10px;
     z-index:11; text-align:center; }
+  #start { position:fixed; inset:0; z-index:20; display:flex; align-items:center; justify-content:center;
+    background:rgba(0,0,0,0.18); color:#fff; border:0; font:700 14px -apple-system,BlinkMacSystemFont,sans-serif; }
+  #start span { padding:10px 14px; border-radius:18px; background:rgba(18,24,32,0.72);
+    border:1px solid rgba(255,255,255,0.25); }
 </style>
 </head>
 <body>
 <div id="player"></div>
 <div id="danmaku"></div>
 <div id="msg" style="display:none"></div>
+<button id="start"><span>タップして再生</span></button>
 <script>
 (function () {
   'use strict';
@@ -47,6 +52,8 @@
   var playerEl = document.getElementById('player');
   var danmakuEl = document.getElementById('danmaku');
   var msgEl = document.getElementById('msg');
+  var startEl = document.getElementById('start');
+  var frameEl = null;
   function showMsg(t) { msgEl.textContent = t; msgEl.style.display = 'block'; }
   function viaProxy(u) { return proxy ? proxy + encodeURIComponent(u) : u; }
   function esc(s) {
@@ -72,8 +79,19 @@
     f.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
     f.setAttribute('allowfullscreen', 'true');
     f.setAttribute('scrolling', 'no');
+    f.setAttribute('playsinline', 'true');
     playerEl.appendChild(f);
+    frameEl = f;
   }
+  function startPlayback() {
+    if (!frameEl) return;
+    var src = frameEl.src;
+    frameEl.src = 'about:blank';
+    setTimeout(function () { frameEl.src = src; }, 40);
+    startEl.style.display = 'none';
+  }
+  startEl.addEventListener('click', startPlayback);
+  startEl.addEventListener('touchend', function (e) { e.preventDefault(); startPlayback(); }, { passive: false });
 
   // ---- filter ----
   function blocked(text, user) {
