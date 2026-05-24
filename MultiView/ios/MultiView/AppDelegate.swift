@@ -65,6 +65,8 @@ enum LayoutMode: String, Codable {
 }
 
 struct AppSettings: Codable {
+  var showChat = true
+  var proxyUrl = ""
   var playAudio = true
   var layoutMode: LayoutMode = .stacked
   var platformOrder = StreamPlatform.allCases
@@ -209,43 +211,22 @@ final class PlayerWebView: WKWebView {
       load(URLRequest(url: URL(string: "https://live.nicovideo.jp/watch/\(stream.channel)")!))
       return
     }
-    loadHTMLString(PlayerWebView.html(for: stream, audio: settings.playAudio), baseURL: URL(string: "https://tonton888115.github.io/MultiView/native-player.html"))
-  }
-
-  private static func html(for stream: StreamItem, audio: Bool) -> String {
-    let channel = stream.channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? stream.channel
-    let muted = audio ? "false" : "true"
-    let muteNum = audio ? "0" : "1"
-    let src: String
-    switch stream.platform {
-    case .twitch:
-      src = "https://player.twitch.tv/?channel=\(channel)&parent=tonton888115.github.io&muted=\(muted)&autoplay=true"
-    case .kick:
-      src = "https://player.kick.com/\(channel)?autoplay=true&muted=\(muted)"
-    case .youtube:
-      src = "https://www.youtube.com/embed/\(channel)?autoplay=1&mute=\(muteNum)&playsinline=1"
-    case .twitcasting:
-      src = "https://twitcasting.tv/\(channel)/embeddedplayer/live?auto_play=true"
-    case .niconico:
-      src = ""
+    var components = URLComponents(string: "https://tonton888115.github.io/MultiView/player.html")!
+    components.queryItems = [
+      URLQueryItem(name: "platform", value: stream.platform.rawValue),
+      URLQueryItem(name: "channel", value: stream.channel),
+      URLQueryItem(name: "chat", value: settings.showChat ? "1" : "0"),
+      URLQueryItem(name: "fs", value: "20"),
+      URLQueryItem(name: "sp", value: "0.13"),
+      URLQueryItem(name: "op", value: "0.9"),
+      URLQueryItem(name: "ml", value: "0"),
+      URLQueryItem(name: "mlen", value: "0"),
+      URLQueryItem(name: "audio", value: settings.playAudio ? "1" : "0"),
+      URLQueryItem(name: "proxy", value: settings.proxyUrl.trimmingCharacters(in: .whitespacesAndNewlines))
+    ]
+    if let url = components.url {
+      load(URLRequest(url: url))
     }
-    return """
-    <!doctype html>
-    <html>
-    <head>
-      <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-      <style>
-        html,body,#player,iframe{margin:0;width:100%;height:100%;background:#000;overflow:hidden;border:0}
-        iframe{position:absolute;inset:0}
-        #tap{position:fixed;right:10px;bottom:10px;z-index:2;padding:8px 10px;border-radius:14px;background:rgba(20,26,34,.62);color:white;font:600 12px -apple-system;border:1px solid rgba(255,255,255,.24)}
-      </style>
-    </head>
-    <body>
-      <div id="player"><iframe src="\(src)" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen playsinline></iframe></div>
-      <button id="tap" onclick="document.querySelector('iframe').focus()">音声</button>
-    </body>
-    </html>
-    """
   }
 
   private static let niconicoCleanerScript = """
@@ -253,7 +234,7 @@ final class PlayerWebView: WKWebView {
     var css = `
       header, nav, footer, aside,
       [class*="Header"], [class*="header"], [class*="Navigation"], [class*="Side"],
-      [class*="Comment"], [class*="comment"], [class*="ProgramInformation"],
+      [class*="ProgramInformation"],
       [class*="Akashic"], [class*="ichiba"], [class*="ranking"] {
         display: none !important;
       }
@@ -764,7 +745,7 @@ final class SettingsController: UITableViewController {
 
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     switch section {
-    case 0: return 2
+    case 0: return 4
     case 1: return platforms.count
     default: return 1
     }
@@ -797,7 +778,7 @@ final class SettingsController: UITableViewController {
         AppState.shared.settings = settings
       }, for: .valueChanged)
       cell.accessoryView = control
-    } else if indexPath.section == 0 {
+    } else if indexPath.section == 0 && indexPath.row == 1 {
       cell.textLabel?.text = "音声を有効にして開始"
       let toggle = UISwitch()
       toggle.isOn = AppState.shared.settings.playAudio
@@ -808,6 +789,22 @@ final class SettingsController: UITableViewController {
         AppState.shared.settings = settings
       }, for: .valueChanged)
       cell.accessoryView = toggle
+    } else if indexPath.section == 0 && indexPath.row == 2 {
+      cell.textLabel?.text = "弾幕を表示"
+      let toggle = UISwitch()
+      toggle.isOn = AppState.shared.settings.showChat
+      toggle.addAction(UIAction { action in
+        guard let s = action.sender as? UISwitch else { return }
+        var settings = AppState.shared.settings
+        settings.showChat = s.isOn
+        AppState.shared.settings = settings
+      }, for: .valueChanged)
+      cell.accessoryView = toggle
+    } else if indexPath.section == 0 {
+      cell.textLabel?.text = "CORSプロキシ"
+      cell.detailTextLabel?.text = nil
+      cell.accessoryType = .disclosureIndicator
+      cell.selectionStyle = .default
     } else if indexPath.section == 1 {
       let platform = platforms[indexPath.row]
       cell.textLabel?.text = platform.label
@@ -840,9 +837,29 @@ final class SettingsController: UITableViewController {
   }
 
   override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-    if indexPath.section == 2 {
+    if indexPath.section == 0 && indexPath.row == 3 {
+      editProxy()
+    } else if indexPath.section == 2 {
       present(AddStreamController(), animated: true)
     }
+  }
+
+  private func editProxy() {
+    let alert = UIAlertController(title: "CORSプロキシ", message: "Kick / ツイキャスの弾幕取得に使います", preferredStyle: .alert)
+    alert.addTextField { field in
+      field.placeholder = "https://xxx.workers.dev/?url="
+      field.text = AppState.shared.settings.proxyUrl
+      field.keyboardType = .URL
+      field.autocapitalizationType = .none
+      field.autocorrectionType = .no
+    }
+    alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
+    alert.addAction(UIAlertAction(title: "保存", style: .default) { _ in
+      var settings = AppState.shared.settings
+      settings.proxyUrl = alert.textFields?.first?.text ?? ""
+      AppState.shared.settings = settings
+    })
+    present(alert, animated: true)
   }
 }
 
