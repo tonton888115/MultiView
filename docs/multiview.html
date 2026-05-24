@@ -13,13 +13,6 @@
     border:1px solid rgba(255,255,255,0.16); }
   body.grid .cell { width:calc(50vw - 16px); }
   .cell iframe { position:absolute; inset:0; width:100%; height:100%; border:0; background:#000; }
-  .bar { position:absolute; z-index:2; left:8px; right:8px; top:8px; height:30px; display:flex; align-items:center;
-    padding:0 10px; box-sizing:border-box; border-radius:14px; background:rgba(18,24,32,0.58);
-    border:1px solid rgba(255,255,255,0.18); font-size:12px; font-weight:700; }
-  .bar.hidden { display:none; }
-  body.clean #hint { display:none; }
-  #hint { position:sticky; top:0; z-index:3; margin:0; padding:8px 10px; color:#ddd;
-    background:rgba(0,0,0,0.72); font-size:12px; text-align:center; }
   #audioStart { position:fixed; right:10px; bottom:10px; z-index:4; padding:10px 14px; border-radius:18px;
     border:1px solid rgba(255,255,255,0.25); background:rgba(18,24,32,0.76); color:#fff;
     font:700 13px -apple-system,BlinkMacSystemFont,sans-serif; }
@@ -27,7 +20,6 @@
 </style>
 </head>
 <body>
-<p id="hint">プレイヤーをタップして再生 / ミュート解除</p>
 <div id="grid"></div>
 <button id="audioStart">音声を開始</button>
 <script>
@@ -46,9 +38,6 @@
   var raw = P.get('streams') || '';
   document.body.className = layout === 'grid' ? 'grid' : 'stacked';
 
-  function esc(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-  }
   function parseStreams() {
     return raw.split(',').map(function (part) {
       var i = part.indexOf(':');
@@ -71,10 +60,6 @@
       '&audio=' + (audioOn ? '1' : '0') +
       (proxy ? '&proxy=' + encodeURIComponent(proxy) : '');
   }
-  function label(s) {
-    var names = { kick:'Kick', twitch:'Twitch', youtube:'YouTube', niconico:'ニコ生', twitcasting:'ツイキャス' };
-    return (names[s.platform] || s.platform) + ' / ' + s.channel;
-  }
   var grid = document.getElementById('grid');
   var audioStart = document.getElementById('audioStart');
   function reloadFramesForGesture() {
@@ -95,15 +80,6 @@
     if (!src) return;
     var cell = document.createElement('div');
     cell.className = 'cell';
-    cell.innerHTML = '<div class="bar">' + esc(label(s)) + '</div>';
-    cell.querySelector('.bar').addEventListener('click', function (e) {
-      e.stopPropagation();
-      this.classList.add('hidden');
-    });
-    cell.querySelector('.bar').addEventListener('touchend', function (e) {
-      e.stopPropagation();
-      this.classList.add('hidden');
-    }, { passive:true });
     var iframe = document.createElement('iframe');
     iframe.src = src;
     iframe.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';

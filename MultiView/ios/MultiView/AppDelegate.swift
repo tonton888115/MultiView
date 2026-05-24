@@ -275,6 +275,261 @@ final class PlayerWebView: WKWebView {
 
 }
 
+final class NiconicoNativePlayerView: UIView {
+  private let player = AVPlayer()
+  private let playerLayer = AVPlayerLayer()
+  private let statusLabel = UILabel()
+  private var pageTask: URLSessionDataTask?
+  private var socketTask: URLSessionWebSocketTask?
+  private let settings: AppSettings
+
+  init(stream: StreamItem, settings: AppSettings) {
+    self.settings = settings
+    super.init(frame: .zero)
+    backgroundColor = .black
+
+    playerLayer.player = player
+    playerLayer.videoGravity = .resizeAspect
+    layer.addSublayer(playerLayer)
+
+    statusLabel.text = "ニコ生を読み込み中"
+    statusLabel.textColor = .white.withAlphaComponent(0.72)
+    statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
+    statusLabel.textAlignment = .center
+    statusLabel.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(statusLabel)
+    NSLayoutConstraint.activate([
+      statusLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+      statusLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+      statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 16),
+      statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16)
+    ])
+
+    load(channel: stream.channel)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    pageTask?.cancel()
+    socketTask?.cancel(with: .goingAway, reason: nil)
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    playerLayer.frame = bounds
+  }
+
+  private func load(channel: String) {
+    let programId = channel.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let url = URL(string: "https://live.nicovideo.jp/watch/\(programId)") else {
+      showStatus("番組IDが不正です")
+      return
+    }
+    var request = URLRequest(url: url)
+    request.setValue(NiconicoNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
+    pageTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+      guard let self else { return }
+      if let error {
+        self.showStatus("ニコ生ページ取得失敗: \(error.localizedDescription)")
+        return
+      }
+      guard let data, let html = String(data: data, encoding: .utf8) else {
+        self.showStatus("ニコ生ページを読めません")
+        return
+      }
+      do {
+        let watch = try self.parseWatchData(from: html)
+        self.connect(webSocketURL: watch.webSocketURL, frontendId: watch.frontendId)
+      } catch {
+        self.showStatus("ニコ生の再生情報を取得できません")
+      }
+    }
+    pageTask?.resume()
+  }
+
+  private func connect(webSocketURL: URL, frontendId: String?) {
+    var components = URLComponents(url: webSocketURL, resolvingAgainstBaseURL: false)
+    var items = components?.queryItems ?? []
+    if let frontendId, !items.contains(where: { $0.name == "frontend_id" }) {
+      items.append(URLQueryItem(name: "frontend_id", value: frontendId))
+      components?.queryItems = items
+    }
+    guard let url = components?.url else {
+      showStatus("ニコ生WebSocket URLが不正です")
+      return
+    }
+    var request = URLRequest(url: url)
+    request.setValue(NiconicoNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("https://live.nicovideo.jp", forHTTPHeaderField: "Origin")
+    let socket = URLSession.shared.webSocketTask(with: request)
+    socketTask = socket
+    socket.resume()
+    receiveNext()
+    sendStartWatching()
+  }
+
+  private func sendStartWatching() {
+    let payload: [String: Any] = [
+      "type": "startWatching",
+      "data": [
+        "stream": [
+          "quality": "abr",
+          "protocol": "hls",
+          "latency": "low",
+          "chasePlay": false
+        ],
+        "room": [
+          "protocol": "webSocket",
+          "commentable": true
+        ],
+        "reconnect": false
+      ]
+    ]
+    send(payload)
+  }
+
+  private func send(_ payload: [String: Any]) {
+    guard let data = try? JSONSerialization.data(withJSONObject: payload),
+          let text = String(data: data, encoding: .utf8) else { return }
+    socketTask?.send(.string(text)) { _ in }
+  }
+
+  private func receiveNext() {
+    socketTask?.receive { [weak self] result in
+      guard let self else { return }
+      switch result {
+      case .success(.string(let text)):
+        self.handleSocketText(text)
+        self.receiveNext()
+      case .success(.data(let data)):
+        if let text = String(data: data, encoding: .utf8) {
+          self.handleSocketText(text)
+        }
+        self.receiveNext()
+      case .failure(let error):
+        self.showStatus("ニコ生WebSocket切断: \(error.localizedDescription)")
+      case .success:
+        self.receiveNext()
+      }
+    }
+  }
+
+  private func handleSocketText(_ text: String) {
+    guard let data = text.data(using: .utf8),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let type = json["type"] as? String else { return }
+    if type == "ping" {
+      send(["type": "pong"])
+      send(["type": "keepSeat"])
+      return
+    }
+    if type == "stream",
+       let payload = json["data"] as? [String: Any],
+       let uriString = payload["uri"] as? String,
+       let uri = URL(string: uriString) {
+      play(hlsURL: uri)
+    }
+    if type == "disconnect" {
+      showStatus("ニコ生から切断されました")
+    }
+  }
+
+  private func play(hlsURL: URL) {
+    DispatchQueue.main.async {
+      self.statusLabel.isHidden = true
+      let item = AVPlayerItem(url: hlsURL)
+      self.player.replaceCurrentItem(with: item)
+      self.player.isMuted = !self.settings.playAudio
+      self.player.volume = self.settings.playAudio ? 1 : 0
+      self.player.play()
+    }
+  }
+
+  private func parseWatchData(from html: String) throws -> (webSocketURL: URL, frontendId: String?) {
+    guard let encoded = firstMatch(in: html, pattern: #"<script[^>]+id=["']initial-state["'][^>]+data-props=["']([^"']+)["']"#)
+      ?? firstMatch(in: html, pattern: #"data-props=["']([^"']+)["'][^>]+id=["']initial-state["']"#)
+      ?? firstMatch(in: html, pattern: #"<script[^>]+id=["']embedded-data["'][^>]+data-props=["']([^"']+)["']"#)
+      ?? firstMatch(in: html, pattern: #"data-props=["']([^"']+)["'][^>]+id=["']embedded-data["']"#) else {
+      throw NSError(domain: "NiconicoNativePlayerView", code: 1)
+    }
+    let decoded = decodeHTMLEntities(encoded)
+    guard let data = decoded.data(using: .utf8),
+          let props = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      throw NSError(domain: "NiconicoNativePlayerView", code: 2)
+    }
+    if let pageContents = props["pageContents"] as? [String: Any],
+       let watchInformation = pageContents["watchInformation"] as? [String: Any],
+       let playerParams = watchInformation["playerParams"] as? [String: Any],
+       let wsEndPoint = playerParams["wsEndPoint"] as? [String: Any],
+       let wsString = wsEndPoint["url"] as? String,
+       !wsString.isEmpty,
+       let url = URL(string: wsString) {
+      let constants = props["constants"] as? [String: Any]
+      let requestInfo = constants?["requestInfo"] as? [String: Any]
+      let frontendId = (requestInfo?["frontendId"] as? String)
+        ?? (requestInfo?["frontendId"] as? Int).map(String.init)
+      return (url, frontendId)
+    }
+    guard let site = props["site"] as? [String: Any] else {
+      throw NSError(domain: "NiconicoNativePlayerView", code: 4)
+    }
+    let relive = site["relive"] as? [String: Any]
+    let wsString = relive?["webSocketUrl"] as? String
+      ?? site["webSocketUrl"] as? String
+      ?? site["websocketUrl"] as? String
+    guard let wsString, let url = URL(string: wsString) else {
+      throw NSError(domain: "NiconicoNativePlayerView", code: 3)
+    }
+    let frontendId = (site["frontendId"] as? String)
+      ?? (site["frontendId"] as? Int).map(String.init)
+      ?? (site["frontendID"] as? String)
+    return (url, frontendId)
+  }
+
+  private func firstMatch(in text: String, pattern: String) -> String? {
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    guard let match = regex.firstMatch(in: text, range: range), match.numberOfRanges > 1,
+          let valueRange = Range(match.range(at: 1), in: text) else { return nil }
+    return String(text[valueRange])
+  }
+
+  private func decodeHTMLEntities(_ text: String) -> String {
+    var output = text
+      .replacingOccurrences(of: "&quot;", with: "\"")
+      .replacingOccurrences(of: "&#34;", with: "\"")
+      .replacingOccurrences(of: "&#x22;", with: "\"")
+      .replacingOccurrences(of: "&#39;", with: "'")
+      .replacingOccurrences(of: "&#x27;", with: "'")
+      .replacingOccurrences(of: "&lt;", with: "<")
+      .replacingOccurrences(of: "&gt;", with: ">")
+      .replacingOccurrences(of: "&amp;", with: "&")
+    let pattern = #"&#x([0-9a-fA-F]+);"#
+    if let regex = try? NSRegularExpression(pattern: pattern) {
+      for match in regex.matches(in: output, range: NSRange(output.startIndex..<output.endIndex, in: output)).reversed() {
+        guard let range = Range(match.range(at: 1), in: output),
+              let code = UInt32(output[range], radix: 16),
+              let scalar = UnicodeScalar(code),
+              let fullRange = Range(match.range(at: 0), in: output) else { continue }
+        output.replaceSubrange(fullRange, with: String(scalar))
+      }
+    }
+    return output
+  }
+
+  private func showStatus(_ text: String) {
+    DispatchQueue.main.async {
+      self.statusLabel.text = text
+      self.statusLabel.isHidden = false
+    }
+  }
+
+  private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+}
+
 final class MultiPlayerWebView: WKWebView {
   init(streams: [StreamItem], settings: AppSettings) {
     let config = WKWebViewConfiguration()
@@ -473,57 +728,46 @@ final class StreamCellView: UIView {
     layer.borderWidth = 0.5
     layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
 
-    let web = PlayerWebView(stream: stream, settings: AppState.shared.settings)
-    web.translatesAutoresizingMaskIntoConstraints = false
-    addSubview(web)
-
-    let bar = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
-    bar.translatesAutoresizingMaskIntoConstraints = false
-    bar.layer.cornerRadius = 14
-    bar.clipsToBounds = true
-    addSubview(bar)
-
-    let label = UILabel()
-    label.text = "● \(stream.platform.label) / \(stream.channel)"
-    label.textColor = .white
-    label.font = .systemFont(ofSize: 12, weight: .bold)
-    label.isUserInteractionEnabled = true
-    label.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(hideTappedLabel(_:))))
-    label.translatesAutoresizingMaskIntoConstraints = false
-    bar.contentView.addSubview(label)
+    let video: UIView
+    if stream.platform == .niconico {
+      video = NiconicoNativePlayerView(stream: stream, settings: AppState.shared.settings)
+    } else {
+      video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
+    }
+    video.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(video)
 
     let focus = UIButton(type: .system)
     focus.setImage(UIImage(systemName: "arrow.up.left.and.arrow.down.right"), for: .normal)
     focus.tintColor = .white
+    focus.backgroundColor = UIColor.black.withAlphaComponent(0.38)
+    focus.layer.cornerRadius = 16
     focus.addAction(UIAction { _ in onFocus() }, for: .touchUpInside)
     focus.translatesAutoresizingMaskIntoConstraints = false
-    bar.contentView.addSubview(focus)
+    addSubview(focus)
 
     let remove = UIButton(type: .system)
     remove.setImage(UIImage(systemName: "xmark"), for: .normal)
     remove.tintColor = .white
+    remove.backgroundColor = UIColor.black.withAlphaComponent(0.38)
+    remove.layer.cornerRadius = 16
     remove.addAction(UIAction { _ in AppState.shared.remove(stream) }, for: .touchUpInside)
     remove.translatesAutoresizingMaskIntoConstraints = false
-    bar.contentView.addSubview(remove)
+    addSubview(remove)
 
     NSLayoutConstraint.activate([
-      web.topAnchor.constraint(equalTo: topAnchor),
-      web.leadingAnchor.constraint(equalTo: leadingAnchor),
-      web.trailingAnchor.constraint(equalTo: trailingAnchor),
-      web.bottomAnchor.constraint(equalTo: bottomAnchor),
-      bar.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-      bar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-      bar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-      bar.heightAnchor.constraint(equalToConstant: 36),
-      label.leadingAnchor.constraint(equalTo: bar.contentView.leadingAnchor, constant: 12),
-      label.centerYAnchor.constraint(equalTo: bar.contentView.centerYAnchor),
-      focus.leadingAnchor.constraint(greaterThanOrEqualTo: label.trailingAnchor, constant: 8),
-      focus.centerYAnchor.constraint(equalTo: bar.contentView.centerYAnchor),
-      remove.leadingAnchor.constraint(equalTo: focus.trailingAnchor, constant: 8),
-      remove.trailingAnchor.constraint(equalTo: bar.contentView.trailingAnchor, constant: -8),
-      remove.centerYAnchor.constraint(equalTo: bar.contentView.centerYAnchor),
+      video.topAnchor.constraint(equalTo: topAnchor),
+      video.leadingAnchor.constraint(equalTo: leadingAnchor),
+      video.trailingAnchor.constraint(equalTo: trailingAnchor),
+      video.bottomAnchor.constraint(equalTo: bottomAnchor),
+      focus.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+      focus.trailingAnchor.constraint(equalTo: remove.leadingAnchor, constant: -8),
       focus.widthAnchor.constraint(equalToConstant: 32),
-      remove.widthAnchor.constraint(equalToConstant: 32)
+      focus.heightAnchor.constraint(equalToConstant: 32),
+      remove.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+      remove.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+      remove.widthAnchor.constraint(equalToConstant: 32),
+      remove.heightAnchor.constraint(equalToConstant: 32)
     ])
   }
 
@@ -531,9 +775,6 @@ final class StreamCellView: UIView {
     fatalError("init(coder:) has not been implemented")
   }
 
-  @objc private func hideTappedLabel(_ sender: UITapGestureRecognizer) {
-    sender.view?.isHidden = true
-  }
 }
 
 final class FocusedStreamView: UIView {
@@ -555,45 +796,36 @@ final class FocusedStreamView: UIView {
     backgroundColor = .black
     heightAnchor.constraint(greaterThanOrEqualToConstant: 640).isActive = true
 
-    let video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
+    let video: UIView
+    if stream.platform == .niconico {
+      video = NiconicoNativePlayerView(stream: stream, settings: AppState.shared.settings)
+    } else {
+      video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
+    }
     video.translatesAutoresizingMaskIntoConstraints = false
     addSubview(video)
 
-    let bar = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
-    bar.translatesAutoresizingMaskIntoConstraints = false
-    bar.layer.cornerRadius = 18
-    bar.clipsToBounds = true
-    addSubview(bar)
-
-    let title = UILabel()
-    title.text = "● \(stream.platform.label) / \(stream.channel)"
-    title.textColor = .white
-    title.font = .systemFont(ofSize: 14, weight: .bold)
-    title.isUserInteractionEnabled = true
-    title.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(hideTappedLabel(_:))))
-    title.translatesAutoresizingMaskIntoConstraints = false
-    bar.contentView.addSubview(title)
-
-    var leading = title.leadingAnchor.constraint(equalTo: bar.contentView.leadingAnchor, constant: 12)
+    var closeButton: UIButton?
     if let onClose {
       let close = UIButton(type: .system)
-      close.setTitle("戻る", for: .normal)
+      close.setImage(UIImage(systemName: "chevron.left"), for: .normal)
+      close.tintColor = .white
+      close.backgroundColor = UIColor.black.withAlphaComponent(0.38)
+      close.layer.cornerRadius = 18
       close.addAction(UIAction { _ in onClose() }, for: .touchUpInside)
       close.translatesAutoresizingMaskIntoConstraints = false
-      bar.contentView.addSubview(close)
-      leading = title.leadingAnchor.constraint(equalTo: close.trailingAnchor, constant: 10)
-      NSLayoutConstraint.activate([
-        close.leadingAnchor.constraint(equalTo: bar.contentView.leadingAnchor, constant: 12),
-        close.centerYAnchor.constraint(equalTo: bar.contentView.centerYAnchor)
-      ])
+      addSubview(close)
+      closeButton = close
     }
 
     let remove = UIButton(type: .system)
     remove.setImage(UIImage(systemName: "xmark"), for: .normal)
     remove.tintColor = .white
+    remove.backgroundColor = UIColor.black.withAlphaComponent(0.38)
+    remove.layer.cornerRadius = 18
     remove.addAction(UIAction { _ in AppState.shared.remove(stream) }, for: .touchUpInside)
     remove.translatesAutoresizingMaskIntoConstraints = false
-    bar.contentView.addSubview(remove)
+    addSubview(remove)
 
     let chatPanel = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
     chatPanel.translatesAutoresizingMaskIntoConstraints = false
@@ -638,16 +870,10 @@ final class FocusedStreamView: UIView {
       video.leadingAnchor.constraint(equalTo: leadingAnchor),
       video.trailingAnchor.constraint(equalTo: trailingAnchor),
       video.bottomAnchor.constraint(equalTo: bottomAnchor),
-      bar.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-      bar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-      bar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-      bar.heightAnchor.constraint(equalToConstant: 42),
-      leading,
-      title.centerYAnchor.constraint(equalTo: bar.contentView.centerYAnchor),
-      remove.leadingAnchor.constraint(equalTo: title.trailingAnchor, constant: 8),
-      remove.trailingAnchor.constraint(equalTo: bar.contentView.trailingAnchor, constant: -12),
-      remove.centerYAnchor.constraint(equalTo: bar.contentView.centerYAnchor),
-      remove.widthAnchor.constraint(equalToConstant: 32),
+      remove.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+      remove.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+      remove.widthAnchor.constraint(equalToConstant: 36),
+      remove.heightAnchor.constraint(equalToConstant: 36),
       chatPanel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
       chatPanel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
       chatPanel.bottomAnchor.constraint(equalTo: input.topAnchor, constant: -8),
@@ -660,6 +886,14 @@ final class FocusedStreamView: UIView {
       send.centerYAnchor.constraint(equalTo: input.centerYAnchor),
       send.widthAnchor.constraint(equalToConstant: 54)
     ]
+    if let closeButton {
+      constraints += [
+        closeButton.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+        closeButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+        closeButton.widthAnchor.constraint(equalToConstant: 36),
+        closeButton.heightAnchor.constraint(equalToConstant: 36)
+      ]
+    }
     if let chatWeb {
       constraints += [
         chatWeb.topAnchor.constraint(equalTo: chatPanel.contentView.topAnchor),
@@ -673,10 +907,6 @@ final class FocusedStreamView: UIView {
 
   required init?(coder: NSCoder) {
     fatalError("init(coder:) has not been implemented")
-  }
-
-  @objc private func hideTappedLabel(_ sender: UITapGestureRecognizer) {
-    sender.view?.isHidden = true
   }
 
   private func sendComment() {
