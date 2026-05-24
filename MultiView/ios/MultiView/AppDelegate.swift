@@ -39,8 +39,14 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
   private func configureAudioSession() {
     let session = AVAudioSession.sharedInstance()
-    try? session.setCategory(.playback, mode: .moviePlayback, options: [])
-    try? session.setActive(true)
+    try? session.setCategory(.playback, mode: .default, options: [])
+    do {
+      try session.setActive(true, options: [])
+    } catch {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+        try? session.setActive(true, options: [])
+      }
+    }
   }
 
   private func installPlaybackObservers() {
@@ -1385,10 +1391,10 @@ final class StreamCellView: UIView {
       remove.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
       remove.widthAnchor.constraint(equalToConstant: 32),
       remove.heightAnchor.constraint(equalToConstant: 32),
-      volume.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
       volume.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-      volume.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-      volume.heightAnchor.constraint(equalToConstant: 36)
+      volume.centerYAnchor.constraint(equalTo: centerYAnchor),
+      volume.widthAnchor.constraint(equalToConstant: 42),
+      volume.heightAnchor.constraint(equalTo: heightAnchor, multiplier: 0.62)
     ])
   }
 
@@ -1421,17 +1427,19 @@ final class VolumeOverlay: UIVisualEffectView {
       StreamVolumeStore.setVolume(slider.value, for: stream)
       onChange(slider.value)
     }, for: .valueChanged)
+    slider.transform = CGAffineTransform(rotationAngle: -.pi / 2)
     slider.translatesAutoresizingMaskIntoConstraints = false
     contentView.addSubview(slider)
 
     NSLayoutConstraint.activate([
-      icon.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
-      icon.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+      icon.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+      icon.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -10),
       icon.widthAnchor.constraint(equalToConstant: 18),
       icon.heightAnchor.constraint(equalToConstant: 18),
-      slider.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
-      slider.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
-      slider.centerYAnchor.constraint(equalTo: contentView.centerYAnchor)
+      slider.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+      slider.centerYAnchor.constraint(equalTo: contentView.centerYAnchor, constant: -8),
+      slider.widthAnchor.constraint(equalTo: contentView.heightAnchor, constant: -58),
+      slider.heightAnchor.constraint(equalToConstant: 30)
     ])
   }
 
@@ -1546,10 +1554,10 @@ final class FocusedStreamView: UIView {
       remove.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
       remove.widthAnchor.constraint(equalToConstant: 36),
       remove.heightAnchor.constraint(equalToConstant: 36),
-      volume.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
       volume.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-      volume.bottomAnchor.constraint(equalTo: chatPanel.topAnchor, constant: -8),
-      volume.heightAnchor.constraint(equalToConstant: 36),
+      volume.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -80),
+      volume.widthAnchor.constraint(equalToConstant: 42),
+      volume.heightAnchor.constraint(equalTo: heightAnchor, multiplier: 0.42),
       chatPanel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
       chatPanel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
       chatPanel.bottomAnchor.constraint(equalTo: input.topAnchor, constant: -8),
