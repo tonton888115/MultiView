@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>MultiView Player</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
+  #player, #player iframe { position:absolute; inset:0; width:100%; height:100%; border:0; }
+  #danmaku { position:fixed; inset:0; overflow:hidden; pointer-events:none; z-index:10; }
+  .cmt {
+    position:absolute; left:100%; top:0; white-space:nowrap;
+    color:#fff; font-family:"Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;
+    font-weight:700; line-height:1.2;
+    text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000;
+    will-change:transform;
+  }
+  .cmt img.emote { height:1.4em; width:auto; vertical-align:middle; }
+  #msg { position:absolute; left:0; right:0; bottom:0; color:#bbb;
+    background:rgba(0,0,0,0.6); font-family:sans-serif; font-size:12px; padding:6px 10px;
+    z-index:11; text-align:center; }
+</style>
+</head>
+<body>
+<div id="player"></div>
+<div id="danmaku"></div>
+<div id="msg" style="display:none"></div>
+<script>
+(function () {
+  'use strict';
+  var P = new URLSearchParams(location.search);
+  var platform = (P.get('platform') || '').toLowerCase();
+  var channel = P.get('channel') || '';
+  var chatOn = P.get('chat') !== '0';
+  var proxy = P.get('proxy') || '';
+  var D = {
+    fontSize: parseFloat(P.get('fs')) || 20,
+    speed: parseFloat(P.get('sp')) || 0.13,
+    opacity: P.get('op') != null ? parseFloat(P.get('op')) : 0.9,
+    maxLines: parseInt(P.get('ml'), 10) || 0,
+    maxLength: parseInt(P.get('mlen'), 10) || 0,
+    ngWords: (P.get('ng') || '').split(',').map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean),
+    ngUsers: (P.get('ngu') || '').split(',').map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean)
+  };
+
+  var playerEl = document.getElementById('player');
+  var danmakuEl = document.getElementById('danmaku');
+  var msgEl = document.getElementById('msg');
+  function showMsg(t) { msgEl.textContent = t; msgEl.style.display = 'block'; }
+  function viaProxy(u) { return proxy ? proxy + encodeURIComponent(u) : u; }
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // ---- embed ----
+  function embedUrl() {
+    var ch = encodeURIComponent(channel), host = location.hostname;
+    if (platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&parent=' + host + '&muted=true&autoplay=true';
+    if (platform === 'kick') return 'https://player.kick.com/' + ch + '?autoplay=true&muted=true';
+    if (platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=1&playsinline=1';
+    if (platform === 'twitcasting') return 'https://twitcasting.tv/' + ch + '/embeddedplayer/live?auto_play=true';
+    return '';
+  }
+  function mountPlayer() {
+    var url = embedUrl();
+    if (!url) { showMsg('未対応: ' + platform); return; }
+    var f = document.createElement('iframe');
+    f.src = url;
+    f.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
+    f.setAttribute('allowfullscreen', 'true');
+    f.setAttribute('scrolling', 'no');
+    playerEl.appendChild(f);
+  }
+
+  // ---- filter ----
+  function blocked(text, user) {
+    if (!text) return true;
+    if (D.maxLength && text.length > D.maxLength) return true;
+    var lt = text.toLowerCase();
+    for (var i = 0; i < D.ngWords.length; i++) if (D.ngWords[i] && lt.indexOf(D.ngWords[i]) !== -1) return true;
+    if (user) { var lu = String(user).toLowerCase(); for (var j = 0; j < D.ngUsers.length; j++) if (D.ngUsers[j] === lu) return true; }
+    return false;
+  }
+
+  // ---- emotes ----
+  function twitchHtml(text, emotesTag) {
+    var chars = Array.from(text);
+    var list = [];
+    if (emotesTag) {
+      emotesTag.split('/').forEach(function (part) {
+        var sp = part.split(':'); if (sp.length < 2) return;
+        sp[1].split(',').forEach(function (r) {
+          var se = r.split('-'); list.push({ id: sp[0], start: +se[0], end: +se[1] });
+        });
+      });
+      list.sort(function (a, b) { return a.start - b.start; });
+    }
+    var html = '', cur = 0;
+    list.forEach(function (e) {
+      html += esc(chars.slice(cur, e.start).join(''));
+      var src = 'https://static-cdn.jtvnw.net/emoticons/v2/' + e.id + '/default/dark/1.0';
+      html += '<img class="emote" src="' + src + '">';
+      cur = e.end + 1;
+    });
+    html += esc(chars.slice(cur).join(''));
+    return html;
+  }
+  function kickHtml(content) {
+    return esc(content).replace(/\[emote:(\d+):([^\]]+)\]/g, function (_, id) {
+      return '<img class="emote" src="https://files.kick.com/emotes/' + id + '/fullsize">';
+    });
+  }
+  function kickPlain(content) { return content.replace(/\[emote:\d+:[^\]]+\]/g, ''); }
+
+  // ---- danmaku ----
+  function Danmaku(root) {
+    this.root = root;
+    this.fontSize = D.fontSize;
+    this.laneHeight = Math.round(this.fontSize * 1.5);
+    this.speed = D.speed;
+    this.opacity = D.opacity;
+    this.maxLines = D.maxLines;
+    this.lanes = [];
+    this.recompute();
+    var self = this;
+    window.addEventListener('resize', function () { self.recompute(); });
+  }
+  Danmaku.prototype.recompute = function () {
+    this.w = this.root.clientWidth || window.innerWidth;
+    this.h = this.root.clientHeight || window.innerHeight;
+    var fit = Math.max(1, Math.floor(this.h / this.laneHeight));
+    var c = this.maxLines ? Math.min(this.maxLines, fit) : fit;
+    if (c !== this.lanes.length) this.lanes = new Array(c).fill(0);
+  };
+  Danmaku.prototype.emit = function (html, color, filterText, user) {
+    if (blocked(filterText, user)) return;
+    var now = performance.now(), lane = -1;
+    for (var i = 0; i < this.lanes.length; i++) if (this.lanes[i] <= now) { lane = i; break; }
+    if (lane === -1) { var m = Infinity; for (var j = 0; j < this.lanes.length; j++) if (this.lanes[j] < m) { m = this.lanes[j]; lane = j; } }
+    var el = document.createElement('div');
+    el.className = 'cmt';
+    el.innerHTML = html;
+    el.style.fontSize = this.fontSize + 'px';
+    el.style.opacity = this.opacity;
+    if (color) el.style.color = color;
+    el.style.top = (lane * this.laneHeight) + 'px';
+    this.root.appendChild(el);
+    var tw = el.offsetWidth || (filterText.length * this.fontSize);
+    var dist = this.w + tw + 8;
+    var dur = dist / this.speed;
+    this.lanes[lane] = now + (tw + 24) / this.speed;
+    el.style.transition = 'transform ' + dur + 'ms linear';
+    void el.offsetHeight;
+    el.style.transform = 'translateX(' + (-dist) + 'px)';
+    setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, dur + 200);
+  };
+  var danmaku = new Danmaku(danmakuEl);
+
+  // ---- Twitch chat ----
+  function parseTags(raw) { var t = {}; raw.split(';').forEach(function (kv) { var i = kv.indexOf('='); if (i > -1) t[kv.slice(0, i)] = kv.slice(i + 1); }); return t; }
+  function connectTwitch() {
+    var ch = channel.toLowerCase().replace(/^#/, ''), ws;
+    function open() {
+      ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+      ws.onopen = function () { ws.send('CAP REQ :twitch.tv/tags'); ws.send('PASS SCHMOOPIIE'); ws.send('NICK justinfan' + Math.floor(Math.random() * 999999)); ws.send('JOIN #' + ch); };
+      ws.onmessage = function (e) {
+        e.data.split('\r\n').forEach(function (line) {
+          if (!line) return;
+          if (line.indexOf('PING') === 0) { ws.send('PONG :tmi.twitch.tv'); return; }
+          var tags = {}, rest = line;
+          if (line[0] === '@') { var sp = line.indexOf(' '); tags = parseTags(line.slice(1, sp)); rest = line.slice(sp + 1); }
+          if (rest.indexOf('PRIVMSG') === -1) return;
+          var mi = rest.indexOf(' :', rest.indexOf('PRIVMSG')); if (mi === -1) return;
+          var text = rest.slice(mi + 2);
+          var user = tags['display-name'] || (rest.indexOf('!') > -1 ? rest.slice(1, rest.indexOf('!')) : '');
+          danmaku.emit(twitchHtml(text, tags.emotes), tags.color || '', text, user);
+        });
+      };
+      ws.onclose = function () { setTimeout(open, 3000); };
+      ws.onerror = function () { try { ws.close(); } catch (x) {} };
+    }
+    open();
+  }
+
+  // ---- Kick chat ----
+  function connectKick() {
+    fetch(viaProxy('https://kick.com/api/v2/channels/' + encodeURIComponent(channel)), { headers: { Accept: 'application/json' } })
+      .then(function (r) { return r.json(); })
+      .then(function (d) { var id = d && d.chatroom && d.chatroom.id; if (!id) { showMsg('Kick: 取得失敗'); return; } subKick(id); })
+      .catch(function () { showMsg('Kick: コメント取得に失敗 (プロキシ設定が必要かも)'); });
+  }
+  function subKick(id) {
+    var ws;
+    function open() {
+      ws = new WebSocket('wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=8.4.0&flash=false');
+      ws.onopen = function () { ws.send(JSON.stringify({ event: 'pusher:subscribe', data: { auth: '', channel: 'chatrooms.' + id + '.v2' } })); };
+      ws.onmessage = function (e) {
+        var d; try { d = JSON.parse(e.data); } catch (x) { return; }
+        if (d.event === 'App\\Events\\ChatMessageEvent') {
+          var p; try { p = JSON.parse(d.data); } catch (x) { return; }
+          var color = p.sender && p.sender.identity && p.sender.identity.color;
+          var user = p.sender && p.sender.username;
+          danmaku.emit(kickHtml(p.content), color || '', kickPlain(p.content), user || '');
+        }
+      };
+      ws.onclose = function () { setTimeout(open, 3000); };
+      ws.onerror = function () { try { ws.close(); } catch (x) {} };
+    }
+    open();
+  }
+
+  // ---- TwitCasting chat ----
+  function connectTwitcasting() {
+    fetch(viaProxy('https://frontendapi.twitcasting.tv/users/' + encodeURIComponent(channel) + '/latest-movie'))
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var mid = d && d.movie && d.movie.id; if (!mid) { showMsg('ツイキャス: 配信が見つかりません'); return; }
+        var b = new URLSearchParams(); b.set('movie_id', mid);
+        return fetch(viaProxy('https://twitcasting.tv/eventpubsuburl.php'), { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: b.toString() });
+      })
+      .then(function (r) { return r ? r.json() : null; })
+      .then(function (d) { var u = d && d.url; if (!u) { showMsg('ツイキャス: 接続URL取得失敗'); return; } subTwitcasting(u); })
+      .catch(function () { showMsg('ツイキャス: コメント取得に失敗 (プロキシ設定が必要かも)'); });
+  }
+  function subTwitcasting(wss) {
+    var ws = new WebSocket(wss);
+    ws.onmessage = function (e) {
+      var arr; try { arr = JSON.parse(e.data); } catch (x) { return; }
+      if (!Array.isArray(arr)) return;
+      arr.forEach(function (it) { if (it && it.type === 'comment' && it.message) danmaku.emit(esc(it.message), '', it.message, (it.author && it.author.name) || ''); });
+    };
+    ws.onclose = function () { setTimeout(connectTwitcasting, 5000); };
+    ws.onerror = function () { try { ws.close(); } catch (x) {} };
+  }
+
+  mountPlayer();
+  if (chatOn) {
+    if (platform === 'twitch') connectTwitch();
+    else if (platform === 'kick') connectKick();
+    else if (platform === 'twitcasting') connectTwitcasting();
+  }
+})();
+</script>
+</body>
+</html>

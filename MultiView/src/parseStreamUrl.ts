@@ -43,7 +43,11 @@ export function parseStreamUrl(raw: string): ParsedStream | null {
   }
 
   if (host === 'kick.com' && parts[0]) {
-    return { platform: 'kick', channel: parts[0] };
+    const skip = ['browse', 'categories', 'category', 'following', 'search', 'clips', 'about', 'help', 'dashboard', 'messages', 'settings', 'subscriptions'];
+    if (!skip.includes(parts[0])) {
+      return { platform: 'kick', channel: parts[0] };
+    }
+    return null;
   }
 
   if (host === 'live.nicovideo.jp' || host === 'live2.nicovideo.jp') {

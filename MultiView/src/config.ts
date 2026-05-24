@@ -33,8 +33,10 @@ export const DEFAULT_SETTINGS: Settings = {
   },
 };
 
-// Origin used for the bundled WebView HTML. Twitch embeds use parent=this host.
-export const WEBVIEW_BASE_URL = 'https://multiview.local';
+// Hosted player/chat pages (GitHub Pages of this repo). Hardcoded so the user
+// never enters a URL. Loaded via {uri} so iframe video players actually play
+// (loadHTMLString/baseUrl breaks iframe media on iOS WKWebView).
+export const PAGES_BASE_URL = 'https://tonton888115.github.io/MultiView';
 
 export const STORAGE_KEYS = {
   streams: 'mv.streams.v1',

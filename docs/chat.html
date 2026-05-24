@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>MultiView Chat</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; background:#18181b; overflow:hidden; }
+  #chat, #chat iframe { position:absolute; inset:0; width:100%; height:100%; border:0; }
+  #fb { position:absolute; left:0; right:0; bottom:0; background:rgba(0,0,0,0.7); color:#ddd;
+    font-family:sans-serif; font-size:12px; text-align:center; padding:6px; }
+  #fb a { color:#9146ff; }
+</style>
+</head>
+<body>
+<div id="chat"></div>
+<div id="fb"></div>
+<script>
+(function () {
+  var P = new URLSearchParams(location.search);
+  var platform = (P.get('platform') || '').toLowerCase();
+  var channel = P.get('channel') || '';
+  var host = location.hostname;
+  var ch = encodeURIComponent(channel);
+  var src = '', fb = '';
+
+  if (platform === 'twitch') {
+    src = 'https://www.twitch.tv/embed/' + ch + '/chat?parent=' + host + '&darkpopout=true';
+    fb = 'ログインできない場合は <a href="https://www.twitch.tv/popout/' + ch + '/chat" target="_blank" rel="noopener">Twitchで開く</a>';
+  } else if (platform === 'youtube') {
+    src = 'https://www.youtube.com/live_chat?v=' + ch + '&embed_domain=' + host;
+  }
+
+  if (src) {
+    var f = document.createElement('iframe');
+    f.src = src;
+    f.setAttribute('sandbox', 'allow-storage-access-by-user-activation allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-modals allow-forms');
+    document.getElementById('chat').appendChild(f);
+  }
+  if (fb) { document.getElementById('fb').innerHTML = fb; }
+})();
+</script>
+</body>
+</html>

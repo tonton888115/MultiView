@@ -7,60 +7,67 @@ interface Props {
   onAddStream: (parsed: ParsedStream) => void;
 }
 
-const CATEGORIES: { key: string; label: string }[] = [
-  { key: 'youtube', label: 'YouTube' },
-  { key: 'twitch', label: 'Twitch' },
-  { key: 'niconama', label: 'ニコ生' },
-  { key: 'twitcasting', label: 'ツイキャス' },
+interface Category {
+  key: string;
+  label: string;
+  uri: string;
+  host: string;
+}
+
+const CATEGORIES: Category[] = [
+  { key: 'kick', label: 'Kick', uri: 'https://kick.com/browse', host: 'kick.com' },
+  { key: 'twitch', label: 'Twitch', uri: 'https://ikioi-ranking.com/v/twitch', host: 'ikioi-ranking.com' },
+  { key: 'youtube', label: 'YouTube', uri: 'https://ikioi-ranking.com/v/youtube', host: 'ikioi-ranking.com' },
+  { key: 'niconama', label: 'ニコ生', uri: 'https://ikioi-ranking.com/v/niconama', host: 'ikioi-ranking.com' },
+  { key: 'twitcasting', label: 'ツイキャス', uri: 'https://ikioi-ranking.com/v/twitcasting', host: 'ikioi-ranking.com' },
 ];
 
 export default function RankingTab({ onAddStream }: Props) {
-  const [category, setCategory] = useState('youtube');
+  const [cat, setCat] = useState<Category>(CATEGORIES[0]);
 
   function onShouldStart(req: { url: string; isTopFrame?: boolean }): boolean {
-    // Only intercept top-frame navigations (let resources/subframes load).
     if (req.isTopFrame === false) {
       return true;
     }
-    const url = req.url;
-    if (/^https?:\/\/(www\.)?ikioi-ranking\.com/i.test(url)) {
-      return true;
-    }
-    if (url.startsWith('about:') || url.startsWith('data:')) {
-      return true;
-    }
-    const parsed = parseStreamUrl(url);
+    const parsed = parseStreamUrl(req.url);
     if (parsed) {
       onAddStream(parsed);
+      return false;
     }
-    // Don't navigate away from the ranking for external links.
-    return false;
+    if (req.url.startsWith('about:') || req.url.startsWith('data:')) {
+      return true;
+    }
+    // Allow navigation within the current source site; block other externals.
+    const m = /^https?:\/\/([^/?#]+)/i.exec(req.url);
+    const host = m ? m[1].replace(/^www\./, '') : '';
+    return host === cat.host;
   }
 
   return (
     <View style={styles.root}>
       <View style={styles.tabs}>
         {CATEGORIES.map(c => {
-          const active = c.key === category;
+          const on = c.key === cat.key;
           return (
             <TouchableOpacity
               key={c.key}
-              style={[styles.tab, active && styles.tabActive]}
-              onPress={() => setCategory(c.key)}>
-              <Text style={[styles.tabText, active && styles.tabTextActive]}>{c.label}</Text>
+              style={[styles.tab, on && styles.tabActive]}
+              onPress={() => setCat(c)}>
+              <Text style={[styles.tabText, on && styles.tabTextActive]}>{c.label}</Text>
             </TouchableOpacity>
           );
         })}
       </View>
       <WebView
-        key={category}
-        source={{ uri: `https://ikioi-ranking.com/v/${category}` }}
+        key={cat.key}
+        source={{ uri: cat.uri }}
         style={styles.web}
         originWhitelist={['*']}
         onShouldStartLoadWithRequest={onShouldStart}
         setSupportMultipleWindows={false}
         javaScriptEnabled
         domStorageEnabled
+        sharedCookiesEnabled
       />
     </View>
   );
@@ -71,7 +78,7 @@ const styles = StyleSheet.create({
   tabs: { flexDirection: 'row', backgroundColor: '#0c0c0c' },
   tab: { flex: 1, paddingVertical: 10, alignItems: 'center', borderBottomWidth: 2, borderBottomColor: 'transparent' },
   tabActive: { borderBottomColor: '#0a84ff' },
-  tabText: { color: '#aaa', fontSize: 13, fontWeight: '600' },
+  tabText: { color: '#aaa', fontSize: 12, fontWeight: '600' },
   tabTextActive: { color: '#fff' },
   web: { flex: 1, backgroundColor: '#111' },
 });
