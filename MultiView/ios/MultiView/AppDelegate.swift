@@ -39,7 +39,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
   private func configureAudioSession() {
     let session = AVAudioSession.sharedInstance()
-    try? session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
+    try? session.setCategory(.playback, mode: .moviePlayback, options: [])
     try? session.setActive(true)
   }
 
@@ -79,6 +79,10 @@ protocol PlaybackResumable: AnyObject {
 
 protocol PlaybackStoppable: AnyObject {
   func stopPlayback()
+}
+
+protocol AudioControllable: AnyObject {
+  func setPlaybackVolume(_ volume: Float)
 }
 
 final class PlaybackCoordinator {
@@ -196,6 +200,31 @@ enum Store {
   }
 }
 
+enum StreamVolumeStore {
+  private static let key = "native.streamVolumes.v1"
+
+  static func volume(for stream: StreamItem) -> Float {
+    let volumes = UserDefaults.standard.dictionary(forKey: key) as? [String: Double] ?? [:]
+    return Float(volumes[storageKey(for: stream)] ?? 1)
+  }
+
+  static func setVolume(_ volume: Float, for stream: StreamItem) {
+    var volumes = UserDefaults.standard.dictionary(forKey: key) as? [String: Double] ?? [:]
+    volumes[storageKey(for: stream)] = Double(min(1, max(0, volume)))
+    UserDefaults.standard.set(volumes, forKey: key)
+  }
+
+  static func remove(_ stream: StreamItem) {
+    var volumes = UserDefaults.standard.dictionary(forKey: key) as? [String: Double] ?? [:]
+    volumes.removeValue(forKey: storageKey(for: stream))
+    UserDefaults.standard.set(volumes, forKey: key)
+  }
+
+  private static func storageKey(for stream: StreamItem) -> String {
+    "\(stream.platform.rawValue):\(stream.channel.lowercased())"
+  }
+}
+
 protocol AppStateDelegate: AnyObject {
   func appStateDidChange()
 }
@@ -227,6 +256,7 @@ final class AppState {
   }
 
   func remove(_ stream: StreamItem) {
+    StreamVolumeStore.remove(stream)
     streams.removeAll { $0.id == stream.id }
   }
 }
@@ -271,12 +301,14 @@ final class MainTabController: UITabBarController, AppStateDelegate {
   }
 }
 
-final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable {
+final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, AudioControllable {
   private let playAudio: Bool
+  private var playbackVolume: Float
   private var isStopped = false
 
   init(stream: StreamItem, settings: AppSettings) {
     playAudio = settings.playAudio
+    playbackVolume = StreamVolumeStore.volume(for: stream)
     let config = WKWebViewConfiguration()
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
@@ -313,6 +345,7 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable {
       URLQueryItem(name: "ml", value: String(settings.danmakuMaxLines)),
       URLQueryItem(name: "mlen", value: String(settings.danmakuMaxLength)),
       URLQueryItem(name: "audio", value: settings.playAudio ? "1" : "0"),
+      URLQueryItem(name: "vol", value: String(StreamVolumeStore.volume(for: stream))),
       URLQueryItem(name: "proxy", value: settings.proxyUrl.trimmingCharacters(in: .whitespacesAndNewlines))
     ]
     if let url = components.url {
@@ -323,22 +356,30 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable {
   func resumePlayback() {
     guard !isStopped else { return }
     let shouldMute = playAudio ? "false" : "true"
+    let volume = playAudio ? playbackVolume : 0
     let script = """
     (function(){
       document.body.classList.add('audio-started');
       document.querySelectorAll('video,audio').forEach(function(media){
         try {
           media.muted = \(shouldMute);
+          media.volume = \(volume);
           var play = media.play && media.play();
           if (play && play.catch) play.catch(function(){});
         } catch(e) {}
       });
       document.querySelectorAll('iframe').forEach(function(frame){
+        try { frame.contentWindow.postMessage({type:'volume', volume:\(volume)}, '*'); } catch(e) {}
         try { frame.contentWindow.postMessage({type:'play'}, '*'); } catch(e) {}
       });
     })();
     """
     evaluateJavaScript(script)
+  }
+
+  func setPlaybackVolume(_ volume: Float) {
+    playbackVolume = min(1, max(0, volume))
+    resumePlayback()
   }
 
   func stopPlayback() {
@@ -376,7 +417,7 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable {
 
 }
 
-final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable {
+final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
   private let danmakuView = UIView()
@@ -391,6 +432,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var itemFailedObserver: NSObjectProtocol?
   private let settings: AppSettings
   private let channel: String
+  private var playbackVolume: Float
   private var isLoading = false
   private var isStopped = false
   private var watchPageURL: URL?
@@ -399,11 +441,13 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   init(stream: StreamItem, settings: AppSettings) {
     self.settings = settings
     self.channel = stream.channel
+    self.playbackVolume = StreamVolumeStore.volume(for: stream)
     super.init(frame: .zero)
     backgroundColor = .black
 
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
+    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
     layer.addSublayer(playerLayer)
 
     danmakuView.isUserInteractionEnabled = false
@@ -466,7 +510,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   func resumePlayback() {
     guard !isStopped else { return }
     let session = AVAudioSession.sharedInstance()
-    try? session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
+    try? session.setCategory(.playback, mode: .moviePlayback, options: [])
     try? session.setActive(true)
     if player.currentItem == nil {
       if isLoading || socketTask != nil {
@@ -476,8 +520,13 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       return
     }
     player.isMuted = !settings.playAudio
-    player.volume = settings.playAudio ? 1 : 0
+    player.volume = settings.playAudio ? playbackVolume : 0
     player.play()
+  }
+
+  func setPlaybackVolume(_ volume: Float) {
+    playbackVolume = min(1, max(0, volume))
+    player.volume = settings.playAudio ? playbackVolume : 0
   }
 
   private func load(channel: String) {
@@ -641,6 +690,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         "AVURLAssetHTTPHeaderFieldsKey": self.niconicoPlaybackHeaders()
       ])
       let item = AVPlayerItem(asset: asset)
+      item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
           DispatchQueue.main.async {
@@ -661,7 +711,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       }
       self.player.replaceCurrentItem(with: item)
       self.player.isMuted = !self.settings.playAudio
-      self.player.volume = self.settings.playAudio ? 1 : 0
+      self.player.volume = self.settings.playAudio ? self.playbackVolume : 0
       self.player.play()
     }
   }
@@ -1009,8 +1059,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
-final class MultiPlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable {
+final class MultiPlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, AudioControllable {
   private let playAudio: Bool
+  private var playbackVolume: Float = 1
   private var isStopped = false
 
   init(streams: [StreamItem], settings: AppSettings) {
@@ -1057,22 +1108,30 @@ final class MultiPlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable 
   func resumePlayback() {
     guard !isStopped else { return }
     let shouldMute = playAudio ? "false" : "true"
+    let volume = playAudio ? playbackVolume : 0
     let script = """
     (function(){
       document.body.classList.add('audio-started');
       document.querySelectorAll('video,audio').forEach(function(media){
         try {
           media.muted = \(shouldMute);
+          media.volume = \(volume);
           var play = media.play && media.play();
           if (play && play.catch) play.catch(function(){});
         } catch(e) {}
       });
       document.querySelectorAll('iframe').forEach(function(frame){
+        try { frame.contentWindow.postMessage({type:'volume', volume:\(volume)}, '*'); } catch(e) {}
         try { frame.contentWindow.postMessage({type:'play'}, '*'); } catch(e) {}
       });
     })();
     """
     evaluateJavaScript(script)
+  }
+
+  func setPlaybackVolume(_ volume: Float) {
+    playbackVolume = min(1, max(0, volume))
+    resumePlayback()
   }
 
   func stopPlayback() {
@@ -1117,11 +1176,11 @@ final class ViewingController: UIViewController {
       }))
       return
     }
-    if streams.contains(where: { $0.platform == .niconico }) {
-      addHybridPlayers(streams)
+    if AppState.shared.settings.layoutMode == .grid {
+      addGrid(streams)
       return
     }
-    addUnifiedPlayer(streams)
+    streams.forEach { addStackedCell($0) }
   }
 
   private func clearStack() {
@@ -1285,6 +1344,7 @@ final class StreamCellView: UIView {
     } else {
       video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
     }
+    let audio = video as? AudioControllable
     video.translatesAutoresizingMaskIntoConstraints = false
     addSubview(video)
 
@@ -1306,6 +1366,12 @@ final class StreamCellView: UIView {
     remove.translatesAutoresizingMaskIntoConstraints = false
     addSubview(remove)
 
+    let volume = VolumeOverlay(stream: stream) { value in
+      audio?.setPlaybackVolume(value)
+    }
+    volume.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(volume)
+
     NSLayoutConstraint.activate([
       video.topAnchor.constraint(equalTo: topAnchor),
       video.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -1318,7 +1384,11 @@ final class StreamCellView: UIView {
       remove.topAnchor.constraint(equalTo: topAnchor, constant: 8),
       remove.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
       remove.widthAnchor.constraint(equalToConstant: 32),
-      remove.heightAnchor.constraint(equalToConstant: 32)
+      remove.heightAnchor.constraint(equalToConstant: 32),
+      volume.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+      volume.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+      volume.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+      volume.heightAnchor.constraint(equalToConstant: 36)
     ])
   }
 
@@ -1326,6 +1396,48 @@ final class StreamCellView: UIView {
     fatalError("init(coder:) has not been implemented")
   }
 
+}
+
+final class VolumeOverlay: UIVisualEffectView {
+  init(stream: StreamItem, onChange: @escaping (Float) -> Void) {
+    super.init(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+    clipsToBounds = true
+    layer.cornerRadius = 18
+
+    let icon = UIImageView(image: UIImage(systemName: "speaker.wave.2.fill"))
+    icon.tintColor = .white
+    icon.contentMode = .scaleAspectFit
+    icon.translatesAutoresizingMaskIntoConstraints = false
+    contentView.addSubview(icon)
+
+    let slider = UISlider()
+    slider.minimumValue = 0
+    slider.maximumValue = 1
+    slider.value = StreamVolumeStore.volume(for: stream)
+    slider.minimumTrackTintColor = stream.platform.tint
+    slider.maximumTrackTintColor = UIColor.white.withAlphaComponent(0.28)
+    slider.addAction(UIAction { action in
+      guard let slider = action.sender as? UISlider else { return }
+      StreamVolumeStore.setVolume(slider.value, for: stream)
+      onChange(slider.value)
+    }, for: .valueChanged)
+    slider.translatesAutoresizingMaskIntoConstraints = false
+    contentView.addSubview(slider)
+
+    NSLayoutConstraint.activate([
+      icon.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
+      icon.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
+      icon.widthAnchor.constraint(equalToConstant: 18),
+      icon.heightAnchor.constraint(equalToConstant: 18),
+      slider.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
+      slider.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
+      slider.centerYAnchor.constraint(equalTo: contentView.centerYAnchor)
+    ])
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
 }
 
 final class FocusedStreamView: UIView {
@@ -1355,6 +1467,7 @@ final class FocusedStreamView: UIView {
     } else {
       video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
     }
+    let audio = video as? AudioControllable
     video.translatesAutoresizingMaskIntoConstraints = false
     addSubview(video)
 
@@ -1379,6 +1492,12 @@ final class FocusedStreamView: UIView {
     remove.addAction(UIAction { _ in AppState.shared.remove(stream) }, for: .touchUpInside)
     remove.translatesAutoresizingMaskIntoConstraints = false
     addSubview(remove)
+
+    let volume = VolumeOverlay(stream: stream) { value in
+      audio?.setPlaybackVolume(value)
+    }
+    volume.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(volume)
 
     let chatPanel = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
     chatPanel.translatesAutoresizingMaskIntoConstraints = false
@@ -1427,6 +1546,10 @@ final class FocusedStreamView: UIView {
       remove.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
       remove.widthAnchor.constraint(equalToConstant: 36),
       remove.heightAnchor.constraint(equalToConstant: 36),
+      volume.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+      volume.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+      volume.bottomAnchor.constraint(equalTo: chatPanel.topAnchor, constant: -8),
+      volume.heightAnchor.constraint(equalToConstant: 36),
       chatPanel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
       chatPanel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
       chatPanel.bottomAnchor.constraint(equalTo: input.topAnchor, constant: -8),

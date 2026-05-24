@@ -39,6 +39,7 @@
   var channel = P.get('channel') || '';
   var chatOn = P.get('chat') !== '0';
   var audioOn = P.get('audio') === '1';
+  var volume = Math.max(0, Math.min(1, parseFloat(P.get('vol') || '1') || 0));
   var proxy = P.get('proxy') || '';
   var D = {
     fontSize: parseFloat(P.get('fs')) || 20,
@@ -70,7 +71,7 @@
     var muteNum = audioOn ? '0' : '1';
     if (platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&parent=' + host + '&muted=' + muted + '&autoplay=true';
     if (platform === 'kick') return 'https://player.kick.cx/' + ch;
-    if (platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=' + muteNum + '&playsinline=1';
+    if (platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=' + muteNum + '&playsinline=1&enablejsapi=1&origin=' + encodeURIComponent(location.origin);
     if (platform === 'twitcasting') return 'https://twitcasting.tv/' + ch + '/embeddedplayer/live?auto_play=true';
     return '';
   }
@@ -85,7 +86,40 @@
     f.setAttribute('playsinline', 'true');
     playerEl.appendChild(f);
     frameEl = f;
+    setTimeout(function () { applyVolume(volume); }, 600);
   }
+  function applyVolume(v) {
+    volume = Math.max(0, Math.min(1, Number(v) || 0));
+    document.querySelectorAll('video,audio').forEach(function (media) {
+      try {
+        media.volume = volume;
+        media.muted = !audioOn || volume <= 0;
+      } catch (e) {}
+    });
+    if (!frameEl || !frameEl.contentWindow) return;
+    try {
+      frameEl.contentWindow.postMessage(JSON.stringify({
+        event: 'command',
+        func: 'setVolume',
+        args: [Math.round(volume * 100)]
+      }), '*');
+      frameEl.contentWindow.postMessage(JSON.stringify({
+        event: 'command',
+        func: volume <= 0 || !audioOn ? 'mute' : 'unMute',
+        args: []
+      }), '*');
+    } catch (e) {}
+    try {
+      frameEl.contentWindow.postMessage({ type: 'volume', volume: volume }, '*');
+    } catch (e) {}
+  }
+  window.addEventListener('message', function (event) {
+    var data = event.data;
+    if (typeof data === 'string') {
+      try { data = JSON.parse(data); } catch (e) {}
+    }
+    if (data && data.type === 'volume') applyVolume(data.volume);
+  });
   function startPlayback() {
     if (!frameEl) return;
     document.body.classList.add('clean');
