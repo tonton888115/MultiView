@@ -60,8 +60,25 @@
       '&audio=' + (audioOn ? '1' : '0') +
       (proxy ? '&proxy=' + encodeURIComponent(proxy) : '');
   }
+  function keyOf(s) {
+    return s.platform + ':' + String(s.channel).toLowerCase();
+  }
   var grid = document.getElementById('grid');
   var audioStart = document.getElementById('audioStart');
+  function applyVolume(key, volume) {
+    var v = Math.max(0, Math.min(1, Number(volume) || 0));
+    Array.prototype.forEach.call(document.querySelectorAll('iframe[data-key]'), function (frame) {
+      if (frame.getAttribute('data-key') !== key) return;
+      try { frame.contentWindow.postMessage({ type:'volume', volume:v }, '*'); } catch (e) {}
+    });
+  }
+  window.addEventListener('message', function (event) {
+    var data = event.data;
+    if (typeof data === 'string') {
+      try { data = JSON.parse(data); } catch (e) {}
+    }
+    if (data && data.type === 'volume' && data.key) applyVolume(data.key, data.volume);
+  });
   function reloadFramesForGesture() {
     document.body.classList.add('audio-started');
     Array.prototype.forEach.call(document.querySelectorAll('iframe'), function (frame) {
@@ -86,6 +103,7 @@
     iframe.setAttribute('allowfullscreen', 'true');
     iframe.setAttribute('playsinline', 'true');
     iframe.setAttribute('scrolling', 'no');
+    iframe.setAttribute('data-key', keyOf(s));
     cell.appendChild(iframe);
     grid.appendChild(cell);
   });
