@@ -20,12 +20,22 @@ interface Props {
   onRemove: (stream: Stream) => void;
 }
 
-function StreamCell({ stream, settings, width, height, onFocus, onRemove }: Props) {
+function StreamCell({
+  stream,
+  settings,
+  width,
+  height,
+  onFocus,
+  onRemove,
+}: Props) {
   const webRef = useRef<WebView>(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
   const info = platformInfo(stream.platform);
-  const source = useMemo(() => streamSource(stream, settings), [stream, settings]);
+  const source = useMemo(
+    () => streamSource(stream, settings),
+    [stream, settings],
+  );
 
   return (
     <View style={[styles.cell, { width, height }]}>
@@ -41,7 +51,8 @@ function StreamCell({ stream, settings, width, height, onFocus, onRemove }: Prop
               setFailed(false);
               setLoading(true);
               webRef.current?.reload();
-            }}>
+            }}
+          >
             <Text style={styles.reloadText}>再読み込み</Text>
           </TouchableOpacity>
         </View>
@@ -72,17 +83,32 @@ function StreamCell({ stream, settings, width, height, onFocus, onRemove }: Prop
         </View>
       )}
 
-      <View style={[styles.header, { borderTopColor: info.color }]} pointerEvents="box-none">
-        <TouchableOpacity style={styles.labelBtn} onPress={() => onFocus(stream)} activeOpacity={0.7}>
+      <View
+        style={[styles.header, { borderTopColor: info.color }]}
+        pointerEvents="box-none"
+      >
+        <TouchableOpacity
+          style={styles.labelBtn}
+          onPress={() => onFocus(stream)}
+          activeOpacity={0.7}
+        >
           <Text style={styles.label} numberOfLines={1}>
             <Text style={{ color: info.color }}>● </Text>
             {info.label} / {stream.channel}
           </Text>
         </TouchableOpacity>
-        <TouchableOpacity hitSlop={6} onPress={() => onFocus(stream)} style={styles.iconBtn}>
+        <TouchableOpacity
+          hitSlop={6}
+          onPress={() => onFocus(stream)}
+          style={styles.iconBtn}
+        >
           <Text style={styles.icon}>⛶ 拡大/コメント</Text>
         </TouchableOpacity>
-        <TouchableOpacity hitSlop={8} onPress={() => onRemove(stream)} style={styles.iconBtn}>
+        <TouchableOpacity
+          hitSlop={8}
+          onPress={() => onRemove(stream)}
+          style={styles.iconBtn}
+        >
           <Text style={styles.closeText}>×</Text>
         </TouchableOpacity>
       </View>
@@ -94,7 +120,7 @@ const styles = StyleSheet.create({
   cell: {
     backgroundColor: '#000',
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#222',
+    borderColor: 'rgba(255,255,255,0.14)',
     overflow: 'hidden',
   },
   web: { flex: 1, backgroundColor: '#000' },
@@ -116,16 +142,36 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     paddingLeft: 8,
-    backgroundColor: 'rgba(0,0,0,0.55)',
+    backgroundColor: 'rgba(18,24,32,0.56)',
     borderTopWidth: 2,
   },
   labelBtn: { flex: 1, height: 26, justifyContent: 'center' },
   label: { color: '#eee', fontSize: 11, fontWeight: '600' },
-  iconBtn: { height: 26, paddingHorizontal: 8, alignItems: 'center', justifyContent: 'center' },
+  iconBtn: {
+    height: 26,
+    paddingHorizontal: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   icon: { color: '#fff', fontSize: 11, fontWeight: '600' },
-  closeText: { color: '#fff', fontSize: 18, lineHeight: 20, paddingHorizontal: 6 },
-  fallback: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 12 },
-  fallbackText: { color: '#eee', fontSize: 13, fontWeight: '600', textAlign: 'center' },
+  closeText: {
+    color: '#fff',
+    fontSize: 18,
+    lineHeight: 20,
+    paddingHorizontal: 6,
+  },
+  fallback: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 12,
+  },
+  fallbackText: {
+    color: '#eee',
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
   fallbackSub: { color: '#888', fontSize: 11, marginTop: 4 },
   reloadBtn: {
     marginTop: 12,

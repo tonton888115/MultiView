@@ -13,15 +13,27 @@ interface Props {
   onRemove: (stream: Stream) => void;
 }
 
-export default function Grid({ streams, settings, width, height, onFocus, onRemove }: Props) {
-  const { rows } = computeGrid(streams.length, width > height);
+export default function Grid({
+  streams,
+  settings,
+  width,
+  height,
+  onFocus,
+  onRemove,
+}: Props) {
+  const { rows } = computeGrid(
+    streams.length,
+    width > height,
+    settings.layoutMode === 'stacked',
+  );
   const perRow = Math.max(1, Math.ceil(streams.length / rows));
 
   const chunks: Stream[][] = [];
   for (let i = 0; i < streams.length; i += perRow) {
     chunks.push(streams.slice(i, i + perRow));
   }
-  const rowHeight = chunks.length > 0 ? Math.floor(height / chunks.length) : height;
+  const rowHeight =
+    chunks.length > 0 ? Math.floor(height / chunks.length) : height;
 
   return (
     <View style={[styles.grid, { width, height }]}>

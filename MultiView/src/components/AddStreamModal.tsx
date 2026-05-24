@@ -10,21 +10,33 @@ import {
   TouchableWithoutFeedback,
   View,
 } from 'react-native';
-import { COMFORTABLE_STREAM_COUNT, PLATFORMS, platformInfo } from '../config';
+import {
+  COMFORTABLE_STREAM_COUNT,
+  orderedPlatforms,
+  platformInfo,
+} from '../config';
 import { Platform } from '../types';
 
 interface Props {
   visible: boolean;
   currentCount: number;
+  platformOrder: Platform[];
   onClose: () => void;
   onAdd: (platform: Platform, channel: string) => void;
 }
 
-export default function AddStreamModal({ visible, currentCount, onClose, onAdd }: Props) {
+export default function AddStreamModal({
+  visible,
+  currentCount,
+  platformOrder,
+  onClose,
+  onAdd,
+}: Props) {
   const [platform, setPlatform] = useState<Platform>('kick');
   const [channel, setChannel] = useState('');
   const info = platformInfo(platform);
   const canAdd = channel.trim().length > 0;
+  const platforms = orderedPlatforms(platformOrder);
 
   function submit() {
     if (!canAdd) {
@@ -35,27 +47,42 @@ export default function AddStreamModal({ visible, currentCount, onClose, onAdd }
   }
 
   return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+    <Modal
+      visible={visible}
+      transparent
+      animationType="fade"
+      onRequestClose={onClose}
+    >
       <TouchableWithoutFeedback onPress={onClose}>
         <View style={styles.backdrop}>
           <TouchableWithoutFeedback>
             <KeyboardAvoidingView
               behavior={RNPlatform.OS === 'ios' ? 'padding' : undefined}
-              style={styles.sheet}>
+              style={styles.sheet}
+            >
               <Text style={styles.title}>配信を追加</Text>
 
               <View style={styles.platformRow}>
-                {PLATFORMS.map(p => {
+                {platforms.map(p => {
                   const active = p.id === platform;
                   return (
                     <TouchableOpacity
                       key={p.id}
                       style={[
                         styles.platformBtn,
-                        active && { backgroundColor: p.color, borderColor: p.color },
+                        active && {
+                          backgroundColor: p.color,
+                          borderColor: p.color,
+                        },
                       ]}
-                      onPress={() => setPlatform(p.id)}>
-                      <Text style={[styles.platformText, active && styles.platformTextActive]}>
+                      onPress={() => setPlatform(p.id)}
+                    >
+                      <Text
+                        style={[
+                          styles.platformText,
+                          active && styles.platformTextActive,
+                        ]}
+                      >
                         {p.label}
                       </Text>
                     </TouchableOpacity>
@@ -88,7 +115,8 @@ export default function AddStreamModal({ visible, currentCount, onClose, onAdd }
                 <TouchableOpacity
                   style={[styles.addBtn, !canAdd && styles.addBtnDisabled]}
                   disabled={!canAdd}
-                  onPress={submit}>
+                  onPress={submit}
+                >
                   <Text style={styles.addText}>追加</Text>
                 </TouchableOpacity>
               </View>
@@ -113,7 +141,12 @@ const styles = StyleSheet.create({
     padding: 18,
   },
   title: { color: '#fff', fontSize: 17, fontWeight: '700', marginBottom: 14 },
-  platformRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 },
+  platformRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginBottom: 14,
+  },
   platformBtn: {
     paddingHorizontal: 14,
     paddingVertical: 8,
@@ -132,7 +165,12 @@ const styles = StyleSheet.create({
     fontSize: 15,
   },
   warn: { color: '#ffb340', fontSize: 12, marginTop: 10 },
-  actions: { flexDirection: 'row', justifyContent: 'flex-end', gap: 10, marginTop: 18 },
+  actions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+    marginTop: 18,
+  },
   cancelBtn: { paddingHorizontal: 16, paddingVertical: 10 },
   cancelText: { color: '#aaa', fontSize: 15 },
   addBtn: {

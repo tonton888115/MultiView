@@ -17,7 +17,12 @@ import SettingsTab from './src/components/SettingsTab';
 import TabBar, { TabKey } from './src/components/TabBar';
 import { DEFAULT_SETTINGS } from './src/config';
 import { ParsedStream } from './src/parseStreamUrl';
-import { loadSettings, loadStreams, saveSettings, saveStreams } from './src/storage';
+import {
+  loadSettings,
+  loadStreams,
+  saveSettings,
+  saveStreams,
+} from './src/storage';
 import { Platform, Settings, Stream } from './src/types';
 
 function genId(): string {
@@ -48,7 +53,13 @@ function AppInner() {
       return;
     }
     setStreams(prev => {
-      if (prev.some(s => s.platform === platform && s.channel.toLowerCase() === ch.toLowerCase())) {
+      if (
+        prev.some(
+          s =>
+            s.platform === platform &&
+            s.channel.toLowerCase() === ch.toLowerCase(),
+        )
+      ) {
         return prev;
       }
       const next = [...prev, { id: genId(), platform, channel: ch }];
@@ -85,14 +96,32 @@ function AppInner() {
   };
 
   return (
-    <SafeAreaView style={styles.root} edges={['top', 'left', 'right', 'bottom']}>
+    <SafeAreaView
+      style={styles.root}
+      edges={['top', 'left', 'right', 'bottom']}
+    >
       <StatusBar barStyle="light-content" backgroundColor="#000" />
 
       <View style={styles.content}>
         {/* View tab stays mounted so streams keep playing while other tabs are open */}
-        <View style={[styles.page, tab !== 'view' && styles.hidden]} onLayout={onBodyLayout}>
+        <View
+          style={[styles.page, tab !== 'view' && styles.hidden]}
+          onLayout={onBodyLayout}
+        >
           {focused ? (
-            <FocusedStream stream={focused} settings={settings} onClose={() => setFocused(null)} />
+            <FocusedStream
+              stream={focused}
+              settings={settings}
+              onClose={() => setFocused(null)}
+              onRemove={removeStream}
+            />
+          ) : streams.length === 1 ? (
+            <FocusedStream
+              stream={streams[0]}
+              settings={settings}
+              onClose={null}
+              onRemove={removeStream}
+            />
           ) : streams.length === 0 ? (
             <View style={styles.center}>
               <Text style={styles.emptyTitle}>配信がありません</Text>
@@ -114,15 +143,30 @@ function AppInner() {
           )}
 
           {!focused && (
-            <TouchableOpacity style={styles.fab} onPress={() => setAddVisible(true)}>
+            <TouchableOpacity
+              style={styles.fab}
+              onPress={() => setAddVisible(true)}
+            >
               <Text style={styles.fabText}>＋</Text>
             </TouchableOpacity>
           )}
         </View>
 
-        {tab === 'ranking' && <RankingTab onAddStream={addParsed} />}
-        {tab === 'following' && <FollowingTab onAddStream={addParsed} />}
-        {tab === 'settings' && <SettingsTab settings={settings} onChange={onChangeSettings} />}
+        {tab === 'ranking' && (
+          <RankingTab
+            platformOrder={settings.platformOrder}
+            onAddStream={addParsed}
+          />
+        )}
+        {tab === 'following' && (
+          <FollowingTab
+            platformOrder={settings.platformOrder}
+            onAddStream={addParsed}
+          />
+        )}
+        {tab === 'settings' && (
+          <SettingsTab settings={settings} onChange={onChangeSettings} />
+        )}
       </View>
 
       <TabBar active={tab} onChange={setTab} />
@@ -130,6 +174,7 @@ function AppInner() {
       <AddStreamModal
         visible={addVisible}
         currentCount={streams.length}
+        platformOrder={settings.platformOrder}
         onClose={() => setAddVisible(false)}
         onAdd={(p, c) => {
           addStream(p, c);
@@ -149,13 +194,35 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: '#000' },
+  root: { flex: 1, backgroundColor: '#05070a' },
   content: { flex: 1 },
-  page: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: '#000' },
+  page: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: '#05070a',
+  },
   hidden: { display: 'none' },
-  center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 28 },
-  emptyTitle: { color: '#fff', fontSize: 17, fontWeight: '700', marginBottom: 8 },
-  emptySub: { color: '#999', fontSize: 13, textAlign: 'center', lineHeight: 19 },
+  center: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 28,
+  },
+  emptyTitle: {
+    color: '#fff',
+    fontSize: 17,
+    fontWeight: '700',
+    marginBottom: 8,
+  },
+  emptySub: {
+    color: '#999',
+    fontSize: 13,
+    textAlign: 'center',
+    lineHeight: 19,
+  },
   fab: {
     position: 'absolute',
     right: 18,
@@ -163,7 +230,9 @@ const styles = StyleSheet.create({
     width: 52,
     height: 52,
     borderRadius: 26,
-    backgroundColor: '#0a84ff',
+    backgroundColor: 'rgba(10,132,255,0.82)',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(255,255,255,0.36)',
     alignItems: 'center',
     justifyContent: 'center',
     elevation: 4,

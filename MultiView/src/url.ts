@@ -12,6 +12,7 @@ function danmakuParams(settings: Settings): string {
     `op=${d.opacity}`,
     `ml=${d.maxLines}`,
     `mlen=${d.maxLength}`,
+    `audio=${settings.playAudio ? '1' : '0'}`,
   ];
   if (d.ngWords.length) {
     parts.push(`ng=${encodeURIComponent(d.ngWords.join(','))}`);
@@ -32,7 +33,9 @@ export function streamSource(stream: Stream, settings: Settings): CellSource {
   if (stream.platform === 'niconico') {
     return { uri: `https://live.nicovideo.jp/watch/${channel}` };
   }
-  const q = `platform=${stream.platform}&channel=${channel}&${danmakuParams(settings)}`;
+  const q = `platform=${stream.platform}&channel=${channel}&${danmakuParams(
+    settings,
+  )}`;
   return { uri: `${PAGES_BASE_URL}/player.html?${q}` };
 }
 
@@ -41,9 +44,13 @@ export function chatSource(stream: Stream): CellSource | null {
   const channel = encodeURIComponent(stream.channel.trim());
   switch (stream.platform) {
     case 'twitch':
-      return { uri: `${PAGES_BASE_URL}/chat.html?platform=twitch&channel=${channel}` };
+      return {
+        uri: `${PAGES_BASE_URL}/chat.html?platform=twitch&channel=${channel}`,
+      };
     case 'youtube':
-      return { uri: `${PAGES_BASE_URL}/chat.html?platform=youtube&channel=${channel}` };
+      return {
+        uri: `${PAGES_BASE_URL}/chat.html?platform=youtube&channel=${channel}`,
+      };
     case 'kick':
       return { uri: `https://kick.com/${channel}` };
     case 'twitcasting':

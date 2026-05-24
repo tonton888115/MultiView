@@ -1,10 +1,17 @@
-export type Platform = 'kick' | 'twitch' | 'youtube' | 'niconico' | 'twitcasting';
+export type Platform =
+  | 'kick'
+  | 'twitch'
+  | 'youtube'
+  | 'niconico'
+  | 'twitcasting';
 
 export interface Stream {
   id: string;
   platform: Platform;
   channel: string;
 }
+
+export type LayoutMode = 'stacked' | 'grid';
 
 // Dr.Maggot-style danmaku filtering + appearance.
 export interface DanmakuSettings {
@@ -23,5 +30,11 @@ export interface Settings {
   // Optional CORS proxy prefix for Kick/TwitCasting chat lookups (a Cloudflare Worker).
   // The target URL is appended url-encoded, e.g. "https://xxx.workers.dev/?url="
   proxyUrl: string;
+  // Start embedded players with audio enabled. Autoplay with sound may still need a user gesture.
+  playAudio: boolean;
+  // Viewing tab layout: stacked keeps one stream per row, grid keeps the balanced auto grid.
+  layoutMode: LayoutMode;
+  // Preferred service order in ranking/following/add surfaces.
+  platformOrder: Platform[];
   danmaku: DanmakuSettings;
 }

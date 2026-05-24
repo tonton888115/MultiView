@@ -1,5 +1,9 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { DEFAULT_SETTINGS, STORAGE_KEYS } from './config';
+import {
+  DEFAULT_PLATFORM_ORDER,
+  DEFAULT_SETTINGS,
+  STORAGE_KEYS,
+} from './config';
 import { Settings, Stream } from './types';
 
 export async function loadStreams(): Promise<Stream[]> {
@@ -29,6 +33,12 @@ export async function loadSettings(): Promise<Settings> {
     return {
       ...DEFAULT_SETTINGS,
       ...parsed,
+      platformOrder: Array.isArray(parsed.platformOrder)
+        ? [...parsed.platformOrder, ...DEFAULT_PLATFORM_ORDER].filter(
+            (id, index, list) =>
+              DEFAULT_PLATFORM_ORDER.includes(id) && list.indexOf(id) === index,
+          )
+        : DEFAULT_PLATFORM_ORDER,
       danmaku: { ...DEFAULT_SETTINGS.danmaku, ...(parsed.danmaku || {}) },
     };
   } catch {

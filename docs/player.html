@@ -32,6 +32,7 @@
   var platform = (P.get('platform') || '').toLowerCase();
   var channel = P.get('channel') || '';
   var chatOn = P.get('chat') !== '0';
+  var audioOn = P.get('audio') === '1';
   var proxy = P.get('proxy') || '';
   var D = {
     fontSize: parseFloat(P.get('fs')) || 20,
@@ -55,9 +56,11 @@
   // ---- embed ----
   function embedUrl() {
     var ch = encodeURIComponent(channel), host = location.hostname;
-    if (platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&parent=' + host + '&muted=true&autoplay=true';
-    if (platform === 'kick') return 'https://player.kick.com/' + ch + '?autoplay=true&muted=true';
-    if (platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=1&playsinline=1';
+    var muted = audioOn ? 'false' : 'true';
+    var muteNum = audioOn ? '0' : '1';
+    if (platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&parent=' + host + '&muted=' + muted + '&autoplay=true';
+    if (platform === 'kick') return 'https://player.kick.com/' + ch + '?autoplay=true&muted=' + muted;
+    if (platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=' + muteNum + '&playsinline=1';
     if (platform === 'twitcasting') return 'https://twitcasting.tv/' + ch + '/embeddedplayer/live?auto_play=true';
     return '';
   }
