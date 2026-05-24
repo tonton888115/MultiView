@@ -63,13 +63,27 @@
   function esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
+  function serviceChannel() {
+    return String(channel || '').trim().replace(/^@+/, '').replace(/^https?:\/\/[^/]+\//, '').split(/[/?#]/)[0];
+  }
+  function parentParams() {
+    var parents = [location.hostname, 'tonton888115.github.io', 'localhost', '127.0.0.1'];
+    var seen = {};
+    return parents.filter(function (host) {
+      if (!host || seen[host]) return false;
+      seen[host] = true;
+      return true;
+    }).map(function (host) {
+      return 'parent=' + encodeURIComponent(host);
+    }).join('&');
+  }
 
   // ---- embed ----
   function embedUrl() {
-    var ch = encodeURIComponent(channel), host = location.hostname;
+    var ch = encodeURIComponent(serviceChannel());
     var muted = audioOn ? 'false' : 'true';
     var muteNum = audioOn ? '0' : '1';
-    if (platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&parent=' + host + '&muted=' + muted + '&autoplay=true';
+    if (platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&' + parentParams() + '&muted=' + muted + '&autoplay=true&playsinline=true';
     if (platform === 'kick') return 'https://player.kick.com/' + ch + '?autoplay=true&muted=' + ((!audioOn || volume <= 0) ? 'true' : 'false');
     if (platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=' + muteNum + '&playsinline=1&enablejsapi=1&origin=' + encodeURIComponent(location.origin);
     if (platform === 'twitcasting') return 'https://twitcasting.tv/' + ch + '/embeddedplayer/live?auto_play=true';
@@ -113,6 +127,19 @@
       frameEl.contentWindow.postMessage({ type: 'volume', volume: volume }, '*');
     } catch (e) {}
   }
+  function sendPlayCommand() {
+    if (!frameEl || !frameEl.contentWindow) return;
+    try {
+      frameEl.contentWindow.postMessage(JSON.stringify({
+        event: 'command',
+        func: 'play',
+        args: []
+      }), '*');
+    } catch (e) {}
+    try {
+      frameEl.contentWindow.postMessage({ type: 'play' }, '*');
+    } catch (e2) {}
+  }
   window.addEventListener('message', function (event) {
     var data = event.data;
     if (typeof data === 'string') {
@@ -124,9 +151,17 @@
   function startPlayback() {
     if (!frameEl) return;
     document.body.classList.add('clean');
+    sendPlayCommand();
+    applyVolume(volume);
     var src = frameEl.src;
     frameEl.src = 'about:blank';
-    setTimeout(function () { frameEl.src = src; }, 40);
+    setTimeout(function () {
+      frameEl.src = src;
+      setTimeout(function () {
+        sendPlayCommand();
+        applyVolume(volume);
+      }, 800);
+    }, 40);
     startEl.style.display = 'none';
   }
   if (showStartOverlay) {
