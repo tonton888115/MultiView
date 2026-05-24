@@ -1263,10 +1263,12 @@ final class StreamCellView: UIView {
 }
 
 final class FocusedStreamView: UIView {
+  private let stream: StreamItem
   private let chatWeb: WKWebView?
   private let input = UITextField()
 
   init(stream: StreamItem, onClose: (() -> Void)?) {
+    self.stream = stream
     let chatURL = FocusedStreamView.chatURL(for: stream)
     if let chatURL {
       let config = WKWebViewConfiguration()
@@ -1395,7 +1397,25 @@ final class FocusedStreamView: UIView {
   }
 
   private func sendComment() {
-    guard let text = input.text, !text.isEmpty, let chatWeb else { return }
+    guard let text = input.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return }
+    if stream.platform == .kick, KickAuthManager.shared.isSignedIn {
+      KickAuthManager.shared.sendChat(channel: stream.channel, content: text) { [weak self] result in
+        DispatchQueue.main.async {
+          switch result {
+          case .success:
+            self?.input.text = ""
+          case .failure:
+            self?.sendWebComment(text)
+          }
+        }
+      }
+      return
+    }
+    sendWebComment(text)
+  }
+
+  private func sendWebComment(_ text: String) {
+    guard let chatWeb else { return }
     let escaped = text
       .replacingOccurrences(of: "\\", with: "\\\\")
       .replacingOccurrences(of: "'", with: "\\'")
@@ -1606,12 +1626,13 @@ final class SettingsController: UITableViewController {
     tableView.reloadData()
   }
 
-  override func numberOfSections(in tableView: UITableView) -> Int { 3 }
+  override func numberOfSections(in tableView: UITableView) -> Int { 4 }
 
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     switch section {
     case 0: return 9
     case 1: return platforms.count
+    case 2: return 3
     default: return 1
     }
   }
@@ -1620,6 +1641,7 @@ final class SettingsController: UITableViewController {
     switch section {
     case 0: return "視聴"
     case 1: return "サービス順"
+    case 2: return "Kick OAuth"
     default: return "追加"
     }
   }
@@ -1687,6 +1709,18 @@ final class SettingsController: UITableViewController {
         control.selectedSegmentIndex = UISegmentedControl.noSegment
       }, for: .valueChanged)
       cell.accessoryView = control
+    } else if indexPath.section == 2 {
+      let config = KickAuthManager.shared.config
+      switch indexPath.row {
+      case 0:
+        cell.textLabel?.text = KickAuthManager.shared.isSignedIn ? "Kickログアウト" : "Kick OAuthログイン"
+      case 1:
+        cell.textLabel?.text = config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
+      default:
+        cell.textLabel?.text = "Redirect URI \(config.redirectURI)"
+      }
+      cell.accessoryType = .disclosureIndicator
+      cell.selectionStyle = .default
     } else {
       cell.textLabel?.text = "配信を手動追加"
       cell.accessoryType = .disclosureIndicator
@@ -1721,6 +1755,8 @@ final class SettingsController: UITableViewController {
     } else if indexPath.section == 0 && (4...8).contains(indexPath.row) {
       editDanmakuValue(row: indexPath.row)
     } else if indexPath.section == 2 {
+      handleKickOAuthRow(indexPath.row)
+    } else if indexPath.section == 3 {
       present(AddStreamController(), animated: true)
     }
   }
@@ -1828,6 +1864,72 @@ final class SettingsController: UITableViewController {
       settings.proxyUrl = alert.textFields?.first?.text ?? ""
       AppState.shared.settings = settings
     })
+    present(alert, animated: true)
+  }
+
+  private func handleKickOAuthRow(_ row: Int) {
+    switch row {
+    case 0:
+      if KickAuthManager.shared.isSignedIn {
+        KickAuthManager.shared.signOut()
+        tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
+        return
+      }
+      KickAuthManager.shared.signIn(presentationAnchor: view.window) { [weak self] result in
+        DispatchQueue.main.async {
+          self?.tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
+          if case .failure(let error) = result {
+            self?.presentError(error)
+          }
+        }
+      }
+    case 1:
+      editKickClientID()
+    case 2:
+      editKickRedirectURI()
+    default:
+      break
+    }
+  }
+
+  private func editKickClientID() {
+    var config = KickAuthManager.shared.config
+    let alert = UIAlertController(title: "Kick Client ID", message: nil, preferredStyle: .alert)
+    alert.addTextField { field in
+      field.text = config.clientId
+      field.autocapitalizationType = .none
+      field.autocorrectionType = .no
+    }
+    alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
+    alert.addAction(UIAlertAction(title: "保存", style: .default) { [weak self] _ in
+      config.clientId = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      KickAuthManager.shared.config = config
+      self?.tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
+    })
+    present(alert, animated: true)
+  }
+
+  private func editKickRedirectURI() {
+    var config = KickAuthManager.shared.config
+    let alert = UIAlertController(title: "Kick Redirect URI", message: nil, preferredStyle: .alert)
+    alert.addTextField { field in
+      field.text = config.redirectURI
+      field.keyboardType = .URL
+      field.autocapitalizationType = .none
+      field.autocorrectionType = .no
+    }
+    alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
+    alert.addAction(UIAlertAction(title: "保存", style: .default) { [weak self] _ in
+      config.redirectURI = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      KickAuthManager.shared.config = config
+      self?.tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
+    })
+    present(alert, animated: true)
+  }
+
+  private func presentError(_ error: Error) {
+    let alert = UIAlertController(title: "エラー", message: error.localizedDescription, preferredStyle: .alert)
+    alert.addAction(UIAlertAction(title: "OK", style: .default))
     present(alert, animated: true)
   }
 }
