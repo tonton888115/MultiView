@@ -15,21 +15,29 @@
   .cell iframe { position:absolute; inset:0; width:100%; height:100%; border:0; background:#000; }
   .bar { position:absolute; z-index:2; left:8px; right:8px; top:8px; height:30px; display:flex; align-items:center;
     padding:0 10px; box-sizing:border-box; border-radius:14px; background:rgba(18,24,32,0.58);
-    border:1px solid rgba(255,255,255,0.18); font-size:12px; font-weight:700; pointer-events:none; }
-  body.clean .bar, body.clean #hint { display:none; }
+    border:1px solid rgba(255,255,255,0.18); font-size:12px; font-weight:700; }
+  .bar.hidden { display:none; }
+  body.clean #hint { display:none; }
   #hint { position:sticky; top:0; z-index:3; margin:0; padding:8px 10px; color:#ddd;
     background:rgba(0,0,0,0.72); font-size:12px; text-align:center; }
+  #audioStart { position:fixed; right:10px; bottom:10px; z-index:4; padding:10px 14px; border-radius:18px;
+    border:1px solid rgba(255,255,255,0.25); background:rgba(18,24,32,0.76); color:#fff;
+    font:700 13px -apple-system,BlinkMacSystemFont,sans-serif; }
+  body.audio-started #audioStart { display:none; }
 </style>
 </head>
 <body>
 <p id="hint">プレイヤーをタップして再生 / ミュート解除</p>
 <div id="grid"></div>
+<button id="audioStart">音声を開始</button>
 <script>
 (function () {
   'use strict';
   var P = new URLSearchParams(location.search);
   var layout = P.get('layout') || 'stacked';
   var audioOn = P.get('audio') === '1';
+  var chatOn = P.get('chat') !== '0';
+  var proxy = P.get('proxy') || '';
   var raw = P.get('streams') || '';
   document.body.className = layout === 'grid' ? 'grid' : 'stacked';
 
@@ -45,28 +53,46 @@
   }
   function embedUrl(s) {
     var ch = encodeURIComponent(s.channel);
-    var muted = audioOn ? 'false' : 'true';
-    var muteNum = audioOn ? '0' : '1';
-    if (s.platform === 'kick') return 'https://player.kick.cx/' + ch;
-    if (s.platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&parent=' + location.hostname + '&muted=' + muted + '&autoplay=true';
-    if (s.platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=' + muteNum + '&playsinline=1';
-    if (s.platform === 'twitcasting') return 'https://twitcasting.tv/' + ch + '/embeddedplayer/live?auto_play=true';
     if (s.platform === 'niconico') return 'https://live.nicovideo.jp/watch/' + ch;
-    return '';
+    return 'https://tonton888115.github.io/MultiView/player.html?platform=' + encodeURIComponent(s.platform) +
+      '&channel=' + ch +
+      '&chat=' + (chatOn ? '1' : '0') +
+      '&fs=20&sp=0.13&op=0.9&ml=0&mlen=0&audio=' + (audioOn ? '1' : '0') +
+      (proxy ? '&proxy=' + encodeURIComponent(proxy) : '');
   }
   function label(s) {
     var names = { kick:'Kick', twitch:'Twitch', youtube:'YouTube', niconico:'ニコ生', twitcasting:'ツイキャス' };
     return (names[s.platform] || s.platform) + ' / ' + s.channel;
   }
   var grid = document.getElementById('grid');
-  document.addEventListener('touchstart', function () { document.body.classList.add('clean'); }, { once:true, passive:true });
-  document.addEventListener('click', function () { document.body.classList.add('clean'); }, { once:true });
+  var audioStart = document.getElementById('audioStart');
+  function reloadFramesForGesture() {
+    document.body.classList.add('audio-started');
+    Array.prototype.forEach.call(document.querySelectorAll('iframe'), function (frame) {
+      var src = frame.src;
+      frame.src = 'about:blank';
+      setTimeout(function () { frame.src = src; }, 40);
+    });
+  }
+  audioStart.addEventListener('click', reloadFramesForGesture);
+  audioStart.addEventListener('touchend', function (e) {
+    e.preventDefault();
+    reloadFramesForGesture();
+  }, { passive:false });
   parseStreams().forEach(function (s) {
     var src = embedUrl(s);
     if (!src) return;
     var cell = document.createElement('div');
     cell.className = 'cell';
     cell.innerHTML = '<div class="bar">' + esc(label(s)) + '</div>';
+    cell.querySelector('.bar').addEventListener('click', function (e) {
+      e.stopPropagation();
+      this.classList.add('hidden');
+    });
+    cell.querySelector('.bar').addEventListener('touchend', function (e) {
+      e.stopPropagation();
+      this.classList.add('hidden');
+    }, { passive:true });
     var iframe = document.createElement('iframe');
     iframe.src = src;
     iframe.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';

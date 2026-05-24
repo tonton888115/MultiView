@@ -10,12 +10,29 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
-    try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
-    try? AVAudioSession.sharedInstance().setActive(true)
+    configureAudioSession()
     window = UIWindow(frame: UIScreen.main.bounds)
     window?.rootViewController = MainTabController()
     window?.makeKeyAndVisible()
     return true
+  }
+
+  func applicationDidBecomeActive(_ application: UIApplication) {
+    configureAudioSession()
+  }
+
+  func applicationWillResignActive(_ application: UIApplication) {
+    configureAudioSession()
+  }
+
+  func applicationDidEnterBackground(_ application: UIApplication) {
+    configureAudioSession()
+  }
+
+  private func configureAudioSession() {
+    let session = AVAudioSession.sharedInstance()
+    try? session.setCategory(.playback, mode: .moviePlayback, options: [])
+    try? session.setActive(true)
   }
 }
 
@@ -70,14 +87,14 @@ enum LayoutMode: String, Codable {
 struct AppSettings: Codable {
   var showChat = true
   var proxyUrl = ""
-  var playAudio = false
+  var playAudio = true
   var layoutMode: LayoutMode = .stacked
   var platformOrder = StreamPlatform.allCases
 }
 
 enum Store {
   private static let streamsKey = "native.streams.v1"
-  private static let settingsKey = "native.settings.v2"
+  private static let settingsKey = "native.settings.v3"
 
   static func loadStreams() -> [StreamItem] {
     guard let data = UserDefaults.standard.data(forKey: streamsKey),
@@ -256,7 +273,9 @@ final class MultiPlayerWebView: WKWebView {
     components.queryItems = [
       URLQueryItem(name: "streams", value: encodedStreams),
       URLQueryItem(name: "layout", value: settings.layoutMode.rawValue),
-      URLQueryItem(name: "audio", value: settings.playAudio ? "1" : "0")
+      URLQueryItem(name: "audio", value: settings.playAudio ? "1" : "0"),
+      URLQueryItem(name: "chat", value: settings.showChat ? "1" : "0"),
+      URLQueryItem(name: "proxy", value: settings.proxyUrl.trimmingCharacters(in: .whitespacesAndNewlines))
     ]
     if let url = components.url {
       load(URLRequest(url: url))
@@ -291,8 +310,8 @@ final class ViewingController: UIViewController {
       }))
       return
     }
-    if streams.count == 1 {
-      addUnifiedPlayer(streams)
+    if streams.contains(where: { $0.platform == .niconico }) {
+      addHybridPlayers(streams)
       return
     }
     addUnifiedPlayer(streams)
@@ -328,10 +347,59 @@ final class ViewingController: UIViewController {
   }
 
   private func addUnifiedPlayer(_ streams: [StreamItem]) {
+    addCloseBar(streams)
     let web = MultiPlayerWebView(streams: streams, settings: AppState.shared.settings)
     web.translatesAutoresizingMaskIntoConstraints = false
     stack.addArrangedSubview(web)
     web.heightAnchor.constraint(equalTo: view.safeAreaLayoutGuide.heightAnchor).isActive = true
+  }
+
+  private func addHybridPlayers(_ streams: [StreamItem]) {
+    let embeddable = streams.filter { $0.platform != .niconico }
+    let niconico = streams.filter { $0.platform == .niconico }
+    if !embeddable.isEmpty {
+      addCloseBar(embeddable)
+      let web = MultiPlayerWebView(streams: embeddable, settings: AppState.shared.settings)
+      web.translatesAutoresizingMaskIntoConstraints = false
+      stack.addArrangedSubview(web)
+      let rows = AppState.shared.settings.layoutMode == .grid ? ceil(Double(embeddable.count) / 2.0) : Double(embeddable.count)
+      web.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: CGFloat(rows) * 9 / 16).isActive = true
+      web.heightAnchor.constraint(greaterThanOrEqualToConstant: embeddable.count == 1 ? 220 : 360).isActive = true
+    }
+    niconico.forEach { addStackedCell($0) }
+  }
+
+  private func addCloseBar(_ streams: [StreamItem]) {
+    let scroller = UIScrollView()
+    scroller.showsHorizontalScrollIndicator = false
+    scroller.translatesAutoresizingMaskIntoConstraints = false
+    let row = UIStackView()
+    row.axis = .horizontal
+    row.spacing = 8
+    row.translatesAutoresizingMaskIntoConstraints = false
+    scroller.addSubview(row)
+
+    streams.forEach { stream in
+      let button = UIButton(type: .system)
+      button.setTitle("× \(stream.platform.label) / \(stream.channel)", for: .normal)
+      button.setTitleColor(.white, for: .normal)
+      button.titleLabel?.font = .systemFont(ofSize: 12, weight: .bold)
+      button.contentEdgeInsets = UIEdgeInsets(top: 7, left: 11, bottom: 7, right: 11)
+      button.backgroundColor = UIColor.white.withAlphaComponent(0.12)
+      button.layer.cornerRadius = 15
+      button.addAction(UIAction { _ in AppState.shared.remove(stream) }, for: .touchUpInside)
+      row.addArrangedSubview(button)
+    }
+
+    stack.addArrangedSubview(scroller)
+    NSLayoutConstraint.activate([
+      scroller.heightAnchor.constraint(equalToConstant: 38),
+      row.topAnchor.constraint(equalTo: scroller.contentLayoutGuide.topAnchor),
+      row.leadingAnchor.constraint(equalTo: scroller.contentLayoutGuide.leadingAnchor),
+      row.trailingAnchor.constraint(equalTo: scroller.contentLayoutGuide.trailingAnchor),
+      row.bottomAnchor.constraint(equalTo: scroller.contentLayoutGuide.bottomAnchor),
+      row.heightAnchor.constraint(equalTo: scroller.frameLayoutGuide.heightAnchor)
+    ])
   }
 
   private func addGrid(_ streams: [StreamItem]) {
@@ -387,6 +455,8 @@ final class StreamCellView: UIView {
     label.text = "● \(stream.platform.label) / \(stream.channel)"
     label.textColor = .white
     label.font = .systemFont(ofSize: 12, weight: .bold)
+    label.isUserInteractionEnabled = true
+    label.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(hideTappedLabel(_:))))
     label.translatesAutoresizingMaskIntoConstraints = false
     bar.contentView.addSubview(label)
 
@@ -428,6 +498,10 @@ final class StreamCellView: UIView {
   required init?(coder: NSCoder) {
     fatalError("init(coder:) has not been implemented")
   }
+
+  @objc private func hideTappedLabel(_ sender: UITapGestureRecognizer) {
+    sender.view?.isHidden = true
+  }
 }
 
 final class FocusedStreamView: UIView {
@@ -463,6 +537,8 @@ final class FocusedStreamView: UIView {
     title.text = "● \(stream.platform.label) / \(stream.channel)"
     title.textColor = .white
     title.font = .systemFont(ofSize: 14, weight: .bold)
+    title.isUserInteractionEnabled = true
+    title.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(hideTappedLabel(_:))))
     title.translatesAutoresizingMaskIntoConstraints = false
     bar.contentView.addSubview(title)
 
@@ -565,6 +641,10 @@ final class FocusedStreamView: UIView {
 
   required init?(coder: NSCoder) {
     fatalError("init(coder:) has not been implemented")
+  }
+
+  @objc private func hideTappedLabel(_ sender: UITapGestureRecognizer) {
+    sender.view?.isHidden = true
   }
 
   private func sendComment() {
