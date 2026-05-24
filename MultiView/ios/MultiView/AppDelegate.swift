@@ -91,6 +91,37 @@ protocol AudioControllable: AnyObject {
   func setPlaybackVolume(_ volume: Float)
 }
 
+final class AutoHidingControls: NSObject {
+  private weak var host: UIView?
+  private let controls: [UIView]
+  private var hideWorkItem: DispatchWorkItem?
+
+  init(host: UIView, controls: [UIView]) {
+    self.host = host
+    self.controls = controls
+    super.init()
+    let tap = UITapGestureRecognizer(target: self, action: #selector(showTemporarily))
+    tap.cancelsTouchesInView = false
+    host.addGestureRecognizer(tap)
+    showTemporarily()
+  }
+
+  @objc func showTemporarily() {
+    hideWorkItem?.cancel()
+    UIView.animate(withDuration: 0.16) {
+      self.controls.forEach { $0.alpha = 1 }
+    }
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      UIView.animate(withDuration: 0.25) {
+        self.controls.forEach { $0.alpha = 0 }
+      }
+    }
+    hideWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.4, execute: work)
+  }
+}
+
 final class PlaybackCoordinator {
   static let shared = PlaybackCoordinator()
   private let views = NSHashTable<AnyObject>.weakObjects()
@@ -1078,14 +1109,18 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private let settings: AppSettings
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
+  private let danmakuView = UIView()
   private let statusLabel = UILabel()
   private var playbackVolume: Float
   private var channelTask: URLSessionDataTask?
+  private var socketTask: URLSessionWebSocketTask?
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
   private var fallbackWebView: PlayerWebView?
+  private var chatroomID: String?
   private var isLoading = false
   private var isStopped = false
+  private var laneCursor = 0
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -1099,6 +1134,10 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     layer.addSublayer(playerLayer)
+
+    danmakuView.isUserInteractionEnabled = false
+    danmakuView.clipsToBounds = true
+    addSubview(danmakuView)
 
     statusLabel.text = "Kickをネイティブ再生で読み込み中"
     statusLabel.textColor = .white.withAlphaComponent(0.72)
@@ -1129,6 +1168,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   override func layoutSubviews() {
     super.layoutSubviews()
     playerLayer.frame = bounds
+    danmakuView.frame = bounds
   }
 
   func resumePlayback() {
@@ -1155,6 +1195,9 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     channelTask = nil
     player.pause()
     player.replaceCurrentItem(with: nil)
+    socketTask?.cancel(with: .goingAway, reason: nil)
+    socketTask = nil
+    chatroomID = nil
     fallbackWebView?.stopPlayback()
     fallbackWebView?.removeFromSuperview()
     fallbackWebView = nil
@@ -1195,7 +1238,15 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         self.installFallback("Kick HLS取得失敗: HTTP \(http.statusCode)")
         return
       }
-      guard let data, let hlsURL = Self.extractPlaybackURL(from: data) else {
+      guard let data else {
+        self.installFallback("Kick HLS URLを取得できません")
+        return
+      }
+      let channelInfo = Self.extractChannelInfo(from: data)
+      if let chatroomID = channelInfo.chatroomID {
+        self.connectKickComments(chatroomID: chatroomID)
+      }
+      guard let hlsURL = channelInfo.hlsURL else {
         self.installFallback("Kick HLS URLを取得できません")
         return
       }
@@ -1257,6 +1308,8 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         web.bottomAnchor.constraint(equalTo: self.bottomAnchor)
       ])
       self.fallbackWebView = web
+      self.socketTask?.cancel(with: .goingAway, reason: nil)
+      self.socketTask = nil
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
         web.resumePlayback()
       }
@@ -1302,16 +1355,144 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     return cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
   }
 
-  private static func extractPlaybackURL(from data: Data) -> URL? {
-    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-    if let raw = json["playback_url"] as? String, let url = URL(string: raw) {
-      return url
+  private func connectKickComments(chatroomID: String) {
+    guard settings.showChat, !isStopped else { return }
+    self.chatroomID = chatroomID
+    socketTask?.cancel(with: .goingAway, reason: nil)
+    guard let url = URL(string: "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=ios-native&version=1.0&flash=false") else { return }
+    let task = URLSession.shared.webSocketTask(with: url)
+    socketTask = task
+    task.resume()
+    let payload: [String: Any] = [
+      "event": "pusher:subscribe",
+      "data": [
+        "auth": "",
+        "channel": "chatrooms.\(chatroomID).v2"
+      ]
+    ]
+    if let data = try? JSONSerialization.data(withJSONObject: payload),
+       let text = String(data: data, encoding: .utf8) {
+      task.send(.string(text)) { _ in }
+    }
+    receiveKickComment()
+  }
+
+  private func receiveKickComment() {
+    socketTask?.receive { [weak self] result in
+      guard let self, !self.isStopped else { return }
+      switch result {
+      case .failure:
+        self.socketTask?.cancel(with: .goingAway, reason: nil)
+        self.socketTask = nil
+        if let chatroomID = self.chatroomID {
+          DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.connectKickComments(chatroomID: chatroomID)
+          }
+        }
+      case .success(let message):
+        if case .string(let text) = message {
+          self.handleKickSocketMessage(text)
+        }
+        self.receiveKickComment()
+      }
+    }
+  }
+
+  private func handleKickSocketMessage(_ text: String) {
+    guard let data = text.data(using: .utf8),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let event = json["event"] as? String else { return }
+    if event == "pusher:ping" {
+      socketTask?.send(.string(#"{"event":"pusher:pong","data":{}}"#)) { _ in }
+      return
+    }
+    guard event == "App\\Events\\ChatMessageEvent" else { return }
+    let payloadData: Data?
+    if let raw = json["data"] as? String {
+      payloadData = raw.data(using: .utf8)
+    } else if let raw = json["data"] as? [String: Any] {
+      payloadData = try? JSONSerialization.data(withJSONObject: raw)
+    } else {
+      payloadData = nil
+    }
+    guard let payloadData,
+          let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
+          let content = payload["content"] as? String else { return }
+    emitDanmaku(Self.kickPlain(content))
+  }
+
+  private func emitDanmaku(_ text: String) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    if settings.danmakuMaxLength > 0, trimmed.count > settings.danmakuMaxLength {
+      return
+    }
+    DispatchQueue.main.async {
+      guard self.danmakuView.bounds.height > 0, self.danmakuView.bounds.width > 0 else { return }
+      let fontSize = CGFloat(self.settings.danmakuFontSize)
+      let lineHeight = fontSize + 8
+      let maxLines = self.settings.danmakuMaxLines > 0
+        ? self.settings.danmakuMaxLines
+        : max(1, Int(self.danmakuView.bounds.height / lineHeight))
+      let label = UILabel()
+      label.text = trimmed
+      label.font = .systemFont(ofSize: fontSize, weight: .bold)
+      label.textColor = UIColor.white.withAlphaComponent(self.settings.danmakuOpacity)
+      label.layer.shadowColor = UIColor.black.cgColor
+      label.layer.shadowRadius = 2
+      label.layer.shadowOpacity = 1
+      label.layer.shadowOffset = CGSize(width: 1, height: 1)
+      label.sizeToFit()
+      let lane = self.laneCursor % maxLines
+      self.laneCursor += 1
+      let y = CGFloat(lane) * lineHeight + 6
+      let startX = self.danmakuView.bounds.width + 12
+      label.frame.origin = CGPoint(x: startX, y: y)
+      self.danmakuView.addSubview(label)
+      let travel = startX + label.bounds.width + 24
+      let pixelsPerSecond = max(35, self.danmakuView.bounds.width * CGFloat(self.settings.danmakuSpeed))
+      let duration = TimeInterval(travel / pixelsPerSecond)
+      UIView.animate(withDuration: duration, delay: 0, options: [.curveLinear]) {
+        label.frame.origin.x = -label.bounds.width - 12
+      } completion: { _ in
+        label.removeFromSuperview()
+      }
+    }
+  }
+
+  private static func kickPlain(_ content: String) -> String {
+    content.replacingOccurrences(of: #"\[emote:\d+:[^\]]+\]"#, with: "", options: .regularExpression)
+  }
+
+  private static func extractChannelInfo(from data: Data) -> (hlsURL: URL?, chatroomID: String?) {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return (nil, nil) }
+    var hlsURL: URL?
+    var chatroomID: String?
+    if let raw = json["playback_url"] as? String {
+      hlsURL = URL(string: raw)
     }
     if let livestream = json["livestream"] as? [String: Any],
        let raw = livestream["playback_url"] as? String,
        let url = URL(string: raw) {
-      return url
+      hlsURL = url
     }
+    if let chatroom = json["chatroom"] as? [String: Any],
+       let id = chatroom["id"] {
+      chatroomID = Self.stringValue(id)
+    }
+    if chatroomID == nil,
+       let livestream = json["livestream"] as? [String: Any],
+       let chatroom = livestream["chatroom"] as? [String: Any],
+       let id = chatroom["id"] {
+      chatroomID = Self.stringValue(id)
+    }
+    return (hlsURL, chatroomID)
+  }
+
+  private static func stringValue(_ value: Any) -> String? {
+    if let string = value as? String { return string }
+    if let int = value as? Int { return String(int) }
+    if let number = value as? NSNumber { return number.stringValue }
     return nil
   }
 
@@ -1687,6 +1868,8 @@ final class ViewingController: UIViewController {
 }
 
 final class StreamCellView: UIView {
+  private var autoHider: AutoHidingControls?
+
   init(stream: StreamItem, onFocus: @escaping () -> Void) {
     super.init(frame: .zero)
     backgroundColor = .black
@@ -1749,6 +1932,7 @@ final class StreamCellView: UIView {
       volume.widthAnchor.constraint(equalToConstant: 42),
       volume.heightAnchor.constraint(equalTo: heightAnchor, multiplier: 0.62)
     ])
+    autoHider = AutoHidingControls(host: self, controls: [focus, remove, volume])
   }
 
   required init?(coder: NSCoder) {
@@ -1805,6 +1989,7 @@ final class FocusedStreamView: UIView {
   private let stream: StreamItem
   private let chatWeb: WKWebView?
   private let input = UITextField()
+  private var autoHider: AutoHidingControls?
 
   init(stream: StreamItem, onClose: (() -> Void)?) {
     self.stream = stream
@@ -1942,6 +2127,11 @@ final class FocusedStreamView: UIView {
       ]
     }
     NSLayoutConstraint.activate(constraints)
+    var autoHideControls: [UIView] = [remove, volume]
+    if let closeButton {
+      autoHideControls.append(closeButton)
+    }
+    autoHider = AutoHidingControls(host: self, controls: autoHideControls)
   }
 
   required init?(coder: NSCoder) {
@@ -2048,7 +2238,7 @@ struct Source {
   let host: String
 }
 
-class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDelegate {
+class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
   private let segmented = UISegmentedControl()
   private let web: WKWebView = {
     let config = WKWebViewConfiguration()
@@ -2065,6 +2255,7 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     view.backgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.04, alpha: 1)
     web.navigationDelegate = self
     web.uiDelegate = self
+    installStreamURLBridge()
     web.allowsBackForwardNavigationGestures = true
     segmented.addTarget(self, action: #selector(sourceChanged), for: .valueChanged)
     segmented.translatesAutoresizingMaskIntoConstraints = false
@@ -2081,6 +2272,10 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
       web.bottomAnchor.constraint(equalTo: view.bottomAnchor)
     ])
     reloadOrder()
+  }
+
+  deinit {
+    web.configuration.userContentController.removeScriptMessageHandler(forName: "streamURL")
   }
 
   func sources() -> [(StreamPlatform, Source)] { [] }
@@ -2108,16 +2303,65 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     web.load(URLRequest(url: activeSources[segmented.selectedSegmentIndex].1.url))
   }
 
+  private func installStreamURLBridge() {
+    let source = """
+    (function(){
+      if (window.__multiViewURLBridge) return;
+      window.__multiViewURLBridge = true;
+      var last = '';
+      function notify(url) {
+        try {
+          var value = String(url || location.href || '');
+          if (!value || value === last) return;
+          last = value;
+          window.webkit.messageHandlers.streamURL.postMessage(value);
+        } catch (e) {}
+      }
+      function notifySoon(url) {
+        setTimeout(function(){ notify(url); notify(location.href); }, 80);
+        setTimeout(function(){ notify(location.href); }, 500);
+      }
+      document.addEventListener('click', function(event) {
+        var node = event.target;
+        while (node && node !== document && !(node.tagName && node.tagName.toLowerCase() === 'a')) node = node.parentNode;
+        if (node && node.href) notifySoon(node.href);
+      }, true);
+      ['pushState', 'replaceState'].forEach(function(name) {
+        var original = history[name];
+        history[name] = function() {
+          var result = original.apply(this, arguments);
+          notifySoon(location.href);
+          return result;
+        };
+      });
+      window.addEventListener('popstate', function(){ notifySoon(location.href); });
+      setInterval(function(){ notify(location.href); }, 1200);
+      notify(location.href);
+    })();
+    """
+    let controller = web.configuration.userContentController
+    controller.add(self, name: "streamURL")
+    controller.addUserScript(WKUserScript(source: source, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+  }
+
   func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
     if let url = navigationAction.request.url, navigationAction.targetFrame?.isMainFrame != false, let parsed = parseStream(url) {
-      AppState.shared.add(platform: parsed.0, channel: parsed.1)
-      if let tab = tabBarController {
-        tab.selectedIndex = 2
-      }
+      addParsedStream(parsed)
       decisionHandler(.cancel)
       return
     }
     decisionHandler(.allow)
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    if let url = webView.url, let parsed = parseStream(url) {
+      addParsedStream(parsed)
+      return
+    }
+    webView.evaluateJavaScript("location.href") { [weak self] value, _ in
+      guard let raw = value as? String, let url = URL(string: raw), let parsed = self?.parseStream(url) else { return }
+      self?.addParsedStream(parsed)
+    }
   }
 
   func webView(
@@ -2130,12 +2374,25 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
       return nil
     }
     if let parsed = parseStream(url) {
-      AppState.shared.add(platform: parsed.0, channel: parsed.1)
-      tabBarController?.selectedIndex = 2
+      addParsedStream(parsed)
       return nil
     }
     webView.load(navigationAction.request)
     return nil
+  }
+
+  func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+    guard message.name == "streamURL",
+          let raw = message.body as? String,
+          let url = URL(string: raw),
+          let parsed = parseStream(url) else { return }
+    addParsedStream(parsed)
+  }
+
+  private func addParsedStream(_ parsed: (StreamPlatform, String)) {
+    AppState.shared.add(platform: parsed.0, channel: parsed.1)
+    tabBarController?.selectedIndex = 2
+    PlaybackCoordinator.shared.resumeAll()
   }
 
   private func parseStream(_ url: URL) -> (StreamPlatform, String)? {
