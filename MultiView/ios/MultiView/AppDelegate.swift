@@ -520,7 +520,8 @@ final class NiconicoNativePlayerView: UIView {
     guard settings.showChat else { return }
     ndgrCommentTask?.cancel()
     ndgrCommentTask = Task { [weak self] in
-      await self?.streamNDGRView(viewURI: viewURI)
+      guard let self else { return }
+      await self.streamNDGRView(viewURI: viewURI)
     }
   }
 
@@ -541,7 +542,8 @@ final class NiconicoNativePlayerView: UIView {
           if let segmentURI = parseNDGRSegmentURI(fromChunkedEntry: message), !activeSegmentURIs.contains(segmentURI) {
             activeSegmentURIs.insert(segmentURI)
             let task = Task { [weak self] in
-              await self?.streamNDGRSegment(uri: segmentURI)
+              guard let self else { return }
+              await self.streamNDGRSegment(uri: segmentURI)
             }
             segmentTasks[segmentURI] = task
           }
