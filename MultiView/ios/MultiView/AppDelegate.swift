@@ -173,6 +173,15 @@ enum StreamPlatform: String, CaseIterable, Codable {
     default: return "チャンネル名"
     }
   }
+
+  var usesIndividualPlayer: Bool {
+    switch self {
+    case .kick, .niconico, .twitch, .twitcasting:
+      return true
+    case .youtube:
+      return false
+    }
+  }
 }
 
 struct StreamItem: Codable, Equatable {
@@ -1825,7 +1834,7 @@ final class ViewingController: UIViewController {
       PlaybackCoordinator.shared.resumeAll()
       return
     }
-    if streams.contains(where: { $0.platform == .niconico || $0.platform == .kick }) {
+    if streams.contains(where: { $0.platform.usesIndividualPlayer }) {
       addHybridPlayers(streams)
       PlaybackCoordinator.shared.resumeAll()
       return
@@ -1894,8 +1903,8 @@ final class ViewingController: UIViewController {
   }
 
   private func addHybridPlayers(_ streams: [StreamItem]) {
-    let native = streams.filter { $0.platform == .niconico || $0.platform == .kick }
-    let embeddable = streams.filter { $0.platform != .niconico && $0.platform != .kick }
+    let individual = streams.filter { $0.platform.usesIndividualPlayer }
+    let embeddable = streams.filter { !$0.platform.usesIndividualPlayer }
     if !embeddable.isEmpty {
       let web = MultiPlayerWebView(streams: embeddable, settings: AppState.shared.settings)
       let host = UIView()
@@ -1915,8 +1924,8 @@ final class ViewingController: UIViewController {
         host.heightAnchor.constraint(greaterThanOrEqualToConstant: embeddable.count == 1 ? 220 : 180)
       ])
     }
-    if !native.isEmpty {
-      addCells(native)
+    if !individual.isEmpty {
+      addCells(individual)
     }
   }
 
