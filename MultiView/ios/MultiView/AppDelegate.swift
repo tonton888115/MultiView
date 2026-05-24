@@ -11,6 +11,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
     configureAudioSession()
+    installPlaybackObservers()
+    application.beginReceivingRemoteControlEvents()
     window = UIWindow(frame: UIScreen.main.bounds)
     window?.rootViewController = MainTabController()
     window?.makeKeyAndVisible()
@@ -19,6 +21,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
   func applicationDidBecomeActive(_ application: UIApplication) {
     configureAudioSession()
+    resumePlaybackSoon()
   }
 
   func applicationWillResignActive(_ application: UIApplication) {
@@ -29,10 +32,63 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     configureAudioSession()
   }
 
+  func applicationWillEnterForeground(_ application: UIApplication) {
+    configureAudioSession()
+    resumePlaybackSoon()
+  }
+
   private func configureAudioSession() {
     let session = AVAudioSession.sharedInstance()
     try? session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
     try? session.setActive(true)
+  }
+
+  private func installPlaybackObservers() {
+    let center = NotificationCenter.default
+    center.addObserver(self, selector: #selector(playbackSignalReceived(_:)), name: AVAudioSession.interruptionNotification, object: nil)
+    center.addObserver(self, selector: #selector(playbackSignalReceived(_:)), name: AVAudioSession.routeChangeNotification, object: nil)
+  }
+
+  @objc private func playbackSignalReceived(_ notification: Notification) {
+    if notification.name == AVAudioSession.interruptionNotification {
+      guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+            let type = AVAudioSession.InterruptionType(rawValue: raw),
+            type == .ended else { return }
+      if let optionsRaw = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt {
+        let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
+        guard options.contains(.shouldResume) else { return }
+      }
+    }
+    configureAudioSession()
+    resumePlaybackSoon()
+  }
+
+  private func resumePlaybackSoon() {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+      PlaybackCoordinator.shared.resumeAll()
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+      PlaybackCoordinator.shared.resumeAll()
+    }
+  }
+}
+
+protocol PlaybackResumable: AnyObject {
+  func resumePlayback()
+}
+
+final class PlaybackCoordinator {
+  static let shared = PlaybackCoordinator()
+  private let views = NSHashTable<AnyObject>.weakObjects()
+
+  func register(_ view: PlaybackResumable) {
+    views.add(view as AnyObject)
+  }
+
+  func resumeAll() {
+    for object in views.allObjects {
+      (object as? PlaybackResumable)?.resumePlayback()
+    }
   }
 }
 
@@ -211,11 +267,15 @@ final class MainTabController: UITabBarController, AppStateDelegate {
   }
 }
 
-final class PlayerWebView: WKWebView {
+final class PlayerWebView: WKWebView, PlaybackResumable {
+  private let playAudio: Bool
+
   init(stream: StreamItem, settings: AppSettings) {
+    playAudio = settings.playAudio
     let config = WKWebViewConfiguration()
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
+    config.websiteDataStore = .default()
     if stream.platform == .niconico {
       config.userContentController.addUserScript(WKUserScript(source: PlayerWebView.niconicoPopupBlockerScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
     }
@@ -224,6 +284,7 @@ final class PlayerWebView: WKWebView {
     backgroundColor = .black
     scrollView.backgroundColor = .black
     scrollView.contentInsetAdjustmentBehavior = .never
+    PlaybackCoordinator.shared.register(self)
     load(stream: stream, settings: settings)
   }
 
@@ -254,6 +315,26 @@ final class PlayerWebView: WKWebView {
     }
   }
 
+  func resumePlayback() {
+    let shouldMute = playAudio ? "false" : "true"
+    let script = """
+    (function(){
+      document.body.classList.add('audio-started');
+      document.querySelectorAll('video,audio').forEach(function(media){
+        try {
+          media.muted = \(shouldMute);
+          var play = media.play && media.play();
+          if (play && play.catch) play.catch(function(){});
+        } catch(e) {}
+      });
+      document.querySelectorAll('iframe').forEach(function(frame){
+        try { frame.contentWindow.postMessage({type:'play'}, '*'); } catch(e) {}
+      });
+    })();
+    """
+    evaluateJavaScript(script)
+  }
+
   private static let niconicoPopupBlockerScript = """
   (function(){
     function hideComfortPopup(){
@@ -275,7 +356,7 @@ final class PlayerWebView: WKWebView {
 
 }
 
-final class NiconicoNativePlayerView: UIView {
+final class NiconicoNativePlayerView: UIView, PlaybackResumable {
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
   private let danmakuView = UIView()
@@ -289,11 +370,14 @@ final class NiconicoNativePlayerView: UIView {
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
   private let settings: AppSettings
+  private let channel: String
+  private var isLoading = false
   private var watchPageURL: URL?
   private var laneCursor = 0
 
   init(stream: StreamItem, settings: AppSettings) {
     self.settings = settings
+    self.channel = stream.channel
     super.init(frame: .zero)
     backgroundColor = .black
 
@@ -318,6 +402,7 @@ final class NiconicoNativePlayerView: UIView {
       statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16)
     ])
 
+    PlaybackCoordinator.shared.register(self)
     load(channel: stream.channel)
   }
 
@@ -344,17 +429,37 @@ final class NiconicoNativePlayerView: UIView {
     danmakuView.frame = bounds
   }
 
+  func resumePlayback() {
+    let session = AVAudioSession.sharedInstance()
+    try? session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
+    try? session.setActive(true)
+    if player.currentItem == nil {
+      if isLoading || socketTask != nil {
+        return
+      }
+      load(channel: channel)
+      return
+    }
+    player.isMuted = !settings.playAudio
+    player.volume = settings.playAudio ? 1 : 0
+    player.play()
+  }
+
   private func load(channel: String) {
+    guard !isLoading else { return }
     let programId = channel.trimmingCharacters(in: .whitespacesAndNewlines)
     guard let url = URL(string: "https://live.nicovideo.jp/watch/\(programId)") else {
       showStatus("番組IDが不正です")
       return
     }
     watchPageURL = url
+    isLoading = true
     var request = URLRequest(url: url)
     request.setValue(NiconicoNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
     pageTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
       guard let self else { return }
+      self.pageTask = nil
+      self.isLoading = false
       if let error {
         self.showStatus("ニコ生ページ取得失敗: \(error.localizedDescription)")
         return
@@ -438,6 +543,7 @@ final class NiconicoNativePlayerView: UIView {
         }
         self.receiveNext()
       case .failure(let error):
+        self.socketTask = nil
         self.showStatus("ニコ生WebSocket切断: \(error.localizedDescription)")
       }
     }
@@ -476,6 +582,7 @@ final class NiconicoNativePlayerView: UIView {
       showStatus("ニコ生エラー: \(code)")
     }
     if type == "disconnect" {
+      socketTask = nil
       showStatus("ニコ生から切断されました")
     }
   }
@@ -865,16 +972,21 @@ final class NiconicoNativePlayerView: UIView {
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
-final class MultiPlayerWebView: WKWebView {
+final class MultiPlayerWebView: WKWebView, PlaybackResumable {
+  private let playAudio: Bool
+
   init(streams: [StreamItem], settings: AppSettings) {
+    playAudio = settings.playAudio
     let config = WKWebViewConfiguration()
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
+    config.websiteDataStore = .default()
     super.init(frame: .zero, configuration: config)
     isOpaque = false
     backgroundColor = .black
     scrollView.backgroundColor = .black
     scrollView.contentInsetAdjustmentBehavior = .never
+    PlaybackCoordinator.shared.register(self)
     load(streams: streams, settings: settings)
   }
 
@@ -902,6 +1014,26 @@ final class MultiPlayerWebView: WKWebView {
     if let url = components.url {
       load(URLRequest(url: url))
     }
+  }
+
+  func resumePlayback() {
+    let shouldMute = playAudio ? "false" : "true"
+    let script = """
+    (function(){
+      document.body.classList.add('audio-started');
+      document.querySelectorAll('video,audio').forEach(function(media){
+        try {
+          media.muted = \(shouldMute);
+          var play = media.play && media.play();
+          if (play && play.catch) play.catch(function(){});
+        } catch(e) {}
+      });
+      document.querySelectorAll('iframe').forEach(function(frame){
+        try { frame.contentWindow.postMessage({type:'play'}, '*'); } catch(e) {}
+      });
+    })();
+    """
+    evaluateJavaScript(script)
   }
 }
 
@@ -1002,15 +1134,33 @@ final class ViewingController: UIViewController {
     scroller.addSubview(row)
 
     streams.forEach { stream in
-      let button = UIButton(type: .system)
-      button.setTitle("× \(stream.platform.label) / \(stream.channel)", for: .normal)
-      button.setTitleColor(.white, for: .normal)
-      button.titleLabel?.font = .systemFont(ofSize: 12, weight: .bold)
-      button.contentEdgeInsets = UIEdgeInsets(top: 7, left: 11, bottom: 7, right: 11)
-      button.backgroundColor = UIColor.white.withAlphaComponent(0.12)
-      button.layer.cornerRadius = 15
-      button.addAction(UIAction { _ in AppState.shared.remove(stream) }, for: .touchUpInside)
-      row.addArrangedSubview(button)
+      let group = UIStackView()
+      group.axis = .horizontal
+      group.spacing = 2
+      group.alignment = .fill
+      group.backgroundColor = UIColor.white.withAlphaComponent(0.12)
+      group.layer.cornerRadius = 15
+      group.clipsToBounds = true
+
+      let open = UIButton(type: .system)
+      open.setTitle("\(stream.platform.label) / \(stream.channel)", for: .normal)
+      open.setTitleColor(.white, for: .normal)
+      open.titleLabel?.font = .systemFont(ofSize: 12, weight: .bold)
+      open.contentEdgeInsets = UIEdgeInsets(top: 7, left: 11, bottom: 7, right: 9)
+      open.addAction(UIAction { [weak self] _ in
+        self?.focused = stream
+        self?.reload()
+      }, for: .touchUpInside)
+
+      let close = UIButton(type: .system)
+      close.setImage(UIImage(systemName: "xmark"), for: .normal)
+      close.tintColor = .white
+      close.contentEdgeInsets = UIEdgeInsets(top: 7, left: 8, bottom: 7, right: 11)
+      close.addAction(UIAction { _ in AppState.shared.remove(stream) }, for: .touchUpInside)
+
+      group.addArrangedSubview(open)
+      group.addArrangedSubview(close)
+      row.addArrangedSubview(group)
     }
 
     stack.addArrangedSubview(scroller)
@@ -1326,15 +1476,23 @@ struct Source {
   let host: String
 }
 
-class BrowserSourceController: UIViewController, WKNavigationDelegate {
+class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDelegate {
   private let segmented = UISegmentedControl()
-  private let web = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+  private let web: WKWebView = {
+    let config = WKWebViewConfiguration()
+    config.allowsInlineMediaPlayback = true
+    config.mediaTypesRequiringUserActionForPlayback = []
+    config.websiteDataStore = .default()
+    config.preferences.javaScriptCanOpenWindowsAutomatically = true
+    return WKWebView(frame: .zero, configuration: config)
+  }()
   private var activeSources = [(StreamPlatform, Source)]()
 
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.04, alpha: 1)
     web.navigationDelegate = self
+    web.uiDelegate = self
     web.allowsBackForwardNavigationGestures = true
     segmented.addTarget(self, action: #selector(sourceChanged), for: .valueChanged)
     segmented.translatesAutoresizingMaskIntoConstraints = false
@@ -1388,6 +1546,24 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate {
       return
     }
     decisionHandler(.allow)
+  }
+
+  func webView(
+    _ webView: WKWebView,
+    createWebViewWith configuration: WKWebViewConfiguration,
+    for navigationAction: WKNavigationAction,
+    windowFeatures: WKWindowFeatures
+  ) -> WKWebView? {
+    guard navigationAction.targetFrame == nil, let url = navigationAction.request.url else {
+      return nil
+    }
+    if let parsed = parseStream(url) {
+      AppState.shared.add(platform: parsed.0, channel: parsed.1)
+      tabBarController?.selectedIndex = 2
+      return nil
+    }
+    webView.load(navigationAction.request)
+    return nil
   }
 
   private func parseStream(_ url: URL) -> (StreamPlatform, String)? {
@@ -1495,42 +1671,9 @@ final class SettingsController: UITableViewController {
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
     } else if indexPath.section == 0 {
-      let slider = UISlider()
-      slider.frame = CGRect(x: 0, y: 0, width: 150, height: 32)
-      slider.tag = indexPath.row
-      slider.addAction(UIAction { [weak self, weak cell] action in
-        guard let slider = action.sender as? UISlider else { return }
-        self?.updateDanmakuSetting(row: slider.tag, value: slider.value)
-        cell.textLabel?.text = self?.danmakuTitle(row: slider.tag)
-      }, for: .valueChanged)
-      switch indexPath.row {
-      case 4:
-        cell.textLabel?.text = danmakuTitle(row: indexPath.row)
-        slider.minimumValue = 12
-        slider.maximumValue = 40
-        slider.value = Float(AppState.shared.settings.danmakuFontSize)
-      case 5:
-        cell.textLabel?.text = danmakuTitle(row: indexPath.row)
-        slider.minimumValue = 0.05
-        slider.maximumValue = 0.3
-        slider.value = Float(AppState.shared.settings.danmakuSpeed)
-      case 6:
-        cell.textLabel?.text = danmakuTitle(row: indexPath.row)
-        slider.minimumValue = 0.3
-        slider.maximumValue = 1
-        slider.value = Float(AppState.shared.settings.danmakuOpacity)
-      case 7:
-        cell.textLabel?.text = danmakuTitle(row: indexPath.row)
-        slider.minimumValue = 0
-        slider.maximumValue = 20
-        slider.value = Float(AppState.shared.settings.danmakuMaxLines)
-      default:
-        cell.textLabel?.text = danmakuTitle(row: indexPath.row)
-        slider.minimumValue = 0
-        slider.maximumValue = 200
-        slider.value = Float(AppState.shared.settings.danmakuMaxLength)
-      }
-      cell.accessoryView = slider
+      cell.textLabel?.text = danmakuTitle(row: indexPath.row)
+      cell.accessoryType = .disclosureIndicator
+      cell.selectionStyle = .default
     } else if indexPath.section == 1 {
       let platform = platforms[indexPath.row]
       cell.textLabel?.text = platform.label
@@ -1575,28 +1718,11 @@ final class SettingsController: UITableViewController {
   override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
     if indexPath.section == 0 && indexPath.row == 3 {
       editProxy()
+    } else if indexPath.section == 0 && (4...8).contains(indexPath.row) {
+      editDanmakuValue(row: indexPath.row)
     } else if indexPath.section == 2 {
       present(AddStreamController(), animated: true)
     }
-  }
-
-  private func updateDanmakuSetting(row: Int, value: Float) {
-    var settings = AppState.shared.settings
-    switch row {
-    case 4:
-      settings.danmakuFontSize = Double(round(value))
-    case 5:
-      settings.danmakuSpeed = Double(value)
-    case 6:
-      settings.danmakuOpacity = Double(value)
-    case 7:
-      settings.danmakuMaxLines = Int(round(value))
-    case 8:
-      settings.danmakuMaxLength = Int(round(value / 10) * 10)
-    default:
-      return
-    }
-    AppState.shared.settings = settings
   }
 
   private func danmakuTitle(row: Int) -> String {
@@ -1615,6 +1741,66 @@ final class SettingsController: UITableViewController {
     default:
       return ""
     }
+  }
+
+  private func editDanmakuValue(row: Int) {
+    let settings = AppState.shared.settings
+    let current: String
+    let title: String
+    let message: String
+    switch row {
+    case 4:
+      title = "文字サイズ"
+      current = String(Int(settings.danmakuFontSize))
+      message = "12〜40"
+    case 5:
+      title = "速度"
+      current = String(Int((settings.danmakuSpeed / 0.13) * 100))
+      message = "100が標準"
+    case 6:
+      title = "透過度"
+      current = String(Int(settings.danmakuOpacity * 100))
+      message = "30〜100"
+    case 7:
+      title = "最大行数"
+      current = String(settings.danmakuMaxLines)
+      message = "0で自動"
+    case 8:
+      title = "最大文字数"
+      current = String(settings.danmakuMaxLength)
+      message = "0で無制限"
+    default:
+      return
+    }
+
+    let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+    alert.addTextField { field in
+      field.text = current
+      field.keyboardType = .numberPad
+      field.clearButtonMode = .whileEditing
+    }
+    alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
+    alert.addAction(UIAlertAction(title: "保存", style: .default) { [weak self] _ in
+      guard let raw = alert.textFields?.first?.text, let value = Double(raw) else { return }
+      var settings = AppState.shared.settings
+      switch row {
+      case 4:
+        settings.danmakuFontSize = min(40, max(12, value.rounded()))
+      case 5:
+        settings.danmakuSpeed = min(300, max(20, value)) / 100 * 0.13
+      case 6:
+        settings.danmakuOpacity = min(100, max(30, value)) / 100
+      case 7:
+        settings.danmakuMaxLines = min(20, max(0, Int(value.rounded())))
+      case 8:
+        settings.danmakuMaxLength = min(500, max(0, Int(value.rounded())))
+      default:
+        return
+      }
+      AppState.shared.settings = settings
+      self?.tableView.reloadRows(at: [IndexPath(row: row, section: 0)], with: .automatic)
+    })
+    present(alert, animated: true)
   }
 
   private func movePlatform(at index: Int, direction: Int) {
