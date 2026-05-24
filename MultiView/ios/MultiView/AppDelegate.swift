@@ -267,7 +267,7 @@ final class AppState {
   }
 }
 
-final class MainTabController: UITabBarController, AppStateDelegate {
+final class MainTabController: UITabBarController, UITabBarControllerDelegate, AppStateDelegate {
   private let viewVC = ViewingController()
   private let rankingVC = RankingController()
   private let followingVC = FollowingController()
@@ -276,6 +276,7 @@ final class MainTabController: UITabBarController, AppStateDelegate {
   override func viewDidLoad() {
     super.viewDidLoad()
     AppState.shared.delegate = self
+    delegate = self
     tabBar.isTranslucent = true
     tabBar.tintColor = .systemBlue
     tabBar.standardAppearance = glassTabAppearance()
@@ -296,6 +297,13 @@ final class MainTabController: UITabBarController, AppStateDelegate {
     rankingVC.reloadOrder()
     followingVC.reloadOrder()
     settingsVC.reload()
+  }
+
+  func tabBarController(_ tabBarController: UITabBarController, didSelect viewController: UIViewController) {
+    PlaybackCoordinator.shared.resumeAll()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+      PlaybackCoordinator.shared.resumeAll()
+    }
   }
 
   private func glassTabAppearance() -> UITabBarAppearance {
@@ -516,7 +524,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   func resumePlayback() {
     guard !isStopped else { return }
     let session = AVAudioSession.sharedInstance()
-    try? session.setCategory(.playback, mode: .moviePlayback, options: [])
+    try? session.setCategory(.playback, mode: .default, options: [])
     try? session.setActive(true)
     if player.currentItem == nil {
       if isLoading || socketTask != nil {
@@ -1065,6 +1073,251 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
+final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+  private let stream: StreamItem
+  private let settings: AppSettings
+  private let player = AVPlayer()
+  private let playerLayer = AVPlayerLayer()
+  private let statusLabel = UILabel()
+  private var playbackVolume: Float
+  private var channelTask: URLSessionDataTask?
+  private var itemStatusObservation: NSKeyValueObservation?
+  private var itemFailedObserver: NSObjectProtocol?
+  private var fallbackWebView: PlayerWebView?
+  private var isLoading = false
+  private var isStopped = false
+
+  init(stream: StreamItem, settings: AppSettings) {
+    self.stream = stream
+    self.settings = settings
+    self.playbackVolume = StreamVolumeStore.volume(for: stream)
+    super.init(frame: .zero)
+    backgroundColor = .black
+
+    player.automaticallyWaitsToMinimizeStalling = false
+    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+    playerLayer.player = player
+    playerLayer.videoGravity = .resizeAspect
+    layer.addSublayer(playerLayer)
+
+    statusLabel.text = "Kickをネイティブ再生で読み込み中"
+    statusLabel.textColor = .white.withAlphaComponent(0.72)
+    statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
+    statusLabel.textAlignment = .center
+    statusLabel.numberOfLines = 2
+    statusLabel.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(statusLabel)
+    NSLayoutConstraint.activate([
+      statusLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+      statusLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+      statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 16),
+      statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16)
+    ])
+
+    PlaybackCoordinator.shared.register(self)
+    loadNativeStream()
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    stopPlayback()
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    playerLayer.frame = bounds
+  }
+
+  func resumePlayback() {
+    guard !isStopped else { return }
+    let session = AVAudioSession.sharedInstance()
+    try? session.setCategory(.playback, mode: .default, options: [])
+    try? session.setActive(true)
+    if let fallbackWebView {
+      fallbackWebView.resumePlayback()
+      return
+    }
+    if player.currentItem == nil {
+      loadNativeStream()
+      return
+    }
+    player.isMuted = !settings.playAudio
+    player.volume = settings.playAudio ? playbackVolume : 0
+    player.play()
+  }
+
+  func stopPlayback() {
+    isStopped = true
+    channelTask?.cancel()
+    channelTask = nil
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    fallbackWebView?.stopPlayback()
+    fallbackWebView?.removeFromSuperview()
+    fallbackWebView = nil
+    itemStatusObservation = nil
+    if let itemFailedObserver {
+      NotificationCenter.default.removeObserver(itemFailedObserver)
+      self.itemFailedObserver = nil
+    }
+  }
+
+  func setPlaybackVolume(_ volume: Float) {
+    playbackVolume = min(1, max(0, volume))
+    player.volume = settings.playAudio ? playbackVolume : 0
+    fallbackWebView?.setPlaybackVolume(playbackVolume)
+  }
+
+  private func loadNativeStream() {
+    guard !isStopped, !isLoading, fallbackWebView == nil else { return }
+    let channel = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let escaped = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+          let url = URL(string: "https://kick.com/api/v2/channels/\(escaped)") else {
+      installFallback("Kickチャンネル名が不正です")
+      return
+    }
+    isLoading = true
+    showStatus("Kickをネイティブ再生で読み込み中")
+    var request = URLRequest(url: url)
+    kickHeaders().forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+    channelTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+      guard let self else { return }
+      self.channelTask = nil
+      self.isLoading = false
+      if let error {
+        self.installFallback("Kick HLS取得失敗: \(error.localizedDescription)")
+        return
+      }
+      if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+        self.installFallback("Kick HLS取得失敗: HTTP \(http.statusCode)")
+        return
+      }
+      guard let data, let hlsURL = Self.extractPlaybackURL(from: data) else {
+        self.installFallback("Kick HLS URLを取得できません")
+        return
+      }
+      self.play(hlsURL: hlsURL)
+    }
+    channelTask?.resume()
+  }
+
+  private func play(hlsURL: URL) {
+    DispatchQueue.main.async {
+      guard !self.isStopped else { return }
+      self.statusLabel.isHidden = true
+      let asset = AVURLAsset(url: hlsURL, options: [
+        "AVURLAssetHTTPHeaderFieldsKey": self.kickPlaybackHeaders()
+      ])
+      let item = AVPlayerItem(asset: asset)
+      item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+      self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+        if item.status == .failed {
+          DispatchQueue.main.async {
+            self?.installFallback(item.error?.localizedDescription ?? "Kickネイティブ再生に失敗しました")
+          }
+        } else if item.status == .readyToPlay {
+          DispatchQueue.main.async {
+            self?.resumePlayback()
+          }
+        }
+      }
+      if let itemFailedObserver = self.itemFailedObserver {
+        NotificationCenter.default.removeObserver(itemFailedObserver)
+      }
+      self.itemFailedObserver = NotificationCenter.default.addObserver(
+        forName: .AVPlayerItemFailedToPlayToEndTime,
+        object: item,
+        queue: .main
+      ) { [weak self] notification in
+        let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
+        self?.installFallback(error?.localizedDescription ?? "Kickネイティブ再生が停止しました")
+      }
+      self.player.replaceCurrentItem(with: item)
+      self.player.isMuted = !self.settings.playAudio
+      self.player.volume = self.settings.playAudio ? self.playbackVolume : 0
+      self.player.play()
+    }
+  }
+
+  private func installFallback(_ reason: String) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil else { return }
+      self.showStatus(reason)
+      let web = PlayerWebView(stream: self.stream, settings: self.settings)
+      web.setPlaybackVolume(self.playbackVolume)
+      web.translatesAutoresizingMaskIntoConstraints = false
+      self.insertSubview(web, belowSubview: self.statusLabel)
+      NSLayoutConstraint.activate([
+        web.topAnchor.constraint(equalTo: self.topAnchor),
+        web.leadingAnchor.constraint(equalTo: self.leadingAnchor),
+        web.trailingAnchor.constraint(equalTo: self.trailingAnchor),
+        web.bottomAnchor.constraint(equalTo: self.bottomAnchor)
+      ])
+      self.fallbackWebView = web
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+        web.resumePlayback()
+      }
+    }
+  }
+
+  private func showStatus(_ text: String) {
+    DispatchQueue.main.async {
+      self.statusLabel.text = text
+      self.statusLabel.isHidden = false
+    }
+  }
+
+  private func kickHeaders() -> [String: String] {
+    var headers = [
+      "Accept": "application/json, text/plain, */*",
+      "User-Agent": Self.userAgent,
+      "Referer": "https://kick.com/\(stream.channel)",
+      "Origin": "https://kick.com"
+    ]
+    if let cookie = kickCookieHeader() {
+      headers["Cookie"] = cookie
+    }
+    return headers
+  }
+
+  private func kickPlaybackHeaders() -> [String: String] {
+    var headers = [
+      "User-Agent": Self.userAgent,
+      "Referer": "https://kick.com/\(stream.channel)",
+      "Origin": "https://kick.com"
+    ]
+    if let cookie = kickCookieHeader() {
+      headers["Cookie"] = cookie
+    }
+    return headers
+  }
+
+  private func kickCookieHeader() -> String? {
+    guard let url = URL(string: "https://kick.com/"),
+          let cookies = HTTPCookieStorage.shared.cookies(for: url),
+          !cookies.isEmpty else { return nil }
+    return cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+  }
+
+  private static func extractPlaybackURL(from data: Data) -> URL? {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    if let raw = json["playback_url"] as? String, let url = URL(string: raw) {
+      return url
+    }
+    if let livestream = json["livestream"] as? [String: Any],
+       let raw = livestream["playback_url"] as? String,
+       let url = URL(string: raw) {
+      return url
+    }
+    return nil
+  }
+
+  private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+}
+
 final class MultiPlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, AudioControllable {
   private let playAudio: Bool
   private var playbackVolume: Float = 1
@@ -1199,6 +1452,14 @@ final class ViewingController: UIViewController {
     reload()
   }
 
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    PlaybackCoordinator.shared.resumeAll()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+      PlaybackCoordinator.shared.resumeAll()
+    }
+  }
+
   func reload() {
     guard isViewLoaded else { return }
     clearStack()
@@ -1207,18 +1468,22 @@ final class ViewingController: UIViewController {
       stack.addArrangedSubview(emptyView())
       return
     }
+    addPlaybackBar()
     if let focused, streams.contains(focused) {
       stack.addArrangedSubview(FocusedStreamView(stream: focused, onClose: { [weak self] in
         self?.focused = nil
         self?.reload()
       }))
+      PlaybackCoordinator.shared.resumeAll()
       return
     }
-    if streams.contains(where: { $0.platform == .niconico }) {
+    if streams.contains(where: { $0.platform == .niconico || $0.platform == .kick }) {
       addHybridPlayers(streams)
+      PlaybackCoordinator.shared.resumeAll()
       return
     }
     addUnifiedPlayer(streams)
+    PlaybackCoordinator.shared.resumeAll()
   }
 
   private func clearStack() {
@@ -1282,8 +1547,8 @@ final class ViewingController: UIViewController {
   }
 
   private func addHybridPlayers(_ streams: [StreamItem]) {
-    let embeddable = streams.filter { $0.platform != .niconico }
-    let niconico = streams.filter { $0.platform == .niconico }
+    let native = streams.filter { $0.platform == .niconico || $0.platform == .kick }
+    let embeddable = streams.filter { $0.platform != .niconico && $0.platform != .kick }
     if !embeddable.isEmpty {
       addCloseBar(embeddable)
       let web = MultiPlayerWebView(streams: embeddable, settings: AppState.shared.settings)
@@ -1303,7 +1568,41 @@ final class ViewingController: UIViewController {
         host.heightAnchor.constraint(greaterThanOrEqualToConstant: embeddable.count == 1 ? 220 : 360)
       ])
     }
-    niconico.forEach { addStackedCell($0) }
+    if !native.isEmpty {
+      addCloseBar(native)
+      native.forEach { addStackedCell($0) }
+    }
+  }
+
+  private func addPlaybackBar() {
+    let host = UIView()
+    host.translatesAutoresizingMaskIntoConstraints = false
+
+    let button = UIButton(type: .system)
+    button.setImage(UIImage(systemName: "play.fill"), for: .normal)
+    button.setTitle(" 全て再生", for: .normal)
+    button.tintColor = .white
+    button.setTitleColor(.white, for: .normal)
+    button.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
+    button.backgroundColor = UIColor.systemGreen.withAlphaComponent(0.85)
+    button.layer.cornerRadius = 16
+    button.contentEdgeInsets = UIEdgeInsets(top: 7, left: 12, bottom: 7, right: 14)
+    button.addAction(UIAction { _ in
+      PlaybackCoordinator.shared.resumeAll()
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        PlaybackCoordinator.shared.resumeAll()
+      }
+    }, for: .touchUpInside)
+    button.translatesAutoresizingMaskIntoConstraints = false
+    host.addSubview(button)
+
+    stack.addArrangedSubview(host)
+    NSLayoutConstraint.activate([
+      host.heightAnchor.constraint(equalToConstant: 38),
+      button.centerYAnchor.constraint(equalTo: host.centerYAnchor),
+      button.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+      button.heightAnchor.constraint(equalToConstant: 34)
+    ])
   }
 
   private func addCloseBar(_ streams: [StreamItem]) {
@@ -1399,6 +1698,8 @@ final class StreamCellView: UIView {
     let video: UIView
     if stream.platform == .niconico {
       video = NiconicoNativePlayerView(stream: stream, settings: AppState.shared.settings)
+    } else if stream.platform == .kick {
+      video = KickNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else {
       video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
     }
@@ -1524,6 +1825,8 @@ final class FocusedStreamView: UIView {
     let video: UIView
     if stream.platform == .niconico {
       video = NiconicoNativePlayerView(stream: stream, settings: AppState.shared.settings)
+    } else if stream.platform == .kick {
+      video = KickNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else {
       video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
     }
