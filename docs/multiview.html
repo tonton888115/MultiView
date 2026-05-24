@@ -13,6 +13,13 @@
     border:1px solid rgba(255,255,255,0.16); }
   body.grid .cell { width:calc(50vw - 16px); }
   .cell iframe { position:absolute; inset:0; width:100%; height:100%; border:0; background:#000; }
+  .close {
+    position:absolute; right:8px; top:8px; z-index:7; width:34px; height:34px; border:0; border-radius:17px;
+    display:flex; align-items:center; justify-content:center; color:#fff; background:rgba(0,0,0,0.44);
+    font:700 25px/1 -apple-system,BlinkMacSystemFont,sans-serif; backdrop-filter:blur(10px);
+  }
+  .cell.idle .close, .cell.idle .vol { opacity:0; pointer-events:none; }
+  .close, .vol { transition:opacity .22s ease; }
   .vol {
     position:absolute; right:8px; top:50%; z-index:5; width:38px; height:min(62%, 220px);
     transform:translateY(-50%); border-radius:19px; background:rgba(28,32,34,0.72);
@@ -125,6 +132,30 @@
     e.preventDefault();
     reloadFramesForGesture();
   }, { passive:false });
+  function notifyRemove(s) {
+    try {
+      window.webkit.messageHandlers.multiview.postMessage({
+        type: 'remove',
+        platform: s.platform,
+        channel: s.channel
+      });
+      return;
+    } catch (e) {}
+    try {
+      window.location.href = 'multiview://remove?platform=' + encodeURIComponent(s.platform) + '&channel=' + encodeURIComponent(s.channel);
+    } catch (e2) {}
+  }
+  function armAutoHide(cell) {
+    var timer = 0;
+    function show() {
+      cell.classList.remove('idle');
+      clearTimeout(timer);
+      timer = setTimeout(function () { cell.classList.add('idle'); }, 2400);
+    }
+    cell.addEventListener('click', show, true);
+    cell.addEventListener('touchstart', show, { passive: true });
+    show();
+  }
   parseStreams().forEach(function (s) {
     var src = embedUrl(s);
     if (!src) return;
@@ -144,6 +175,16 @@
       iframe.setAttribute('data-muted', String((volumes[key] || 1) <= 0 || !audioOn));
     }
     cell.appendChild(iframe);
+    var close = document.createElement('button');
+    close.className = 'close';
+    close.type = 'button';
+    close.textContent = '×';
+    close.addEventListener('click', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      notifyRemove(s);
+    });
+    cell.appendChild(close);
     var control = document.createElement('label');
     control.className = 'vol';
     var range = document.createElement('input');
@@ -157,6 +198,7 @@
     control.insertAdjacentHTML('beforeend', '<svg viewBox="0 0 24 24"><path d="M3 9v6h4l5 4V5L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.06A4.5 4.5 0 0 0 16.5 12zm-2.5-8.7v2.06A7.5 7.5 0 0 1 18.5 12a7.5 7.5 0 0 1-4.5 6.64v2.06A9.5 9.5 0 0 0 20.5 12 9.5 9.5 0 0 0 14 3.3z"/></svg>');
     cell.appendChild(control);
     grid.appendChild(cell);
+    armAutoHide(cell);
     setTimeout(function () { applyVolume(key, range.value); }, 900);
   });
 })();

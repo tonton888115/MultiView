@@ -119,6 +119,7 @@
       try { data = JSON.parse(data); } catch (e) {}
     }
     if (data && data.type === 'volume') applyVolume(data.volume);
+    if (data && data.type === 'play') startPlayback();
   });
   function startPlayback() {
     if (!frameEl) return;

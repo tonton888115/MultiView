@@ -1568,7 +1568,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
-final class MultiPlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResumable, PlaybackStoppable, AudioControllable {
   private let playAudio: Bool
   private var playbackVolume: Float = 1
   private var isStopped = false
@@ -1584,12 +1584,17 @@ final class MultiPlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable,
     backgroundColor = .black
     scrollView.backgroundColor = .black
     scrollView.contentInsetAdjustmentBehavior = .never
+    configuration.userContentController.add(self, name: "multiview")
     PlaybackCoordinator.shared.register(self)
     load(streams: streams, settings: settings)
   }
 
   required init?(coder: NSCoder) {
     fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    configuration.userContentController.removeScriptMessageHandler(forName: "multiview")
   }
 
   private func load(streams: [StreamItem], settings: AppSettings) {
@@ -1653,6 +1658,21 @@ final class MultiPlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable,
       window.dispatchEvent(new MessageEvent('message', {data: payload}));
     })();
     """)
+  }
+
+  func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+    guard message.name == "multiview",
+          let payload = message.body as? [String: Any],
+          let type = payload["type"] as? String,
+          type == "remove",
+          let platformRaw = payload["platform"] as? String,
+          let platform = StreamPlatform(rawValue: platformRaw),
+          let channel = payload["channel"] as? String else { return }
+    if let stream = AppState.shared.streams.first(where: {
+      $0.platform == platform && $0.channel.lowercased() == channel.lowercased()
+    }) {
+      AppState.shared.remove(stream)
+    }
   }
 
   func stopPlayback() {
@@ -1877,7 +1897,20 @@ final class ViewingController: UIViewController {
     button.backgroundColor = color.withAlphaComponent(0.85)
     button.layer.cornerRadius = 16
     button.contentEdgeInsets = UIEdgeInsets(top: 7, left: 12, bottom: 7, right: 14)
-    button.addAction(UIAction { _ in action() }, for: .touchUpInside)
+    button.addAction(UIAction { actionEvent in
+      guard let sender = actionEvent.sender as? UIButton else {
+        action()
+        return
+      }
+      let originalTitle = sender.title(for: .normal)
+      sender.alpha = 0.62
+      sender.setTitle(" 実行中", for: .normal)
+      action()
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+        sender.alpha = 1
+        sender.setTitle(originalTitle, for: .normal)
+      }
+    }, for: .touchUpInside)
     return button
   }
 
