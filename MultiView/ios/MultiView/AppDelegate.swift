@@ -2328,13 +2328,14 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   private static func parseTwitchTags(_ raw: String) -> [String: String] {
     var tags: [String: String] = [:]
     raw.split(separator: ";").forEach { pair in
-      guard let eq = pair.firstIndex(of: "=") else { return }
-      let key = String(pair[..<eq])
-      let value = String(pair[pair.index(after: eq)...])
-        .replacingOccurrences(of: #"\\s"#, with: " ", options: .regularExpression)
-        .replacingOccurrences(of: #"\\:"#, with: ";", options: .regularExpression)
-        .replacingOccurrences(of: #"\\r"#, with: "\r", options: .regularExpression)
-        .replacingOccurrences(of: #"\\n"#, with: "\n", options: .regularExpression)
+      let rawPair = String(pair)
+      guard let eq = rawPair.firstIndex(of: "=") else { return }
+      let key = String(rawPair[..<eq])
+      let value = String(rawPair[rawPair.index(after: eq)...])
+        .replacingOccurrences(of: "\\s", with: " ")
+        .replacingOccurrences(of: "\\:", with: ";")
+        .replacingOccurrences(of: "\\r", with: "\r")
+        .replacingOccurrences(of: "\\n", with: "\n")
       tags[key] = value
     }
     return tags
