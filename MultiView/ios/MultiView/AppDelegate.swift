@@ -642,10 +642,32 @@ final class TwitcastingChatClient {
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let movie = json["movie"] as? [String: Any],
             let movieId = Self.stringValue(movie["id"]) else {
-        DispatchQueue.main.async { self?.scheduleRetry() }
+        DispatchQueue.main.async { self?.fetchMovieIDFromWatchPage() }
         return
       }
       DispatchQueue.main.async { self?.fetchSubscribeURL(movieId: movieId) }
+    }.resume()
+  }
+
+  private func fetchMovieIDFromWatchPage() {
+    guard !stopped, !channel.isEmpty else { return }
+    guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+          let url = URL(string: "https://twitcasting.tv/\(encoded)") else { return }
+    var request = URLRequest(url: url)
+    request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("https://twitcasting.tv/", forHTTPHeaderField: "Referer")
+    if let cookie = Self.cookieHeader() {
+      request.setValue(cookie, forHTTPHeaderField: "Cookie")
+    }
+    URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+      guard let self else { return }
+      guard let data,
+            let html = String(data: data, encoding: .utf8),
+            let movieId = Self.parseMovieID(from: html) else {
+        DispatchQueue.main.async { self.scheduleRetry() }
+        return
+      }
+      DispatchQueue.main.async { self.fetchSubscribeURL(movieId: movieId) }
     }.resume()
   }
 
@@ -657,6 +679,7 @@ final class TwitcastingChatClient {
     request.setValue("application/json, text/javascript, */*; q=0.01", forHTTPHeaderField: "Accept")
     request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
     request.setValue("https://twitcasting.tv/\(channel)", forHTTPHeaderField: "Referer")
+    request.setValue("https://twitcasting.tv", forHTTPHeaderField: "Origin")
     request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
     if let cookie = Self.cookieHeader() {
       request.setValue(cookie, forHTTPHeaderField: "Cookie")
@@ -712,13 +735,53 @@ final class TwitcastingChatClient {
 
   private func handle(_ text: String) {
     guard let data = text.data(using: .utf8),
-          let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return }
-    for item in arr {
-      guard (item["type"] as? String) == "comment",
-            let message = item["message"] as? String, !message.isEmpty else { continue }
-      let author = (item["author"] as? [String: Any])?["name"] as? String ?? ""
+          let json = try? JSONSerialization.jsonObject(with: data) else { return }
+    for item in Self.commentItems(from: json) {
+      guard let message = item["message"] as? String, !message.isEmpty else { continue }
+      let author = (item["author"] as? [String: Any])?["name"] as? String
+        ?? (item["user"] as? [String: Any])?["name"] as? String
+        ?? ""
       onComment(message, author)
     }
+  }
+
+  private static func commentItems(from value: Any) -> [[String: Any]] {
+    if let array = value as? [Any] {
+      return array.flatMap { commentItems(from: $0) }
+    }
+    guard let dict = value as? [String: Any] else { return [] }
+    let type = (dict["type"] as? String) ?? (dict["event"] as? String) ?? ""
+    if let message = dict["message"] as? String, !message.isEmpty,
+       (type.isEmpty || type.localizedCaseInsensitiveContains("comment") || dict["author"] != nil || dict["user"] != nil) {
+      return [dict]
+    }
+    if let message = dict["message"] as? [String: Any] {
+      return commentItems(from: message)
+    }
+    if let data = dict["data"] {
+      return commentItems(from: data)
+    }
+    if let payload = dict["payload"] {
+      return commentItems(from: payload)
+    }
+    return []
+  }
+
+  private static func parseMovieID(from html: String) -> String? {
+    let patterns = [
+      #""movie_id"\s*:\s*"?(\d+)"?"#,
+      #""movieId"\s*:\s*"?(\d+)"?"#,
+      #"data-movie-id=["'](\d+)["']"#,
+      #"/movie/(\d+)"#
+    ]
+    for pattern in patterns {
+      guard let regex = try? NSRegularExpression(pattern: pattern),
+            let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..<html.endIndex, in: html)),
+            match.numberOfRanges > 1,
+            let range = Range(match.range(at: 1), in: html) else { continue }
+      return String(html[range])
+    }
+    return nil
   }
 
   private static func stringValue(_ value: Any?) -> String? {
@@ -800,7 +863,9 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
 
   func load(stream: StreamItem, settings: AppSettings) {
     if stream.platform == .niconico {
-      load(URLRequest(url: URL(string: "https://live.nicovideo.jp/watch/\(stream.channel)")!))
+      var request = URLRequest(url: URL(string: "https://live.nicovideo.jp/watch/\(stream.channel)")!)
+      Self.mobileBrowserHeaders(referer: "https://live.nicovideo.jp/").forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+      load(request)
       return
     }
     var components = URLComponents(string: "https://tonton888115.github.io/MultiView/player.html")!
@@ -917,6 +982,15 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
   """
 
   private static let mobileSafariUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+
+  private static func mobileBrowserHeaders(referer: String) -> [String: String] {
+    [
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6",
+      "User-Agent": mobileSafariUserAgent,
+      "Referer": referer
+    ]
+  }
 
 }
 
@@ -2764,6 +2838,11 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
 }
 
 final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, WKNavigationDelegate {
+  private enum PlayerMode {
+    case iframeEmbed
+    case normalPage
+  }
+
   private let stream: StreamItem
   private let settings: AppSettings
   private let web: WKWebView
@@ -2774,6 +2853,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private var laneCursor = 0
   private var isStopped = false
   private var usingNormalPageFallback = false
+  private var playerMode: PlayerMode = .iframeEmbed
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -2785,6 +2865,9 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
+    if #available(iOS 13.0, *) {
+      config.defaultWebpagePreferences.preferredContentMode = .mobile
+    }
     self.web = WKWebView(frame: .zero, configuration: config)
     super.init(frame: .zero)
     backgroundColor = .black
@@ -2885,7 +2968,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     ]
     if let url = components.url {
       usingNormalPageFallback = false
-      web.load(Self.browserRequest(url: url, referer: "https://twitcasting.tv/\(encoded)"))
+      playerMode = .iframeEmbed
+      web.loadHTMLString(Self.embedHTML(playerURL: url), baseURL: URL(string: "https://twitcasting.tv/\(encoded)"))
     }
   }
 
@@ -2894,6 +2978,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
           let url = URL(string: "https://twitcasting.tv/\(encoded)") else { return }
     usingNormalPageFallback = true
+    playerMode = .normalPage
     web.load(Self.browserRequest(url: url, referer: "https://twitcasting.tv/"))
   }
 
@@ -2910,7 +2995,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       """
       self.web.evaluateJavaScript(script) { [weak self] value, _ in
         guard let self, !self.isStopped, !self.usingNormalPageFallback else { return }
-        if (value as? String) == "empty" {
+        if (value as? String) == "empty" || ((value as? String) == "frame" && self.playerMode == .iframeEmbed) {
           self.loadNormalPageFallback()
         } else {
           self.resumePlayback()
@@ -2955,6 +3040,25 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       request.setValue(cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; "), forHTTPHeaderField: "Cookie")
     }
     return request
+  }
+
+  private static func embedHTML(playerURL: URL) -> String {
+    """
+    <!doctype html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+      <style>
+        html,body,#root,iframe{margin:0;width:100%;height:100%;background:#000;overflow:hidden;border:0;}
+      </style>
+    </head>
+    <body>
+      <div id="root">
+        <iframe src="\(playerURL.absoluteString)" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen playsinline></iframe>
+      </div>
+    </body>
+    </html>
+    """
   }
 
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
@@ -3261,6 +3365,36 @@ final class ViewingController: UIViewController {
     row.translatesAutoresizingMaskIntoConstraints = false
     host.addSubview(row)
 
+    let layoutStack = UIStackView()
+    layoutStack.axis = .horizontal
+    layoutStack.spacing = 6
+    layoutStack.alignment = .center
+    let stackedButton = layoutButton(
+      icon: "rectangle.grid.1x2",
+      selected: AppState.shared.settings.layoutMode == .stacked,
+      accessibilityLabel: "縦表示"
+    ) { [weak self] in
+      var settings = AppState.shared.settings
+      settings.layoutMode = .stacked
+      AppState.shared.settings = settings
+      self?.reload()
+    }
+    let gridButton = layoutButton(
+      icon: "square.grid.2x2",
+      selected: AppState.shared.settings.layoutMode == .grid,
+      accessibilityLabel: "グリッド表示"
+    ) { [weak self] in
+      var settings = AppState.shared.settings
+      settings.layoutMode = .grid
+      AppState.shared.settings = settings
+      self?.reload()
+    }
+    layoutStack.addArrangedSubview(stackedButton)
+    layoutStack.addArrangedSubview(gridButton)
+
+    let spacer = UIView()
+    spacer.translatesAutoresizingMaskIntoConstraints = false
+
     let playButton = playbackButton(title: " 全て再生", icon: "play.fill", color: .systemGreen) {
       PlaybackCoordinator.shared.resumeAll()
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -3273,6 +3407,8 @@ final class ViewingController: UIViewController {
         PlaybackCoordinator.shared.resumeAll()
       }
     }
+    row.addArrangedSubview(layoutStack)
+    row.addArrangedSubview(spacer)
     row.addArrangedSubview(playButton)
     row.addArrangedSubview(reloadButton)
 
@@ -3280,10 +3416,26 @@ final class ViewingController: UIViewController {
     NSLayoutConstraint.activate([
       host.heightAnchor.constraint(equalToConstant: 38),
       row.centerYAnchor.constraint(equalTo: host.centerYAnchor),
+      row.leadingAnchor.constraint(equalTo: host.leadingAnchor),
       row.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+      stackedButton.widthAnchor.constraint(equalToConstant: 34),
+      stackedButton.heightAnchor.constraint(equalToConstant: 34),
+      gridButton.widthAnchor.constraint(equalToConstant: 34),
+      gridButton.heightAnchor.constraint(equalToConstant: 34),
       playButton.heightAnchor.constraint(equalToConstant: 34),
       reloadButton.heightAnchor.constraint(equalToConstant: 34)
     ])
+  }
+
+  private func layoutButton(icon: String, selected: Bool, accessibilityLabel: String, action: @escaping () -> Void) -> UIButton {
+    let button = UIButton(type: .system)
+    button.setImage(UIImage(systemName: icon), for: .normal)
+    button.tintColor = .white
+    button.accessibilityLabel = accessibilityLabel
+    button.backgroundColor = (selected ? UIColor.systemBlue : UIColor.white).withAlphaComponent(selected ? 0.9 : 0.16)
+    button.layer.cornerRadius = 17
+    button.addAction(UIAction { _ in action() }, for: .touchUpInside)
+    return button
   }
 
   private func playbackButton(title: String, icon: String, color: UIColor, action: @escaping () -> Void) -> UIButton {
@@ -3467,7 +3619,9 @@ final class ViewingController: UIViewController {
           let from = AppState.shared.streams.firstIndex(where: { $0.id == sourceStream.id }),
           let to = AppState.shared.streams.firstIndex(where: { $0.id == targetStream.id }) else { return }
     var next = AppState.shared.streams
-    next.swapAt(from, to)
+    let moved = next.remove(at: from)
+    let insertIndex = from < to ? to - 1 : to
+    next.insert(moved, at: max(0, min(insertIndex, next.count)))
     AppState.shared.streams = next
   }
 
@@ -3528,7 +3682,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate {
     layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
 
     let video: UIView
-    if stream.platform == .niconico {
+    if stream.platform == .niconico, UIDevice.current.userInterfaceIdiom != .pad {
       video = NiconicoNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else if stream.platform == .kick {
       video = KickNativePlayerView(stream: stream, settings: AppState.shared.settings)
@@ -3700,7 +3854,7 @@ final class FocusedStreamView: UIView {
     heightAnchor.constraint(greaterThanOrEqualToConstant: 640).isActive = true
 
     let video: UIView
-    if stream.platform == .niconico {
+    if stream.platform == .niconico, UIDevice.current.userInterfaceIdiom != .pad {
       video = NiconicoNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else if stream.platform == .kick {
       video = KickNativePlayerView(stream: stream, settings: AppState.shared.settings)
@@ -4160,7 +4314,7 @@ final class SettingsController: UITableViewController {
 
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     switch section {
-    case 0: return 12
+    case 0: return 11
     case 1: return platforms.count
     case 2: return 3
     default: return 1
@@ -4185,17 +4339,6 @@ final class SettingsController: UITableViewController {
     cell.accessoryType = .none
 
     if indexPath.section == 0 && indexPath.row == 0 {
-      cell.textLabel?.text = "縦スクロール表示"
-      let control = UISegmentedControl(items: ["縦", "グリッド"])
-      control.selectedSegmentIndex = AppState.shared.settings.layoutMode == .stacked ? 0 : 1
-      control.addAction(UIAction { action in
-        guard let c = action.sender as? UISegmentedControl else { return }
-        var settings = AppState.shared.settings
-        settings.layoutMode = c.selectedSegmentIndex == 0 ? .stacked : .grid
-        AppState.shared.settings = settings
-      }, for: .valueChanged)
-      cell.accessoryView = control
-    } else if indexPath.section == 0 && indexPath.row == 1 {
       cell.textLabel?.text = "音声を有効にして開始"
       let toggle = UISwitch()
       toggle.isOn = AppState.shared.settings.playAudio
@@ -4206,7 +4349,7 @@ final class SettingsController: UITableViewController {
         AppState.shared.settings = settings
       }, for: .valueChanged)
       cell.accessoryView = toggle
-    } else if indexPath.section == 0 && indexPath.row == 2 {
+    } else if indexPath.section == 0 && indexPath.row == 1 {
       cell.textLabel?.text = "弾幕を表示"
       let toggle = UISwitch()
       toggle.isOn = AppState.shared.settings.showChat
@@ -4217,7 +4360,7 @@ final class SettingsController: UITableViewController {
         AppState.shared.settings = settings
       }, for: .valueChanged)
       cell.accessoryView = toggle
-    } else if indexPath.section == 0 && indexPath.row == 3 {
+    } else if indexPath.section == 0 && indexPath.row == 2 {
       cell.textLabel?.text = "レイド先を自動追加"
       let toggle = UISwitch()
       toggle.isOn = AppState.shared.settings.autoFollowRaids
@@ -4228,21 +4371,21 @@ final class SettingsController: UITableViewController {
         AppState.shared.settings = settings
       }, for: .valueChanged)
       cell.accessoryView = toggle
-    } else if indexPath.section == 0 && indexPath.row == 4 {
+    } else if indexPath.section == 0 && indexPath.row == 3 {
       cell.textLabel?.text = "Wi-Fi時の画質"
       cell.accessoryView = qualityControl(selected: AppState.shared.settings.wifiQuality) { quality in
         var settings = AppState.shared.settings
         settings.wifiQuality = quality
         AppState.shared.settings = settings
       }
-    } else if indexPath.section == 0 && indexPath.row == 5 {
+    } else if indexPath.section == 0 && indexPath.row == 4 {
       cell.textLabel?.text = "モバイル通信時の画質"
       cell.accessoryView = qualityControl(selected: AppState.shared.settings.mobileQuality) { quality in
         var settings = AppState.shared.settings
         settings.mobileQuality = quality
         AppState.shared.settings = settings
       }
-    } else if indexPath.section == 0 && indexPath.row == 6 {
+    } else if indexPath.section == 0 && indexPath.row == 5 {
       cell.textLabel?.text = "CORSプロキシ"
       cell.detailTextLabel?.text = nil
       cell.accessoryType = .disclosureIndicator
@@ -4305,9 +4448,9 @@ final class SettingsController: UITableViewController {
   }
 
   override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-    if indexPath.section == 0 && indexPath.row == 6 {
+    if indexPath.section == 0 && indexPath.row == 5 {
       editProxy()
-    } else if indexPath.section == 0 && (7...11).contains(indexPath.row) {
+    } else if indexPath.section == 0 && (6...10).contains(indexPath.row) {
       editDanmakuValue(row: indexPath.row)
     } else if indexPath.section == 2 {
       handleKickOAuthRow(indexPath.row)
@@ -4319,15 +4462,15 @@ final class SettingsController: UITableViewController {
   private func danmakuTitle(row: Int) -> String {
     let settings = AppState.shared.settings
     switch row {
-    case 7:
+    case 6:
       return "文字サイズ \(Int(settings.danmakuFontSize))"
-    case 8:
+    case 7:
       return "速度 \(Int((settings.danmakuSpeed / 0.13) * 100))%"
-    case 9:
+    case 8:
       return "透過度 \(Int(settings.danmakuOpacity * 100))%"
-    case 10:
+    case 9:
       return "最大行数 \(settings.danmakuMaxLines == 0 ? "自動" : String(settings.danmakuMaxLines))"
-    case 11:
+    case 10:
       return "最大文字数 \(settings.danmakuMaxLength == 0 ? "無制限" : String(settings.danmakuMaxLength))"
     default:
       return ""
@@ -4350,23 +4493,23 @@ final class SettingsController: UITableViewController {
     let title: String
     let message: String
     switch row {
-    case 7:
+    case 6:
       title = "文字サイズ"
       current = String(Int(settings.danmakuFontSize))
       message = "12〜40"
-    case 8:
+    case 7:
       title = "速度"
       current = String(Int((settings.danmakuSpeed / 0.13) * 100))
       message = "100が標準"
-    case 9:
+    case 8:
       title = "透過度"
       current = String(Int(settings.danmakuOpacity * 100))
       message = "30〜100"
-    case 10:
+    case 9:
       title = "最大行数"
       current = String(settings.danmakuMaxLines)
       message = "0で自動"
-    case 11:
+    case 10:
       title = "最大文字数"
       current = String(settings.danmakuMaxLength)
       message = "0で無制限"
@@ -4385,15 +4528,15 @@ final class SettingsController: UITableViewController {
       guard let raw = alert.textFields?.first?.text, let value = Double(raw) else { return }
       var settings = AppState.shared.settings
       switch row {
-      case 7:
+      case 6:
         settings.danmakuFontSize = min(40, max(12, value.rounded()))
-      case 8:
+      case 7:
         settings.danmakuSpeed = min(300, max(20, value)) / 100 * 0.13
-      case 9:
+      case 8:
         settings.danmakuOpacity = min(100, max(30, value)) / 100
-      case 10:
+      case 9:
         settings.danmakuMaxLines = min(20, max(0, Int(value.rounded())))
-      case 11:
+      case 10:
         settings.danmakuMaxLength = min(500, max(0, Int(value.rounded())))
       default:
         return
