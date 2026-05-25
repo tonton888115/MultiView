@@ -2,6 +2,7 @@ import UIKit
 import WebKit
 import AVFoundation
 import Network
+import ImageIO
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -576,6 +577,9 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
     backgroundColor = .black
     scrollView.backgroundColor = .black
     scrollView.contentInsetAdjustmentBehavior = .never
+    if stream.platform == .niconico {
+      customUserAgent = Self.mobileSafariUserAgent
+    }
     navigationDelegate = self
     PlaybackCoordinator.shared.register(self)
     load(stream: stream, settings: settings)
@@ -703,6 +707,8 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
   })();
   """
 
+  private static let mobileSafariUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+
 }
 
 private enum NativeDanmakuToken {
@@ -804,15 +810,48 @@ private final class NativeDanmakuRenderer {
     let key = url as NSURL
     if let cached = imageCache.object(forKey: key) {
       imageView.image = cached
+      if cached.images?.isEmpty == false {
+        imageView.startAnimating()
+      }
       return
     }
     URLSession.shared.dataTask(with: url) { data, _, _ in
-      guard let data, let image = UIImage(data: data) else { return }
+      guard let data, let image = animatedImage(from: data) ?? UIImage(data: data) else { return }
       imageCache.setObject(image, forKey: key)
       DispatchQueue.main.async {
         imageView.image = image
+        if image.images?.isEmpty == false {
+          imageView.startAnimating()
+        }
       }
     }.resume()
+  }
+
+  private static func animatedImage(from data: Data) -> UIImage? {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+    let count = CGImageSourceGetCount(source)
+    guard count > 1 else { return nil }
+
+    var images: [UIImage] = []
+    var duration: TimeInterval = 0
+    for index in 0..<count {
+      guard let cgImage = CGImageSourceCreateImageAtIndex(source, index, nil) else { continue }
+      images.append(UIImage(cgImage: cgImage))
+      duration += frameDuration(at: index, source: source)
+    }
+    guard !images.isEmpty else { return nil }
+    return UIImage.animatedImage(with: images, duration: max(duration, Double(images.count) * 0.08))
+  }
+
+  private static func frameDuration(at index: Int, source: CGImageSource) -> TimeInterval {
+    guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+          let gif = properties[kCGImagePropertyGIFDictionary] as? [CFString: Any] else {
+      return 0.1
+    }
+    let unclamped = gif[kCGImagePropertyGIFUnclampedDelayTime] as? Double
+    let clamped = gif[kCGImagePropertyGIFDelayTime] as? Double
+    let value = unclamped ?? clamped ?? 0.1
+    return value < 0.02 ? 0.1 : value
   }
 }
 
@@ -2388,6 +2427,151 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 }
 
+final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+  private let stream: StreamItem
+  private let settings: AppSettings
+  private let web: WKWebView
+  private let danmakuView = UIView()
+  private var chatClient: TwitcastingChatClient?
+  private var playbackVolume: Float
+  private var isMutedForEmbed: Bool
+  private var laneCursor = 0
+  private var isStopped = false
+
+  init(stream: StreamItem, settings: AppSettings) {
+    self.stream = stream
+    self.settings = settings
+    let initialVolume = StreamVolumeStore.volume(for: stream)
+    self.playbackVolume = initialVolume
+    self.isMutedForEmbed = !settings.playAudio || initialVolume <= 0
+    let config = WKWebViewConfiguration()
+    config.allowsInlineMediaPlayback = true
+    config.mediaTypesRequiringUserActionForPlayback = []
+    config.websiteDataStore = .default()
+    self.web = WKWebView(frame: .zero, configuration: config)
+    super.init(frame: .zero)
+    backgroundColor = .black
+
+    web.isOpaque = false
+    web.backgroundColor = .black
+    web.scrollView.backgroundColor = .black
+    web.scrollView.contentInsetAdjustmentBehavior = .never
+    web.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(web)
+
+    danmakuView.isUserInteractionEnabled = false
+    danmakuView.clipsToBounds = true
+    danmakuView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(danmakuView)
+
+    NSLayoutConstraint.activate([
+      web.topAnchor.constraint(equalTo: topAnchor),
+      web.leadingAnchor.constraint(equalTo: leadingAnchor),
+      web.trailingAnchor.constraint(equalTo: trailingAnchor),
+      web.bottomAnchor.constraint(equalTo: bottomAnchor),
+      danmakuView.topAnchor.constraint(equalTo: topAnchor),
+      danmakuView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      danmakuView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      danmakuView.bottomAnchor.constraint(equalTo: bottomAnchor)
+    ])
+
+    PlaybackCoordinator.shared.register(self)
+    loadPlayer()
+    startCommentsIfNeeded()
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    stopPlayback()
+  }
+
+  func resumePlayback() {
+    guard !isStopped else { return }
+    let muted = !settings.playAudio || playbackVolume <= 0
+    let script = """
+    (function(){
+      document.querySelectorAll('video,audio').forEach(function(media){
+        try {
+          media.muted = \(muted ? "true" : "false");
+          media.volume = \(muted ? 0 : playbackVolume);
+          var play = media.play && media.play();
+          if (play && play.catch) play.catch(function(){});
+        } catch(e) {}
+      });
+      document.querySelectorAll('button').forEach(function(button){
+        var label = (button.getAttribute('aria-label') || button.textContent || '').toLowerCase();
+        if (label.indexOf('play') !== -1 || label.indexOf('再生') !== -1) {
+          try { button.click(); } catch(e) {}
+        }
+      });
+    })();
+    """
+    web.evaluateJavaScript(script)
+  }
+
+  func stopPlayback() {
+    isStopped = true
+    chatClient?.stop()
+    chatClient = nil
+    web.stopLoading()
+    web.evaluateJavaScript("""
+    document.querySelectorAll('video,audio').forEach(function(media){
+      try { media.pause(); media.src = ''; media.load(); } catch(e) {}
+    });
+    """)
+    web.loadHTMLString("", baseURL: nil)
+  }
+
+  func setPlaybackVolume(_ volume: Float) {
+    playbackVolume = min(1, max(0, volume))
+    reloadPlayerForMuteState()
+    resumePlayback()
+  }
+
+  private func loadPlayer() {
+    let channel = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+          var components = URLComponents(string: "https://twitcasting.tv/\(encoded)/embeddedplayer/live") else { return }
+    components.queryItems = [
+      URLQueryItem(name: "auto_play", value: "true"),
+      URLQueryItem(name: "default_mute", value: isMutedForEmbed ? "true" : "false")
+    ]
+    if let url = components.url {
+      web.load(URLRequest(url: url))
+    }
+  }
+
+  private func reloadPlayerForMuteState() {
+    guard !isStopped else { return }
+    let nextMuted = !settings.playAudio || playbackVolume <= 0
+    guard nextMuted != isMutedForEmbed else { return }
+    isMutedForEmbed = nextMuted
+    loadPlayer()
+  }
+
+  private func startCommentsIfNeeded() {
+    guard settings.showChat else { return }
+    chatClient = TwitcastingChatClient(channel: stream.channel) { [weak self] message, _ in
+      self?.emitDanmaku(message)
+    }
+  }
+
+  private func emitDanmaku(_ text: String) {
+    DispatchQueue.main.async {
+      self.laneCursor = NativeDanmakuRenderer.emit(
+        tokens: NativeDanmakuRenderer.textTokens(text),
+        filterText: text,
+        in: self.danmakuView,
+        laneCursor: self.laneCursor,
+        settings: self.settings
+      )
+    }
+  }
+}
+
 final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResumable, PlaybackStoppable, AudioControllable {
   private let playAudio: Bool
   private var playbackVolume: Float = 1
@@ -2834,6 +3018,8 @@ final class StreamCellView: UIView {
       video = KickNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else if stream.platform == .twitch {
       video = TwitchNativePlayerView(stream: stream, settings: AppState.shared.settings)
+    } else if stream.platform == .twitcasting {
+      video = TwitcastingNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else {
       video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
     }
@@ -2972,6 +3158,8 @@ final class FocusedStreamView: UIView {
       video = KickNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else if stream.platform == .twitch {
       video = TwitchNativePlayerView(stream: stream, settings: AppState.shared.settings)
+    } else if stream.platform == .twitcasting {
+      video = TwitcastingNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else {
       video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
     }
