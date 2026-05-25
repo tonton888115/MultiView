@@ -705,6 +705,117 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
 
 }
 
+private enum NativeDanmakuToken {
+  case text(String)
+  case image(URL)
+}
+
+private final class NativeDanmakuRenderer {
+  private static let imageCache = NSCache<NSURL, UIImage>()
+
+  static func emit(
+    tokens: [NativeDanmakuToken],
+    filterText: String,
+    in root: UIView,
+    laneCursor: Int,
+    settings: AppSettings
+  ) -> Int {
+    let trimmed = filterText.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return laneCursor }
+    if settings.danmakuMaxLength > 0, trimmed.count > settings.danmakuMaxLength {
+      return laneCursor
+    }
+    guard root.bounds.height > 0, root.bounds.width > 0 else { return laneCursor }
+
+    let fontSize = CGFloat(settings.danmakuFontSize)
+    let lineHeight = fontSize + 8
+    let maxLines = settings.danmakuMaxLines > 0
+      ? settings.danmakuMaxLines
+      : max(1, Int(root.bounds.height / lineHeight))
+    let lane = laneCursor % maxLines
+    let comment = makeCommentView(tokens: tokens, fontSize: fontSize, opacity: settings.danmakuOpacity, lineHeight: lineHeight)
+    guard comment.bounds.width > 0 else { return laneCursor }
+
+    let y = CGFloat(lane) * lineHeight + 6
+    let startX = root.bounds.width + 12
+    comment.frame.origin = CGPoint(x: startX, y: y)
+    root.addSubview(comment)
+
+    let travel = startX + comment.bounds.width + 24
+    let pixelsPerSecond = max(35, root.bounds.width * CGFloat(settings.danmakuSpeed))
+    let duration = TimeInterval(travel / pixelsPerSecond)
+    UIView.animate(withDuration: duration, delay: 0, options: [.curveLinear]) {
+      comment.frame.origin.x = -comment.bounds.width - 12
+    } completion: { _ in
+      comment.removeFromSuperview()
+    }
+    return laneCursor + 1
+  }
+
+  static func textTokens(_ text: String) -> [NativeDanmakuToken] {
+    [.text(text)]
+  }
+
+  private static func makeCommentView(
+    tokens: [NativeDanmakuToken],
+    fontSize: CGFloat,
+    opacity: Double,
+    lineHeight: CGFloat
+  ) -> UIView {
+    let container = UIView()
+    var x: CGFloat = 0
+    let imageSide = max(18, fontSize * 1.4)
+
+    for token in tokens {
+      switch token {
+      case .text(let text):
+        guard !text.isEmpty else { continue }
+        let label = UILabel()
+        label.text = text
+        label.font = .systemFont(ofSize: fontSize, weight: .bold)
+        label.textColor = UIColor.white.withAlphaComponent(CGFloat(opacity))
+        label.layer.shadowColor = UIColor.black.cgColor
+        label.layer.shadowRadius = 2
+        label.layer.shadowOpacity = 1
+        label.layer.shadowOffset = CGSize(width: 1, height: 1)
+        label.sizeToFit()
+        label.frame.origin = CGPoint(x: x, y: 0)
+        container.addSubview(label)
+        x += label.bounds.width
+      case .image(let url):
+        let imageView = UIImageView(frame: CGRect(x: x + 3, y: max(0, (lineHeight - imageSide) / 2), width: imageSide, height: imageSide))
+        imageView.contentMode = .scaleAspectFit
+        imageView.alpha = CGFloat(opacity)
+        imageView.layer.shadowColor = UIColor.black.cgColor
+        imageView.layer.shadowRadius = 2
+        imageView.layer.shadowOpacity = 1
+        imageView.layer.shadowOffset = CGSize(width: 1, height: 1)
+        container.addSubview(imageView)
+        loadImage(url, into: imageView)
+        x += imageSide + 6
+      }
+    }
+
+    container.frame = CGRect(x: 0, y: 0, width: x, height: lineHeight)
+    return container
+  }
+
+  private static func loadImage(_ url: URL, into imageView: UIImageView) {
+    let key = url as NSURL
+    if let cached = imageCache.object(forKey: key) {
+      imageView.image = cached
+      return
+    }
+    URLSession.shared.dataTask(with: url) { data, _, _ in
+      guard let data, let image = UIImage(data: data) else { return }
+      imageCache.setObject(image, forKey: key)
+      DispatchQueue.main.async {
+        imageView.image = image
+      }
+    }.resume()
+  }
+}
+
 final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
   private let stream: StreamItem
   private let player = AVPlayer()
@@ -892,6 +1003,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
           "quality": NetworkQuality.shared.activeQuality(settings: settings).niconicoQuality,
           "protocol": "hls",
           "latency": "low",
+          "requireNewStream": true,
           "accessRightMethod": "single_cookie",
           "chasePlay": false
         ],
@@ -1769,58 +1881,56 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     guard let payloadData,
           let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
           let content = (payload["content"] as? String) ?? (payload["message"] as? String) else { return }
-    emitDanmaku(Self.kickDisplayText(content))
+    let tokens = Self.kickDanmakuTokens(content)
+    let filterText = Self.kickFilterText(content)
+    emitDanmaku(tokens, filterText: filterText)
   }
 
-  private func emitDanmaku(_ text: String) {
-    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return }
-    if settings.danmakuMaxLength > 0, trimmed.count > settings.danmakuMaxLength {
-      return
-    }
+  private func emitDanmaku(_ tokens: [NativeDanmakuToken], filterText: String) {
     DispatchQueue.main.async {
-      guard self.danmakuView.bounds.height > 0, self.danmakuView.bounds.width > 0 else { return }
-      let fontSize = CGFloat(self.settings.danmakuFontSize)
-      let lineHeight = fontSize + 8
-      let maxLines = self.settings.danmakuMaxLines > 0
-        ? self.settings.danmakuMaxLines
-        : max(1, Int(self.danmakuView.bounds.height / lineHeight))
-      let label = UILabel()
-      label.text = trimmed
-      label.font = .systemFont(ofSize: fontSize, weight: .bold)
-      label.textColor = UIColor.white.withAlphaComponent(self.settings.danmakuOpacity)
-      label.layer.shadowColor = UIColor.black.cgColor
-      label.layer.shadowRadius = 2
-      label.layer.shadowOpacity = 1
-      label.layer.shadowOffset = CGSize(width: 1, height: 1)
-      label.sizeToFit()
-      let lane = self.laneCursor % maxLines
-      self.laneCursor += 1
-      let y = CGFloat(lane) * lineHeight + 6
-      let startX = self.danmakuView.bounds.width + 12
-      label.frame.origin = CGPoint(x: startX, y: y)
-      self.danmakuView.addSubview(label)
-      let travel = startX + label.bounds.width + 24
-      let pixelsPerSecond = max(35, self.danmakuView.bounds.width * CGFloat(self.settings.danmakuSpeed))
-      let duration = TimeInterval(travel / pixelsPerSecond)
-      UIView.animate(withDuration: duration, delay: 0, options: [.curveLinear]) {
-        label.frame.origin.x = -label.bounds.width - 12
-      } completion: { _ in
-        label.removeFromSuperview()
-      }
+      self.laneCursor = NativeDanmakuRenderer.emit(
+        tokens: tokens,
+        filterText: filterText,
+        in: self.danmakuView,
+        laneCursor: self.laneCursor,
+        settings: self.settings
+      )
     }
   }
 
-  private static func kickDisplayText(_ content: String) -> String {
-    let pattern = #"\[emote:\d+:([^\]]+)\]"#
+  private static func kickDanmakuTokens(_ content: String) -> [NativeDanmakuToken] {
+    let pattern = #"\[emote:(\d+):([^\]]+)\]"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return [.text(content)] }
+    let range = NSRange(content.startIndex..<content.endIndex, in: content)
+    var tokens: [NativeDanmakuToken] = []
+    var cursor = content.startIndex
+    for match in regex.matches(in: content, range: range) {
+      guard let fullRange = Range(match.range(at: 0), in: content),
+            let idRange = Range(match.range(at: 1), in: content) else { continue }
+      if cursor < fullRange.lowerBound {
+        tokens.append(.text(String(content[cursor..<fullRange.lowerBound])))
+      }
+      let id = String(content[idRange])
+      if let url = URL(string: "https://files.kick.com/emotes/\(id)/fullsize") {
+        tokens.append(.image(url))
+      }
+      cursor = fullRange.upperBound
+    }
+    if cursor < content.endIndex {
+      tokens.append(.text(String(content[cursor..<content.endIndex])))
+    }
+    return tokens.isEmpty ? [.text(content)] : tokens
+  }
+
+  private static func kickFilterText(_ content: String) -> String {
+    let pattern = #"\[emote:(\d+):([^\]]+)\]"#
     guard let regex = try? NSRegularExpression(pattern: pattern) else { return content }
     var output = content
-    let range = NSRange(output.startIndex..<output.endIndex, in: output)
-    for match in regex.matches(in: output, range: range).reversed() {
+    for match in regex.matches(in: output, range: NSRange(output.startIndex..<output.endIndex, in: output)).reversed() {
       guard let fullRange = Range(match.range(at: 0), in: output),
-            let nameRange = Range(match.range(at: 1), in: output) else { continue }
+            let nameRange = Range(match.range(at: 2), in: output) else { continue }
       let name = String(output[nameRange])
-      output.replaceSubrange(fullRange, with: ":\(name):")
+      output.replaceSubrange(fullRange, with: name)
     }
     return output
   }
@@ -2190,50 +2300,80 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
         chatSocket?.send(.string("PONG :tmi.twitch.tv")) { _ in }
         continue
       }
-      guard let privmsg = rawLine.range(of: " PRIVMSG "),
-            let bodyRange = rawLine.range(of: " :", range: privmsg.lowerBound..<rawLine.endIndex) else { continue }
-      let message = String(rawLine[bodyRange.upperBound...])
-      emitDanmaku(message)
+      var tags: [String: String] = [:]
+      var line = rawLine
+      if line.hasPrefix("@"), let split = line.firstIndex(of: " ") {
+        tags = Self.parseTwitchTags(String(line[line.index(after: line.startIndex)..<split]))
+        line = String(line[line.index(after: split)...])
+      }
+      guard let privmsg = line.range(of: " PRIVMSG "),
+            let bodyRange = line.range(of: " :", range: privmsg.lowerBound..<line.endIndex) else { continue }
+      let message = String(line[bodyRange.upperBound...])
+      emitDanmaku(Self.twitchDanmakuTokens(message, emotesTag: tags["emotes"]), filterText: message)
     }
   }
 
-  private func emitDanmaku(_ text: String) {
-    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return }
-    if settings.danmakuMaxLength > 0, trimmed.count > settings.danmakuMaxLength {
-      return
-    }
+  private func emitDanmaku(_ tokens: [NativeDanmakuToken], filterText: String) {
     DispatchQueue.main.async {
-      guard self.danmakuView.bounds.height > 0, self.danmakuView.bounds.width > 0 else { return }
-      let fontSize = CGFloat(self.settings.danmakuFontSize)
-      let lineHeight = fontSize + 8
-      let maxLines = self.settings.danmakuMaxLines > 0
-        ? self.settings.danmakuMaxLines
-        : max(1, Int(self.danmakuView.bounds.height / lineHeight))
-      let label = UILabel()
-      label.text = trimmed
-      label.font = .systemFont(ofSize: fontSize, weight: .bold)
-      label.textColor = UIColor.white.withAlphaComponent(self.settings.danmakuOpacity)
-      label.layer.shadowColor = UIColor.black.cgColor
-      label.layer.shadowRadius = 2
-      label.layer.shadowOpacity = 1
-      label.layer.shadowOffset = CGSize(width: 1, height: 1)
-      label.sizeToFit()
-      let lane = self.laneCursor % maxLines
-      self.laneCursor += 1
-      let y = CGFloat(lane) * lineHeight + 6
-      let startX = self.danmakuView.bounds.width + 12
-      label.frame.origin = CGPoint(x: startX, y: y)
-      self.danmakuView.addSubview(label)
-      let travel = startX + label.bounds.width + 24
-      let pixelsPerSecond = max(35, self.danmakuView.bounds.width * CGFloat(self.settings.danmakuSpeed))
-      let duration = TimeInterval(travel / pixelsPerSecond)
-      UIView.animate(withDuration: duration, delay: 0, options: [.curveLinear]) {
-        label.frame.origin.x = -label.bounds.width - 12
-      } completion: { _ in
-        label.removeFromSuperview()
+      self.laneCursor = NativeDanmakuRenderer.emit(
+        tokens: tokens,
+        filterText: filterText,
+        in: self.danmakuView,
+        laneCursor: self.laneCursor,
+        settings: self.settings
+      )
+    }
+  }
+
+  private static func parseTwitchTags(_ raw: String) -> [String: String] {
+    var tags: [String: String] = [:]
+    raw.split(separator: ";").forEach { pair in
+      guard let eq = pair.firstIndex(of: "=") else { return }
+      let key = String(pair[..<eq])
+      let value = String(pair[pair.index(after: eq)...])
+        .replacingOccurrences(of: #"\\s"#, with: " ", options: .regularExpression)
+        .replacingOccurrences(of: #"\\:"#, with: ";", options: .regularExpression)
+        .replacingOccurrences(of: #"\\r"#, with: "\r", options: .regularExpression)
+        .replacingOccurrences(of: #"\\n"#, with: "\n", options: .regularExpression)
+      tags[key] = value
+    }
+    return tags
+  }
+
+  private static func twitchDanmakuTokens(_ message: String, emotesTag: String?) -> [NativeDanmakuToken] {
+    let chars = Array(message)
+    var ranges: [(id: String, start: Int, end: Int)] = []
+    emotesTag?.split(separator: "/").forEach { part in
+      let pieces = part.split(separator: ":")
+      guard pieces.count == 2 else { return }
+      let id = String(pieces[0])
+      pieces[1].split(separator: ",").forEach { rawRange in
+        let bounds = rawRange.split(separator: "-")
+        guard bounds.count == 2,
+              let start = Int(bounds[0]),
+              let end = Int(bounds[1]),
+              start >= 0,
+              end >= start,
+              end < chars.count else { return }
+        ranges.append((id, start, end))
       }
     }
+    ranges.sort { $0.start < $1.start }
+    var tokens: [NativeDanmakuToken] = []
+    var cursor = 0
+    for range in ranges where range.start >= cursor {
+      if cursor < range.start {
+        tokens.append(.text(String(chars[cursor..<range.start])))
+      }
+      if let url = URL(string: "https://static-cdn.jtvnw.net/emoticons/v2/\(range.id)/default/dark/1.0") {
+        tokens.append(.image(url))
+      }
+      cursor = range.end + 1
+    }
+    if cursor < chars.count {
+      tokens.append(.text(String(chars[cursor..<chars.count])))
+    }
+    return tokens.isEmpty ? [.text(message)] : tokens
   }
 
   private static func normalizeChannel(_ raw: String) -> String {
