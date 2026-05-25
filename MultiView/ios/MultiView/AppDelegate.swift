@@ -22,6 +22,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     configureAudioSession()
     installPlaybackObservers()
     application.beginReceivingRemoteControlEvents()
+    WebLoginCookies.restore()
     window = UIWindow(frame: UIScreen.main.bounds)
     window?.rootViewController = MainTabController()
     window?.makeKeyAndVisible()
@@ -431,14 +432,119 @@ final class NetworkQuality {
 // the user hit). Run it proactively so native playback uses the latest session.
 enum WebLoginCookies {
   private static let domains = ["nicovideo.jp", "kick.com", "twitch.tv", "twitcasting.tv", "youtube.com", "google.com"]
+  private static let snapshotKey = "web.login.cookies.snapshot.v1"
 
   static func sync(_ completion: (() -> Void)? = nil) {
     let store = WKWebsiteDataStore.default().httpCookieStore
     store.getAllCookies { cookies in
-      for cookie in cookies where domains.contains(where: { cookie.domain.contains($0) }) {
+      let loginCookies = cookies.filter { cookie in
+        domains.contains(where: { cookie.domain.contains($0) })
+      }
+      for cookie in loginCookies {
         HTTPCookieStorage.shared.setCookie(cookie)
       }
+      saveSnapshot(loginCookies)
       DispatchQueue.main.async { completion?() }
+    }
+  }
+
+  static func restore(_ completion: (() -> Void)? = nil) {
+    let cookies = loadSnapshot()
+    guard !cookies.isEmpty else {
+      DispatchQueue.main.async { completion?() }
+      return
+    }
+    let store = WKWebsiteDataStore.default().httpCookieStore
+    let group = DispatchGroup()
+    for cookie in cookies {
+      HTTPCookieStorage.shared.setCookie(cookie)
+      group.enter()
+      store.setCookie(cookie) {
+        group.leave()
+      }
+    }
+    group.notify(queue: .main) {
+      completion?()
+    }
+  }
+
+  static func clearAll(completion: @escaping () -> Void) {
+    UserDefaults.standard.removeObject(forKey: snapshotKey)
+    if let cookies = HTTPCookieStorage.shared.cookies {
+      cookies
+        .filter { cookie in domains.contains(where: { cookie.domain.contains($0) }) }
+        .forEach { HTTPCookieStorage.shared.deleteCookie($0) }
+    }
+    let store = WKWebsiteDataStore.default()
+    store.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
+      let targets = records.filter { record in
+        let name = record.displayName.lowercased()
+        return domains.contains(where: { domain in
+          let bare = domain
+            .replacingOccurrences(of: ".jp", with: "")
+            .replacingOccurrences(of: ".com", with: "")
+          return name.contains(domain) || name.contains(bare)
+        })
+      }
+      store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: targets) {
+        DispatchQueue.main.async { completion() }
+      }
+    }
+  }
+
+  static func hasCookie(named name: String, domainContains domain: String) -> Bool {
+    if HTTPCookieStorage.shared.cookies?.contains(where: {
+      $0.name == name && !$0.value.isEmpty && $0.domain.contains(domain)
+    }) == true {
+      return true
+    }
+    return loadSnapshot().contains {
+      $0.name == name && !$0.value.isEmpty && $0.domain.contains(domain)
+    }
+  }
+
+  private static func saveSnapshot(_ cookies: [HTTPCookie]) {
+    guard !cookies.isEmpty else { return }
+    let merged = (loadSnapshot() + cookies).reduce(into: [String: HTTPCookie]()) { result, cookie in
+      let key = "\(cookie.domain)|\(cookie.path)|\(cookie.name)"
+      result[key] = cookie
+    }.values
+    let rows = merged.compactMap { cookie -> [String: Any]? in
+      var row: [String: Any] = [
+        "name": cookie.name,
+        "value": cookie.value,
+        "domain": cookie.domain,
+        "path": cookie.path,
+        "secure": cookie.isSecure
+      ]
+      if let expires = cookie.expiresDate {
+        row["expires"] = expires.timeIntervalSince1970
+      }
+      return row
+    }
+    UserDefaults.standard.set(rows, forKey: snapshotKey)
+  }
+
+  private static func loadSnapshot() -> [HTTPCookie] {
+    guard let rows = UserDefaults.standard.array(forKey: snapshotKey) as? [[String: Any]] else { return [] }
+    return rows.compactMap { row in
+      guard let name = row["name"] as? String,
+            let value = row["value"] as? String,
+            let domain = row["domain"] as? String,
+            let path = row["path"] as? String else { return nil }
+      var props: [HTTPCookiePropertyKey: Any] = [
+        .name: name,
+        .value: value,
+        .domain: domain,
+        .path: path
+      ]
+      if let secure = row["secure"] as? Bool, secure {
+        props[.secure] = "TRUE"
+      }
+      if let expires = row["expires"] as? TimeInterval {
+        props[.expires] = Date(timeIntervalSince1970: expires)
+      }
+      return HTTPCookie(properties: props)
     }
   }
 }
@@ -459,7 +565,9 @@ final class NiconicoWarmup: NSObject, WKNavigationDelegate {
       return
     }
     if !forceReload, let last = lastFinished[programId], Date().timeIntervalSince(last) < 30 {
-      WebLoginCookies.sync(completion)
+      WebLoginCookies.restore {
+        WebLoginCookies.sync(completion)
+      }
       return
     }
     if let completion {
@@ -467,7 +575,9 @@ final class NiconicoWarmup: NSObject, WKNavigationDelegate {
     }
     if let existing = webViews[programId] {
       reloadCounts[programId] = 0
-      existing.load(URLRequest(url: url))
+      WebLoginCookies.restore {
+        existing.load(URLRequest(url: url))
+      }
       DispatchQueue.main.asyncAfter(deadline: .now() + 7) { [weak self] in
         self?.complete(programId: programId)
       }
@@ -494,7 +604,9 @@ final class NiconicoWarmup: NSObject, WKNavigationDelegate {
       web.frame = CGRect(x: 0, y: window.bounds.maxY - 1, width: 1, height: 1)
       window.addSubview(web)
     }
-    web.load(URLRequest(url: url))
+    WebLoginCookies.restore {
+      web.load(URLRequest(url: url))
+    }
     DispatchQueue.main.asyncAfter(deadline: .now() + 7) { [weak self] in
       self?.complete(programId: programId)
     }
@@ -506,7 +618,9 @@ final class NiconicoWarmup: NSObject, WKNavigationDelegate {
     guard count > 0 else {
       reloadCounts[programId] = count + 1
       WebLoginCookies.sync {
-        webView.reload()
+        WebLoginCookies.restore {
+          webView.reload()
+        }
       }
       DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
         self?.complete(programId: programId)
@@ -2310,10 +2424,13 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     watchPageURL = url
     isLoading = true
     showStatus(loadAttempts == 0 ? "ニコ生セッションを準備中" : "ニコ生再試行中… (\(loadAttempts))")
-    NiconicoWarmup.shared.prewarm(programId: programId, forceReload: loadAttempts > 0) { [weak self] in
+    WebLoginCookies.restore { [weak self] in
       guard let self, !self.isStopped else { return }
-      self.syncNiconicoWebCookies { [weak self] in
-        self?.fetchWatchPage(url: url)
+      NiconicoWarmup.shared.prewarm(programId: programId, forceReload: self.loadAttempts > 0) { [weak self] in
+        guard let self, !self.isStopped else { return }
+        self.syncNiconicoWebCookies { [weak self] in
+          self?.fetchWatchPage(url: url)
+        }
       }
     }
   }
@@ -2337,10 +2454,13 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     socketTask = nil
     isLoading = false
     let delay = Double(loadAttempts)
-    NiconicoWarmup.shared.prewarm(programId: channel, forceReload: true) { [weak self] in
+    WebLoginCookies.restore { [weak self] in
       guard let self, !self.isStopped else { return }
-      DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-        self.load(channel: self.channel)
+      NiconicoWarmup.shared.prewarm(programId: self.channel, forceReload: true) { [weak self] in
+        guard let self, !self.isStopped else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+          self.load(channel: self.channel)
+        }
       }
     }
   }
@@ -2439,7 +2559,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       case .failure(let error):
         self.socketTask = nil
         if self.player.currentItem == nil {
-          self.installFallback("ニコ生WebSocket切断: \(error.localizedDescription)")
+          self.retryOrFallback("ニコ生WebSocket切断: \(error.localizedDescription)")
           return
         }
         self.showStatus("ニコ生WebSocket再接続中: \(error.localizedDescription)")
@@ -2485,12 +2605,15 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     if type == "error",
        let payload = json["data"] as? [String: Any],
        let code = payload["code"] as? String {
-      showStatus("ニコ生エラー: \(code)")
       let lower = code.lowercased()
       if lower.contains("permission") || lower.contains("resource") || lower.contains("auth") || lower.contains("login") || lower.contains("denied") {
         // Usually a just-completed web login whose cookies have not reached the
         // native jar yet — re-sync and retry the whole load before falling back.
         retryOrFallback("ニコ生エラー: \(code)")
+      } else if player.currentItem == nil {
+        retryOrFallback("ニコ生エラー: \(code)")
+      } else {
+        showStatus("ニコ生エラー: \(code)")
       }
     }
     if type == "disconnect" {
@@ -4400,9 +4523,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
-// Per-cell YouTube playback uses the official IFrame Player API with controls
-// disabled. It keeps the surface to the video frame and lets our own overlays own
-// focus, volume and comments.
+// Per-cell YouTube playback prefers native AVPlayer URLs. The official iframe is
+// only a muted visual fallback so it cannot compete with Kick/Twitch/native audio.
 final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, WKNavigationDelegate {
   private let stream: StreamItem
   private let settings: AppSettings
@@ -4490,7 +4612,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
     applyVolume()
-    fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(Int(playbackVolume * 100)));")
+    // YouTube fallback is iframe-based; keep it muted so audio output never fights
+    // the same AVAudioSession used by Kick/Twitch/native YouTube playback.
+    fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(0);")
   }
 
   private func applyVolume() {
@@ -4609,30 +4733,123 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     extractorWebView = nil
   }
 
-  // Only muxed (audio+video) progressive formats are usable by AVPlayer; pick <=720p.
+  // Only muxed (audio+video) progressive formats match the Kick/Twitch audio path:
+  // AVPlayer owns playback and the iframe never owns audio.
   private static func bestFormatURL(_ formats: [[String: Any]]) -> URL? {
-    let candidates: [(Int, URL)] = formats.compactMap { fmt in
+    let candidates: [(Int, Int, URL)] = formats.compactMap { fmt in
       guard let urlString = fmt["url"] as? String, let url = URL(string: urlString) else { return nil }
       let height = (fmt["height"] as? Int) ?? 0
-      return (height, url)
+      let bitrate = (fmt["bitrate"] as? Int) ?? 0
+      let mime = (fmt["mimeType"] as? String) ?? ""
+      let hasAudio = !mime.contains("video/") || mime.contains("mp4a") || (fmt["hasAudio"] as? Bool) == true
+      guard mime.contains("video/"), hasAudio else { return nil }
+      return (height, bitrate, url)
     }
     guard !candidates.isEmpty else { return nil }
-    let sorted = candidates.sorted { $0.0 < $1.0 }
-    return (sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.1
+    let sorted = candidates.sorted {
+      if $0.0 == $1.0 { return $0.1 < $1.1 }
+      return $0.0 < $1.0
+    }
+    return (sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.2
   }
 
   private static let extractionJS = """
   (function(){
     try {
-      var r = window.ytInitialPlayerResponse;
-      if ((!r || !r.streamingData) && window.ytplayer && ytplayer.config && ytplayer.config.args && ytplayer.config.args.player_response) {
-        r = JSON.parse(ytplayer.config.args.player_response);
+      function parseMaybe(value) {
+        if (!value) return null;
+        if (typeof value === 'string') { try { return JSON.parse(value); } catch(e) { return null; } }
+        return value;
       }
-      if (!r || !r.streamingData) return null;
-      var sd = r.streamingData, vd = r.videoDetails || {};
-      var out = { isLive: !!vd.isLive, hls: sd.hlsManifestUrl || null, formats: [] };
-      (sd.formats || []).forEach(function(f){ if (f.url) out.formats.push({ url: f.url, height: f.height || 0 }); });
-      return JSON.stringify(out);
+      function ytcfgValue(key) {
+        try { if (window.ytcfg && ytcfg.get) return ytcfg.get(key); } catch(e) {}
+        return null;
+      }
+      function scriptPlayerResponse() {
+        var scripts = Array.prototype.slice.call(document.scripts || []);
+        for (var i = 0; i < scripts.length; i++) {
+          var text = scripts[i].textContent || '';
+          var key = 'ytInitialPlayerResponse';
+          var pos = text.indexOf(key);
+          if (pos < 0) continue;
+          var start = text.indexOf('{', pos);
+          if (start < 0) continue;
+          var depth = 0, inString = false, quote = '', escape = false;
+          for (var j = start; j < text.length; j++) {
+            var ch = text[j];
+            if (inString) {
+              if (escape) { escape = false; continue; }
+              if (ch === '\\\\') { escape = true; continue; }
+              if (ch === quote) { inString = false; quote = ''; }
+              continue;
+            }
+            if (ch === '"' || ch === "'") { inString = true; quote = ch; continue; }
+            if (ch === '{') depth++;
+            if (ch === '}') {
+              depth--;
+              if (depth === 0) return parseMaybe(text.slice(start, j + 1));
+            }
+          }
+        }
+        return null;
+      }
+      function candidatesFromResponse(r) {
+        r = parseMaybe(r);
+        if (!r || !r.streamingData) return null;
+        var sd = r.streamingData, vd = r.videoDetails || {};
+        var out = { isLive: !!(vd.isLive || vd.isLiveContent), hls: sd.hlsManifestUrl || null, formats: [] };
+        function add(f, adaptive) {
+          if (!f || !f.url) return;
+          out.formats.push({
+            url: f.url,
+            height: f.height || 0,
+            bitrate: f.bitrate || 0,
+            mimeType: f.mimeType || '',
+            hasAudio: !adaptive || !!f.audioQuality || !!f.audioSampleRate
+          });
+        }
+        (sd.formats || []).forEach(function(f){ add(f, false); });
+        (sd.adaptiveFormats || []).forEach(function(f){ add(f, true); });
+        return out;
+      }
+      var responses = [
+        window.ytInitialPlayerResponse,
+        ytcfgValue('PLAYER_RESPONSE'),
+        window.ytplayer && ytplayer.config && ytplayer.config.args && ytplayer.config.args.player_response,
+        scriptPlayerResponse()
+      ];
+      for (var i = 0; i < responses.length; i++) {
+        var out = candidatesFromResponse(responses[i]);
+        if (out && (out.hls || out.formats.length)) return JSON.stringify(out);
+      }
+      var apiKey = ytcfgValue('INNERTUBE_API_KEY');
+      var context = ytcfgValue('INNERTUBE_CONTEXT') || {
+        client: {
+          clientName: 'MWEB',
+          clientVersion: ytcfgValue('INNERTUBE_CLIENT_VERSION') || '2.20240501.01.00',
+          hl: 'ja',
+          gl: 'JP'
+        }
+      };
+      var videoId = (window.location.search.match(/[?&]v=([^&]+)/) || [])[1];
+      if (!apiKey || !videoId || !window.fetch) return null;
+      return fetch('/youtubei/v1/player?key=' + encodeURIComponent(apiKey), {
+        method: 'POST',
+        credentials: 'include',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          context: context,
+          videoId: videoId,
+          contentCheckOk: true,
+          racyCheckOk: true,
+          playbackContext: {contentPlaybackContext: {html5Preference: 'HTML5_PREF_WANTS'}}
+        })
+      }).then(function(r){ return r.json(); })
+        .then(function(json){
+          var out = candidatesFromResponse(json);
+          return out ? JSON.stringify(out) : null;
+        })
+        .catch(function(){ return null; });
     } catch (e) { return null; }
   })();
   """
@@ -4690,7 +4907,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     fallbackWebView = web
     // A real HTTPS base URL on our own domain gives the embed a valid origin/Referer
     // (loadHTMLString with youtube.com or nil triggers YouTube error 152).
-    web.loadHTMLString(Self.embedHTML(videoId: videoId, playAudio: settings.playAudio, volume: playbackVolume), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
+    web.loadHTMLString(Self.embedHTML(videoId: videoId), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
   }
 
   // MARK: - SponsorBlock (VOD)
@@ -4799,9 +5016,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   // Fallback embed (only used when stream extraction fails). No forced-play loop —
   // that was making every YouTube cell fight for the audio session and stall. Includes
   // a lightweight SponsorBlock skipper (no-op for live, which has no segments).
-  private static func embedHTML(videoId: String, playAudio: Bool, volume: Float) -> String {
-    let initialVolume = Int(min(1, max(0, volume)) * 100)
-    let muted = playAudio && initialVolume > 0 ? "false" : "true"
+  private static func embedHTML(videoId: String) -> String {
     let sbCategories = "%5B%22sponsor%22%2C%22selfpromo%22%2C%22interaction%22%2C%22intro%22%2C%22outro%22%2C%22preview%22%2C%22music_offtopic%22%5D"
     return """
     <!doctype html>
@@ -4812,12 +5027,12 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     <div id="player"></div>
     <script src="https://www.youtube.com/iframe_api"></script>
     <script>
-      var player=null, ready=false, muted=\(muted), volume=\(initialVolume), sb=[];
+      var player=null, ready=false, muted=true, volume=0, sb=[];
       function applyAudio(){
         if(!player||!ready)return;
         try{
-          player.setVolume(volume);
-          if(muted||volume<=0){player.mute();}else{player.unMute();}
+          player.setVolume(0);
+          player.mute();
         }catch(e){}
       }
       function play(){
@@ -4846,9 +5061,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           events:{onReady:function(){ready=true;play();loadSB();}}
         });
       };
-      window.mvPlay=function(){muted=\(muted);play();};
+      window.mvPlay=function(){muted=true;volume=0;play();};
       window.mvPause=function(){try{player&&player.pauseVideo();}catch(e){}};
-      window.mvSetVolume=function(v){volume=Math.max(0,Math.min(100,v|0));muted=(volume<=0)||\(!playAudio ? "true" : "false");applyAudio();};
+      window.mvSetVolume=function(v){muted=true;volume=0;applyAudio();};
       setInterval(sbTick, 400);
     </script>
     </body>
@@ -6262,7 +6477,10 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
   private func loadSelected() {
     guard activeSources.indices.contains(segmented.selectedSegmentIndex) else { return }
-    web.load(URLRequest(url: activeSources[segmented.selectedSegmentIndex].1.url))
+    let request = URLRequest(url: activeSources[segmented.selectedSegmentIndex].1.url)
+    WebLoginCookies.restore { [weak self] in
+      self?.web.load(request)
+    }
   }
 
   private func installStreamURLBridge() {
@@ -6326,6 +6544,10 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
       return
     }
     decisionHandler(.allow)
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    WebLoginCookies.sync()
   }
 
   func webView(
@@ -6426,10 +6648,15 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
 // The user_session cookie persists in WKWebsiteDataStore + HTTPCookieStorage and is
 // reused by the native player/comment/post code.
 enum NiconicoSession {
+  private static let snapshotKey = "web.login.cookies.snapshot.v1"
+
   static var isLoggedIn: Bool {
     guard let url = URL(string: "https://live.nicovideo.jp/"),
-          let cookies = HTTPCookieStorage.shared.cookies(for: url) else { return false }
+          let cookies = HTTPCookieStorage.shared.cookies(for: url) else {
+      return WebLoginCookies.hasCookie(named: "user_session", domainContains: "nicovideo.jp")
+    }
     return cookies.contains { $0.name == "user_session" && !$0.value.isEmpty }
+      || WebLoginCookies.hasCookie(named: "user_session", domainContains: "nicovideo.jp")
   }
 
   static func logout(completion: @escaping () -> Void) {
@@ -6441,9 +6668,31 @@ enum NiconicoSession {
     store.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
       let nico = records.filter { $0.displayName.contains("nicovideo") || $0.displayName.contains("nimg") }
       store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: nico) {
+        removeSnapshotCookies(matching: { $0.domain.contains("nicovideo.jp") || $0.domain.contains("nimg.jp") })
         DispatchQueue.main.async { completion() }
       }
     }
+  }
+
+  private static func removeSnapshotCookies(matching shouldRemove: (HTTPCookie) -> Bool) {
+    guard let rows = UserDefaults.standard.array(forKey: snapshotKey) as? [[String: Any]] else { return }
+    let kept = rows.filter { row in
+      guard let name = row["name"] as? String,
+            let value = row["value"] as? String,
+            let domain = row["domain"] as? String,
+            let path = row["path"] as? String else { return true }
+      var props: [HTTPCookiePropertyKey: Any] = [
+        .name: name,
+        .value: value,
+        .domain: domain,
+        .path: path
+      ]
+      if let cookie = HTTPCookie(properties: props) {
+        return !shouldRemove(cookie)
+      }
+      return true
+    }
+    UserDefaults.standard.set(kept, forKey: snapshotKey)
   }
 }
 
@@ -6496,6 +6745,8 @@ final class SettingsController: UITableViewController {
     tableView.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
     tableView.isEditing = true
     tableView.allowsSelectionDuringEditing = true
+    tableView.estimatedSectionFooterHeight = 72
+    tableView.sectionFooterHeight = UITableView.automaticDimension
   }
 
   func reload() {
@@ -6507,7 +6758,7 @@ final class SettingsController: UITableViewController {
   // setup is its own clearly-labelled section (the old layout mixed playback with
   // danmaku and scattered OAuth across confusing rows).
   private enum Sec: Int, CaseIterable {
-    case playback, danmaku, comments, order, kick, twitch, twitcasting, youtube, niconico, add
+    case playback, danmaku, comments, order, kick, twitch, twitcasting, youtube, niconico, webData, add
   }
 
   private func switchControl(isOn: Bool, onChange: @escaping (Bool) -> Void) -> UISwitch {
@@ -6540,6 +6791,7 @@ final class SettingsController: UITableViewController {
     case .twitcasting: return 3
     case .youtube: return 3
     case .niconico: return 2
+    case .webData: return 1
     case .add: return 1
     }
   }
@@ -6556,11 +6808,16 @@ final class SettingsController: UITableViewController {
     case .twitcasting: return "ツイキャス 連携"
     case .youtube: return "YouTube 連携"
     case .niconico: return "ニコ生 連携"
+    case .webData: return "ログイン情報"
     case .add: return "追加"
     }
   }
 
   override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
+    nil
+  }
+
+  private func footerText(for section: Int) -> String? {
     guard let sec = Sec(rawValue: section) else { return nil }
     switch sec {
     case .order:
@@ -6575,6 +6832,8 @@ final class SettingsController: UITableViewController {
       return "Google Cloud Console の iOS OAuth Client ID を設定し、youtube.force-ssl スコープでライブチャット投稿に使います(行をタップでRedirectURIをコピー)。"
     case .niconico:
       return "ニコ生は公式の外部連携(OAuth)が無いため、Webでログインします。ログイン状態はアプリ内のCookieに保持され、視聴・コメント投稿・コメント受信に使われます。"
+    case .webData:
+      return "フォロー・ランキング・視聴タブで使うWebログインCookieと閲覧データを削除します。OAuthトークンとClient ID設定は残ります。"
     case .add:
       let info = Bundle.main.infoDictionary
       let version = (info?["CFBundleShortVersionString"] as? String) ?? "?"
@@ -6583,6 +6842,30 @@ final class SettingsController: UITableViewController {
     default:
       return nil
     }
+  }
+
+  override func tableView(_ tableView: UITableView, viewForFooterInSection section: Int) -> UIView? {
+    guard let text = footerText(for: section) else { return nil }
+    let container = UIView()
+    let label = UILabel()
+    label.text = text
+    label.textColor = UIColor.white.withAlphaComponent(0.56)
+    label.font = .systemFont(ofSize: 12)
+    label.numberOfLines = 0
+    label.lineBreakMode = .byWordWrapping
+    label.translatesAutoresizingMaskIntoConstraints = false
+    container.addSubview(label)
+    NSLayoutConstraint.activate([
+      label.topAnchor.constraint(equalTo: container.topAnchor, constant: 6),
+      label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
+      label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -20),
+      label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12)
+    ])
+    return container
+  }
+
+  override func tableView(_ tableView: UITableView, heightForFooterInSection section: Int) -> CGFloat {
+    footerText(for: section) == nil ? CGFloat.leastNormalMagnitude : UITableView.automaticDimension
   }
 
   override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
@@ -6595,6 +6878,8 @@ final class SettingsController: UITableViewController {
     cell.editingAccessoryView = nil
     cell.editingAccessoryType = .none
     cell.showsReorderControl = false
+    cell.textLabel?.numberOfLines = 0
+    cell.textLabel?.lineBreakMode = .byWordWrapping
 
     guard let sec = Sec(rawValue: indexPath.section) else { return cell }
     switch sec {
@@ -6682,6 +6967,11 @@ final class SettingsController: UITableViewController {
       }
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
+    case .webData:
+      cell.textLabel?.text = "Webログイン情報と履歴を削除"
+      cell.textLabel?.textColor = .systemRed
+      cell.accessoryType = .disclosureIndicator
+      cell.selectionStyle = .default
     case .add:
       cell.textLabel?.text = "配信を手動追加"
       cell.accessoryType = .disclosureIndicator
@@ -6739,6 +7029,8 @@ final class SettingsController: UITableViewController {
       handleYouTubeOAuthRow(indexPath.row)
     case .niconico:
       handleNiconicoRow(indexPath.row)
+    case .webData:
+      confirmClearWebData()
     case .add:
       present(AddStreamController(), animated: true)
     default:
@@ -7090,6 +7382,21 @@ final class SettingsController: UITableViewController {
     alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
     alert.addAction(UIAlertAction(title: "ログアウト", style: .destructive) { [weak self] _ in
       NiconicoSession.logout { self?.tableView.reloadData() }
+    })
+    present(alert, animated: true)
+  }
+
+  private func confirmClearWebData() {
+    let alert = UIAlertController(
+      title: "Webログイン情報と履歴を削除",
+      message: "Kick、ニコ生、YouTube、Twitch、ツイキャスのWebView Cookie・閲覧データを削除します。OAuth連携のログイン状態は残します。",
+      preferredStyle: .alert
+    )
+    alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
+    alert.addAction(UIAlertAction(title: "削除", style: .destructive) { [weak self] _ in
+      WebLoginCookies.clearAll {
+        self?.tableView.reloadData()
+      }
     })
     present(alert, animated: true)
   }
