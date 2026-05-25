@@ -256,6 +256,10 @@
     setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, dur + 200);
   };
   var danmaku = new Danmaku(danmakuEl);
+  window.MultiViewEmitComment = function (message, user) {
+    if (!message) return;
+    danmaku.emit(esc(String(message)), '', String(message), user || '');
+  };
 
   // ---- Twitch chat ----
   function parseTags(raw) { var t = {}; raw.split(';').forEach(function (kv) { var i = kv.indexOf('='); if (i > -1) t[kv.slice(0, i)] = kv.slice(i + 1); }); return t; }
@@ -310,35 +314,10 @@
     open();
   }
 
-  // ---- TwitCasting chat ----
-  function connectTwitcasting() {
-    fetch(viaProxy('https://frontendapi.twitcasting.tv/users/' + encodeURIComponent(channel) + '/latest-movie'))
-      .then(function (r) { return r.json(); })
-      .then(function (d) {
-        var mid = d && d.movie && d.movie.id; if (!mid) { showMsg('ツイキャス: 配信が見つかりません'); return; }
-        var b = new URLSearchParams(); b.set('movie_id', mid);
-        return fetch(viaProxy('https://twitcasting.tv/eventpubsuburl.php'), { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: b.toString() });
-      })
-      .then(function (r) { return r ? r.json() : null; })
-      .then(function (d) { var u = d && d.url; if (!u) { showMsg('ツイキャス: 接続URL取得失敗'); return; } subTwitcasting(u); })
-      .catch(function () { showMsg('ツイキャス: コメント取得に失敗 (プロキシ設定が必要かも)'); });
-  }
-  function subTwitcasting(wss) {
-    var ws = new WebSocket(wss);
-    ws.onmessage = function (e) {
-      var arr; try { arr = JSON.parse(e.data); } catch (x) { return; }
-      if (!Array.isArray(arr)) return;
-      arr.forEach(function (it) { if (it && it.type === 'comment' && it.message) danmaku.emit(esc(it.message), '', it.message, (it.author && it.author.name) || ''); });
-    };
-    ws.onclose = function () { setTimeout(connectTwitcasting, 5000); };
-    ws.onerror = function () { try { ws.close(); } catch (x) {} };
-  }
-
   mountPlayer();
   if (chatOn) {
     if (platform === 'twitch') connectTwitch();
     else if (platform === 'kick') connectKick();
-    else if (platform === 'twitcasting') connectTwitcasting();
   }
 })();
 </script>

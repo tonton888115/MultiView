@@ -429,14 +429,141 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
   }
 }
 
-final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+// Non-official TwitCasting comment stream. Runs natively (no WebView CORS) and
+// pushes comments into the hosted player's danmaku via MultiViewEmitComment.
+final class TwitcastingChatClient {
+  private let channel: String
+  private let onComment: (String, String) -> Void
+  private var socket: URLSessionWebSocketTask?
+  private var stopped = false
+  private var retryWork: DispatchWorkItem?
+
+  init(channel: String, onComment: @escaping (String, String) -> Void) {
+    self.channel = channel.trimmingCharacters(in: .whitespacesAndNewlines)
+    self.onComment = onComment
+    start()
+  }
+
+  func stop() {
+    stopped = true
+    retryWork?.cancel()
+    retryWork = nil
+    socket?.cancel(with: .goingAway, reason: nil)
+    socket = nil
+  }
+
+  private func scheduleRetry() {
+    guard !stopped else { return }
+    let work = DispatchWorkItem { [weak self] in self?.start() }
+    retryWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
+  }
+
+  private func start() {
+    guard !stopped, !channel.isEmpty else { return }
+    guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+          let url = URL(string: "https://frontendapi.twitcasting.tv/users/\(encoded)/latest-movie") else { return }
+    var request = URLRequest(url: url)
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+      guard let data,
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let movie = json["movie"] as? [String: Any],
+            let movieId = Self.stringValue(movie["id"]) else {
+        DispatchQueue.main.async { self?.scheduleRetry() }
+        return
+      }
+      DispatchQueue.main.async { self?.fetchSubscribeURL(movieId: movieId) }
+    }.resume()
+  }
+
+  private func fetchSubscribeURL(movieId: String) {
+    guard !stopped, let url = URL(string: "https://twitcasting.tv/eventpubsuburl.php") else { return }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    let encodedId = movieId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? movieId
+    request.httpBody = "movie_id=\(encodedId)".data(using: .utf8)
+    URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+      guard let data,
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let urlString = json["url"] as? String,
+            let wsURL = URL(string: urlString) else {
+        DispatchQueue.main.async { self?.scheduleRetry() }
+        return
+      }
+      DispatchQueue.main.async { self?.connect(wsURL: wsURL) }
+    }.resume()
+  }
+
+  private func connect(wsURL: URL) {
+    guard !stopped else { return }
+    let task = URLSession.shared.webSocketTask(with: wsURL)
+    socket = task
+    task.resume()
+    receive()
+  }
+
+  private func receive() {
+    socket?.receive { [weak self] result in
+      guard let self else { return }
+      switch result {
+      case .success(let message):
+        switch message {
+        case .string(let text):
+          self.handle(text)
+        case .data(let data):
+          if let text = String(data: data, encoding: .utf8) { self.handle(text) }
+        @unknown default:
+          break
+        }
+        DispatchQueue.main.async { [weak self] in
+          guard let self, !self.stopped else { return }
+          self.receive()
+        }
+      case .failure:
+        DispatchQueue.main.async { [weak self] in
+          guard let self else { return }
+          self.socket = nil
+          self.scheduleRetry()
+        }
+      }
+    }
+  }
+
+  private func handle(_ text: String) {
+    guard let data = text.data(using: .utf8),
+          let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return }
+    for item in arr {
+      guard (item["type"] as? String) == "comment",
+            let message = item["message"] as? String, !message.isEmpty else { continue }
+      let author = (item["author"] as? [String: Any])?["name"] as? String ?? ""
+      onComment(message, author)
+    }
+  }
+
+  private static func stringValue(_ value: Any?) -> String? {
+    if let s = value as? String { return s }
+    if let i = value as? Int { return String(i) }
+    if let n = value as? NSNumber { return n.stringValue }
+    return nil
+  }
+}
+
+final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, AudioControllable, WKNavigationDelegate {
   private let playAudio: Bool
   private var playbackVolume: Float
   private var isStopped = false
+  private let stream: StreamItem
+  private let showChat: Bool
+  private var twitcastingChat: TwitcastingChatClient?
+  private var twitcastingStarted = false
 
   init(stream: StreamItem, settings: AppSettings) {
     playAudio = settings.playAudio
     playbackVolume = StreamVolumeStore.volume(for: stream)
+    self.stream = stream
+    self.showChat = settings.showChat
     let config = WKWebViewConfiguration()
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
@@ -449,6 +576,7 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
     backgroundColor = .black
     scrollView.backgroundColor = .black
     scrollView.contentInsetAdjustmentBehavior = .never
+    navigationDelegate = self
     PlaybackCoordinator.shared.register(self)
     load(stream: stream, settings: settings)
   }
@@ -513,6 +641,8 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
 
   func stopPlayback() {
     isStopped = true
+    twitcastingChat?.stop()
+    twitcastingChat = nil
     stopLoading()
     evaluateJavaScript("""
     document.querySelectorAll('video,audio').forEach(function(media){
@@ -523,6 +653,35 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
     });
     """)
     loadHTMLString("", baseURL: nil)
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    startTwitcastingChatIfNeeded()
+  }
+
+  private func startTwitcastingChatIfNeeded() {
+    guard stream.platform == .twitcasting, showChat, !twitcastingStarted else { return }
+    twitcastingStarted = true
+    twitcastingChat = TwitcastingChatClient(channel: stream.channel) { [weak self] message, user in
+      self?.emitComment(message, user)
+    }
+  }
+
+  private func emitComment(_ message: String, _ user: String) {
+    let js = "window.MultiViewEmitComment && window.MultiViewEmitComment('\(Self.jsEscape(message))', '\(Self.jsEscape(user))');"
+    DispatchQueue.main.async { [weak self] in
+      self?.evaluateJavaScript(js)
+    }
+  }
+
+  private static func jsEscape(_ text: String) -> String {
+    text
+      .replacingOccurrences(of: "\\", with: "\\\\")
+      .replacingOccurrences(of: "'", with: "\\'")
+      .replacingOccurrences(of: "\n", with: " ")
+      .replacingOccurrences(of: "\r", with: " ")
+      .replacingOccurrences(of: "\u{2028}", with: " ")
+      .replacingOccurrences(of: "\u{2029}", with: " ")
   }
 
   private static let niconicoPopupBlockerScript = """
@@ -808,7 +967,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
        let payload = json["data"] as? [String: Any],
        let uriString = payload["uri"] as? String,
        let uri = URL(string: uriString) {
-      play(hlsURL: uri)
+      let cookies = parseStreamCookies(payload["cookies"], for: uri)
+      applyNiconicoCookies(cookies)
+      play(hlsURL: uri, cookies: cookies)
     }
     if type == "error",
        let payload = json["data"] as? [String: Any],
@@ -839,13 +1000,17 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
   }
 
-  private func play(hlsURL: URL) {
+  private func play(hlsURL: URL, cookies: [HTTPCookie] = []) {
     DispatchQueue.main.async {
       guard !self.isStopped else { return }
       self.statusLabel.isHidden = true
-      let asset = AVURLAsset(url: hlsURL, options: [
+      var assetOptions: [String: Any] = [
         "AVURLAssetHTTPHeaderFieldsKey": self.niconicoPlaybackHeaders()
-      ])
+      ]
+      if !cookies.isEmpty {
+        assetOptions[AVURLAssetHTTPCookiesKey] = cookies
+      }
+      let asset = AVURLAsset(url: hlsURL, options: assetOptions)
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
@@ -885,6 +1050,39 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       headers["Cookie"] = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
     }
     return headers
+  }
+
+  private func parseStreamCookies(_ raw: Any?, for url: URL) -> [HTTPCookie] {
+    guard let array = raw as? [[String: Any]] else { return [] }
+    return array.compactMap { dict -> HTTPCookie? in
+      guard let name = dict["name"] as? String,
+            let value = dict["value"] as? String else { return nil }
+      var props: [HTTPCookiePropertyKey: Any] = [
+        .name: name,
+        .value: value,
+        .path: (dict["path"] as? String) ?? "/"
+      ]
+      if let domain = dict["domain"] as? String, !domain.isEmpty {
+        props[.domain] = domain
+      } else if let host = url.host {
+        props[.domain] = host
+      }
+      if let secure = dict["secure"] as? Bool, secure {
+        props[.secure] = "TRUE"
+      }
+      if let expire = dict["expireTime"] as? Double {
+        props[.expires] = Date(timeIntervalSince1970: expire)
+      } else if let maxAgeString = dict["maxAge"] as? String, let maxAge = Double(maxAgeString) {
+        props[.expires] = Date(timeIntervalSinceNow: maxAge)
+      } else if let maxAge = dict["maxAge"] as? Double {
+        props[.expires] = Date(timeIntervalSinceNow: maxAge)
+      }
+      return HTTPCookie(properties: props)
+    }
+  }
+
+  private func applyNiconicoCookies(_ cookies: [HTTPCookie]) {
+    cookies.forEach { HTTPCookieStorage.shared.setCookie($0) }
   }
 
   private func installFallback(_ reason: String) {
@@ -2179,6 +2377,13 @@ final class VolumeOverlay: UIVisualEffectView {
       StreamVolumeStore.setVolume(slider.value, for: stream)
       onChange(slider.value)
     }, for: .valueChanged)
+    let thumbSize: CGFloat = 15
+    let thumb = UIGraphicsImageRenderer(size: CGSize(width: thumbSize, height: thumbSize)).image { context in
+      UIColor.white.setFill()
+      context.cgContext.fillEllipse(in: CGRect(x: 0, y: 0, width: thumbSize, height: thumbSize))
+    }
+    slider.setThumbImage(thumb, for: .normal)
+    slider.setThumbImage(thumb, for: .highlighted)
     slider.transform = CGAffineTransform(rotationAngle: -.pi / 2)
     slider.translatesAutoresizingMaskIntoConstraints = false
     contentView.addSubview(slider)
@@ -2190,8 +2395,8 @@ final class VolumeOverlay: UIVisualEffectView {
       icon.heightAnchor.constraint(equalToConstant: 18),
       slider.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
       slider.centerYAnchor.constraint(equalTo: contentView.centerYAnchor, constant: -8),
-      slider.widthAnchor.constraint(equalTo: contentView.heightAnchor, constant: -58),
-      slider.heightAnchor.constraint(equalToConstant: 30)
+      slider.widthAnchor.constraint(equalTo: contentView.heightAnchor, constant: -34),
+      slider.heightAnchor.constraint(equalToConstant: 24)
     ])
   }
 
