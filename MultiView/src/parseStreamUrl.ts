@@ -28,6 +28,9 @@ export function parseStreamUrl(raw: string): ParsedStream | null {
     if ((parts[0] === 'live' || parts[0] === 'embed' || parts[0] === 'shorts') && parts[1]) {
       return { platform: 'youtube', channel: parts[1] };
     }
+    if (parts[0]?.startsWith('@') || ['channel', 'c', 'user'].includes(parts[0])) {
+      return { platform: 'youtube', channel: parts.join('/') };
+    }
     return null;
   }
   if (host === 'youtu.be' && parts[0]) {

@@ -6,9 +6,25 @@ import UIKit
 
 struct KickOAuthConfig: Codable {
   var clientId = ""
+  var clientSecret = ""
   // Kick only accepts an https redirect URI, so we register this hosted bridge page
   // which forwards to the app's custom scheme (captured by ASWebAuthenticationSession).
   var redirectURI = "https://tonton888115.github.io/MultiView/kick-oauth.html"
+
+  init() {}
+
+  private enum CodingKeys: String, CodingKey {
+    case clientId
+    case clientSecret
+    case redirectURI
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    clientId = try container.decodeIfPresent(String.self, forKey: .clientId) ?? ""
+    clientSecret = try container.decodeIfPresent(String.self, forKey: .clientSecret) ?? ""
+    redirectURI = try container.decodeIfPresent(String.self, forKey: .redirectURI) ?? KickOAuthConfig().redirectURI
+  }
 }
 
 struct KickOAuthToken: Codable {
@@ -76,6 +92,10 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
     let config = self.config
     guard !config.clientId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
       Self.finish(completion, .failure(KickAuthError.missingClientId))
+      return
+    }
+    guard !config.clientSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      Self.finish(completion, .failure(KickAuthError.missingClientSecret))
       return
     }
     guard URL(string: config.redirectURI) != nil else {
@@ -184,6 +204,7 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
     let body = Self.formBody([
       "grant_type": "authorization_code",
       "client_id": config.clientId,
+      "client_secret": config.clientSecret,
       "redirect_uri": config.redirectURI,
       "code": code,
       "code_verifier": verifier
@@ -203,6 +224,7 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
     let body = Self.formBody([
       "grant_type": "refresh_token",
       "client_id": config.clientId,
+      "client_secret": config.clientSecret,
       "refresh_token": refreshToken
     ])
     tokenRequest(body: body, completion: completion)
@@ -218,10 +240,17 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
         Self.finish(completion, .failure(error))
         return
       }
-      guard let data, let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      guard let data, let http = response as? HTTPURLResponse else {
+        Self.finish(completion, .failure(KickAuthError.oauthRequestFailed("レスポンスを取得できませんでした")))
+        return
+      }
+      guard (200..<300).contains(http.statusCode) else {
+        Self.finish(completion, .failure(KickAuthError.oauthRequestFailed(Self.oauthErrorMessage(status: http.statusCode, data: data))))
+        return
+      }
+      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let accessToken = json["access_token"] as? String else {
-        Self.finish(completion, .failure(KickAuthError.oauthRequestFailed))
+        Self.finish(completion, .failure(KickAuthError.oauthRequestFailed("トークンレスポンスを解析できませんでした")))
         return
       }
       let expiresIn = json["expires_in"] as? Double ?? 3600
@@ -366,17 +395,27 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
     }
     return nil
   }
+
+  private static func oauthErrorMessage(status: Int, data: Data) -> String {
+    let fallback = "HTTP \(status)"
+    guard let body = String(data: data, encoding: .utf8),
+          !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      return fallback
+    }
+    return "\(fallback): \(body)"
+  }
 }
 
 enum KickAuthError: LocalizedError {
   case missingClientId
+  case missingClientSecret
   case invalidRedirectURI
   case invalidAuthorizeURL
   case invalidCallback
   case couldNotStartSession
   case notSignedIn
   case tokenExpired
-  case oauthRequestFailed
+  case oauthRequestFailed(String)
   case invalidChannel
   case channelLookupFailed
   case chatSendFailed
@@ -384,13 +423,14 @@ enum KickAuthError: LocalizedError {
   var errorDescription: String? {
     switch self {
     case .missingClientId: return "Kick Client IDが未設定です"
+    case .missingClientSecret: return "Kick Client Secretが未設定です"
     case .invalidRedirectURI: return "Kick Redirect URIが不正です"
     case .invalidAuthorizeURL: return "Kick認証URLを作成できません"
     case .invalidCallback: return "Kick認証の戻りURLが不正です"
     case .couldNotStartSession: return "Kick認証を開始できません"
     case .notSignedIn: return "Kickにログインしていません"
     case .tokenExpired: return "Kickトークンが期限切れです"
-    case .oauthRequestFailed: return "Kick OAuthトークン取得に失敗しました"
+    case .oauthRequestFailed(let message): return "Kick OAuthトークン取得に失敗しました: \(message)"
     case .invalidChannel: return "Kickチャンネルが不正です"
     case .channelLookupFailed: return "KickチャンネルIDを取得できません"
     case .chatSendFailed: return "Kickコメント送信に失敗しました"

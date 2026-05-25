@@ -291,7 +291,7 @@ enum StreamPlatform: String, CaseIterable, Codable {
 
   var hint: String {
     switch self {
-    case .youtube: return "動画ID"
+    case .youtube: return "動画ID / @handle"
     case .niconico: return "番組ID"
     case .twitcasting: return "ユーザーID"
     default: return "チャンネル名"
@@ -3580,11 +3580,13 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
 // other individual native players (video + audio). It autoplays muted (the only
 // autoplay browsers allow) and then unmutes via the API — which works without a
 // user gesture because the web view disables the user-action playback requirement.
-final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, WKNavigationDelegate {
   private let stream: StreamItem
   private let settings: AppSettings
   private let web: WKWebView
+  private let statusLabel = UILabel()
   private var playbackVolume: Float
+  private var resolveTask: URLSessionDataTask?
   private var isStopped = false
 
   init(stream: StreamItem, settings: AppSettings) {
@@ -3603,13 +3605,27 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     web.scrollView.backgroundColor = .black
     web.scrollView.isScrollEnabled = false
     web.scrollView.contentInsetAdjustmentBehavior = .never
+    web.customUserAgent = Self.userAgent
+    web.navigationDelegate = self
     web.translatesAutoresizingMaskIntoConstraints = false
     addSubview(web)
+
+    statusLabel.text = "YouTubeを読み込み中"
+    statusLabel.textColor = .white.withAlphaComponent(0.72)
+    statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
+    statusLabel.textAlignment = .center
+    statusLabel.numberOfLines = 2
+    statusLabel.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(statusLabel)
     NSLayoutConstraint.activate([
       web.topAnchor.constraint(equalTo: topAnchor),
       web.leadingAnchor.constraint(equalTo: leadingAnchor),
       web.trailingAnchor.constraint(equalTo: trailingAnchor),
-      web.bottomAnchor.constraint(equalTo: bottomAnchor)
+      web.bottomAnchor.constraint(equalTo: bottomAnchor),
+      statusLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+      statusLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+      statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 16),
+      statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16)
     ])
     PlaybackCoordinator.shared.register(self)
     loadPlayer()
@@ -3644,19 +3660,75 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   func stopPlayback() {
     isStopped = true
+    resolveTask?.cancel()
+    resolveTask = nil
     web.evaluateJavaScript("window.mvPause && window.mvPause();")
     web.stopLoading()
     web.loadHTMLString("", baseURL: nil)
   }
 
   private func loadPlayer() {
-    let videoId = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
-      .filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
+    let raw = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let videoId = Self.videoID(from: raw) {
+      loadResolvedPlayer(videoId: videoId)
+      return
+    }
+    resolveLiveVideoID(from: raw)
+  }
+
+  private func loadResolvedPlayer(videoId: String) {
     let audioOn = settings.playAudio && playbackVolume > 0
     let volume = Int((settings.playAudio ? playbackVolume : 0) * 100)
+    statusLabel.isHidden = true
     // A real HTTPS base URL on our own domain gives the embed a valid origin/Referer
     // (loadHTMLString with youtube.com or nil triggers YouTube error 152).
     web.loadHTMLString(Self.html(videoId: videoId, audioOn: audioOn, volume: volume), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
+  }
+
+  private func resolveLiveVideoID(from raw: String) {
+    guard let url = Self.liveResolutionURL(from: raw) else {
+      showStatus("YouTube動画IDまたはライブURLが不正です")
+      return
+    }
+    showStatus("YouTubeライブURLを解決中")
+    var request = URLRequest(url: url)
+    request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+    request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
+    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+      guard let self else { return }
+      self.resolveTask = nil
+      if let error {
+        self.showStatus("YouTubeライブ解決失敗: \(error.localizedDescription)")
+        return
+      }
+      if let finalURL = response?.url, let id = Self.videoID(from: finalURL.absoluteString) {
+        DispatchQueue.main.async { self.loadResolvedPlayer(videoId: id) }
+        return
+      }
+      guard let data, let html = String(data: data, encoding: .utf8),
+            let id = Self.extractVideoID(fromHTML: html) else {
+        self.showStatus("YouTubeライブ動画IDを取得できません")
+        return
+      }
+      DispatchQueue.main.async { self.loadResolvedPlayer(videoId: id) }
+    }
+    resolveTask?.resume()
+  }
+
+  private func showStatus(_ text: String) {
+    DispatchQueue.main.async {
+      self.statusLabel.text = text
+      self.statusLabel.isHidden = false
+    }
+  }
+
+  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+    showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
+  }
+
+  func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+    showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
   private static func html(videoId: String, audioOn: Bool, volume: Int) -> String {
@@ -3685,6 +3757,90 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     </html>
     """
   }
+
+  private static func videoID(from raw: String) -> String? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.range(of: #"^[A-Za-z0-9_-]{11}$"#, options: .regularExpression) != nil {
+      return trimmed
+    }
+    let normalized: String
+    if trimmed.hasPrefix("youtu.be/") || trimmed.hasPrefix("youtube.com/") || trimmed.hasPrefix("www.youtube.com/") || trimmed.hasPrefix("m.youtube.com/") {
+      normalized = "https://\(trimmed)"
+    } else {
+      normalized = trimmed.contains("://") ? trimmed : "https://www.youtube.com/\(trimmed)"
+    }
+    guard let url = URL(string: normalized) else {
+      return nil
+    }
+    let host = url.host?.replacingOccurrences(of: "www.", with: "").lowercased() ?? ""
+    let parts = url.path.split(separator: "/").map(String.init)
+    if host == "youtu.be", let first = parts.first, first.range(of: #"^[A-Za-z0-9_-]{11}$"#, options: .regularExpression) != nil {
+      return first
+    }
+    if host.contains("youtube.com"),
+       let v = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "v" })?.value,
+       v.range(of: #"^[A-Za-z0-9_-]{11}$"#, options: .regularExpression) != nil {
+      return v
+    }
+    if host.contains("youtube.com"),
+       ["live", "embed", "shorts"].contains(parts.first ?? ""),
+       parts.count > 1,
+       parts[1].range(of: #"^[A-Za-z0-9_-]{11}$"#, options: .regularExpression) != nil {
+      return parts[1]
+    }
+    return nil
+  }
+
+  private static func liveResolutionURL(from raw: String) -> URL? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    if trimmed.hasPrefix("youtube.com/") || trimmed.hasPrefix("www.youtube.com/") || trimmed.hasPrefix("m.youtube.com/") {
+      return liveResolutionURL(from: "https://\(trimmed)")
+    }
+    if let url = URL(string: trimmed), let host = url.host?.lowercased(), host.contains("youtube.com") {
+      if url.path.hasSuffix("/live") {
+        return url
+      }
+      var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+      var path = components?.path ?? url.path
+      if !path.hasSuffix("/") { path += "/" }
+      path += "live"
+      components?.path = path
+      components?.queryItems = nil
+      return components?.url
+    }
+    if trimmed.hasPrefix("@") {
+      return URL(string: "https://www.youtube.com/\(trimmed)/live")
+    }
+    if trimmed.hasPrefix("channel/") || trimmed.hasPrefix("c/") || trimmed.hasPrefix("user/") {
+      return URL(string: "https://www.youtube.com/\(trimmed)/live")
+    }
+    if trimmed.hasPrefix("UC") {
+      return URL(string: "https://www.youtube.com/channel/\(trimmed)/live")
+    }
+    let handle = trimmed.replacingOccurrences(of: "^@+", with: "", options: .regularExpression)
+      .components(separatedBy: CharacterSet(charactersIn: "/?# ")).first ?? trimmed
+    return URL(string: "https://www.youtube.com/@\(handle)/live")
+  }
+
+  private static func extractVideoID(fromHTML html: String) -> String? {
+    let patterns = [
+      #"<link rel=\"canonical\" href=\"https://www\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})\""#,
+      #"watch\?v=([A-Za-z0-9_-]{11})"#,
+      #""videoId":"([A-Za-z0-9_-]{11})""#
+    ]
+    for pattern in patterns {
+      if let match = html.range(of: pattern, options: .regularExpression) {
+        let segment = String(html[match])
+        if let idRange = segment.range(of: #"[A-Za-z0-9_-]{11}"#, options: .regularExpression) {
+          return String(segment[idRange])
+        }
+      }
+    }
+    return nil
+  }
+
+  private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
 final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResumable, PlaybackStoppable, AudioControllable {
@@ -5071,6 +5227,17 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     if host.contains("youtube.com"), let v = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "v" })?.value {
       return (.youtube, v)
     }
+    if host.contains("youtube.com"),
+       let first = parts.first,
+       ["live", "embed", "shorts"].contains(first),
+       parts.count > 1 {
+      return (.youtube, parts[1])
+    }
+    if host.contains("youtube.com"),
+       let first = parts.first,
+       first.hasPrefix("@") || ["channel", "c", "user"].contains(first) {
+      return (.youtube, parts.joined(separator: "/"))
+    }
     if host == "youtu.be", let first = parts.first {
       return (.youtube, first)
     }
@@ -5117,7 +5284,7 @@ final class SettingsController: UITableViewController {
     switch section {
     case 0: return 11
     case 1: return platforms.count
-    case 2: return 3
+    case 2: return 4
     default: return 1
     }
   }
@@ -5133,7 +5300,7 @@ final class SettingsController: UITableViewController {
 
   override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
     if section == 2 {
-      return "Client IDはあなたのユーザーIDではなく、kick.com → Settings → Developer で作るOAuthアプリのIDです。そのアプリに Redirect URI「\(KickAuthManager.shared.config.redirectURI)」を登録してください(Redirect URI行をタップでコピー)。コメント投稿に使います。"
+      return "Client ID/SecretはあなたのユーザーIDやパスワードではなく、kick.com → Settings → Developer で作るOAuthアプリの値です。そのアプリに Redirect URI「\(KickAuthManager.shared.config.redirectURI)」を登録してください(Redirect URI行をタップでコピー)。コメント投稿に使います。"
     }
     guard section == numberOfSections(in: tableView) - 1 else { return nil }
     let info = Bundle.main.infoDictionary
@@ -5226,6 +5393,8 @@ final class SettingsController: UITableViewController {
         cell.textLabel?.text = KickAuthManager.shared.isSignedIn ? "Kickログアウト" : "Kick OAuthログイン"
       case 1:
         cell.textLabel?.text = config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
+      case 2:
+        cell.textLabel?.text = config.clientSecret.isEmpty ? "Client Secret 未設定" : "Client Secret 設定済み"
       default:
         cell.textLabel?.text = "Redirect URI \(config.redirectURI)"
       }
@@ -5406,6 +5575,8 @@ final class SettingsController: UITableViewController {
     case 1:
       editKickClientID()
     case 2:
+      editKickClientSecret()
+    case 3:
       let uri = KickAuthManager.shared.config.redirectURI
       UIPasteboard.general.string = uri
       let alert = UIAlertController(
@@ -5432,6 +5603,24 @@ final class SettingsController: UITableViewController {
     alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
     alert.addAction(UIAlertAction(title: "保存", style: .default) { [weak self] _ in
       config.clientId = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      KickAuthManager.shared.config = config
+      self?.tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
+    })
+    present(alert, animated: true)
+  }
+
+  private func editKickClientSecret() {
+    var config = KickAuthManager.shared.config
+    let alert = UIAlertController(title: "Kick Client Secret", message: "Kick Developerで作成したOAuthアプリの Client Secret を貼り付けてください。Kickの現在のtoken/refreshエンドポイントでは必須です。", preferredStyle: .alert)
+    alert.addTextField { field in
+      field.text = config.clientSecret
+      field.isSecureTextEntry = true
+      field.autocapitalizationType = .none
+      field.autocorrectionType = .no
+    }
+    alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
+    alert.addAction(UIAlertAction(title: "保存", style: .default) { [weak self] _ in
+      config.clientSecret = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
       KickAuthManager.shared.config = config
       self?.tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
     })

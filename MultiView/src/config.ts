@@ -24,7 +24,7 @@ export const PLATFORMS: PlatformInfo[] = [
     id: 'youtube',
     label: 'YouTube',
     color: '#ff0000',
-    hint: '動画ID (例: jfKfPfyJRdk)',
+    hint: '動画ID / @handle (例: jfKfPfyJRdk)',
   },
   {
     id: 'niconico',
