@@ -27,6 +27,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
   func applicationDidBecomeActive(_ application: UIApplication) {
     configureAudioSession()
+    // Pull any fresh web-view logins into the native cookie jar.
+    WebLoginCookies.sync()
     if needsPlaybackReload {
       needsPlaybackReload = false
       reloadAndResumeSoon()
@@ -64,15 +66,20 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
             let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
       switch type {
       case .began:
-        // Another app grabbed the audio session. YIELD — do not reactivate the
-        // session here; that fight was killing the other app's audio. Our players
-        // pause automatically; we just remember to recover afterwards.
+        // Another app grabbed the audio session. YIELD: explicitly pause every
+        // player (AVPlayer auto-pauses, but WKWebView media may not) and do NOT
+        // reactivate the session — that fight was stopping the other app's audio.
+        PlaybackCoordinator.shared.pauseAll()
         needsPlaybackReload = true
       case .ended:
-        // The other source released the session. Only reclaim+rebuild if we are
-        // frontmost; otherwise applicationDidBecomeActive recovers on return so we
-        // never reclaim audio while still in the background.
-        if UIApplication.shared.applicationState == .active {
+        // Standard system flow (same as Music): resume only when iOS sets
+        // shouldResume. This avoids relying on applicationState, which is
+        // unreliable under LiveContainer, so we never re-grab while another app
+        // is still meant to own audio. (If shouldResume is absent, we recover when
+        // the user returns to us via applicationDidBecomeActive.)
+        let shouldResume = (notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
+          .map { AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) } ?? false
+        if shouldResume {
           needsPlaybackReload = false
           configureAudioSession()
           reloadAndResumeSoon()
@@ -108,6 +115,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
 protocol PlaybackResumable: AnyObject {
   func resumePlayback()
+  func pausePlayback()
+}
+
+extension PlaybackResumable {
+  func pausePlayback() {}
 }
 
 protocol PlaybackStoppable: AnyObject {
@@ -167,6 +179,12 @@ final class PlaybackCoordinator {
   func resumeAll() {
     for object in views.allObjects {
       (object as? PlaybackResumable)?.resumePlayback()
+    }
+  }
+
+  func pauseAll() {
+    for object in views.allObjects {
+      (object as? PlaybackResumable)?.pausePlayback()
     }
   }
 }
@@ -401,6 +419,25 @@ final class NetworkQuality {
   }
 }
 
+// Copies the logins made in the in-app web views (WKWebsiteDataStore) into the
+// shared HTTPCookieStorage that the native URLSession players use. WKWebView and
+// URLSession keep separate cookie jars, so without this a fresh web login is not
+// seen by the native fetch until much later (the "permission error until reload"
+// the user hit). Run it proactively so native playback uses the latest session.
+enum WebLoginCookies {
+  private static let domains = ["nicovideo.jp", "kick.com", "twitch.tv", "twitcasting.tv", "youtube.com", "google.com"]
+
+  static func sync(_ completion: (() -> Void)? = nil) {
+    let store = WKWebsiteDataStore.default().httpCookieStore
+    store.getAllCookies { cookies in
+      for cookie in cookies where domains.contains(where: { cookie.domain.contains($0) }) {
+        HTTPCookieStorage.shared.setCookie(cookie)
+      }
+      DispatchQueue.main.async { completion?() }
+    }
+  }
+}
+
 enum Store {
   private static let streamsKey = "native.streams.v1"
   private static let settingsKey = "native.settings.v4"
@@ -477,6 +514,9 @@ extension Notification.Name {
   // Posted when the connection flips WiFi<->cellular so the viewing tab can rebuild
   // players at the quality for the new network.
   static let multiViewNetworkQualityChanged = Notification.Name("MultiViewNetworkQualityChanged")
+  // Posted by a player when it hits a recoverable error so the viewing tab can
+  // auto-refresh (debounced) to clear it.
+  static let multiViewPlaybackErrored = Notification.Name("MultiViewPlaybackErrored")
 }
 
 enum RaidAutoFollow {
@@ -638,6 +678,9 @@ final class AppState {
     if streams.contains(where: { $0.platform == platform && $0.channel.lowercased() == channel.lowercased() }) {
       return false
     }
+    // A stream is usually added straight after logging in / browsing in a web view,
+    // so capture that session for the native player about to be created.
+    WebLoginCookies.sync()
     streams.append(StreamItem(id: UUID().uuidString, platform: platform, channel: channel))
     return true
   }
@@ -1041,6 +1084,19 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
     resumePlayback()
   }
 
+  func pausePlayback() {
+    guard !isStopped else { return }
+    evaluateJavaScript("""
+    (function(){
+      document.querySelectorAll('video,audio').forEach(function(m){ try { m.pause(); } catch(e) {} });
+      document.querySelectorAll('iframe').forEach(function(f){
+        try { f.contentWindow.postMessage({type:'pause'}, '*'); } catch(e) {}
+        try { f.contentWindow.postMessage(JSON.stringify({event:'command',func:'pauseVideo',args:[]}), '*'); } catch(e) {}
+      });
+    })();
+    """)
+  }
+
   func stopPlayback() {
     isStopped = true
     twitcastingChat?.stop()
@@ -1295,6 +1351,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var isStopped = false
   private var watchPageURL: URL?
   private var laneCursor = 0
+  private var didRetryAfterPermission = false
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -1388,6 +1445,11 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     player.isMuted = !settings.playAudio
     player.volume = settings.playAudio ? playbackVolume : 0
     player.play()
+  }
+
+  func pausePlayback() {
+    player.pause()
+    fallbackWebView?.pausePlayback()
   }
 
   func setPlaybackVolume(_ volume: Float) {
@@ -1552,7 +1614,21 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
        let code = payload["code"] as? String {
       showStatus("ニコ生エラー: \(code)")
       if code.lowercased().contains("permission") || code.lowercased().contains("resource") {
-        installFallback("ニコ生エラー: \(code)")
+        if didRetryAfterPermission {
+          installFallback("ニコ生エラー: \(code)")
+        } else {
+          // The first permission failure is usually a just-completed web login whose
+          // cookies have not reached the native jar yet. Sync them and retry once.
+          didRetryAfterPermission = true
+          socketTask?.cancel(with: .goingAway, reason: nil)
+          socketTask = nil
+          WebLoginCookies.sync { [weak self] in
+            guard let self, !self.isStopped else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+              self.load(channel: self.channel)
+            }
+          }
+        }
       }
     }
     if type == "disconnect" {
@@ -1733,6 +1809,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
 
   private func streamNDGRView(viewURI: String) async {
     var nextAt: String? = "now"
+    var consecutiveFailures = 0
     while !Task.isCancelled {
       let requestAt = nextAt
       guard var components = URLComponents(string: viewURI) else { return }
@@ -1757,12 +1834,22 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
             nextAt = String(at)
           }
         }
+        consecutiveFailures = 0
       } catch {
         if Task.isCancelled || error is CancellationError {
           return
         }
+        consecutiveFailures += 1
         nextAt = requestAt ?? "now"
         showStatus("ニコ生コメント取得失敗: \(error.localizedDescription)")
+        if consecutiveFailures >= 3 {
+          // The comment view URI has likely gone stale; rather than retry a dead
+          // endpoint forever, request a full auto-refresh to get a fresh session.
+          DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
+          }
+          return
+        }
         try? await Task.sleep(nanoseconds: 3_000_000_000)
         continue
       }
@@ -2136,6 +2223,11 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     player.isMuted = !settings.playAudio
     player.volume = settings.playAudio ? playbackVolume : 0
     player.play()
+  }
+
+  func pausePlayback() {
+    player.pause()
+    fallbackWebView?.pausePlayback()
   }
 
   func stopPlayback() {
@@ -2686,6 +2778,11 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     player.play()
   }
 
+  func pausePlayback() {
+    player.pause()
+    fallbackWebView?.pausePlayback()
+  }
+
   func stopPlayback() {
     isStopped = true
     tokenTask?.cancel()
@@ -3124,6 +3221,11 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     player.play()
   }
 
+  func pausePlayback() {
+    player.pause()
+    fallbackWebView?.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(function(m){try{m.pause()}catch(e){}});")
+  }
+
   func stopPlayback() {
     isStopped = true
     chatClient?.stop()
@@ -3494,6 +3596,19 @@ final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResum
     resumePlayback()
   }
 
+  func pausePlayback() {
+    guard !isStopped else { return }
+    evaluateJavaScript("""
+    (function(){
+      document.querySelectorAll('video,audio').forEach(function(m){ try { m.pause(); } catch(e) {} });
+      document.querySelectorAll('iframe').forEach(function(f){
+        try { f.contentWindow.postMessage({type:'pause'}, '*'); } catch(e) {}
+        try { f.contentWindow.postMessage(JSON.stringify({event:'command',func:'pauseVideo',args:[]}), '*'); } catch(e) {}
+      });
+    })();
+    """)
+  }
+
   func setStreamVolume(_ volume: Float, for stream: StreamItem) {
     let safeKey = Self.jsString(Self.streamKey(for: stream))
     let safeVolume = min(1, max(0, volume))
@@ -3563,6 +3678,7 @@ final class ViewingController: UIViewController {
   private weak var dragTargetCell: StreamCellView?
   private var dragSnapshot: UIView?
   private var dragSourceStream: StreamItem?
+  private var lastAutoReloadAt = Date.distantPast
 
   override func viewDidLoad() {
     super.viewDidLoad()
@@ -3571,6 +3687,7 @@ final class ViewingController: UIViewController {
     reload()
     NotificationCenter.default.addObserver(self, selector: #selector(reloadAndResume), name: .multiViewReloadAndResume, object: nil)
     NotificationCenter.default.addObserver(self, selector: #selector(networkQualityChanged), name: .multiViewNetworkQualityChanged, object: nil)
+    NotificationCenter.default.addObserver(self, selector: #selector(playbackErrored), name: .multiViewPlaybackErrored, object: nil)
   }
 
   deinit {
@@ -3590,6 +3707,16 @@ final class ViewingController: UIViewController {
     let settings = AppState.shared.settings
     guard settings.wifiQuality != settings.mobileQuality else { return }
     reloadAndResume()
+  }
+
+  @objc private func playbackErrored() {
+    // Debounced auto-refresh to clear a recoverable error. Capped at once per 45s
+    // and coalesced so a permanently-failing stream can't trigger a reload loop.
+    guard Date().timeIntervalSince(lastAutoReloadAt) > 45 else { return }
+    lastAutoReloadAt = Date()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+      self?.reloadAndResume()
+    }
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -3658,13 +3785,17 @@ final class ViewingController: UIViewController {
     ])
   }
 
-  private func addStackedCell(_ stream: StreamItem) {
-    let cell = StreamCellView(stream: stream, onFocus: { [weak self] in
+  private func makeCell(_ stream: StreamItem) -> StreamCellView {
+    StreamCellView(stream: stream, onFocus: { [weak self] in
       self?.focused = stream
       self?.reload()
     }, onReorder: { [weak self] cell, gesture in
       self?.handleReorder(cell: cell, gesture: gesture)
     })
+  }
+
+  private func addStackedCell(_ stream: StreamItem) {
+    let cell = makeCell(stream)
     stack.addArrangedSubview(cell)
     cell.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: 9 / 16).isActive = true
     cell.heightAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
@@ -3874,23 +4005,23 @@ final class ViewingController: UIViewController {
   }
 
   private func addGrid(_ streams: [StreamItem]) {
-    let rows = stride(from: 0, to: streams.count, by: 2).map { Array(streams[$0..<min($0 + 2, streams.count)]) }
-    rows.forEach { rowStreams in
+    // Full pairs go two-up; a trailing odd stream gets its own full-width row so no
+    // empty space is left beside it.
+    var index = 0
+    while index + 2 <= streams.count {
       let row = UIStackView()
       row.axis = .horizontal
       row.spacing = 10
       row.distribution = .fillEqually
-      rowStreams.forEach { stream in
-        row.addArrangedSubview(StreamCellView(stream: stream, onFocus: { [weak self] in
-          self?.focused = stream
-          self?.reload()
-        }, onReorder: { [weak self] cell, gesture in
-          self?.handleReorder(cell: cell, gesture: gesture)
-        }))
-      }
+      row.addArrangedSubview(makeCell(streams[index]))
+      row.addArrangedSubview(makeCell(streams[index + 1]))
       stack.addArrangedSubview(row)
       row.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: 9 / 32).isActive = true
       row.heightAnchor.constraint(greaterThanOrEqualToConstant: 150).isActive = true
+      index += 2
+    }
+    if index < streams.count {
+      addStackedCell(streams[index])
     }
   }
 
