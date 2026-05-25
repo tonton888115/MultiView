@@ -93,7 +93,7 @@ protocol AudioControllable: AnyObject {
   func setPlaybackVolume(_ volume: Float)
 }
 
-final class AutoHidingControls: NSObject {
+final class AutoHidingControls: NSObject, UIGestureRecognizerDelegate {
   private weak var host: UIView?
   private let controls: [UIView]
   private var hideWorkItem: DispatchWorkItem?
@@ -103,9 +103,16 @@ final class AutoHidingControls: NSObject {
     self.controls = controls
     super.init()
     let tap = UITapGestureRecognizer(target: self, action: #selector(showTemporarily))
+    tap.delegate = self
     tap.cancelsTouchesInView = false
+    tap.delaysTouchesBegan = false
+    tap.delaysTouchesEnded = false
     host.addGestureRecognizer(tap)
     showTemporarily()
+  }
+
+  func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+    true
   }
 
   @objc func showTemporarily() {
@@ -462,10 +469,22 @@ final class TwitcastingChatClient {
 
   private func start() {
     guard !stopped, !channel.isEmpty else { return }
+    syncWebViewCookies { [weak self] in
+      self?.fetchLatestMovie()
+    }
+  }
+
+  private func fetchLatestMovie() {
+    guard !stopped, !channel.isEmpty else { return }
     guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
           let url = URL(string: "https://frontendapi.twitcasting.tv/users/\(encoded)/latest-movie") else { return }
     var request = URLRequest(url: url)
     request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("https://twitcasting.tv/\(encoded)", forHTTPHeaderField: "Referer")
+    if let cookie = Self.cookieHeader() {
+      request.setValue(cookie, forHTTPHeaderField: "Cookie")
+    }
     URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
       guard let data,
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -483,6 +502,13 @@ final class TwitcastingChatClient {
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json, text/javascript, */*; q=0.01", forHTTPHeaderField: "Accept")
+    request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("https://twitcasting.tv/\(channel)", forHTTPHeaderField: "Referer")
+    request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+    if let cookie = Self.cookieHeader() {
+      request.setValue(cookie, forHTTPHeaderField: "Cookie")
+    }
     let encodedId = movieId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? movieId
     request.httpBody = "movie_id=\(encodedId)".data(using: .utf8)
     URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
@@ -549,6 +575,34 @@ final class TwitcastingChatClient {
     if let n = value as? NSNumber { return n.stringValue }
     return nil
   }
+
+  private func syncWebViewCookies(_ completion: @escaping () -> Void) {
+    WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+      cookies
+        .filter { $0.domain.contains("twitcasting.tv") }
+        .forEach { HTTPCookieStorage.shared.setCookie($0) }
+      DispatchQueue.main.async(execute: completion)
+    }
+  }
+
+  private static func cookieHeader() -> String? {
+    let urls = [
+      URL(string: "https://twitcasting.tv/"),
+      URL(string: "https://frontendapi.twitcasting.tv/")
+    ].compactMap { $0 }
+    let cookies = urls.flatMap { HTTPCookieStorage.shared.cookies(for: $0) ?? [] }
+    var seen = Set<String>()
+    let unique = cookies.filter { cookie in
+      let key = "\(cookie.name)=\(cookie.value)"
+      guard !seen.contains(key) else { return false }
+      seen.insert(key)
+      return true
+    }
+    guard !unique.isEmpty else { return nil }
+    return unique.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+  }
+
+  private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
 final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, AudioControllable, WKNavigationDelegate {
@@ -570,6 +624,9 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
     if stream.platform == .niconico {
+      if #available(iOS 13.0, *) {
+        config.defaultWebpagePreferences.preferredContentMode = .mobile
+      }
       config.userContentController.addUserScript(WKUserScript(source: PlayerWebView.niconicoPopupBlockerScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
     }
     super.init(frame: .zero, configuration: config)
@@ -990,7 +1047,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     watchPageURL = url
     isLoading = true
     var request = URLRequest(url: url)
-    request.setValue(NiconicoNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
+    Self.mobileBrowserHeaders(referer: "https://live.nicovideo.jp/").forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
     pageTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
       guard let self else { return }
       self.pageTask = nil
@@ -1025,7 +1082,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       return
     }
     var request = URLRequest(url: url)
-    request.setValue(NiconicoNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
+    Self.mobileBrowserHeaders(referer: watchPageURL?.absoluteString ?? "https://live.nicovideo.jp/").forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
     request.setValue("https://live.nicovideo.jp", forHTTPHeaderField: "Origin")
     let socket = URLSession.shared.webSocketTask(with: request)
     socketTask = socket
@@ -1194,16 +1251,22 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   }
 
   private func niconicoPlaybackHeaders() -> [String: String] {
-    var headers = [
-      "User-Agent": NiconicoNativePlayerView.userAgent,
-      "Referer": watchPageURL?.absoluteString ?? "https://live.nicovideo.jp/",
-      "Origin": "https://live.nicovideo.jp"
-    ]
+    var headers = Self.mobileBrowserHeaders(referer: watchPageURL?.absoluteString ?? "https://live.nicovideo.jp/")
+    headers["Origin"] = "https://live.nicovideo.jp"
     let cookieURL = URL(string: "https://live.nicovideo.jp/")!
     if let cookies = HTTPCookieStorage.shared.cookies(for: cookieURL), !cookies.isEmpty {
       headers["Cookie"] = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
     }
     return headers
+  }
+
+  private static func mobileBrowserHeaders(referer: String) -> [String: String] {
+    [
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6",
+      "User-Agent": NiconicoNativePlayerView.userAgent,
+      "Referer": referer
+    ]
   }
 
   private func parseStreamCookies(_ raw: Any?, for url: URL) -> [HTTPCookie] {
@@ -2427,7 +2490,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 }
 
-final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, WKNavigationDelegate {
   private let stream: StreamItem
   private let settings: AppSettings
   private let web: WKWebView
@@ -2437,6 +2500,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private var isMutedForEmbed: Bool
   private var laneCursor = 0
   private var isStopped = false
+  private var usingNormalPageFallback = false
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -2456,6 +2520,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     web.backgroundColor = .black
     web.scrollView.backgroundColor = .black
     web.scrollView.contentInsetAdjustmentBehavior = .never
+    web.customUserAgent = Self.userAgent
+    web.navigationDelegate = self
     web.translatesAutoresizingMaskIntoConstraints = false
     addSubview(web)
 
@@ -2525,6 +2591,11 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     web.loadHTMLString("", baseURL: nil)
   }
 
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    resumePlayback()
+    schedulePlaybackFallbackCheck()
+  }
+
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
     reloadPlayerForMuteState()
@@ -2540,7 +2611,38 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       URLQueryItem(name: "default_mute", value: isMutedForEmbed ? "true" : "false")
     ]
     if let url = components.url {
-      web.load(URLRequest(url: url))
+      usingNormalPageFallback = false
+      web.load(Self.browserRequest(url: url, referer: "https://twitcasting.tv/\(encoded)"))
+    }
+  }
+
+  private func loadNormalPageFallback() {
+    let channel = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+          let url = URL(string: "https://twitcasting.tv/\(encoded)") else { return }
+    usingNormalPageFallback = true
+    web.load(Self.browserRequest(url: url, referer: "https://twitcasting.tv/"))
+  }
+
+  private func schedulePlaybackFallbackCheck() {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+      guard let self, !self.isStopped, !self.usingNormalPageFallback else { return }
+      let script = """
+      (function(){
+        var media = Array.prototype.slice.call(document.querySelectorAll('video,audio'));
+        if (media.some(function(item){ return item.readyState > 0 || item.currentSrc; })) return 'media';
+        if (document.querySelectorAll('iframe').length > 0) return 'frame';
+        return 'empty';
+      })();
+      """
+      self.web.evaluateJavaScript(script) { [weak self] value, _ in
+        guard let self, !self.isStopped, !self.usingNormalPageFallback else { return }
+        if (value as? String) == "empty" {
+          self.loadNormalPageFallback()
+        } else {
+          self.resumePlayback()
+        }
+      }
     }
   }
 
@@ -2570,6 +2672,19 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       )
     }
   }
+
+  private static func browserRequest(url: URL, referer: String) -> URLRequest {
+    var request = URLRequest(url: url)
+    request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue(referer, forHTTPHeaderField: "Referer")
+    request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
+    if let cookies = HTTPCookieStorage.shared.cookies(for: URL(string: "https://twitcasting.tv/")!), !cookies.isEmpty {
+      request.setValue(cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; "), forHTTPHeaderField: "Cookie")
+    }
+    return request
+  }
+
+  private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
 final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResumable, PlaybackStoppable, AudioControllable {
