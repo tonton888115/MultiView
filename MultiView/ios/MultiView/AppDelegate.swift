@@ -5,6 +5,7 @@ import Network
 import ImageIO
 import AuthenticationServices
 import Security
+import CryptoKit
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -448,15 +449,16 @@ final class NiconicoWarmup: NSObject, WKNavigationDelegate {
   private var webViews: [String: WKWebView] = [:]
   private var completions: [String: [() -> Void]] = [:]
   private var lastFinished: [String: Date] = [:]
+  private var reloadCounts: [String: Int] = [:]
 
-  func prewarm(programId rawProgramId: String, completion: (() -> Void)? = nil) {
+  func prewarm(programId rawProgramId: String, forceReload: Bool = false, completion: (() -> Void)? = nil) {
     let programId = rawProgramId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !programId.isEmpty,
           let url = URL(string: "https://live.nicovideo.jp/watch/\(programId)") else {
       completion?()
       return
     }
-    if let last = lastFinished[programId], Date().timeIntervalSince(last) < 30 {
+    if !forceReload, let last = lastFinished[programId], Date().timeIntervalSince(last) < 30 {
       WebLoginCookies.sync(completion)
       return
     }
@@ -464,8 +466,9 @@ final class NiconicoWarmup: NSObject, WKNavigationDelegate {
       completions[programId, default: []].append(completion)
     }
     if let existing = webViews[programId] {
+      reloadCounts[programId] = 0
       existing.load(URLRequest(url: url))
-      DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+      DispatchQueue.main.asyncAfter(deadline: .now() + 7) { [weak self] in
         self?.complete(programId: programId)
       }
       return
@@ -478,24 +481,39 @@ final class NiconicoWarmup: NSObject, WKNavigationDelegate {
     let web = WKWebView(frame: CGRect(x: -240, y: -240, width: 160, height: 160), configuration: config)
     web.customUserAgent = NiconicoNativePlayerView.userAgent
     web.navigationDelegate = self
-    web.isHidden = true
+    web.alpha = 0.01
+    web.isUserInteractionEnabled = false
     web.accessibilityIdentifier = programId
     webViews[programId] = web
+    reloadCounts[programId] = 0
 
     if let window = UIApplication.shared.connectedScenes
       .compactMap({ $0 as? UIWindowScene })
       .flatMap({ $0.windows })
       .first(where: { $0.isKeyWindow }) {
+      web.frame = CGRect(x: 0, y: window.bounds.maxY - 1, width: 1, height: 1)
       window.addSubview(web)
     }
     web.load(URLRequest(url: url))
-    DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+    DispatchQueue.main.asyncAfter(deadline: .now() + 7) { [weak self] in
       self?.complete(programId: programId)
     }
   }
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-    complete(programId: webView.accessibilityIdentifier)
+    guard let programId = webView.accessibilityIdentifier else { return }
+    let count = reloadCounts[programId] ?? 0
+    guard count > 0 else {
+      reloadCounts[programId] = count + 1
+      WebLoginCookies.sync {
+        webView.reload()
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+        self?.complete(programId: programId)
+      }
+      return
+    }
+    complete(programId: programId)
   }
 
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -522,6 +540,7 @@ final class NiconicoWarmup: NSObject, WKNavigationDelegate {
       self.webViews[programId]?.removeFromSuperview()
       self.webViews.removeValue(forKey: programId)
       self.lastFinished.removeValue(forKey: programId)
+      self.reloadCounts.removeValue(forKey: programId)
     }
   }
 }
@@ -935,6 +954,272 @@ final class TwitcastingAuthManager: NSObject, ASWebAuthenticationPresentationCon
     if let value = value as? String { return value }
     if let value = value as? NSNumber { return value.stringValue }
     return nil
+  }
+
+  private static func finish<T>(_ completion: @escaping (Result<T, Error>) -> Void, _ result: Result<T, Error>) {
+    DispatchQueue.main.async { completion(result) }
+  }
+}
+
+struct YouTubeOAuthConfig: Codable {
+  var clientId = ""
+  var redirectURI = "multiview://youtube-oauth"
+}
+
+final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContextProviding {
+  static let shared = YouTubeAuthManager()
+  private let configKey = "youtube.oauth.config.v1"
+  private let tokenAccount = "youtube"
+  private var activeSession: ASWebAuthenticationSession?
+  private var authAnchor: ASPresentationAnchor?
+
+  var config: YouTubeOAuthConfig {
+    get {
+      guard let data = UserDefaults.standard.data(forKey: configKey),
+            let config = try? JSONDecoder().decode(YouTubeOAuthConfig.self, from: data) else {
+        return YouTubeOAuthConfig()
+      }
+      return config
+    }
+    set {
+      if let data = try? JSONEncoder().encode(newValue) {
+        UserDefaults.standard.set(data, forKey: configKey)
+      }
+    }
+  }
+
+  var isSignedIn: Bool { OAuthKeychain.load(account: tokenAccount)?.isValid == true }
+
+  func signOut() {
+    OAuthKeychain.save(nil, account: tokenAccount)
+  }
+
+  func signIn(presentationAnchor: ASPresentationAnchor?, completion: @escaping (Result<Void, Error>) -> Void) {
+    guard let presentationAnchor else {
+      Self.finish(completion, .failure(OAuthServiceError.message("YouTube認証を開始できません")))
+      return
+    }
+    let config = self.config
+    guard !config.clientId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      Self.finish(completion, .failure(OAuthServiceError.message("YouTube Client IDが未設定です")))
+      return
+    }
+    let verifier = Self.randomVerifier()
+    let state = UUID().uuidString
+    var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth")!
+    components.queryItems = [
+      URLQueryItem(name: "client_id", value: config.clientId),
+      URLQueryItem(name: "redirect_uri", value: config.redirectURI),
+      URLQueryItem(name: "response_type", value: "code"),
+      URLQueryItem(name: "scope", value: "https://www.googleapis.com/auth/youtube.force-ssl"),
+      URLQueryItem(name: "state", value: state),
+      URLQueryItem(name: "access_type", value: "offline"),
+      URLQueryItem(name: "prompt", value: "consent"),
+      URLQueryItem(name: "code_challenge", value: Self.codeChallenge(for: verifier)),
+      URLQueryItem(name: "code_challenge_method", value: "S256")
+    ]
+    guard let url = components.url else {
+      Self.finish(completion, .failure(OAuthServiceError.message("YouTube認証URLを作成できません")))
+      return
+    }
+    authAnchor = presentationAnchor
+    let session = ASWebAuthenticationSession(url: url, callbackURLScheme: "multiview") { [weak self] callbackURL, error in
+      guard let self else { return }
+      self.activeSession = nil
+      self.authAnchor = nil
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let callbackURL,
+            let callback = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false),
+            callback.queryItems?.first(where: { $0.name == "state" })?.value == state,
+            let code = callback.queryItems?.first(where: { $0.name == "code" })?.value else {
+        Self.finish(completion, .failure(OAuthServiceError.message("YouTube認証の戻りURLが不正です")))
+        return
+      }
+      self.exchangeCode(code, verifier: verifier, completion: completion)
+    }
+    session.presentationContextProvider = self
+    session.prefersEphemeralWebBrowserSession = false
+    activeSession = session
+    if !session.start() {
+      activeSession = nil
+      authAnchor = nil
+      Self.finish(completion, .failure(OAuthServiceError.message("YouTube認証を開始できません")))
+    }
+  }
+
+  func sendChat(channel: String, content: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    guard let token = OAuthKeychain.load(account: tokenAccount), token.isValid else {
+      Self.finish(completion, .failure(OAuthServiceError.message("YouTubeにログインしてください")))
+      return
+    }
+    resolveVideoID(from: channel) { result in
+      switch result {
+      case .failure(let error):
+        Self.finish(completion, .failure(error))
+      case .success(let videoID):
+        self.resolveLiveChatID(videoID: videoID, accessToken: token.accessToken) { chatResult in
+          switch chatResult {
+          case .failure(let error):
+            Self.finish(completion, .failure(error))
+          case .success(let liveChatID):
+            self.postMessage(liveChatID: liveChatID, message: content, accessToken: token.accessToken, completion: completion)
+          }
+        }
+      }
+    }
+  }
+
+  func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+    authAnchor ?? ASPresentationAnchor()
+  }
+
+  private func exchangeCode(_ code: String, verifier: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
+    request.httpMethod = "POST"
+    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    let body = [
+      "client_id": config.clientId,
+      "redirect_uri": config.redirectURI,
+      "grant_type": "authorization_code",
+      "code": code,
+      "code_verifier": verifier
+    ]
+    request.httpBody = Self.formBody(body)
+    URLSession.shared.dataTask(with: request) { data, response, error in
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let data,
+            let http = response as? HTTPURLResponse,
+            (200..<300).contains(http.statusCode),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let accessToken = json["access_token"] as? String else {
+        Self.finish(completion, .failure(OAuthServiceError.message("YouTube OAuthトークン取得に失敗しました")))
+        return
+      }
+      let expiresIn = json["expires_in"] as? Double ?? 3600
+      OAuthKeychain.save(SimpleOAuthToken(
+        accessToken: accessToken,
+        expiresAt: Date().timeIntervalSince1970 + max(60, expiresIn - 60),
+        userID: nil
+      ), account: self.tokenAccount)
+      Self.finish(completion, .success(()))
+    }.resume()
+  }
+
+  private func resolveVideoID(from raw: String, completion: @escaping (Result<String, Error>) -> Void) {
+    if let videoID = YouTubeNativePlayerView.videoID(from: raw) {
+      Self.finish(completion, .success(videoID))
+      return
+    }
+    guard let url = YouTubeNativePlayerView.liveResolutionURL(from: raw) else {
+      Self.finish(completion, .failure(OAuthServiceError.message("YouTube動画IDまたはライブURLが不正です")))
+      return
+    }
+    var request = URLRequest(url: url)
+    request.setValue(YouTubeNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
+    URLSession.shared.dataTask(with: request) { data, response, error in
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      if let finalURL = response?.url, let id = YouTubeNativePlayerView.videoID(from: finalURL.absoluteString) {
+        Self.finish(completion, .success(id))
+        return
+      }
+      guard let data,
+            let html = String(data: data, encoding: .utf8),
+            let id = YouTubeNativePlayerView.extractVideoID(fromHTML: html) else {
+        Self.finish(completion, .failure(OAuthServiceError.message("YouTubeライブ動画IDを取得できません")))
+        return
+      }
+      Self.finish(completion, .success(id))
+    }.resume()
+  }
+
+  private func resolveLiveChatID(videoID: String, accessToken: String, completion: @escaping (Result<String, Error>) -> Void) {
+    var components = URLComponents(string: "https://www.googleapis.com/youtube/v3/videos")!
+    components.queryItems = [
+      URLQueryItem(name: "part", value: "liveStreamingDetails"),
+      URLQueryItem(name: "id", value: videoID)
+    ]
+    var request = URLRequest(url: components.url!)
+    request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+    URLSession.shared.dataTask(with: request) { data, response, error in
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let data,
+            let http = response as? HTTPURLResponse,
+            (200..<300).contains(http.statusCode),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let items = json["items"] as? [[String: Any]],
+            let details = items.first?["liveStreamingDetails"] as? [String: Any],
+            let liveChatID = details["activeLiveChatId"] as? String else {
+        Self.finish(completion, .failure(OAuthServiceError.message("YouTubeライブチャットIDを取得できません")))
+        return
+      }
+      Self.finish(completion, .success(liveChatID))
+    }.resume()
+  }
+
+  private func postMessage(liveChatID: String, message: String, accessToken: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    var components = URLComponents(string: "https://www.googleapis.com/youtube/v3/liveChat/messages")!
+    components.queryItems = [URLQueryItem(name: "part", value: "snippet")]
+    var request = URLRequest(url: components.url!)
+    request.httpMethod = "POST"
+    request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: [
+      "snippet": [
+        "liveChatId": liveChatID,
+        "type": "textMessageEvent",
+        "textMessageDetails": ["messageText": message]
+      ]
+    ])
+    URLSession.shared.dataTask(with: request) { _, response, error in
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+        Self.finish(completion, .failure(OAuthServiceError.message("YouTubeコメント送信に失敗しました")))
+        return
+      }
+      Self.finish(completion, .success(()))
+    }.resume()
+  }
+
+  private static func randomVerifier() -> String {
+    let alphabet = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
+    return String((0..<64).map { _ in alphabet[Int.random(in: 0..<alphabet.count)] })
+  }
+
+  private static func codeChallenge(for verifier: String) -> String {
+    Data(SHA256.hash(data: Data(verifier.utf8))).base64EncodedString()
+      .replacingOccurrences(of: "+", with: "-")
+      .replacingOccurrences(of: "/", with: "_")
+      .replacingOccurrences(of: "=", with: "")
+  }
+
+  private static func formBody(_ values: [String: String]) -> Data {
+    values
+      .map { key, value in
+        "\(escape(key))=\(escape(value))"
+      }
+      .joined(separator: "&")
+      .data(using: .utf8) ?? Data()
+  }
+
+  private static func escape(_ value: String) -> String {
+    var allowed = CharacterSet.urlQueryAllowed
+    allowed.remove(charactersIn: "&+=?")
+    return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
   }
 
   private static func finish<T>(_ completion: @escaping (Result<T, Error>) -> Void, _ result: Result<T, Error>) {
@@ -2025,7 +2310,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     watchPageURL = url
     isLoading = true
     showStatus(loadAttempts == 0 ? "ニコ生セッションを準備中" : "ニコ生再試行中… (\(loadAttempts))")
-    NiconicoWarmup.shared.prewarm(programId: programId) { [weak self] in
+    NiconicoWarmup.shared.prewarm(programId: programId, forceReload: loadAttempts > 0) { [weak self] in
       guard let self, !self.isStopped else { return }
       self.syncNiconicoWebCookies { [weak self] in
         self?.fetchWatchPage(url: url)
@@ -2040,7 +2325,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private func retryOrFallback(_ reason: String) {
     guard !isStopped, fallbackWebView == nil else { return }
     loadAttempts += 1
-    guard loadAttempts <= 2 else {
+    guard loadAttempts <= 4 else {
       showStatus("\(reason)\n再読み込みします")
       DispatchQueue.main.async {
         NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
@@ -2052,7 +2337,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     socketTask = nil
     isLoading = false
     let delay = Double(loadAttempts)
-    WebLoginCookies.sync { [weak self] in
+    NiconicoWarmup.shared.prewarm(programId: channel, forceReload: true) { [weak self] in
       guard let self, !self.isStopped else { return }
       DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
         self.load(channel: self.channel)
@@ -4107,10 +4392,10 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
-// Per-cell YouTube playback is intentionally video-only. Multiple YouTube iframe
-// players competing for audio/session control on iOS will pause each other, so we
-// keep the embed muted and minimal for stable simultaneous viewing.
-final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, WKNavigationDelegate {
+// Per-cell YouTube playback uses the official IFrame Player API with controls
+// disabled. It keeps the surface to the video frame and lets our own overlays own
+// focus, volume and comments.
+final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, WKNavigationDelegate {
   private let stream: StreamItem
   private let settings: AppSettings
   private let web: WKWebView
@@ -4181,9 +4466,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
-    // Keep YouTube muted for simultaneous playback stability; the shared overlay
-    // still stores the user's preferred level for consistency with other cells.
-    web.evaluateJavaScript("window.mvMute && window.mvMute();")
+    web.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(Int(playbackVolume * 100)));")
+  }
+
+  func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    YouTubeAuthManager.shared.sendChat(channel: stream.channel, content: text, completion: completion)
   }
 
   func stopPlayback() {
@@ -4208,7 +4495,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     statusLabel.isHidden = true
     // A real HTTPS base URL on our own domain gives the embed a valid origin/Referer
     // (loadHTMLString with youtube.com or nil triggers YouTube error 152).
-    web.loadHTMLString(Self.html(videoId: videoId), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
+    web.loadHTMLString(Self.html(videoId: videoId, playAudio: settings.playAudio, volume: playbackVolume), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
   }
 
   private func resolveLiveVideoID(from raw: String) {
@@ -4257,28 +4544,48 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
-  private static func html(videoId: String) -> String {
+  private static func html(videoId: String, playAudio: Bool, volume: Float) -> String {
+    let initialVolume = Int(min(1, max(0, volume)) * 100)
+    let muted = playAudio && initialVolume > 0 ? "false" : "true"
     """
     <!doctype html>
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-    <style>html,body{margin:0;height:100%;background:#000;overflow:hidden}iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}</style></head>
+    <style>html,body,#player{margin:0;width:100%;height:100%;background:#000;overflow:hidden}iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}</style></head>
     <body>
-    <iframe id="p" src="https://www.youtube.com/embed/\(videoId)?autoplay=1&mute=1&playsinline=1&controls=0&rel=0&modestbranding=1&enablejsapi=1&origin=https%3A%2F%2Ftonton888115.github.io" allow="autoplay; encrypted-media; picture-in-picture" playsinline></iframe>
+    <div id="player"></div>
+    <script src="https://www.youtube.com/iframe_api"></script>
     <script>
-      var frame=document.getElementById('p');
-      function cmd(func,args){try{frame.contentWindow.postMessage(JSON.stringify({event:'command',func:func,args:args||[]}), '*');}catch(e){}}
-      window.mvPlay=function(){cmd('mute');cmd('playVideo');};
-      window.mvPause=function(){cmd('pauseVideo');};
-      window.mvMute=function(){cmd('mute');};
-      setInterval(function(){window.mvPlay();}, 5000);
+      var player=null, ready=false, muted=\(muted), volume=\(initialVolume);
+      function applyAudio(){
+        if(!player||!ready)return;
+        try{
+          player.setVolume(volume);
+          if(muted||volume<=0){player.mute();}else{player.unMute();}
+        }catch(e){}
+      }
+      function play(){
+        if(!player||!ready)return;
+        try{applyAudio();player.playVideo();}catch(e){}
+      }
+      window.onYouTubeIframeAPIReady=function(){
+        player=new YT.Player('player',{
+          width:'100%',height:'100%',videoId:'\(videoId)',
+          playerVars:{autoplay:1,playsinline:1,controls:0,rel:0,modestbranding:1,fs:0,disablekb:1,iv_load_policy:3,origin:'https://tonton888115.github.io'},
+          events:{onReady:function(){ready=true;play();},onStateChange:function(e){if(e.data===YT.PlayerState.PAUSED||e.data===YT.PlayerState.CUED){setTimeout(play,250);}}}
+        });
+      };
+      window.mvPlay=function(){muted=\(muted);play();};
+      window.mvPause=function(){try{player&&player.pauseVideo();}catch(e){}};
+      window.mvSetVolume=function(v){volume=Math.max(0,Math.min(100,v|0));muted=(volume<=0)||\(!playAudio ? "true" : "false");applyAudio();};
+      setInterval(play, 5000);
     </script>
     </body>
     </html>
     """
   }
 
-  private static func videoID(from raw: String) -> String? {
+  fileprivate static func videoID(from raw: String) -> String? {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     if trimmed.range(of: #"^[A-Za-z0-9_-]{11}$"#, options: .regularExpression) != nil {
       return trimmed
@@ -4311,7 +4618,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     return nil
   }
 
-  private static func liveResolutionURL(from raw: String) -> URL? {
+  fileprivate static func liveResolutionURL(from raw: String) -> URL? {
     let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
     if trimmed.hasPrefix("youtube.com/") || trimmed.hasPrefix("www.youtube.com/") || trimmed.hasPrefix("m.youtube.com/") {
@@ -4343,7 +4650,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     return URL(string: "https://www.youtube.com/@\(handle)/live")
   }
 
-  private static func extractVideoID(fromHTML html: String) -> String? {
+  fileprivate static func extractVideoID(fromHTML html: String) -> String? {
     let patterns = [
       #"<link rel=\"canonical\" href=\"https://www\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})\""#,
       #"watch\?v=([A-Za-z0-9_-]{11})"#,
@@ -4360,7 +4667,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     return nil
   }
 
-  private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+  fileprivate static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
 final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResumable, PlaybackStoppable, AudioControllable {
@@ -5362,6 +5669,7 @@ final class FocusedStreamView: UIView {
   private let chatWeb: WKWebView?
   private let input = UITextField()
   private var autoHider: AutoHidingControls?
+  private weak var commentPoster: CommentPostable?
 
   init(stream: StreamItem, onClose: (() -> Void)?) {
     self.stream = stream
@@ -5394,6 +5702,7 @@ final class FocusedStreamView: UIView {
       video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
     }
     let audio = video as? AudioControllable
+    commentPoster = video as? CommentPostable
     video.translatesAutoresizingMaskIntoConstraints = false
     addSubview(video)
 
@@ -5516,8 +5825,8 @@ final class FocusedStreamView: UIView {
 
   private func sendComment() {
     guard let text = input.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return }
-    if stream.platform == .kick, KickAuthManager.shared.isSignedIn {
-      KickAuthManager.shared.sendChat(channel: stream.channel, content: text) { [weak self] result in
+    if let commentPoster {
+      commentPoster.postComment(text) { [weak self] result in
         DispatchQueue.main.async {
           switch result {
           case .success:
@@ -5596,7 +5905,7 @@ final class FollowingController: BrowserSourceController {
   private let allSources: [StreamPlatform: Source] = [
     .twitch: Source(label: "Twitch", url: URL(string: "https://m.twitch.tv/directory/following")!, host: "twitch.tv"),
     .youtube: Source(label: "YouTube", url: URL(string: "https://m.youtube.com/feed/subscriptions")!, host: "youtube.com"),
-    .kick: Source(label: "Kick", url: URL(string: "https://kick.com/following")!, host: "kick.com"),
+    .kick: Source(label: "Kick", url: URL(string: "https://kick.com/")!, host: "kick.com"),
     .niconico: Source(label: "ニコ生", url: URL(string: "https://live.nicovideo.jp/follow")!, host: "live.nicovideo.jp"),
     .twitcasting: Source(label: "ツイキャス", url: URL(string: "https://twitcasting.tv/")!, host: "twitcasting.tv")
   ]
@@ -5853,7 +6162,7 @@ final class SettingsController: UITableViewController {
     tableView.reloadData()
   }
 
-  override func numberOfSections(in tableView: UITableView) -> Int { 5 }
+  override func numberOfSections(in tableView: UITableView) -> Int { 6 }
 
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     switch section {
@@ -5861,6 +6170,7 @@ final class SettingsController: UITableViewController {
     case 1: return platforms.count
     case 2: return 4
     case 3: return 6
+    case 4: return 3
     default: return 1
     }
   }
@@ -5871,6 +6181,7 @@ final class SettingsController: UITableViewController {
     case 1: return "サービス順"
     case 2: return "Kick OAuth"
     case 3: return "Twitch / ツイキャス OAuth"
+    case 4: return "YouTube OAuth"
     default: return "追加"
     }
   }
@@ -5881,6 +6192,9 @@ final class SettingsController: UITableViewController {
     }
     if section == 3 {
       return "Twitchは user:read:chat / user:write:chat、ツイキャスはWrite権限のOAuthアプリを使います。Redirect URI行をタップするとコピーできます。"
+    }
+    if section == 4 {
+      return "YouTubeは youtube.force-ssl スコープでライブチャット投稿に使います。Google Cloud ConsoleのiOS OAuth Client IDに Redirect URI を登録してください。"
     }
     if section == 1 {
       return "右端の並べ替えハンドルをドラッグして、表示順を自由に変更できます。"
@@ -5991,6 +6305,17 @@ final class SettingsController: UITableViewController {
       }
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
+    } else if indexPath.section == 4 {
+      switch indexPath.row {
+      case 0:
+        cell.textLabel?.text = YouTubeAuthManager.shared.isSignedIn ? "YouTubeログアウト" : "YouTube OAuthログイン"
+      case 1:
+        cell.textLabel?.text = YouTubeAuthManager.shared.config.clientId.isEmpty ? "YouTube Client ID 未設定" : "YouTube Client ID 設定済み"
+      default:
+        cell.textLabel?.text = "YouTube Redirect URI \(YouTubeAuthManager.shared.config.redirectURI)"
+      }
+      cell.accessoryType = .disclosureIndicator
+      cell.selectionStyle = .default
     } else {
       cell.textLabel?.text = "配信を手動追加"
       cell.accessoryType = .disclosureIndicator
@@ -6033,6 +6358,8 @@ final class SettingsController: UITableViewController {
     } else if indexPath.section == 3 {
       handleOtherOAuthRow(indexPath.row)
     } else if indexPath.section == 4 {
+      handleYouTubeOAuthRow(indexPath.row)
+    } else if indexPath.section == 5 {
       present(AddStreamController(), animated: true)
     }
   }
@@ -6285,6 +6612,31 @@ final class SettingsController: UITableViewController {
     }
   }
 
+  private func handleYouTubeOAuthRow(_ row: Int) {
+    switch row {
+    case 0:
+      if YouTubeAuthManager.shared.isSignedIn {
+        YouTubeAuthManager.shared.signOut()
+        tableView.reloadSections(IndexSet(integer: 4), with: .automatic)
+        return
+      }
+      YouTubeAuthManager.shared.signIn(presentationAnchor: view.window) { [weak self] result in
+        DispatchQueue.main.async {
+          self?.tableView.reloadSections(IndexSet(integer: 4), with: .automatic)
+          if case .failure(let error) = result { self?.presentError(error) }
+        }
+      }
+    case 1:
+      editYouTubeClientID()
+    case 2:
+      let uri = YouTubeAuthManager.shared.config.redirectURI
+      UIPasteboard.general.string = uri
+      presentCopiedRedirectAlert(service: "YouTube", uri: uri) { [weak self] in self?.editYouTubeRedirectURI() }
+    default:
+      break
+    }
+  }
+
   private func editTwitchClientID() {
     var config = TwitchAuthManager.shared.config
     editText(title: "Twitch Client ID", message: "Twitch Developer Consoleで作成したアプリの Client ID を貼り付けてください。", text: config.clientId, keyboard: .default) { [weak self] value in
@@ -6318,6 +6670,24 @@ final class SettingsController: UITableViewController {
       config.redirectURI = value
       TwitcastingAuthManager.shared.config = config
       self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+    }
+  }
+
+  private func editYouTubeClientID() {
+    var config = YouTubeAuthManager.shared.config
+    editText(title: "YouTube Client ID", message: "Google Cloud Consoleで作成したiOS OAuth Client IDを貼り付けてください。", text: config.clientId, keyboard: .default) { [weak self] value in
+      config.clientId = value
+      YouTubeAuthManager.shared.config = config
+      self?.tableView.reloadSections(IndexSet(integer: 4), with: .automatic)
+    }
+  }
+
+  private func editYouTubeRedirectURI() {
+    var config = YouTubeAuthManager.shared.config
+    editText(title: "YouTube Redirect URI", message: nil, text: config.redirectURI, keyboard: .URL) { [weak self] value in
+      config.redirectURI = value
+      YouTubeAuthManager.shared.config = config
+      self?.tableView.reloadSections(IndexSet(integer: 4), with: .automatic)
     }
   }
 
