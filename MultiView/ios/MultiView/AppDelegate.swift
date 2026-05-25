@@ -4547,7 +4547,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private static func html(videoId: String, playAudio: Bool, volume: Float) -> String {
     let initialVolume = Int(min(1, max(0, volume)) * 100)
     let muted = playAudio && initialVolume > 0 ? "false" : "true"
-    """
+    return """
     <!doctype html>
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
@@ -5905,7 +5905,7 @@ final class FollowingController: BrowserSourceController {
   private let allSources: [StreamPlatform: Source] = [
     .twitch: Source(label: "Twitch", url: URL(string: "https://m.twitch.tv/directory/following")!, host: "twitch.tv"),
     .youtube: Source(label: "YouTube", url: URL(string: "https://m.youtube.com/feed/subscriptions")!, host: "youtube.com"),
-    .kick: Source(label: "Kick", url: URL(string: "https://kick.com/")!, host: "kick.com"),
+    .kick: Source(label: "Kick", url: URL(string: "https://kick.com/following")!, host: "kick.com"),
     .niconico: Source(label: "ニコ生", url: URL(string: "https://live.nicovideo.jp/follow")!, host: "live.nicovideo.jp"),
     .twitcasting: Source(label: "ツイキャス", url: URL(string: "https://twitcasting.tv/")!, host: "twitcasting.tv")
   ]
