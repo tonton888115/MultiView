@@ -35,7 +35,7 @@ export function parseStreamUrl(raw: string): ParsedStream | null {
   }
 
   if (host === 'twitch.tv' || host === 'm.twitch.tv') {
-    const skip = ['videos', 'directory', 'p', 'settings', 'subscriptions', 'wallet', 'drops', 'u'];
+    const skip = ['videos', 'directory', 'login', 'signup', 'p', 'settings', 'subscriptions', 'wallet', 'drops', 'u'];
     if (parts[0] && !skip.includes(parts[0])) {
       return { platform: 'twitch', channel: parts[0] };
     }
@@ -43,7 +43,7 @@ export function parseStreamUrl(raw: string): ParsedStream | null {
   }
 
   if (host === 'kick.com' && parts[0]) {
-    const skip = ['browse', 'categories', 'category', 'following', 'search', 'clips', 'about', 'help', 'dashboard', 'messages', 'settings', 'subscriptions'];
+    const skip = ['browse', 'categories', 'category', 'following', 'search', 'clips', 'about', 'help', 'dashboard', 'messages', 'settings', 'subscriptions', 'login', 'signup', 'auth', 'oauth'];
     if (!skip.includes(parts[0])) {
       return { platform: 'kick', channel: parts[0] };
     }

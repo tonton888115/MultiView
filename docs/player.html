@@ -222,7 +222,11 @@
       return '<img class="emote" src="https://files.kick.com/emotes/' + id + '/fullsize">';
     });
   }
-  function kickPlain(content) { return content.replace(/\[emote:\d+:[^\]]+\]/g, ''); }
+  function kickPlain(content) {
+    return content.replace(/\[emote:\d+:([^\]]+)\]/g, function (_, name) {
+      return ':' + name + ':';
+    });
+  }
 
   // ---- danmaku ----
   function Danmaku(root) {

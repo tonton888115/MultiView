@@ -22,7 +22,7 @@ const SOURCES: { key: Platform; label: string; url: string }[] = [
     url: 'https://m.youtube.com/feed/subscriptions',
   },
   { key: 'kick', label: 'Kick', url: 'https://kick.com/following' },
-  { key: 'niconico', label: 'ニコ生', url: 'https://live.nicovideo.jp/' },
+  { key: 'niconico', label: 'ニコ生', url: 'https://live.nicovideo.jp/follow' },
   { key: 'twitcasting', label: 'ツイキャス', url: 'https://twitcasting.tv/' },
 ];
 

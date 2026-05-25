@@ -975,6 +975,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
        let payload = json["data"] as? [String: Any],
        let code = payload["code"] as? String {
       showStatus("ニコ生エラー: \(code)")
+      if code.lowercased().contains("permission") || code.lowercased().contains("resource") {
+        installFallback("ニコ生エラー: \(code)")
+      }
     }
     if type == "disconnect" {
       socketTask = nil
@@ -1091,6 +1094,8 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       self.showStatus(reason)
       self.player.pause()
       self.player.replaceCurrentItem(with: nil)
+      self.keepSeatTimer?.invalidate()
+      self.keepSeatTimer = nil
       self.socketTask?.cancel(with: .goingAway, reason: nil)
       self.socketTask = nil
       self.ndgrCommentTask?.cancel()
@@ -1764,7 +1769,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     guard let payloadData,
           let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
           let content = (payload["content"] as? String) ?? (payload["message"] as? String) else { return }
-    emitDanmaku(Self.kickPlain(content))
+    emitDanmaku(Self.kickDisplayText(content))
   }
 
   private func emitDanmaku(_ text: String) {
@@ -1806,8 +1811,18 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     }
   }
 
-  private static func kickPlain(_ content: String) -> String {
-    content.replacingOccurrences(of: #"\[emote:\d+:[^\]]+\]"#, with: "", options: .regularExpression)
+  private static func kickDisplayText(_ content: String) -> String {
+    let pattern = #"\[emote:\d+:([^\]]+)\]"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return content }
+    var output = content
+    let range = NSRange(output.startIndex..<output.endIndex, in: output)
+    for match in regex.matches(in: output, range: range).reversed() {
+      guard let fullRange = Range(match.range(at: 0), in: output),
+            let nameRange = Range(match.range(at: 1), in: output) else { continue }
+      let name = String(output[nameRange])
+      output.replaceSubrange(fullRange, with: ":\(name):")
+    }
+    return output
   }
 
   private static func extractChannelInfo(from data: Data) -> (hlsURL: URL?, chatroomID: String?) {
@@ -2141,6 +2156,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     chatSocket = task
     task.resume()
     let nick = "justinfan\(Int.random(in: 10000..<1_000_000))"
+    task.send(.string("CAP REQ :twitch.tv/tags")) { _ in }
     task.send(.string("PASS SCHMOOPIIE")) { _ in }
     task.send(.string("NICK \(nick)")) { _ in }
     task.send(.string("JOIN #\(channel)")) { _ in }
@@ -3214,10 +3230,10 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
         return (.niconico, liveNo.hasPrefix("lv") ? liveNo : "lv\(liveNo)")
       }
     }
-    if host == "kick.com", let first = parts.first, !["browse", "following", "search", "categories"].contains(first) {
+    if host == "kick.com", let first = parts.first, !Self.kickNonStreamPaths.contains(first) {
       return (.kick, first)
     }
-    if host == "twitch.tv" || host == "m.twitch.tv", let first = parts.first, !["directory", "videos"].contains(first) {
+    if host == "twitch.tv" || host == "m.twitch.tv", let first = parts.first, !Self.twitchNonStreamPaths.contains(first) {
       return (.twitch, first)
     }
     if host.contains("youtube.com"), let v = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "v" })?.value {
@@ -3234,6 +3250,18 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     }
     return nil
   }
+
+  private static let kickNonStreamPaths: Set<String> = [
+    "browse", "categories", "category", "following", "search", "clips", "about",
+    "help", "dashboard", "messages", "settings", "subscriptions", "login",
+    "signup", "auth", "oauth"
+  ]
+
+  private static let twitchNonStreamPaths: Set<String> = [
+    "directory", "videos", "login", "signup", "p", "settings", "subscriptions",
+    "wallet", "drops", "u", "downloads", "jobs", "privacy", "terms", "turbo",
+    "store"
+  ]
 }
 
 final class SettingsController: UITableViewController {
