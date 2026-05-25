@@ -233,6 +233,7 @@ struct AppSettings: Codable {
   var showChat = true
   var proxyUrl = ""
   var playAudio = true
+  var autoFollowRaids = false
   var layoutMode: LayoutMode = .stacked
   var wifiQuality: PlaybackQuality = .high
   var mobileQuality: PlaybackQuality = .economy
@@ -250,6 +251,7 @@ struct AppSettings: Codable {
     showChat = try container.decodeIfPresent(Bool.self, forKey: .showChat) ?? true
     proxyUrl = try container.decodeIfPresent(String.self, forKey: .proxyUrl) ?? ""
     playAudio = try container.decodeIfPresent(Bool.self, forKey: .playAudio) ?? true
+    autoFollowRaids = try container.decodeIfPresent(Bool.self, forKey: .autoFollowRaids) ?? false
     layoutMode = try container.decodeIfPresent(LayoutMode.self, forKey: .layoutMode) ?? .stacked
     wifiQuality = try container.decodeIfPresent(PlaybackQuality.self, forKey: .wifiQuality) ?? .high
     mobileQuality = try container.decodeIfPresent(PlaybackQuality.self, forKey: .mobileQuality) ?? .economy
@@ -357,6 +359,141 @@ protocol AppStateDelegate: AnyObject {
   func appStateDidChange()
 }
 
+extension Notification.Name {
+  static let multiViewRaidFollowed = Notification.Name("MultiViewRaidFollowed")
+}
+
+enum RaidAutoFollow {
+  static func follow(platform: StreamPlatform, channel rawChannel: String, currentChannel: String) {
+    let channel = normalize(rawChannel, platform: platform)
+    let current = normalize(currentChannel, platform: platform)
+    guard !channel.isEmpty, channel.lowercased() != current.lowercased() else { return }
+    DispatchQueue.main.async {
+      guard AppState.shared.settings.autoFollowRaids else { return }
+      if AppState.shared.addIfNeeded(platform: platform, channel: channel) {
+        NotificationCenter.default.post(name: .multiViewRaidFollowed, object: nil)
+      }
+    }
+  }
+
+  static func detectTarget(in text: String, preferredPlatform: StreamPlatform) -> (StreamPlatform, String)? {
+    let lower = text.lowercased()
+    guard lower.contains("raid") || lower.contains("raiding") || lower.contains("レイド") || lower.contains("host") || lower.contains("hosting") || lower.contains("ホスト") else {
+      return nil
+    }
+    if let linked = firstStreamURL(in: text) {
+      return linked
+    }
+    return plainMentionTarget(in: text, preferredPlatform: preferredPlatform)
+  }
+
+  static func detectTarget(in payload: Any, preferredPlatform: StreamPlatform) -> (StreamPlatform, String)? {
+    if let text = payload as? String {
+      return detectTarget(in: text, preferredPlatform: preferredPlatform)
+    }
+    if let dict = payload as? [String: Any] {
+      if let direct = targetFromDictionary(dict, preferredPlatform: preferredPlatform) {
+        return direct
+      }
+      let joined = dict.compactMap { key, value -> String? in
+        guard key.lowercased().contains("raid") || key.lowercased().contains("host") || key.lowercased().contains("target") else { return nil }
+        return "\(key) \(value)"
+      }.joined(separator: " ")
+      if let direct = detectTarget(in: joined, preferredPlatform: preferredPlatform) {
+        return direct
+      }
+      for value in dict.values {
+        if let nested = detectTarget(in: value, preferredPlatform: preferredPlatform) {
+          return nested
+        }
+      }
+    }
+    if let array = payload as? [Any] {
+      for value in array {
+        if let nested = detectTarget(in: value, preferredPlatform: preferredPlatform) {
+          return nested
+        }
+      }
+    }
+    return nil
+  }
+
+  private static func targetFromDictionary(_ dict: [String: Any], preferredPlatform: StreamPlatform) -> (StreamPlatform, String)? {
+    for (key, value) in dict {
+      let lowerKey = key.lowercased()
+      guard lowerKey.contains("target") || lowerKey == "to" || lowerKey.contains("recipient") || lowerKey.contains("raided") || lowerKey.contains("hosted") else {
+        continue
+      }
+      if let text = value as? String {
+        if let linked = firstStreamURL(in: text) {
+          return linked
+        }
+        let channel = normalize(text, platform: preferredPlatform)
+        if !channel.isEmpty {
+          return (preferredPlatform, channel)
+        }
+      }
+      if let nested = detectTarget(in: value, preferredPlatform: preferredPlatform) {
+        return nested
+      }
+    }
+    return nil
+  }
+
+  private static func firstStreamURL(in text: String) -> (StreamPlatform, String)? {
+    let pattern = #"https?://[^\s<>"']+"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    for match in regex.matches(in: text, range: range) {
+      guard let valueRange = Range(match.range, in: text),
+            let url = URL(string: String(text[valueRange]).trimmingCharacters(in: CharacterSet(charactersIn: ".,)」]"))) else { continue }
+      let host = url.host?.replacingOccurrences(of: "www.", with: "").lowercased() ?? ""
+      let parts = url.path.split(separator: "/").map(String.init)
+      if (host == "twitch.tv" || host == "m.twitch.tv"), let first = parts.first {
+        let channel = normalize(first, platform: .twitch)
+        if !channel.isEmpty { return (.twitch, channel) }
+      }
+      if host == "kick.com", let first = parts.first {
+        let channel = normalize(first, platform: .kick)
+        if !channel.isEmpty { return (.kick, channel) }
+      }
+    }
+    return nil
+  }
+
+  private static func plainMentionTarget(in text: String, preferredPlatform: StreamPlatform) -> (StreamPlatform, String)? {
+    let pattern = #"(?:raid(?:ing)?|レイド|host(?:ing)?|ホスト)[^\w@#]{0,24}@?([A-Za-z0-9_.-]{2,32})"#
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    guard let match = regex.firstMatch(in: text, range: range),
+          let valueRange = Range(match.range(at: 1), in: text) else { return nil }
+    let channel = normalize(String(text[valueRange]), platform: preferredPlatform)
+    let ignored = ["to", "into", "over", "the", "a", "channel", "チャンネル"]
+    guard !ignored.contains(channel.lowercased()) else { return nil }
+    return channel.isEmpty ? nil : (preferredPlatform, channel)
+  }
+
+  private static func normalize(_ raw: String, platform: StreamPlatform) -> String {
+    var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    value = value.replacingOccurrences(of: "^[@#]+", with: "", options: .regularExpression)
+    if let range = value.range(of: "twitch.tv/", options: .caseInsensitive) {
+      value = String(value[range.upperBound...])
+    }
+    if let range = value.range(of: "kick.com/", options: .caseInsensitive) {
+      value = String(value[range.upperBound...])
+    }
+    value = value.components(separatedBy: CharacterSet(charactersIn: "/?# \n\t.,)」]")).first ?? value
+    switch platform {
+    case .twitch:
+      return value.lowercased()
+    case .kick:
+      return value
+    default:
+      return value
+    }
+  }
+}
+
 final class AppState {
   static let shared = AppState()
 
@@ -375,12 +512,18 @@ final class AppState {
   }
 
   func add(platform: StreamPlatform, channel rawChannel: String) {
+    _ = addIfNeeded(platform: platform, channel: rawChannel)
+  }
+
+  @discardableResult
+  func addIfNeeded(platform: StreamPlatform, channel rawChannel: String) -> Bool {
     let channel = rawChannel.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !channel.isEmpty else { return }
+    guard !channel.isEmpty else { return false }
     if streams.contains(where: { $0.platform == platform && $0.channel.lowercased() == channel.lowercased() }) {
-      return
+      return false
     }
     streams.append(StreamItem(id: UUID().uuidString, platform: platform, channel: channel))
+    return true
   }
 
   func remove(_ stream: StreamItem) {
@@ -412,6 +555,7 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
     settingsVC.tabBarItem = UITabBarItem(title: "設定", image: UIImage(systemName: "gearshape"), tag: 3)
     viewControllers = [followingVC, rankingVC, viewVC, settingsVC]
     selectedIndex = 2
+    NotificationCenter.default.addObserver(self, selector: #selector(raidFollowed), name: .multiViewRaidFollowed, object: nil)
   }
 
   func appStateDidChange() {
@@ -419,6 +563,14 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
     rankingVC.reloadOrder()
     followingVC.reloadOrder()
     settingsVC.reload()
+  }
+
+  @objc private func raidFollowed() {
+    selectedIndex = 2
+    viewVC.reload()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+      PlaybackCoordinator.shared.resumeAll()
+    }
   }
 
   func tabBarController(_ tabBarController: UITabBarController, didSelect viewController: UIViewController) {
@@ -1788,6 +1940,13 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     }
     isLoading = true
     showStatus("Kickをネイティブ再生で読み込み中")
+    syncKickWebCookies { [weak self] in
+      self?.fetchKickChannel(url: url, channel: channel)
+    }
+  }
+
+  private func fetchKickChannel(url: URL, channel: String) {
+    guard !isStopped else { return }
     var request = URLRequest(url: url)
     kickHeaders().forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
     channelTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
@@ -1809,6 +1968,8 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       let channelInfo = Self.extractChannelInfo(from: data)
       if let chatroomID = channelInfo.chatroomID {
         self.connectKickComments(chatroomID: chatroomID)
+      } else {
+        self.fetchKickChatroom(channel: channel)
       }
       guard let hlsURL = channelInfo.hlsURL else {
         self.installFallback("Kick HLS URLを取得できません")
@@ -1817,6 +1978,25 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       self.play(hlsURL: hlsURL)
     }
     channelTask?.resume()
+  }
+
+  private func fetchKickChatroom(channel: String) {
+    guard (settings.showChat || settings.autoFollowRaids), !isStopped else { return }
+    guard let escaped = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+          let url = URL(string: "https://kick.com/api/v2/channels/\(escaped)/chatroom") else { return }
+    var request = URLRequest(url: url)
+    kickHeaders().forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+    URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+      guard let self, !self.isStopped else { return }
+      if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+        if http.statusCode == 401 || http.statusCode == 403 {
+          self.showStatus("Kick R18コメントは18歳以上確認済みログインが必要です")
+        }
+        return
+      }
+      guard let data, let chatroomID = Self.extractChatroomID(from: data) else { return }
+      self.connectKickComments(chatroomID: chatroomID)
+    }.resume()
   }
 
   private func play(hlsURL: URL) {
@@ -1914,14 +2094,35 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   }
 
   private func kickCookieHeader() -> String? {
-    guard let url = URL(string: "https://kick.com/"),
-          let cookies = HTTPCookieStorage.shared.cookies(for: url),
-          !cookies.isEmpty else { return nil }
-    return cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+    let urls = [
+      URL(string: "https://kick.com/"),
+      URL(string: "https://www.kick.com/"),
+      URL(string: "https://api.kick.com/")
+    ].compactMap { $0 }
+    var cookies = urls.flatMap { HTTPCookieStorage.shared.cookies(for: $0) ?? [] }
+    cookies.append(contentsOf: HTTPCookieStorage.shared.cookies?.filter { $0.domain.contains("kick.com") } ?? [])
+    var seen = Set<String>()
+    let unique = cookies.filter { cookie in
+      let key = "\(cookie.name)=\(cookie.value)"
+      guard !seen.contains(key) else { return false }
+      seen.insert(key)
+      return true
+    }
+    guard !unique.isEmpty else { return nil }
+    return unique.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+  }
+
+  private func syncKickWebCookies(_ completion: @escaping () -> Void) {
+    WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+      cookies
+        .filter { $0.domain.contains("kick.com") }
+        .forEach { HTTPCookieStorage.shared.setCookie($0) }
+      DispatchQueue.main.async(execute: completion)
+    }
   }
 
   private func connectKickComments(chatroomID: String) {
-    guard settings.showChat, !isStopped else { return }
+    guard (settings.showChat || settings.autoFollowRaids), !isStopped else { return }
     self.chatroomID = chatroomID
     socketTask?.cancel(with: .goingAway, reason: nil)
     guard let url = URL(string: "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=ios-native&version=1.0&flash=false") else { return }
@@ -1971,7 +2172,6 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       socketTask?.send(.string(#"{"event":"pusher:pong","data":{}}"#)) { _ in }
       return
     }
-    guard event.contains("ChatMessage") else { return }
     let payloadData: Data?
     if let raw = json["data"] as? String {
       payloadData = raw.data(using: .utf8)
@@ -1981,11 +2181,23 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       payloadData = nil
     }
     guard let payloadData,
-          let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
+          let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else { return }
+    if settings.autoFollowRaids,
+       (event.localizedCaseInsensitiveContains("raid") || event.localizedCaseInsensitiveContains("host")),
+       let target = RaidAutoFollow.detectTarget(in: payload, preferredPlatform: .kick) {
+      RaidAutoFollow.follow(platform: target.0, channel: target.1, currentChannel: stream.channel)
+    }
+    guard event.contains("ChatMessage"),
           let content = (payload["content"] as? String) ?? (payload["message"] as? String) else { return }
-    let tokens = Self.kickDanmakuTokens(content)
-    let filterText = Self.kickFilterText(content)
-    emitDanmaku(tokens, filterText: filterText)
+    if settings.autoFollowRaids,
+       let target = RaidAutoFollow.detectTarget(in: content, preferredPlatform: .kick) {
+      RaidAutoFollow.follow(platform: target.0, channel: target.1, currentChannel: stream.channel)
+    }
+    if settings.showChat {
+      let tokens = Self.kickDanmakuTokens(content)
+      let filterText = Self.kickFilterText(content)
+      emitDanmaku(tokens, filterText: filterText)
+    }
   }
 
   private func emitDanmaku(_ tokens: [NativeDanmakuToken], filterText: String) {
@@ -2067,6 +2279,33 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       chatroomID = Self.stringValue(livestream["chatroom_id"] ?? livestream["chatroomId"])
     }
     return (hlsURL, chatroomID)
+  }
+
+  private static func extractChatroomID(from data: Data) -> String? {
+    guard let json = try? JSONSerialization.jsonObject(with: data) else { return nil }
+    return extractChatroomID(from: json)
+  }
+
+  private static func extractChatroomID(from value: Any) -> String? {
+    if let dict = value as? [String: Any] {
+      if let id = stringValue(dict["id"] ?? dict["chatroom_id"] ?? dict["chatroomId"]) {
+        return id
+      }
+      if let chatroom = dict["chatroom"], let id = extractChatroomID(from: chatroom) {
+        return id
+      }
+      if let data = dict["data"], let id = extractChatroomID(from: data) {
+        return id
+      }
+    }
+    if let array = value as? [Any] {
+      for item in array {
+        if let id = extractChatroomID(from: item) {
+          return id
+        }
+      }
+    }
+    return nil
   }
 
   private static func stringValue(_ value: Any) -> String? {
@@ -2360,7 +2599,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 
   private func connectTwitchChat(channel: String) {
-    guard settings.showChat, !isStopped, fallbackWebView == nil else { return }
+    guard (settings.showChat || settings.autoFollowRaids), !isStopped, fallbackWebView == nil else { return }
     chatChannel = channel
     chatSocket?.cancel(with: .goingAway, reason: nil)
     guard let url = URL(string: "wss://irc-ws.chat.twitch.tv:443") else { return }
@@ -2368,7 +2607,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     chatSocket = task
     task.resume()
     let nick = "justinfan\(Int.random(in: 10000..<1_000_000))"
-    task.send(.string("CAP REQ :twitch.tv/tags")) { _ in }
+    task.send(.string("CAP REQ :twitch.tv/tags twitch.tv/commands")) { _ in }
     task.send(.string("PASS SCHMOOPIIE")) { _ in }
     task.send(.string("NICK \(nick)")) { _ in }
     task.send(.string("JOIN #\(channel)")) { _ in }
@@ -2408,11 +2647,45 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
         tags = Self.parseTwitchTags(String(line[line.index(after: line.startIndex)..<split]))
         line = String(line[line.index(after: split)...])
       }
+      if settings.autoFollowRaids,
+         let target = Self.twitchRaidTarget(from: line, tags: tags) {
+        RaidAutoFollow.follow(platform: target.0, channel: target.1, currentChannel: stream.channel)
+      }
       guard let privmsg = line.range(of: " PRIVMSG "),
             let bodyRange = line.range(of: " :", range: privmsg.lowerBound..<line.endIndex) else { continue }
       let message = String(line[bodyRange.upperBound...])
-      emitDanmaku(Self.twitchDanmakuTokens(message, emotesTag: tags["emotes"]), filterText: message)
+      if settings.autoFollowRaids,
+         let target = RaidAutoFollow.detectTarget(in: message, preferredPlatform: .twitch) {
+        RaidAutoFollow.follow(platform: target.0, channel: target.1, currentChannel: stream.channel)
+      }
+      if settings.showChat {
+        emitDanmaku(Self.twitchDanmakuTokens(message, emotesTag: tags["emotes"]), filterText: message)
+      }
     }
+  }
+
+  private static func twitchRaidTarget(from line: String, tags: [String: String]) -> (StreamPlatform, String)? {
+    let lower = line.lowercased()
+    if lower.contains(" usernotice ") || lower.contains(" notice ") {
+      let targetKeys = [
+        "msg-param-target-login",
+        "msg-param-target_user_login",
+        "msg-param-targetuserlogin",
+        "msg-param-to-broadcaster-user-login",
+        "msg-param-raid-target",
+        "msg-param-channel"
+      ]
+      for key in targetKeys {
+        if let value = tags[key], !value.isEmpty {
+          return (.twitch, value)
+        }
+      }
+      if let bodyRange = line.range(of: " :"),
+         let target = RaidAutoFollow.detectTarget(in: String(line[bodyRange.upperBound...]), preferredPlatform: .twitch) {
+        return target
+      }
+    }
+    return nil
   }
 
   private func emitDanmaku(_ tokens: [NativeDanmakuToken], filterText: String) {
@@ -2834,6 +3107,10 @@ final class ViewingController: UIViewController {
   private let scrollView = UIScrollView()
   private let stack = UIStackView()
   private var focused: StreamItem?
+  private weak var dragSourceCell: StreamCellView?
+  private weak var dragTargetCell: StreamCellView?
+  private var dragSnapshot: UIView?
+  private var dragSourceStream: StreamItem?
 
   override func viewDidLoad() {
     super.viewDidLoad()
@@ -2912,6 +3189,8 @@ final class ViewingController: UIViewController {
     let cell = StreamCellView(stream: stream, onFocus: { [weak self] in
       self?.focused = stream
       self?.reload()
+    }, onReorder: { [weak self] cell, gesture in
+      self?.handleReorder(cell: cell, gesture: gesture)
     })
     stack.addArrangedSubview(cell)
     cell.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: 9 / 16).isActive = true
@@ -3096,12 +3375,124 @@ final class ViewingController: UIViewController {
         row.addArrangedSubview(StreamCellView(stream: stream, onFocus: { [weak self] in
           self?.focused = stream
           self?.reload()
+        }, onReorder: { [weak self] cell, gesture in
+          self?.handleReorder(cell: cell, gesture: gesture)
         }))
       }
       stack.addArrangedSubview(row)
       row.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: 9 / 32).isActive = true
       row.heightAnchor.constraint(greaterThanOrEqualToConstant: 150).isActive = true
     }
+  }
+
+  private func handleReorder(cell: StreamCellView, gesture: UILongPressGestureRecognizer) {
+    guard focused == nil, AppState.shared.streams.count > 1 else { return }
+    let location = gesture.location(in: view)
+    switch gesture.state {
+    case .began:
+      beginReorder(cell: cell, at: location)
+    case .changed:
+      updateReorder(at: location)
+    case .ended:
+      finishReorder(commit: true)
+    case .cancelled, .failed:
+      finishReorder(commit: false)
+    default:
+      break
+    }
+  }
+
+  private func beginReorder(cell: StreamCellView, at location: CGPoint) {
+    guard dragSnapshot == nil else { return }
+    dragSourceCell = cell
+    dragTargetCell = cell
+    dragSourceStream = cell.stream
+    scrollView.isScrollEnabled = false
+    cell.setReorderSourceActive(true)
+    let snapshot = cell.snapshotView(afterScreenUpdates: false) ?? UIView(frame: cell.bounds)
+    snapshot.frame = cell.convert(cell.bounds, to: view)
+    snapshot.layer.shadowColor = UIColor.black.cgColor
+    snapshot.layer.shadowOpacity = 0.35
+    snapshot.layer.shadowRadius = 14
+    snapshot.layer.shadowOffset = CGSize(width: 0, height: 8)
+    snapshot.transform = CGAffineTransform(scaleX: 1.03, y: 1.03)
+    view.addSubview(snapshot)
+    dragSnapshot = snapshot
+    updateReorder(at: location)
+  }
+
+  private func updateReorder(at location: CGPoint) {
+    dragSnapshot?.center = location
+    guard let target = reorderCell(at: location), target !== dragSourceCell else {
+      if dragTargetCell !== dragSourceCell {
+        dragTargetCell?.setDropTargetActive(false)
+        dragTargetCell = dragSourceCell
+      }
+      return
+    }
+    if target !== dragTargetCell {
+      dragTargetCell?.setDropTargetActive(false)
+      dragTargetCell = target
+      target.setDropTargetActive(true)
+    }
+  }
+
+  private func finishReorder(commit: Bool) {
+    scrollView.isScrollEnabled = true
+    let sourceCell = dragSourceCell
+    let targetCell = dragTargetCell
+    let sourceStream = dragSourceStream
+    dragSourceCell = nil
+    dragTargetCell = nil
+    dragSourceStream = nil
+
+    sourceCell?.setReorderSourceActive(false)
+    targetCell?.setDropTargetActive(false)
+
+    let snapshot = dragSnapshot
+    dragSnapshot = nil
+    UIView.animate(withDuration: 0.16, animations: {
+      if let sourceCell, let snapshot {
+        snapshot.frame = sourceCell.convert(sourceCell.bounds, to: self.view)
+      }
+      snapshot?.alpha = 0
+    }, completion: { _ in
+      snapshot?.removeFromSuperview()
+    })
+
+    guard commit,
+          let sourceStream,
+          let targetStream = targetCell?.stream,
+          sourceStream.id != targetStream.id,
+          let from = AppState.shared.streams.firstIndex(where: { $0.id == sourceStream.id }),
+          let to = AppState.shared.streams.firstIndex(where: { $0.id == targetStream.id }) else { return }
+    var next = AppState.shared.streams
+    next.swapAt(from, to)
+    AppState.shared.streams = next
+  }
+
+  private func reorderCell(at location: CGPoint) -> StreamCellView? {
+    let cells = reorderCells(in: stack)
+    if let containing = cells.first(where: { $0.convert($0.bounds, to: view).contains(location) }) {
+      return containing
+    }
+    return cells.min { lhs, rhs in
+      let left = lhs.convert(lhs.bounds, to: view).centerDistance(to: location)
+      let right = rhs.convert(rhs.bounds, to: view).centerDistance(to: location)
+      return left < right
+    }
+  }
+
+  private func reorderCells(in root: UIView) -> [StreamCellView] {
+    var result: [StreamCellView] = []
+    for subview in root.subviews {
+      if let cell = subview as? StreamCellView {
+        result.append(cell)
+      } else {
+        result.append(contentsOf: reorderCells(in: subview))
+      }
+    }
+    return result
   }
 
   private func emptyView() -> UIView {
@@ -3115,10 +3506,20 @@ final class ViewingController: UIViewController {
   }
 }
 
-final class StreamCellView: UIView {
+private extension CGRect {
+  func centerDistance(to point: CGPoint) -> CGFloat {
+    hypot(midX - point.x, midY - point.y)
+  }
+}
+
+final class StreamCellView: UIView, UIGestureRecognizerDelegate {
+  let stream: StreamItem
+  private let onReorder: (StreamCellView, UILongPressGestureRecognizer) -> Void
   private var autoHider: AutoHidingControls?
 
-  init(stream: StreamItem, onFocus: @escaping () -> Void) {
+  init(stream: StreamItem, onFocus: @escaping () -> Void, onReorder: @escaping (StreamCellView, UILongPressGestureRecognizer) -> Void) {
+    self.stream = stream
+    self.onReorder = onReorder
     super.init(frame: .zero)
     backgroundColor = .black
     clipsToBounds = true
@@ -3185,12 +3586,44 @@ final class StreamCellView: UIView {
       volume.heightAnchor.constraint(equalTo: heightAnchor, multiplier: 0.62)
     ])
     autoHider = AutoHidingControls(host: self, controls: [focus, remove, volume])
+    let reorder = UILongPressGestureRecognizer(target: self, action: #selector(handleReorderGesture(_:)))
+    reorder.minimumPressDuration = 0.45
+    reorder.delegate = self
+    addGestureRecognizer(reorder)
   }
 
   required init?(coder: NSCoder) {
     fatalError("init(coder:) has not been implemented")
   }
 
+  @objc private func handleReorderGesture(_ gesture: UILongPressGestureRecognizer) {
+    onReorder(self, gesture)
+  }
+
+  func setReorderSourceActive(_ active: Bool) {
+    alpha = active ? 0.42 : 1
+    layer.borderWidth = active ? 2 : 0.5
+    layer.borderColor = (active ? UIColor.systemYellow : UIColor.white.withAlphaComponent(0.18)).cgColor
+  }
+
+  func setDropTargetActive(_ active: Bool) {
+    guard dragVisualCanChange else { return }
+    layer.borderWidth = active ? 2 : 0.5
+    layer.borderColor = (active ? UIColor.systemGreen : UIColor.white.withAlphaComponent(0.18)).cgColor
+  }
+
+  func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+    var current: UIView? = touch.view
+    while let view = current {
+      if view is UIControl { return false }
+      current = view.superview
+    }
+    return true
+  }
+
+  private var dragVisualCanChange: Bool {
+    alpha > 0.8
+  }
 }
 
 final class VolumeOverlay: UIVisualEffectView {
@@ -3727,7 +4160,7 @@ final class SettingsController: UITableViewController {
 
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     switch section {
-    case 0: return 11
+    case 0: return 12
     case 1: return platforms.count
     case 2: return 3
     default: return 1
@@ -3785,20 +4218,31 @@ final class SettingsController: UITableViewController {
       }, for: .valueChanged)
       cell.accessoryView = toggle
     } else if indexPath.section == 0 && indexPath.row == 3 {
+      cell.textLabel?.text = "レイド先を自動追加"
+      let toggle = UISwitch()
+      toggle.isOn = AppState.shared.settings.autoFollowRaids
+      toggle.addAction(UIAction { action in
+        guard let s = action.sender as? UISwitch else { return }
+        var settings = AppState.shared.settings
+        settings.autoFollowRaids = s.isOn
+        AppState.shared.settings = settings
+      }, for: .valueChanged)
+      cell.accessoryView = toggle
+    } else if indexPath.section == 0 && indexPath.row == 4 {
       cell.textLabel?.text = "Wi-Fi時の画質"
       cell.accessoryView = qualityControl(selected: AppState.shared.settings.wifiQuality) { quality in
         var settings = AppState.shared.settings
         settings.wifiQuality = quality
         AppState.shared.settings = settings
       }
-    } else if indexPath.section == 0 && indexPath.row == 4 {
+    } else if indexPath.section == 0 && indexPath.row == 5 {
       cell.textLabel?.text = "モバイル通信時の画質"
       cell.accessoryView = qualityControl(selected: AppState.shared.settings.mobileQuality) { quality in
         var settings = AppState.shared.settings
         settings.mobileQuality = quality
         AppState.shared.settings = settings
       }
-    } else if indexPath.section == 0 && indexPath.row == 5 {
+    } else if indexPath.section == 0 && indexPath.row == 6 {
       cell.textLabel?.text = "CORSプロキシ"
       cell.detailTextLabel?.text = nil
       cell.accessoryType = .disclosureIndicator
@@ -3861,9 +4305,9 @@ final class SettingsController: UITableViewController {
   }
 
   override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-    if indexPath.section == 0 && indexPath.row == 5 {
+    if indexPath.section == 0 && indexPath.row == 6 {
       editProxy()
-    } else if indexPath.section == 0 && (6...10).contains(indexPath.row) {
+    } else if indexPath.section == 0 && (7...11).contains(indexPath.row) {
       editDanmakuValue(row: indexPath.row)
     } else if indexPath.section == 2 {
       handleKickOAuthRow(indexPath.row)
@@ -3875,15 +4319,15 @@ final class SettingsController: UITableViewController {
   private func danmakuTitle(row: Int) -> String {
     let settings = AppState.shared.settings
     switch row {
-    case 6:
-      return "文字サイズ \(Int(settings.danmakuFontSize))"
     case 7:
-      return "速度 \(Int((settings.danmakuSpeed / 0.13) * 100))%"
+      return "文字サイズ \(Int(settings.danmakuFontSize))"
     case 8:
-      return "透過度 \(Int(settings.danmakuOpacity * 100))%"
+      return "速度 \(Int((settings.danmakuSpeed / 0.13) * 100))%"
     case 9:
-      return "最大行数 \(settings.danmakuMaxLines == 0 ? "自動" : String(settings.danmakuMaxLines))"
+      return "透過度 \(Int(settings.danmakuOpacity * 100))%"
     case 10:
+      return "最大行数 \(settings.danmakuMaxLines == 0 ? "自動" : String(settings.danmakuMaxLines))"
+    case 11:
       return "最大文字数 \(settings.danmakuMaxLength == 0 ? "無制限" : String(settings.danmakuMaxLength))"
     default:
       return ""
@@ -3906,23 +4350,23 @@ final class SettingsController: UITableViewController {
     let title: String
     let message: String
     switch row {
-    case 6:
+    case 7:
       title = "文字サイズ"
       current = String(Int(settings.danmakuFontSize))
       message = "12〜40"
-    case 7:
+    case 8:
       title = "速度"
       current = String(Int((settings.danmakuSpeed / 0.13) * 100))
       message = "100が標準"
-    case 8:
+    case 9:
       title = "透過度"
       current = String(Int(settings.danmakuOpacity * 100))
       message = "30〜100"
-    case 9:
+    case 10:
       title = "最大行数"
       current = String(settings.danmakuMaxLines)
       message = "0で自動"
-    case 10:
+    case 11:
       title = "最大文字数"
       current = String(settings.danmakuMaxLength)
       message = "0で無制限"
@@ -3941,15 +4385,15 @@ final class SettingsController: UITableViewController {
       guard let raw = alert.textFields?.first?.text, let value = Double(raw) else { return }
       var settings = AppState.shared.settings
       switch row {
-      case 6:
-        settings.danmakuFontSize = min(40, max(12, value.rounded()))
       case 7:
-        settings.danmakuSpeed = min(300, max(20, value)) / 100 * 0.13
+        settings.danmakuFontSize = min(40, max(12, value.rounded()))
       case 8:
-        settings.danmakuOpacity = min(100, max(30, value)) / 100
+        settings.danmakuSpeed = min(300, max(20, value)) / 100 * 0.13
       case 9:
-        settings.danmakuMaxLines = min(20, max(0, Int(value.rounded())))
+        settings.danmakuOpacity = min(100, max(30, value)) / 100
       case 10:
+        settings.danmakuMaxLines = min(20, max(0, Int(value.rounded())))
+      case 11:
         settings.danmakuMaxLength = min(500, max(0, Int(value.rounded())))
       default:
         return

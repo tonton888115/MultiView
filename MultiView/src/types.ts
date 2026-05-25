@@ -32,6 +32,8 @@ export interface Settings {
   proxyUrl: string;
   // Start embedded players with audio enabled. Autoplay with sound may still need a user gesture.
   playAudio: boolean;
+  // Automatically add Twitch/Kick raid targets to the viewing tab when detectable.
+  autoFollowRaids: boolean;
   // Viewing tab layout: stacked keeps one stream per row, grid keeps the balanced auto grid.
   layoutMode: LayoutMode;
   // Preferred service order in ranking/following/add surfaces.

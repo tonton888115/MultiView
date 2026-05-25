@@ -137,6 +137,13 @@ export default function SettingsTab({ settings, onChange }: Props) {
           onValueChange={v => onChange({ ...settings, playAudio: v })}
         />
       </View>
+      <View style={styles.row}>
+        <Text style={styles.label}>レイド先を自動追加</Text>
+        <Switch
+          value={settings.autoFollowRaids}
+          onValueChange={v => onChange({ ...settings, autoFollowRaids: v })}
+        />
+      </View>
 
       <Text style={[styles.h, styles.gap]}>サービス順</Text>
       {platforms.map((p, index) => (

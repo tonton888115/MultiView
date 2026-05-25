@@ -70,6 +70,7 @@ export const DEFAULT_SETTINGS: Settings = {
   showChat: true,
   proxyUrl: '',
   playAudio: true,
+  autoFollowRaids: false,
   layoutMode: 'stacked',
   platformOrder: DEFAULT_PLATFORM_ORDER,
   danmaku: {
