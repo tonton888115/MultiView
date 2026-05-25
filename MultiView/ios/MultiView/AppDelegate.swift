@@ -1131,7 +1131,7 @@ private final class NativeDanmakuRenderer {
     }
     guard root.bounds.height > 0, root.bounds.width > 0 else { return laneCursor }
 
-    let fontSize = CGFloat(settings.danmakuFontSize)
+    let fontSize = scaledFontSize(base: settings.danmakuFontSize, in: root)
     let lineHeight = fontSize + 8
     let maxLines = settings.danmakuMaxLines > 0
       ? settings.danmakuMaxLines
@@ -1158,6 +1158,17 @@ private final class NativeDanmakuRenderer {
 
   static func textTokens(_ text: String) -> [NativeDanmakuToken] {
     [.text(text)]
+  }
+
+  // Scale the configured comment size to the cell so text keeps a consistent
+  // proportion: bigger in a single-column (wide) cell, smaller in a packed grid
+  // (narrow) cell. Reference width ~= a phone single-column cell.
+  static func scaledFontSize(base: Double, in view: UIView) -> CGFloat {
+    let referenceWidth: CGFloat = 340
+    let width = view.bounds.width
+    guard width > 0 else { return CGFloat(base) }
+    let scale = min(1.8, max(0.55, width / referenceWidth))
+    return (CGFloat(base) * scale).rounded()
   }
 
   private static func makeCommentView(
@@ -1968,7 +1979,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
     DispatchQueue.main.async {
       guard self.danmakuView.bounds.height > 0, self.danmakuView.bounds.width > 0 else { return }
-      let fontSize = CGFloat(self.settings.danmakuFontSize)
+      let fontSize = NativeDanmakuRenderer.scaledFontSize(base: self.settings.danmakuFontSize, in: self.danmakuView)
       let lineHeight = fontSize + 8
       let maxLines = self.settings.danmakuMaxLines > 0
         ? self.settings.danmakuMaxLines
