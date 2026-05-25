@@ -2721,8 +2721,8 @@ final class StreamCellView: UIView {
       remove.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
       remove.widthAnchor.constraint(equalToConstant: 32),
       remove.heightAnchor.constraint(equalToConstant: 32),
-      volume.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-      volume.centerYAnchor.constraint(equalTo: centerYAnchor),
+      volume.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+      volume.topAnchor.constraint(equalTo: topAnchor, constant: 8),
       volume.widthAnchor.constraint(equalToConstant: 42),
       volume.heightAnchor.constraint(equalTo: heightAnchor, multiplier: 0.62)
     ])
