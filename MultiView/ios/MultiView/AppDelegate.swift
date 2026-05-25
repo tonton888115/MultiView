@@ -293,12 +293,8 @@ enum StreamPlatform: String, CaseIterable, Codable {
   }
 
   var usesIndividualPlayer: Bool {
-    switch self {
-    case .kick, .niconico, .twitch, .twitcasting:
-      return true
-    case .youtube:
-      return false
-    }
+    // All platforms now have a dedicated per-cell native player.
+    true
   }
 }
 
@@ -1351,7 +1347,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var isStopped = false
   private var watchPageURL: URL?
   private var laneCursor = 0
-  private var didRetryAfterPermission = false
+  private var loadAttempts = 0
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -1474,6 +1470,30 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
   }
 
+  // The first attempt right after a web login often runs before the login cookies
+  // have propagated to the native jar, so transient failures retry the whole load
+  // (re-syncing cookies) a couple of times before giving up to the web fallback —
+  // this removes the "expand once and come back" workaround.
+  private func retryOrFallback(_ reason: String) {
+    guard !isStopped, fallbackWebView == nil else { return }
+    loadAttempts += 1
+    guard loadAttempts <= 2 else {
+      installFallback(reason)
+      return
+    }
+    showStatus("ニコ生再試行中… (\(loadAttempts))")
+    socketTask?.cancel(with: .goingAway, reason: nil)
+    socketTask = nil
+    isLoading = false
+    let delay = Double(loadAttempts)
+    WebLoginCookies.sync { [weak self] in
+      guard let self, !self.isStopped else { return }
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+        self.load(channel: self.channel)
+      }
+    }
+  }
+
   private func fetchWatchPage(url: URL) {
     guard !isStopped else { return }
     var request = URLRequest(url: url)
@@ -1483,18 +1503,18 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       self.pageTask = nil
       self.isLoading = false
       if let error {
-        self.installFallback("ニコ生ページ取得失敗: \(error.localizedDescription)")
+        self.retryOrFallback("ニコ生ページ取得失敗: \(error.localizedDescription)")
         return
       }
       guard let data, let html = String(data: data, encoding: .utf8) else {
-        self.installFallback("ニコ生ページを読めません")
+        self.retryOrFallback("ニコ生ページを読めません")
         return
       }
       do {
         let watch = try self.parseWatchData(from: html)
         self.connect(webSocketURL: watch.webSocketURL, frontendId: watch.frontendId)
       } catch {
-        self.installFallback("ニコ生の再生情報を取得できません")
+        self.retryOrFallback("ニコ生の再生情報を取得できません")
       }
     }
     pageTask?.resume()
@@ -1605,6 +1625,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
        let payload = json["data"] as? [String: Any],
        let uriString = payload["uri"] as? String,
        let uri = URL(string: uriString) {
+      loadAttempts = 0
       let cookies = parseStreamCookies(payload["cookies"], for: uri)
       applyNiconicoCookies(cookies)
       play(hlsURL: uri, cookies: cookies)
@@ -1614,21 +1635,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
        let code = payload["code"] as? String {
       showStatus("ニコ生エラー: \(code)")
       if code.lowercased().contains("permission") || code.lowercased().contains("resource") {
-        if didRetryAfterPermission {
-          installFallback("ニコ生エラー: \(code)")
-        } else {
-          // The first permission failure is usually a just-completed web login whose
-          // cookies have not reached the native jar yet. Sync them and retry once.
-          didRetryAfterPermission = true
-          socketTask?.cancel(with: .goingAway, reason: nil)
-          socketTask = nil
-          WebLoginCookies.sync { [weak self] in
-            guard let self, !self.isStopped else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-              self.load(channel: self.channel)
-            }
-          }
-        }
+        // Usually a just-completed web login whose cookies have not reached the
+        // native jar yet — re-sync and retry the whole load before falling back.
+        retryOrFallback("ニコ生エラー: \(code)")
       }
     }
     if type == "disconnect" {
@@ -3514,6 +3523,114 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
+// Per-cell YouTube player using the IFrame Player API, so YouTube behaves like the
+// other individual native players (video + audio). It autoplays muted (the only
+// autoplay browsers allow) and then unmutes via the API — which works without a
+// user gesture because the web view disables the user-action playback requirement.
+final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+  private let stream: StreamItem
+  private let settings: AppSettings
+  private let web: WKWebView
+  private var playbackVolume: Float
+  private var isStopped = false
+
+  init(stream: StreamItem, settings: AppSettings) {
+    self.stream = stream
+    self.settings = settings
+    self.playbackVolume = StreamVolumeStore.volume(for: stream)
+    let config = WKWebViewConfiguration()
+    config.allowsInlineMediaPlayback = true
+    config.mediaTypesRequiringUserActionForPlayback = []
+    config.websiteDataStore = .default()
+    self.web = WKWebView(frame: .zero, configuration: config)
+    super.init(frame: .zero)
+    backgroundColor = .black
+    web.isOpaque = false
+    web.backgroundColor = .black
+    web.scrollView.backgroundColor = .black
+    web.scrollView.isScrollEnabled = false
+    web.scrollView.contentInsetAdjustmentBehavior = .never
+    web.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(web)
+    NSLayoutConstraint.activate([
+      web.topAnchor.constraint(equalTo: topAnchor),
+      web.leadingAnchor.constraint(equalTo: leadingAnchor),
+      web.trailingAnchor.constraint(equalTo: trailingAnchor),
+      web.bottomAnchor.constraint(equalTo: bottomAnchor)
+    ])
+    PlaybackCoordinator.shared.register(self)
+    loadPlayer()
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    stopPlayback()
+  }
+
+  func resumePlayback() {
+    guard !isStopped else { return }
+    let session = AVAudioSession.sharedInstance()
+    try? session.setCategory(.playback, mode: .default, options: [])
+    try? session.setActive(true)
+    web.evaluateJavaScript("window.mvPlay && window.mvPlay();")
+  }
+
+  func pausePlayback() {
+    guard !isStopped else { return }
+    web.evaluateJavaScript("window.mvPause && window.mvPause();")
+  }
+
+  func setPlaybackVolume(_ volume: Float) {
+    playbackVolume = min(1, max(0, volume))
+    let on = settings.playAudio ? playbackVolume : 0
+    web.evaluateJavaScript("window.mvVolume && window.mvVolume(\(on));")
+  }
+
+  func stopPlayback() {
+    isStopped = true
+    web.evaluateJavaScript("window.mvPause && window.mvPause();")
+    web.stopLoading()
+    web.loadHTMLString("", baseURL: nil)
+  }
+
+  private func loadPlayer() {
+    let videoId = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
+      .filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
+    let audioOn = settings.playAudio && playbackVolume > 0
+    let volume = Int((settings.playAudio ? playbackVolume : 0) * 100)
+    web.loadHTMLString(Self.html(videoId: videoId, audioOn: audioOn, volume: volume), baseURL: URL(string: "https://www.youtube.com"))
+  }
+
+  private static func html(videoId: String, audioOn: Bool, volume: Int) -> String {
+    """
+    <!doctype html>
+    <html>
+    <head><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#p{position:absolute;inset:0}</style></head>
+    <body>
+    <div id="p"></div>
+    <script src="https://www.youtube.com/iframe_api"></script>
+    <script>
+      var player, READY=false, VID="\(videoId)", AUDIO=\(audioOn ? "true" : "false"), VOL=\(volume);
+      function onYouTubeIframeAPIReady(){
+        player=new YT.Player('p',{videoId:VID,playerVars:{autoplay:1,mute:1,playsinline:1,controls:1,rel:0,modestbranding:1},
+          events:{onReady:function(){READY=true;apply();},
+          onStateChange:function(e){ if(e.data===YT.PlayerState.UNSTARTED||e.data===YT.PlayerState.CUED){ try{e.target.playVideo();}catch(x){} } }}});
+      }
+      function apply(){ if(!player||!READY)return; try{ player.playVideo(); if(AUDIO){player.unMute();player.setVolume(VOL);} else {player.mute();} }catch(x){} }
+      window.mvPlay=function(){ apply(); };
+      window.mvPause=function(){ try{ player&&player.pauseVideo(); }catch(x){} };
+      window.mvVolume=function(v){ VOL=Math.round(Math.max(0,Math.min(1,v))*100); AUDIO=VOL>0; apply(); };
+    </script>
+    </body>
+    </html>
+    """
+  }
+}
+
 final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResumable, PlaybackStoppable, AudioControllable {
   private let playAudio: Bool
   private var playbackVolume: Float = 1
@@ -3865,76 +3982,59 @@ final class ViewingController: UIViewController {
     row.translatesAutoresizingMaskIntoConstraints = false
     host.addSubview(row)
 
-    let layoutStack = UIStackView()
-    layoutStack.axis = .horizontal
-    layoutStack.spacing = 6
-    layoutStack.alignment = .center
-    let stackedButton = layoutButton(
-      icon: "rectangle.grid.1x2",
-      selected: AppState.shared.settings.layoutMode == .stacked,
-      accessibilityLabel: "縦表示"
-    ) { [weak self] in
+    // Clear segmented toggle: the selected side (縦 / グリッド) is highlighted.
+    let layoutControl = UISegmentedControl(items: [
+      UIImage(systemName: "rectangle.grid.1x2") ?? UIImage(),
+      UIImage(systemName: "square.grid.2x2") ?? UIImage()
+    ])
+    layoutControl.selectedSegmentIndex = AppState.shared.settings.layoutMode == .stacked ? 0 : 1
+    layoutControl.selectedSegmentTintColor = .systemBlue
+    layoutControl.setImage(UIImage(systemName: "rectangle.grid.1x2"), forSegmentAt: 0)
+    layoutControl.setImage(UIImage(systemName: "square.grid.2x2"), forSegmentAt: 1)
+    layoutControl.setTitleTextAttributes([.foregroundColor: UIColor.white], for: .selected)
+    layoutControl.translatesAutoresizingMaskIntoConstraints = false
+    layoutControl.addAction(UIAction { [weak self] actionEvent in
+      guard let control = actionEvent.sender as? UISegmentedControl else { return }
       var settings = AppState.shared.settings
-      settings.layoutMode = .stacked
+      settings.layoutMode = control.selectedSegmentIndex == 0 ? .stacked : .grid
       AppState.shared.settings = settings
       self?.reload()
-    }
-    let gridButton = layoutButton(
-      icon: "square.grid.2x2",
-      selected: AppState.shared.settings.layoutMode == .grid,
-      accessibilityLabel: "グリッド表示"
-    ) { [weak self] in
-      var settings = AppState.shared.settings
-      settings.layoutMode = .grid
-      AppState.shared.settings = settings
-      self?.reload()
-    }
-    layoutStack.addArrangedSubview(stackedButton)
-    layoutStack.addArrangedSubview(gridButton)
+    }, for: .valueChanged)
 
     let spacer = UIView()
     spacer.translatesAutoresizingMaskIntoConstraints = false
 
-    let playButton = playbackButton(title: "全て再生", icon: "play.fill", color: .systemGreen) {
+    let playButton = playbackButton(title: "全て再生", icon: "play.fill", color: UIColor(red: 0.20, green: 0.80, blue: 0.45, alpha: 1)) {
       PlaybackCoordinator.shared.resumeAll()
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
         PlaybackCoordinator.shared.resumeAll()
       }
     }
-    let reloadButton = playbackButton(title: "自動更新", icon: "arrow.clockwise", color: .systemBlue) { [weak self] in
+    let reloadButton = playbackButton(title: "更新", icon: "arrow.triangle.2.circlepath", color: nil) { [weak self] in
       self?.reload()
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
         PlaybackCoordinator.shared.resumeAll()
       }
     }
-    row.addArrangedSubview(layoutStack)
+    row.addArrangedSubview(layoutControl)
     row.addArrangedSubview(spacer)
     row.addArrangedSubview(playButton)
     row.addArrangedSubview(reloadButton)
 
     stack.addArrangedSubview(host)
     NSLayoutConstraint.activate([
-      host.heightAnchor.constraint(equalToConstant: 38),
+      host.heightAnchor.constraint(equalToConstant: 40),
       row.centerYAnchor.constraint(equalTo: host.centerYAnchor),
       row.leadingAnchor.constraint(equalTo: host.leadingAnchor),
       row.trailingAnchor.constraint(equalTo: host.trailingAnchor),
-      stackedButton.widthAnchor.constraint(equalToConstant: 34),
-      stackedButton.heightAnchor.constraint(equalToConstant: 34),
-      gridButton.widthAnchor.constraint(equalToConstant: 34),
-      gridButton.heightAnchor.constraint(equalToConstant: 34),
-      playButton.heightAnchor.constraint(equalToConstant: 34),
-      reloadButton.heightAnchor.constraint(equalToConstant: 34)
+      layoutControl.widthAnchor.constraint(equalToConstant: 96),
+      layoutControl.heightAnchor.constraint(equalToConstant: 34),
+      playButton.heightAnchor.constraint(equalToConstant: 36),
+      reloadButton.heightAnchor.constraint(equalToConstant: 36)
     ])
   }
 
-  private func layoutButton(icon: String, selected: Bool, accessibilityLabel: String, action: @escaping () -> Void) -> UIButton {
-    let button = LiquidGlass.makeButton(title: nil, systemImage: icon, tint: selected ? .systemBlue : nil)
-    button.accessibilityLabel = accessibilityLabel
-    button.addAction(UIAction { _ in action() }, for: .touchUpInside)
-    return button
-  }
-
-  private func playbackButton(title: String, icon: String, color: UIColor, action: @escaping () -> Void) -> UIButton {
+  private func playbackButton(title: String, icon: String, color: UIColor?, action: @escaping () -> Void) -> UIButton {
     let button = LiquidGlass.makeButton(title: title, systemImage: icon, tint: color)
     button.addAction(UIAction { actionEvent in
       guard let sender = actionEvent.sender as? UIButton else {
@@ -4154,10 +4254,14 @@ private extension CGRect {
   }
 }
 
-final class StreamCellView: UIView, UIGestureRecognizerDelegate {
+final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDelegate {
   let stream: StreamItem
   private let onReorder: (StreamCellView, UILongPressGestureRecognizer) -> Void
   private var autoHider: AutoHidingControls?
+  private let commentBar = UIView()
+  private let commentField = UITextField()
+  private let commentStatus = UILabel()
+  private var commentBottom: NSLayoutConstraint?
 
   init(stream: StreamItem, onFocus: @escaping () -> Void, onReorder: @escaping (StreamCellView, UILongPressGestureRecognizer) -> Void) {
     self.stream = stream
@@ -4178,6 +4282,8 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate {
       video = TwitchNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else if stream.platform == .twitcasting {
       video = TwitcastingNativePlayerView(stream: stream, settings: AppState.shared.settings)
+    } else if stream.platform == .youtube {
+      video = YouTubeNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else {
       video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
     }
@@ -4209,6 +4315,17 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate {
     volume.translatesAutoresizingMaskIntoConstraints = false
     addSubview(volume)
 
+    let comment = UIButton(type: .system)
+    comment.setImage(UIImage(systemName: "text.bubble"), for: .normal)
+    comment.tintColor = .white
+    comment.backgroundColor = UIColor.black.withAlphaComponent(0.38)
+    comment.layer.cornerRadius = 16
+    comment.addAction(UIAction { [weak self] _ in self?.toggleCommentBar() }, for: .touchUpInside)
+    comment.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(comment)
+
+    buildCommentBar()
+
     NSLayoutConstraint.activate([
       video.topAnchor.constraint(equalTo: topAnchor),
       video.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -4222,20 +4339,150 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate {
       remove.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
       remove.widthAnchor.constraint(equalToConstant: 32),
       remove.heightAnchor.constraint(equalToConstant: 32),
+      comment.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+      comment.trailingAnchor.constraint(equalTo: focus.leadingAnchor, constant: -8),
+      comment.widthAnchor.constraint(equalToConstant: 32),
+      comment.heightAnchor.constraint(equalToConstant: 32),
       volume.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
       volume.topAnchor.constraint(equalTo: topAnchor, constant: 8),
       volume.widthAnchor.constraint(equalToConstant: 42),
       volume.heightAnchor.constraint(equalTo: heightAnchor, multiplier: 0.62)
     ])
-    autoHider = AutoHidingControls(host: self, controls: [focus, remove, volume])
+    autoHider = AutoHidingControls(host: self, controls: [focus, remove, comment, volume])
     let reorder = UILongPressGestureRecognizer(target: self, action: #selector(handleReorderGesture(_:)))
     reorder.minimumPressDuration = 0.45
     reorder.delegate = self
     addGestureRecognizer(reorder)
   }
 
+  private func buildCommentBar() {
+    commentBar.translatesAutoresizingMaskIntoConstraints = false
+    commentBar.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+    commentBar.isHidden = true
+    addSubview(commentBar)
+
+    commentStatus.font = .systemFont(ofSize: 11)
+    commentStatus.textColor = UIColor.white.withAlphaComponent(0.85)
+    commentStatus.numberOfLines = 1
+    commentStatus.isHidden = true
+    commentStatus.translatesAutoresizingMaskIntoConstraints = false
+    commentBar.addSubview(commentStatus)
+
+    commentField.placeholder = "コメント"
+    commentField.font = .systemFont(ofSize: 13)
+    commentField.textColor = .white
+    commentField.backgroundColor = UIColor.white.withAlphaComponent(0.14)
+    commentField.layer.cornerRadius = 8
+    commentField.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 8, height: 1))
+    commentField.leftViewMode = .always
+    commentField.returnKeyType = .send
+    commentField.autocorrectionType = .no
+    commentField.delegate = self
+    commentField.translatesAutoresizingMaskIntoConstraints = false
+    commentBar.addSubview(commentField)
+
+    let send = UIButton(type: .system)
+    send.setImage(UIImage(systemName: "paperplane.fill"), for: .normal)
+    send.tintColor = .systemBlue
+    send.addAction(UIAction { [weak self] _ in self?.submitComment() }, for: .touchUpInside)
+    send.translatesAutoresizingMaskIntoConstraints = false
+    commentBar.addSubview(send)
+
+    let bottom = commentBar.bottomAnchor.constraint(equalTo: bottomAnchor)
+    commentBottom = bottom
+    NSLayoutConstraint.activate([
+      commentBar.leadingAnchor.constraint(equalTo: leadingAnchor),
+      commentBar.trailingAnchor.constraint(equalTo: trailingAnchor),
+      bottom,
+      commentBar.heightAnchor.constraint(equalToConstant: 46),
+      commentStatus.leadingAnchor.constraint(equalTo: commentBar.leadingAnchor, constant: 12),
+      commentStatus.topAnchor.constraint(equalTo: commentBar.topAnchor, constant: 3),
+      commentField.leadingAnchor.constraint(equalTo: commentBar.leadingAnchor, constant: 10),
+      commentField.bottomAnchor.constraint(equalTo: commentBar.bottomAnchor, constant: -8),
+      commentField.heightAnchor.constraint(equalToConstant: 30),
+      send.leadingAnchor.constraint(equalTo: commentField.trailingAnchor, constant: 8),
+      send.trailingAnchor.constraint(equalTo: commentBar.trailingAnchor, constant: -10),
+      send.centerYAnchor.constraint(equalTo: commentField.centerYAnchor),
+      send.widthAnchor.constraint(equalToConstant: 30)
+    ])
+    NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillChange(_:)), name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
+    NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillHide), name: UIResponder.keyboardWillHideNotification, object: nil)
+  }
+
+  @objc private func keyboardWillChange(_ note: Notification) {
+    guard commentField.isFirstResponder,
+          let window,
+          let value = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue else { return }
+    let keyboardTop = value.cgRectValue.minY
+    let cellInWindow = convert(bounds, to: window)
+    let overlap = cellInWindow.maxY - keyboardTop
+    commentBottom?.constant = overlap > 0 ? -overlap : 0
+    UIView.animate(withDuration: 0.2) { self.superview?.layoutIfNeeded() }
+  }
+
+  @objc private func keyboardWillHide() {
+    commentBottom?.constant = 0
+    UIView.animate(withDuration: 0.2) { self.superview?.layoutIfNeeded() }
+  }
+
+  private func toggleCommentBar() {
+    setCommentBar(visible: commentBar.isHidden)
+  }
+
+  private func setCommentBar(visible: Bool) {
+    commentBar.isHidden = !visible
+    if visible {
+      commentField.becomeFirstResponder()
+    } else {
+      commentField.resignFirstResponder()
+    }
+  }
+
+  private func submitComment() {
+    let text = commentField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !text.isEmpty else { return }
+    switch stream.platform {
+    case .kick:
+      guard KickAuthManager.shared.isSignedIn else {
+        showCommentStatus("設定でKickにログインしてください")
+        return
+      }
+      KickAuthManager.shared.sendChat(channel: stream.channel, content: text) { [weak self] result in
+        DispatchQueue.main.async {
+          switch result {
+          case .success:
+            self?.commentField.text = ""
+            self?.showCommentStatus("送信しました")
+            self?.setCommentBar(visible: false)
+          case .failure(let error):
+            self?.showCommentStatus(error.localizedDescription)
+          }
+        }
+      }
+    default:
+      showCommentStatus("拡大(⤢)してコメントを送信できます")
+    }
+  }
+
+  private func showCommentStatus(_ text: String) {
+    commentStatus.text = text
+    commentStatus.isHidden = false
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+      self?.commentStatus.isHidden = true
+    }
+  }
+
+  func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+    submitComment()
+    return true
+  }
+
   required init?(coder: NSCoder) {
     fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    NotificationCenter.default.removeObserver(self)
   }
 
   @objc private func handleReorderGesture(_ gesture: UILongPressGestureRecognizer) {
@@ -4358,6 +4605,8 @@ final class FocusedStreamView: UIView {
       video = TwitchNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else if stream.platform == .twitcasting {
       video = TwitcastingNativePlayerView(stream: stream, settings: AppState.shared.settings)
+    } else if stream.platform == .youtube {
+      video = YouTubeNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else {
       video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
     }
@@ -4829,6 +5078,9 @@ final class SettingsController: UITableViewController {
   }
 
   override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
+    if section == 2 {
+      return "Client IDはあなたのユーザーIDではなく、kick.com → Settings → Developer で作るOAuthアプリのIDです。そのアプリに Redirect URI「\(KickAuthManager.shared.config.redirectURI)」を登録してください(Redirect URI行をタップでコピー)。コメント投稿に使います。"
+    }
     guard section == numberOfSections(in: tableView) - 1 else { return nil }
     let info = Bundle.main.infoDictionary
     let version = (info?["CFBundleShortVersionString"] as? String) ?? "?"
@@ -5100,7 +5352,16 @@ final class SettingsController: UITableViewController {
     case 1:
       editKickClientID()
     case 2:
-      editKickRedirectURI()
+      let uri = KickAuthManager.shared.config.redirectURI
+      UIPasteboard.general.string = uri
+      let alert = UIAlertController(
+        title: "Redirect URI をコピーしました",
+        message: "\(uri)\n\nKickの開発者ポータル(Settings → Developer)で作成したアプリのRedirect URIに、この値をそのまま登録してください。",
+        preferredStyle: .alert
+      )
+      alert.addAction(UIAlertAction(title: "編集", style: .default) { [weak self] _ in self?.editKickRedirectURI() })
+      alert.addAction(UIAlertAction(title: "OK", style: .cancel))
+      present(alert, animated: true)
     default:
       break
     }
@@ -5108,7 +5369,7 @@ final class SettingsController: UITableViewController {
 
   private func editKickClientID() {
     var config = KickAuthManager.shared.config
-    let alert = UIAlertController(title: "Kick Client ID", message: nil, preferredStyle: .alert)
+    let alert = UIAlertController(title: "Kick Client ID", message: "kick.com → Settings → Developer でOAuthアプリを作成し、表示される Client ID を貼り付けてください(ユーザーIDではありません)。", preferredStyle: .alert)
     alert.addTextField { field in
       field.text = config.clientId
       field.autocapitalizationType = .none
