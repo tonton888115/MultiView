@@ -7,6 +7,10 @@ import ImageIO
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
   var window: UIWindow?
+  // Set when another app/video interrupts our audio session. When we regain
+  // control we rebuild the players (auto-refresh) instead of only nudging play,
+  // because embedded players often stay paused after a takeover.
+  private var needsPlaybackReload = false
 
   func application(
     _ application: UIApplication,
@@ -23,7 +27,12 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
   func applicationDidBecomeActive(_ application: UIApplication) {
     configureAudioSession()
-    resumePlaybackSoon()
+    if needsPlaybackReload {
+      needsPlaybackReload = false
+      reloadAndResumeSoon()
+    } else {
+      resumePlaybackSoon()
+    }
   }
 
   func applicationWillResignActive(_ application: UIApplication) {
@@ -58,16 +67,37 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
   }
 
   @objc private func playbackSignalReceived(_ notification: Notification) {
+    configureAudioSession()
     if notification.name == AVAudioSession.interruptionNotification {
       guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-            let type = AVAudioSession.InterruptionType(rawValue: raw),
-            type == .ended else { return }
-      if let optionsRaw = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt {
-        let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
-        guard options.contains(.shouldResume) else { return }
+            let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+      switch type {
+      case .began:
+        // Another app (e.g. a video) grabbed the audio session. Remember it so we
+        // can rebuild and resume once we are frontmost again.
+        needsPlaybackReload = true
+      case .ended:
+        if UIApplication.shared.applicationState == .active {
+          // The takeover ended while we are still frontmost (e.g. PiP/inline video
+          // that finished). Honor iOS's resume hint: a full rebuild when it asks us
+          // to resume, otherwise just a light nudge so we don't flash a reload after
+          // an interruption iOS did not want us to resume from.
+          needsPlaybackReload = false
+          let shouldResume = (notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
+            .map { AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) } ?? false
+          if shouldResume {
+            reloadAndResumeSoon()
+          } else {
+            resumePlaybackSoon()
+          }
+        }
+        // If we are not active, applicationDidBecomeActive consumes the flag.
+      @unknown default:
+        break
       }
+      return
     }
-    configureAudioSession()
+    // Route change (headphones, etc.) — a light resume is enough.
     resumePlaybackSoon()
   }
 
@@ -78,6 +108,13 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
       PlaybackCoordinator.shared.resumeAll()
     }
+  }
+
+  private func reloadAndResumeSoon() {
+    DispatchQueue.main.async {
+      NotificationCenter.default.post(name: .multiViewReloadAndResume, object: nil)
+    }
+    resumePlaybackSoon()
   }
 }
 
@@ -143,6 +180,73 @@ final class PlaybackCoordinator {
     for object in views.allObjects {
       (object as? PlaybackResumable)?.resumePlayback()
     }
+  }
+}
+
+// Liquid Glass (iOS 26) adoption with a material-blur fallback. The
+// `#if compiler(>=6.2)` guard keeps the iOS 26-only symbols out of older SDKs
+// (Xcode < 26) so the project still builds, while `#available` picks the right
+// path at runtime.
+enum LiquidGlass {
+  static func makePanel(
+    cornerRadius: CGFloat,
+    interactive: Bool = false,
+    fallbackStyle: UIBlurEffect.Style = .systemUltraThinMaterialDark
+  ) -> UIVisualEffectView {
+    #if compiler(>=6.2)
+    if #available(iOS 26.0, *) {
+      let glass = UIGlassEffect()
+      glass.isInteractive = interactive
+      let view = UIVisualEffectView(effect: glass)
+      view.layer.cornerRadius = cornerRadius
+      view.clipsToBounds = true
+      return view
+    }
+    #endif
+    let view = UIVisualEffectView(effect: UIBlurEffect(style: fallbackStyle))
+    view.layer.cornerRadius = cornerRadius
+    view.clipsToBounds = true
+    return view
+  }
+
+  // Builds a capsule button that uses a glass configuration on iOS 26 and a
+  // tinted/gray configuration on older systems. `tint` is used as the accent for
+  // prominent buttons (e.g. play); pass nil for a neutral button.
+  static func makeButton(title: String?, systemImage: String?, tint: UIColor?) -> UIButton {
+    let button = UIButton(type: .system)
+    var config: UIButton.Configuration
+    #if compiler(>=6.2)
+    if #available(iOS 26.0, *) {
+      config = tint != nil ? .prominentGlass() : .glass()
+    } else {
+      config = legacyConfiguration(tint: tint)
+    }
+    #else
+    config = legacyConfiguration(tint: tint)
+    #endif
+    if let title { config.title = title }
+    if let systemImage { config.image = UIImage(systemName: systemImage) }
+    config.imagePadding = 6
+    config.cornerStyle = .capsule
+    config.baseForegroundColor = .white
+    if let tint { config.baseBackgroundColor = tint }
+    config.contentInsets = title == nil
+      ? NSDirectionalEdgeInsets(top: 6, leading: 6, bottom: 6, trailing: 6)
+      : NSDirectionalEdgeInsets(top: 7, leading: 14, bottom: 7, trailing: 16)
+    button.configuration = config
+    button.tintColor = .white
+    return button
+  }
+
+  private static func legacyConfiguration(tint: UIColor?) -> UIButton.Configuration {
+    if let tint {
+      var config = UIButton.Configuration.filled()
+      config.baseBackgroundColor = tint.withAlphaComponent(0.85)
+      return config
+    }
+    var config = UIButton.Configuration.gray()
+    config.baseBackgroundColor = UIColor.white.withAlphaComponent(0.16)
+    return config
   }
 }
 
@@ -361,6 +465,9 @@ protocol AppStateDelegate: AnyObject {
 
 extension Notification.Name {
   static let multiViewRaidFollowed = Notification.Name("MultiViewRaidFollowed")
+  // Posted when audio was taken over by another app/video and control returned,
+  // so the viewing tab rebuilds its players (auto-refresh) and resumes playback.
+  static let multiViewReloadAndResume = Notification.Name("MultiViewReloadAndResume")
 }
 
 enum RaidAutoFollow {
@@ -542,17 +649,25 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
     super.viewDidLoad()
     AppState.shared.delegate = self
     delegate = self
-    tabBar.isTranslucent = true
     tabBar.tintColor = .systemBlue
-    tabBar.standardAppearance = glassTabAppearance()
-    if #available(iOS 15.0, *) {
-      tabBar.scrollEdgeAppearance = tabBar.standardAppearance
+    // On iOS 26 the tab bar is Liquid Glass automatically; overriding its
+    // background would fight that, so only style it on older systems.
+    var useNativeGlassBar = false
+    #if compiler(>=6.2)
+    if #available(iOS 26.0, *) { useNativeGlassBar = true }
+    #endif
+    if !useNativeGlassBar {
+      tabBar.isTranslucent = true
+      tabBar.standardAppearance = glassTabAppearance()
+      if #available(iOS 15.0, *) {
+        tabBar.scrollEdgeAppearance = tabBar.standardAppearance
+      }
     }
 
-    followingVC.tabBarItem = UITabBarItem(title: "フォロー", image: UIImage(systemName: "antenna.radiowaves.left.and.right"), tag: 0)
-    rankingVC.tabBarItem = UITabBarItem(title: "ランキング", image: UIImage(systemName: "chart.bar"), tag: 1)
-    viewVC.tabBarItem = UITabBarItem(title: "視聴", image: UIImage(systemName: "square.grid.2x2"), tag: 2)
-    settingsVC.tabBarItem = UITabBarItem(title: "設定", image: UIImage(systemName: "gearshape"), tag: 3)
+    followingVC.tabBarItem = UITabBarItem(title: "フォロー", image: UIImage(systemName: "antenna.radiowaves.left.and.right"), selectedImage: UIImage(systemName: "antenna.radiowaves.left.and.right.fill"), tag: 0)
+    rankingVC.tabBarItem = UITabBarItem(title: "ランキング", image: UIImage(systemName: "chart.bar"), selectedImage: UIImage(systemName: "chart.bar.fill"), tag: 1)
+    viewVC.tabBarItem = UITabBarItem(title: "視聴", image: UIImage(systemName: "square.grid.2x2"), selectedImage: UIImage(systemName: "square.grid.2x2.fill"), tag: 2)
+    settingsVC.tabBarItem = UITabBarItem(title: "設定", image: UIImage(systemName: "gearshape"), selectedImage: UIImage(systemName: "gearshape.fill"), tag: 3)
     viewControllers = [followingVC, rankingVC, viewVC, settingsVC]
     selectedIndex = 2
     NotificationCenter.default.addObserver(self, selector: #selector(raidFollowed), name: .multiViewRaidFollowed, object: nil)
@@ -2837,68 +2952,56 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 }
 
-final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, WKNavigationDelegate {
-  private enum PlayerMode {
-    case iframeEmbed
-    case normalPage
-  }
-
+final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
   private let stream: StreamItem
   private let settings: AppSettings
-  private let web: WKWebView
+  private let player = AVPlayer()
+  private let playerLayer = AVPlayerLayer()
   private let danmakuView = UIView()
+  private let statusLabel = UILabel()
   private var chatClient: TwitcastingChatClient?
+  private var streamTask: URLSessionDataTask?
+  private var itemStatusObservation: NSKeyValueObservation?
+  private var itemFailedObserver: NSObjectProtocol?
+  private var fallbackWebView: WKWebView?
   private var playbackVolume: Float
-  private var isMutedForEmbed: Bool
   private var laneCursor = 0
+  private var isLoading = false
   private var isStopped = false
-  private var usingNormalPageFallback = false
-  private var playerMode: PlayerMode = .iframeEmbed
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
     self.settings = settings
-    let initialVolume = StreamVolumeStore.volume(for: stream)
-    self.playbackVolume = initialVolume
-    self.isMutedForEmbed = !settings.playAudio || initialVolume <= 0
-    let config = WKWebViewConfiguration()
-    config.allowsInlineMediaPlayback = true
-    config.mediaTypesRequiringUserActionForPlayback = []
-    config.websiteDataStore = .default()
-    if #available(iOS 13.0, *) {
-      config.defaultWebpagePreferences.preferredContentMode = .mobile
-    }
-    self.web = WKWebView(frame: .zero, configuration: config)
+    self.playbackVolume = StreamVolumeStore.volume(for: stream)
     super.init(frame: .zero)
     backgroundColor = .black
 
-    web.isOpaque = false
-    web.backgroundColor = .black
-    web.scrollView.backgroundColor = .black
-    web.scrollView.contentInsetAdjustmentBehavior = .never
-    web.customUserAgent = Self.userAgent
-    web.navigationDelegate = self
-    web.translatesAutoresizingMaskIntoConstraints = false
-    addSubview(web)
+    player.automaticallyWaitsToMinimizeStalling = false
+    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+    playerLayer.player = player
+    playerLayer.videoGravity = .resizeAspect
+    layer.addSublayer(playerLayer)
 
     danmakuView.isUserInteractionEnabled = false
     danmakuView.clipsToBounds = true
-    danmakuView.translatesAutoresizingMaskIntoConstraints = false
     addSubview(danmakuView)
 
+    statusLabel.text = "ツイキャスをネイティブ再生で読み込み中"
+    statusLabel.textColor = .white.withAlphaComponent(0.72)
+    statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
+    statusLabel.textAlignment = .center
+    statusLabel.numberOfLines = 2
+    statusLabel.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(statusLabel)
     NSLayoutConstraint.activate([
-      web.topAnchor.constraint(equalTo: topAnchor),
-      web.leadingAnchor.constraint(equalTo: leadingAnchor),
-      web.trailingAnchor.constraint(equalTo: trailingAnchor),
-      web.bottomAnchor.constraint(equalTo: bottomAnchor),
-      danmakuView.topAnchor.constraint(equalTo: topAnchor),
-      danmakuView.leadingAnchor.constraint(equalTo: leadingAnchor),
-      danmakuView.trailingAnchor.constraint(equalTo: trailingAnchor),
-      danmakuView.bottomAnchor.constraint(equalTo: bottomAnchor)
+      statusLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+      statusLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+      statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 16),
+      statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16)
     ])
 
     PlaybackCoordinator.shared.register(self)
-    loadPlayer()
+    loadNativeStream()
     startCommentsIfNeeded()
   }
 
@@ -2910,106 +3013,229 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     stopPlayback()
   }
 
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    playerLayer.frame = bounds
+    danmakuView.frame = bounds
+  }
+
   func resumePlayback() {
     guard !isStopped else { return }
-    let muted = !settings.playAudio || playbackVolume <= 0
-    let script = """
-    (function(){
-      document.querySelectorAll('video,audio').forEach(function(media){
-        try {
-          media.muted = \(muted ? "true" : "false");
-          media.volume = \(muted ? 0 : playbackVolume);
-          var play = media.play && media.play();
-          if (play && play.catch) play.catch(function(){});
-        } catch(e) {}
-      });
-      document.querySelectorAll('button').forEach(function(button){
-        var label = (button.getAttribute('aria-label') || button.textContent || '').toLowerCase();
-        if (label.indexOf('play') !== -1 || label.indexOf('再生') !== -1) {
-          try { button.click(); } catch(e) {}
-        }
-      });
-    })();
-    """
-    web.evaluateJavaScript(script)
+    let session = AVAudioSession.sharedInstance()
+    try? session.setCategory(.playback, mode: .default, options: [])
+    try? session.setActive(true)
+    if let fallbackWebView {
+      fallbackWebView.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(function(m){try{m.play()}catch(e){}});")
+      return
+    }
+    if player.currentItem == nil {
+      if !isLoading {
+        loadNativeStream()
+      }
+      return
+    }
+    player.isMuted = !settings.playAudio
+    player.volume = settings.playAudio ? playbackVolume : 0
+    player.play()
   }
 
   func stopPlayback() {
     isStopped = true
     chatClient?.stop()
     chatClient = nil
-    web.stopLoading()
-    web.evaluateJavaScript("""
-    document.querySelectorAll('video,audio').forEach(function(media){
-      try { media.pause(); media.src = ''; media.load(); } catch(e) {}
-    });
-    """)
-    web.loadHTMLString("", baseURL: nil)
-  }
-
-  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-    resumePlayback()
-    schedulePlaybackFallbackCheck()
+    streamTask?.cancel()
+    streamTask = nil
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    itemStatusObservation = nil
+    if let itemFailedObserver {
+      NotificationCenter.default.removeObserver(itemFailedObserver)
+      self.itemFailedObserver = nil
+    }
+    fallbackWebView?.stopLoading()
+    fallbackWebView?.loadHTMLString("", baseURL: nil)
+    fallbackWebView?.removeFromSuperview()
+    fallbackWebView = nil
   }
 
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
-    reloadPlayerForMuteState()
-    resumePlayback()
+    player.volume = settings.playAudio ? playbackVolume : 0
   }
 
-  private func loadPlayer() {
-    let channel = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-          var components = URLComponents(string: "https://twitcasting.tv/\(encoded)/embeddedplayer/live") else { return }
-    components.queryItems = [
-      URLQueryItem(name: "auto_play", value: "true"),
-      URLQueryItem(name: "default_mute", value: isMutedForEmbed ? "true" : "false")
-    ]
-    if let url = components.url {
-      usingNormalPageFallback = false
-      playerMode = .iframeEmbed
-      web.loadHTMLString(Self.embedHTML(playerURL: url), baseURL: URL(string: "https://twitcasting.tv/\(encoded)"))
+  private func loadNativeStream() {
+    guard !isStopped, !isLoading, fallbackWebView == nil else { return }
+    isLoading = true
+    showStatus("ツイキャスをネイティブ再生で読み込み中")
+    syncTwitcastingWebCookies { [weak self] in
+      self?.fetchStreamServer()
     }
   }
 
-  private func loadNormalPageFallback() {
+  private func fetchStreamServer() {
+    guard !isStopped else { return }
     let channel = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-          let url = URL(string: "https://twitcasting.tv/\(encoded)") else { return }
-    usingNormalPageFallback = true
-    playerMode = .normalPage
-    web.load(Self.browserRequest(url: url, referer: "https://twitcasting.tv/"))
+    guard let target = channel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+          let url = URL(string: "https://twitcasting.tv/streamserver.php?target=\(target)&mode=client&player=pc_web") else {
+      isLoading = false
+      installEmbedFallback("ツイキャスのチャンネル名が不正です")
+      return
+    }
+    var request = URLRequest(url: url)
+    twitcastingHeaders().forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+    streamTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+      guard let self else { return }
+      self.streamTask = nil
+      // Keep isLoading true until play()/installEmbedFallback runs on the main
+      // queue, so a concurrent resumePlayback() can't kick off a second fetch.
+      if let error {
+        self.installEmbedFallback("ツイキャス取得失敗: \(error.localizedDescription)")
+        return
+      }
+      if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+        self.installEmbedFallback("ツイキャス取得失敗: HTTP \(http.statusCode)")
+        return
+      }
+      guard let data, let info = Self.extractStreamInfo(from: data) else {
+        self.installEmbedFallback("ツイキャスの配信情報を取得できません")
+        return
+      }
+      guard let hlsURL = info.hlsURL else {
+        self.installEmbedFallback(info.isLive ? "ツイキャスのHLSを取得できません" : "ツイキャスはオフラインです")
+        return
+      }
+      // Play the HLS whenever one is advertised. If it is stale (truly offline)
+      // AVPlayer fails and we drop to the official embed.
+      self.play(hlsURL: hlsURL)
+    }
+    streamTask?.resume()
   }
 
-  private func schedulePlaybackFallbackCheck() {
-    DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
-      guard let self, !self.isStopped, !self.usingNormalPageFallback else { return }
-      let script = """
-      (function(){
-        var media = Array.prototype.slice.call(document.querySelectorAll('video,audio'));
-        if (media.some(function(item){ return item.readyState > 0 || item.currentSrc; })) return 'media';
-        if (document.querySelectorAll('iframe').length > 0) return 'frame';
-        return 'empty';
-      })();
-      """
-      self.web.evaluateJavaScript(script) { [weak self] value, _ in
-        guard let self, !self.isStopped, !self.usingNormalPageFallback else { return }
-        if (value as? String) == "empty" || ((value as? String) == "frame" && self.playerMode == .iframeEmbed) {
-          self.loadNormalPageFallback()
-        } else {
-          self.resumePlayback()
+  private func play(hlsURL: URL) {
+    DispatchQueue.main.async {
+      self.isLoading = false
+      guard !self.isStopped else { return }
+      self.statusLabel.isHidden = true
+      let asset = AVURLAsset(url: hlsURL, options: [
+        "AVURLAssetHTTPHeaderFieldsKey": self.twitcastingPlaybackHeaders()
+      ])
+      let item = AVPlayerItem(asset: asset)
+      item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+      item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
+      self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+        if item.status == .failed {
+          DispatchQueue.main.async {
+            self?.installEmbedFallback(item.error?.localizedDescription ?? "ツイキャスのネイティブ再生に失敗しました")
+          }
+        } else if item.status == .readyToPlay {
+          DispatchQueue.main.async {
+            self?.resumePlayback()
+          }
         }
       }
+      if let itemFailedObserver = self.itemFailedObserver {
+        NotificationCenter.default.removeObserver(itemFailedObserver)
+      }
+      self.itemFailedObserver = NotificationCenter.default.addObserver(
+        forName: .AVPlayerItemFailedToPlayToEndTime,
+        object: item,
+        queue: .main
+      ) { [weak self] notification in
+        let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
+        self?.installEmbedFallback(error?.localizedDescription ?? "ツイキャスのネイティブ再生が停止しました")
+      }
+      self.player.replaceCurrentItem(with: item)
+      self.player.isMuted = !self.settings.playAudio
+      self.player.volume = self.settings.playAudio ? self.playbackVolume : 0
+      self.player.play()
     }
   }
 
-  private func reloadPlayerForMuteState() {
-    guard !isStopped else { return }
-    let nextMuted = !settings.playAudio || playbackVolume <= 0
-    guard nextMuted != isMutedForEmbed else { return }
-    isMutedForEmbed = nextMuted
-    loadPlayer()
+  // Last resort: the official embedded player (handles offline/standby and
+  // member-only lives that the native HLS path cannot reach).
+  private func installEmbedFallback(_ reason: String) {
+    DispatchQueue.main.async {
+      self.isLoading = false
+      guard !self.isStopped, self.fallbackWebView == nil else { return }
+      self.showStatus(reason)
+      self.player.pause()
+      self.player.replaceCurrentItem(with: nil)
+      let channel = self.stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+            var components = URLComponents(string: "https://twitcasting.tv/\(encoded)/embeddedplayer/live") else { return }
+      let muted = !self.settings.playAudio || self.playbackVolume <= 0
+      components.queryItems = [
+        URLQueryItem(name: "auto_play", value: "true"),
+        URLQueryItem(name: "default_mute", value: muted ? "true" : "false")
+      ]
+      guard let playerURL = components.url else { return }
+      let config = WKWebViewConfiguration()
+      config.allowsInlineMediaPlayback = true
+      config.mediaTypesRequiringUserActionForPlayback = []
+      config.websiteDataStore = .default()
+      if #available(iOS 13.0, *) {
+        config.defaultWebpagePreferences.preferredContentMode = .mobile
+      }
+      let web = WKWebView(frame: .zero, configuration: config)
+      web.isOpaque = false
+      web.backgroundColor = .black
+      web.scrollView.backgroundColor = .black
+      web.scrollView.contentInsetAdjustmentBehavior = .never
+      web.customUserAgent = Self.userAgent
+      web.translatesAutoresizingMaskIntoConstraints = false
+      self.insertSubview(web, belowSubview: self.danmakuView)
+      NSLayoutConstraint.activate([
+        web.topAnchor.constraint(equalTo: self.topAnchor),
+        web.leadingAnchor.constraint(equalTo: self.leadingAnchor),
+        web.trailingAnchor.constraint(equalTo: self.trailingAnchor),
+        web.bottomAnchor.constraint(equalTo: self.bottomAnchor)
+      ])
+      web.loadHTMLString(Self.embedHTML(playerURL: playerURL), baseURL: URL(string: "https://twitcasting.tv/\(encoded)"))
+      self.fallbackWebView = web
+      self.statusLabel.isHidden = true
+    }
+  }
+
+  private func twitcastingHeaders() -> [String: String] {
+    var headers = [
+      "Accept": "application/json, text/plain, */*",
+      "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6",
+      "User-Agent": Self.userAgent,
+      "Referer": "https://twitcasting.tv/\(stream.channel)",
+      "Origin": "https://twitcasting.tv",
+      "X-Requested-With": "XMLHttpRequest"
+    ]
+    if let cookie = cookieHeader() {
+      headers["Cookie"] = cookie
+    }
+    return headers
+  }
+
+  private func twitcastingPlaybackHeaders() -> [String: String] {
+    var headers = [
+      "User-Agent": Self.userAgent,
+      "Referer": "https://twitcasting.tv/\(stream.channel)",
+      "Origin": "https://twitcasting.tv"
+    ]
+    if let cookie = cookieHeader() {
+      headers["Cookie"] = cookie
+    }
+    return headers
+  }
+
+  private func cookieHeader() -> String? {
+    guard let url = URL(string: "https://twitcasting.tv/"),
+          let cookies = HTTPCookieStorage.shared.cookies(for: url), !cookies.isEmpty else { return nil }
+    return cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+  }
+
+  private func syncTwitcastingWebCookies(_ completion: @escaping () -> Void) {
+    WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+      cookies
+        .filter { $0.domain.contains("twitcasting.tv") }
+        .forEach { HTTPCookieStorage.shared.setCookie($0) }
+      DispatchQueue.main.async(execute: completion)
+    }
   }
 
   private func startCommentsIfNeeded() {
@@ -3031,15 +3257,45 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     }
   }
 
-  private static func browserRequest(url: URL, referer: String) -> URLRequest {
-    var request = URLRequest(url: url)
-    request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-    request.setValue(referer, forHTTPHeaderField: "Referer")
-    request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
-    if let cookies = HTTPCookieStorage.shared.cookies(for: URL(string: "https://twitcasting.tv/")!), !cookies.isEmpty {
-      request.setValue(cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; "), forHTTPHeaderField: "Cookie")
+  private func showStatus(_ text: String) {
+    DispatchQueue.main.async {
+      self.statusLabel.text = text
+      self.statusLabel.isHidden = false
     }
-    return request
+  }
+
+  // Parse twitcasting.tv/streamserver.php JSON: movie.live + the tc-hls media URL.
+  private static func extractStreamInfo(from data: Data) -> (isLive: Bool, hlsURL: URL?)? {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    var isLive = false
+    if let movie = json["movie"] as? [String: Any] {
+      if let live = movie["live"] as? Bool {
+        isLive = live
+      } else if let live = movie["live"] as? Int {
+        isLive = live != 0
+      }
+    }
+    var hlsURL: URL?
+    if let tcHls = json["tc-hls"] as? [String: Any],
+       let streams = tcHls["streams"] as? [String: Any] {
+      // Prefer a mid quality for multi-stream performance; AVPlayerItem's
+      // preferredPeakBitRate cannot downswitch a single-rendition media playlist.
+      let priority = ["medium", "high", "low", "base", "mobilesource", "main"]
+      var raw: String?
+      for key in priority {
+        if let value = streams[key] as? String, !value.isEmpty {
+          raw = value
+          break
+        }
+      }
+      if raw == nil {
+        raw = streams.values.compactMap { $0 as? String }.first { !$0.isEmpty }
+      }
+      if let raw {
+        hlsURL = URL(string: raw)
+      }
+    }
+    return (isLive, hlsURL)
   }
 
   private static func embedHTML(playerURL: URL) -> String {
@@ -3221,6 +3477,18 @@ final class ViewingController: UIViewController {
     view.backgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.04, alpha: 1)
     configureScroll()
     reload()
+    NotificationCenter.default.addObserver(self, selector: #selector(reloadAndResume), name: .multiViewReloadAndResume, object: nil)
+  }
+
+  deinit {
+    NotificationCenter.default.removeObserver(self)
+  }
+
+  @objc private func reloadAndResume() {
+    reload()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+      PlaybackCoordinator.shared.resumeAll()
+    }
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -3395,13 +3663,13 @@ final class ViewingController: UIViewController {
     let spacer = UIView()
     spacer.translatesAutoresizingMaskIntoConstraints = false
 
-    let playButton = playbackButton(title: " 全て再生", icon: "play.fill", color: .systemGreen) {
+    let playButton = playbackButton(title: "全て再生", icon: "play.fill", color: .systemGreen) {
       PlaybackCoordinator.shared.resumeAll()
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
         PlaybackCoordinator.shared.resumeAll()
       }
     }
-    let reloadButton = playbackButton(title: " 自動更新", icon: "arrow.clockwise", color: .systemBlue) { [weak self] in
+    let reloadButton = playbackButton(title: "自動更新", icon: "arrow.clockwise", color: .systemBlue) { [weak self] in
       self?.reload()
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
         PlaybackCoordinator.shared.resumeAll()
@@ -3428,38 +3696,26 @@ final class ViewingController: UIViewController {
   }
 
   private func layoutButton(icon: String, selected: Bool, accessibilityLabel: String, action: @escaping () -> Void) -> UIButton {
-    let button = UIButton(type: .system)
-    button.setImage(UIImage(systemName: icon), for: .normal)
-    button.tintColor = .white
+    let button = LiquidGlass.makeButton(title: nil, systemImage: icon, tint: selected ? .systemBlue : nil)
     button.accessibilityLabel = accessibilityLabel
-    button.backgroundColor = (selected ? UIColor.systemBlue : UIColor.white).withAlphaComponent(selected ? 0.9 : 0.16)
-    button.layer.cornerRadius = 17
     button.addAction(UIAction { _ in action() }, for: .touchUpInside)
     return button
   }
 
   private func playbackButton(title: String, icon: String, color: UIColor, action: @escaping () -> Void) -> UIButton {
-    let button = UIButton(type: .system)
-    button.setImage(UIImage(systemName: icon), for: .normal)
-    button.setTitle(title, for: .normal)
-    button.tintColor = .white
-    button.setTitleColor(.white, for: .normal)
-    button.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
-    button.backgroundColor = color.withAlphaComponent(0.85)
-    button.layer.cornerRadius = 16
-    button.contentEdgeInsets = UIEdgeInsets(top: 7, left: 12, bottom: 7, right: 14)
+    let button = LiquidGlass.makeButton(title: title, systemImage: icon, tint: color)
     button.addAction(UIAction { actionEvent in
       guard let sender = actionEvent.sender as? UIButton else {
         action()
         return
       }
-      let originalTitle = sender.title(for: .normal)
+      let originalTitle = sender.configuration?.title
       sender.alpha = 0.62
-      sender.setTitle(" 実行中", for: .normal)
+      sender.configuration?.title = "実行中"
       action()
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
         sender.alpha = 1
-        sender.setTitle(originalTitle, for: .normal)
+        sender.configuration?.title = originalTitle
       }
     }, for: .touchUpInside)
     return button
@@ -3682,7 +3938,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate {
     layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
 
     let video: UIView
-    if stream.platform == .niconico, UIDevice.current.userInterfaceIdiom != .pad {
+    if stream.platform == .niconico {
       video = NiconicoNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else if stream.platform == .kick {
       video = KickNativePlayerView(stream: stream, settings: AppState.shared.settings)
@@ -3782,7 +4038,15 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate {
 
 final class VolumeOverlay: UIVisualEffectView {
   init(stream: StreamItem, onChange: @escaping (Float) -> Void) {
+    #if compiler(>=6.2)
+    if #available(iOS 26.0, *) {
+      super.init(effect: UIGlassEffect())
+    } else {
+      super.init(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+    }
+    #else
     super.init(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+    #endif
     clipsToBounds = true
     layer.cornerRadius = 18
 
@@ -3854,7 +4118,7 @@ final class FocusedStreamView: UIView {
     heightAnchor.constraint(greaterThanOrEqualToConstant: 640).isActive = true
 
     let video: UIView
-    if stream.platform == .niconico, UIDevice.current.userInterfaceIdiom != .pad {
+    if stream.platform == .niconico {
       video = NiconicoNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else if stream.platform == .kick {
       video = KickNativePlayerView(stream: stream, settings: AppState.shared.settings)
@@ -3897,10 +4161,8 @@ final class FocusedStreamView: UIView {
     volume.translatesAutoresizingMaskIntoConstraints = false
     addSubview(volume)
 
-    let chatPanel = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+    let chatPanel = LiquidGlass.makePanel(cornerRadius: 18)
     chatPanel.translatesAutoresizingMaskIntoConstraints = false
-    chatPanel.layer.cornerRadius = 18
-    chatPanel.clipsToBounds = true
     addSubview(chatPanel)
 
     if let chatWeb {
@@ -4159,6 +4421,11 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
       if (window.__multiViewURLBridge) return;
       window.__multiViewURLBridge = true;
       var last = '';
+      var lastGestureAt = 0;
+      // Only treat a URL change as a stream selection when it follows a real user
+      // tap. Auto-redirects (e.g. Twitch sending a logged-out user to a featured
+      // channel) and periodic polling must NOT add streams or switch tabs.
+      function recentGesture() { return (Date.now() - lastGestureAt) < 1500; }
       function notify(url) {
         try {
           var value = String(url || location.href || '');
@@ -4171,7 +4438,11 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
         setTimeout(function(){ notify(url); notify(location.href); }, 80);
         setTimeout(function(){ notify(location.href); }, 500);
       }
+      ['pointerdown', 'touchstart', 'mousedown'].forEach(function(name){
+        document.addEventListener(name, function(){ lastGestureAt = Date.now(); }, true);
+      });
       document.addEventListener('click', function(event) {
+        lastGestureAt = Date.now();
         var node = event.target;
         while (node && node !== document && !(node.tagName && node.tagName.toLowerCase() === 'a')) node = node.parentNode;
         if (node && node.href) notifySoon(node.href);
@@ -4180,13 +4451,11 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
         var original = history[name];
         history[name] = function() {
           var result = original.apply(this, arguments);
-          notifySoon(location.href);
+          if (recentGesture()) notifySoon(location.href);
           return result;
         };
       });
-      window.addEventListener('popstate', function(){ notifySoon(location.href); });
-      setInterval(function(){ notify(location.href); }, 1200);
-      notify(location.href);
+      window.addEventListener('popstate', function(){ if (recentGesture()) notifySoon(location.href); });
     })();
     """
     let controller = web.configuration.userContentController
@@ -4195,23 +4464,18 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
   }
 
   func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-    if let url = navigationAction.request.url, navigationAction.targetFrame?.isMainFrame != false, let parsed = parseStream(url) {
+    // Only a user-activated link should add a stream and jump to the viewing tab.
+    // Server/SPA redirects (navigationType .other) must navigate normally so that
+    // opening the Following tab never auto-selects a featured channel.
+    if navigationAction.navigationType == .linkActivated,
+       let url = navigationAction.request.url,
+       navigationAction.targetFrame?.isMainFrame != false,
+       let parsed = parseStream(url) {
       addParsedStream(parsed)
       decisionHandler(.cancel)
       return
     }
     decisionHandler(.allow)
-  }
-
-  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-    if let url = webView.url, let parsed = parseStream(url) {
-      addParsedStream(parsed)
-      return
-    }
-    webView.evaluateJavaScript("location.href") { [weak self] value, _ in
-      guard let raw = value as? String, let url = URL(string: raw), let parsed = self?.parseStream(url) else { return }
-      self?.addParsedStream(parsed)
-    }
   }
 
   func webView(
@@ -4223,7 +4487,9 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     guard navigationAction.targetFrame == nil, let url = navigationAction.request.url else {
       return nil
     }
-    if let parsed = parseStream(url) {
+    // Only a user-tapped link that opens a new window should add a stream;
+    // programmatic window.open (navigationType .other) must not.
+    if navigationAction.navigationType == .linkActivated, let parsed = parseStream(url) {
       addParsedStream(parsed)
       return nil
     }
