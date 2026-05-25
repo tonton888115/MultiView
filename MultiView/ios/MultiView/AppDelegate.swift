@@ -1296,13 +1296,20 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
         "textMessageDetails": ["messageText": message]
       ]
     ])
-    URLSession.shared.dataTask(with: request) { _, response, error in
+    URLSession.shared.dataTask(with: request) { data, response, error in
       if let error {
         Self.finish(completion, .failure(error))
         return
       }
       guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-        Self.finish(completion, .failure(OAuthServiceError.message("YouTubeコメント送信に失敗しました")))
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        if status == 404 {
+          Self.finish(completion, .failure(OAuthServiceError.message("YouTubeライブチャットが見つかりません。配信が終了した、チャットが無効、またはliveChatIdが古い可能性があります。")))
+        } else {
+          let detail = body.trimmingCharacters(in: .whitespacesAndNewlines)
+          Self.finish(completion, .failure(OAuthServiceError.message(detail.isEmpty ? "YouTubeコメント送信に失敗しました (HTTP \(status))" : "YouTubeコメント送信に失敗しました (HTTP \(status)): \(detail)")))
+        }
         return
       }
       Self.finish(completion, .success(()))
@@ -2257,6 +2264,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var segmentTasks: [String: Task<Void, Never>] = [:]
   private var activeSegmentURIs = Set<String>()
   private var keepSeatTimer: Timer?
+  private var endRemovalWorkItem: DispatchWorkItem?
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
   private var fallbackWebView: PlayerWebView?
@@ -2318,6 +2326,8 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     player.replaceCurrentItem(with: nil)
     keepSeatTimer?.invalidate()
     keepSeatTimer = nil
+    endRemovalWorkItem?.cancel()
+    endRemovalWorkItem = nil
     ndgrCommentTask?.cancel()
     ndgrCommentTask = nil
     segmentTasks.values.forEach { $0.cancel() }
@@ -2404,7 +2414,15 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
           return
         }
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-          completion(.failure(NSError(domain: "Niconico", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "投稿失敗 (HTTP \(http.statusCode))"])))
+          let message: String
+          if http.statusCode == 404 {
+            message = "投稿先のニコ生番組が見つかりません。番組終了後、または番組IDが違う場合は404になります。"
+          } else if http.statusCode == 401 || http.statusCode == 403 {
+            message = "ニコ生の投稿権限がありません。設定から再ログインしてください。"
+          } else {
+            message = "投稿失敗 (HTTP \(http.statusCode))"
+          }
+          completion(.failure(NSError(domain: "Niconico", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: message])))
           return
         }
         completion(.success(()))
@@ -2483,6 +2501,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       }
       do {
         let watch = try self.parseWatchData(from: html)
+        self.scheduleProgramEndIfNeeded(watch.endDate)
         self.connect(webSocketURL: watch.webSocketURL, frontendId: watch.frontendId)
       } catch {
         self.retryOrFallback("ニコ生の再生情報を取得できません")
@@ -2617,6 +2636,11 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       }
     }
     if type == "disconnect" {
+      if let payload = json["data"] as? [String: Any],
+         Self.isProgramEndedPayload(payload) {
+        removeEndedProgram("ニコ生番組が終了しました")
+        return
+      }
       socketTask = nil
       if player.currentItem == nil {
         installFallback("ニコ生から切断されました")
@@ -2628,6 +2652,39 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         self.load(channel: self.channel)
       }
     }
+  }
+
+  private func scheduleProgramEndIfNeeded(_ endDate: Date?) {
+    endRemovalWorkItem?.cancel()
+    endRemovalWorkItem = nil
+    guard let endDate else { return }
+    let delay = endDate.timeIntervalSinceNow
+    guard delay > 5 else {
+      removeEndedProgram("ニコ生番組が終了しました")
+      return
+    }
+    let work = DispatchWorkItem { [weak self] in
+      self?.removeEndedProgram("ニコ生番組が終了しました")
+    }
+    endRemovalWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay + 8, execute: work)
+  }
+
+  private func removeEndedProgram(_ reason: String) {
+    DispatchQueue.main.async {
+      guard !self.isStopped else { return }
+      self.showStatus(reason)
+      self.stopPlayback()
+      AppState.shared.remove(self.stream)
+    }
+  }
+
+  private static func isProgramEndedPayload(_ payload: [String: Any]) -> Bool {
+    let text = payload
+      .map { "\($0.key)=\($0.value)" }
+      .joined(separator: " ")
+      .lowercased()
+    return text.contains("end") || text.contains("finished") || text.contains("program_end") || text.contains("番組終了")
   }
 
   private func startKeepSeatTimer(interval: TimeInterval) {
@@ -2927,7 +2984,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     return nil
   }
 
-  private func parseWatchData(from html: String) throws -> (webSocketURL: URL, frontendId: String?) {
+  private func parseWatchData(from html: String) throws -> (webSocketURL: URL, frontendId: String?, endDate: Date?) {
     guard let encoded = firstMatch(in: html, pattern: #"<script[^>]+id=["']initial-state["'][^>]+data-props=["']([^"']+)["']"#)
       ?? firstMatch(in: html, pattern: #"data-props=["']([^"']+)["'][^>]+id=["']initial-state["']"#)
       ?? firstMatch(in: html, pattern: #"<script[^>]+id=["']embedded-data["'][^>]+data-props=["']([^"']+)["']"#)
@@ -2950,7 +3007,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       let requestInfo = constants?["requestInfo"] as? [String: Any]
       let frontendId = (requestInfo?["frontendId"] as? String)
         ?? (requestInfo?["frontendId"] as? Int).map(String.init)
-      return (url, frontendId)
+      return (url, frontendId, Self.findProgramEndDate(in: props))
     }
     guard let site = props["site"] as? [String: Any] else {
       throw NSError(domain: "NiconicoNativePlayerView", code: 4)
@@ -2965,7 +3022,61 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     let frontendId = (site["frontendId"] as? String)
       ?? (site["frontendId"] as? Int).map(String.init)
       ?? (site["frontendID"] as? String)
-    return (url, frontendId)
+    return (url, frontendId, Self.findProgramEndDate(in: props))
+  }
+
+  private static func findProgramEndDate(in value: Any) -> Date? {
+    var candidates: [Date] = []
+    collectProgramEndDates(in: value, currentKey: "", into: &candidates)
+    let now = Date()
+    return candidates
+      .filter { $0.timeIntervalSince(now) > -60 }
+      .sorted()
+      .first
+  }
+
+  private static func collectProgramEndDates(in value: Any, currentKey: String, into candidates: inout [Date]) {
+    if let dict = value as? [String: Any] {
+      for (key, nested) in dict {
+        collectProgramEndDates(in: nested, currentKey: key, into: &candidates)
+      }
+      return
+    }
+    if let array = value as? [Any] {
+      array.forEach { collectProgramEndDates(in: $0, currentKey: currentKey, into: &candidates) }
+      return
+    }
+    let key = currentKey.lowercased()
+    guard key.contains("end") || key.contains("expire") || key.contains("close") else { return }
+    if let number = value as? NSNumber {
+      let raw = number.doubleValue
+      let seconds = raw > 10_000_000_000 ? raw / 1000 : raw
+      let date = Date(timeIntervalSince1970: seconds)
+      if date.timeIntervalSince1970 > 1_600_000_000 {
+        candidates.append(date)
+      }
+      return
+    }
+    if let text = value as? String {
+      if let raw = Double(text) {
+        let seconds = raw > 10_000_000_000 ? raw / 1000 : raw
+        let date = Date(timeIntervalSince1970: seconds)
+        if date.timeIntervalSince1970 > 1_600_000_000 {
+          candidates.append(date)
+        }
+        return
+      }
+      let formatter = ISO8601DateFormatter()
+      formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+      if let date = formatter.date(from: text) {
+        candidates.append(date)
+        return
+      }
+      formatter.formatOptions = [.withInternetDateTime]
+      if let date = formatter.date(from: text) {
+        candidates.append(date)
+      }
+    }
   }
 
   private func firstMatch(in text: String, pattern: String) -> String? {
@@ -4715,6 +4826,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           self.startPlayback(url: best, videoId: videoId, isLive: false)
           return
         }
+        if let apiKey = parsed["apiKey"] as? String, !apiKey.isEmpty {
+          self.requestYouTubeIClients(videoId: videoId, apiKey: apiKey, baseContext: parsed["context"] as? [String: Any], attempt: 0)
+          return
+        }
       }
       if attempt < 3 {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
@@ -4724,6 +4839,104 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         self.installEmbedFallback(videoId: videoId)
       }
     }
+  }
+
+  private func requestYouTubeIClients(videoId: String, apiKey: String, baseContext: [String: Any]?, attempt: Int) {
+    guard !isStopped, player.currentItem == nil, extractorWebView != nil else { return }
+    let clients = Self.youtubeIClientContexts(baseContext: baseContext)
+    guard clients.indices.contains(attempt) else {
+      installEmbedFallback(videoId: videoId)
+      return
+    }
+    var components = URLComponents(string: "https://www.youtube.com/youtubei/v1/player")!
+    components.queryItems = [URLQueryItem(name: "key", value: apiKey)]
+    guard let url = components.url else {
+      installEmbedFallback(videoId: videoId)
+      return
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+    request.setValue("https://www.youtube.com/watch?v=\(videoId)", forHTTPHeaderField: "Referer")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: [
+      "context": clients[attempt],
+      "videoId": videoId,
+      "contentCheckOk": true,
+      "racyCheckOk": true,
+      "playbackContext": [
+        "contentPlaybackContext": [
+          "html5Preference": "HTML5_PREF_WANTS"
+        ]
+      ]
+    ])
+    resolveTask?.cancel()
+    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+      guard let self else { return }
+      self.resolveTask = nil
+      if let data,
+         let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+         let stream = Self.extractPlayableStream(from: parsed) {
+        DispatchQueue.main.async {
+          guard !self.isStopped, self.player.currentItem == nil else { return }
+          self.teardownExtractor()
+          self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive)
+        }
+        return
+      }
+      DispatchQueue.main.async {
+        self.requestYouTubeIClients(videoId: videoId, apiKey: apiKey, baseContext: baseContext, attempt: attempt + 1)
+      }
+    }
+    resolveTask?.resume()
+  }
+
+  private static func youtubeIClientContexts(baseContext: [String: Any]?) -> [[String: Any]] {
+    let baseClient = (baseContext?["client"] as? [String: Any]) ?? [:]
+    let hl = (baseClient["hl"] as? String) ?? "ja"
+    let gl = (baseClient["gl"] as? String) ?? "JP"
+    let visitorData = baseClient["visitorData"] as? String
+    func context(_ name: String, _ version: String, extra: [String: Any] = [:]) -> [String: Any] {
+      var client: [String: Any] = [
+        "clientName": name,
+        "clientVersion": version,
+        "hl": hl,
+        "gl": gl
+      ]
+      if let visitorData { client["visitorData"] = visitorData }
+      extra.forEach { client[$0.key] = $0.value }
+      return ["client": client]
+    }
+    return [
+      context("WEB_SAFARI", (baseClient["clientVersion"] as? String) ?? "2.20240501.01.00", extra: [
+        "browserName": "Safari",
+        "browserVersion": "17.6",
+        "osName": "iOS",
+        "osVersion": "17.6"
+      ]),
+      context("MWEB", (baseClient["clientVersion"] as? String) ?? "2.20240501.01.00"),
+      context("WEB_EMBEDDED_PLAYER", "1.20240501.01.00", extra: [
+        "thirdParty": ["embedUrl": "https://tonton888115.github.io/MultiView/"]
+      ]),
+      context("TVHTML5_SIMPLY_EMBEDDED_PLAYER", "2.0", extra: [
+        "clientScreen": "EMBED"
+      ])
+    ]
+  }
+
+  private static func extractPlayableStream(from parsed: [String: Any]) -> (url: URL, isLive: Bool)? {
+    guard let sd = parsed["streamingData"] as? [String: Any] else { return nil }
+    let details = parsed["videoDetails"] as? [String: Any]
+    let isLive = (details?["isLive"] as? Bool) ?? (details?["isLiveContent"] as? Bool) ?? false
+    if let hls = sd["hlsManifestUrl"] as? String, let url = URL(string: hls) {
+      return (url, isLive)
+    }
+    let formats = (sd["formats"] as? [[String: Any]]) ?? []
+    if let url = bestFormatURL(formats) {
+      return (url, isLive)
+    }
+    return nil
   }
 
   private func teardownExtractor() {
@@ -4822,7 +5035,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         var out = candidatesFromResponse(responses[i]);
         if (out && (out.hls || out.formats.length)) return JSON.stringify(out);
       }
-      var apiKey = ytcfgValue('INNERTUBE_API_KEY');
+      var apiKey = ytcfgValue('INNERTUBE_API_KEY') || '';
       var context = ytcfgValue('INNERTUBE_CONTEXT') || {
         client: {
           clientName: 'MWEB',
@@ -4831,25 +5044,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           gl: 'JP'
         }
       };
-      var videoId = (window.location.search.match(/[?&]v=([^&]+)/) || [])[1];
-      if (!apiKey || !videoId || !window.fetch) return null;
-      return fetch('/youtubei/v1/player?key=' + encodeURIComponent(apiKey), {
-        method: 'POST',
-        credentials: 'include',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          context: context,
-          videoId: videoId,
-          contentCheckOk: true,
-          racyCheckOk: true,
-          playbackContext: {contentPlaybackContext: {html5Preference: 'HTML5_PREF_WANTS'}}
-        })
-      }).then(function(r){ return r.json(); })
-        .then(function(json){
-          var out = candidatesFromResponse(json);
-          return out ? JSON.stringify(out) : null;
-        })
-        .catch(function(){ return null; });
+      return JSON.stringify({apiKey: apiKey, context: context, formats: []});
     } catch (e) { return null; }
   })();
   """
@@ -4994,7 +5189,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
     guard webView === extractorWebView, !isStopped, let videoId = pendingVideoId else { return }
-    runExtraction(videoId: videoId, attempt: 0)
+    WebLoginCookies.sync { [weak self] in
+      self?.runExtraction(videoId: videoId, attempt: 0)
+    }
   }
 
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
