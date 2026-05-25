@@ -442,6 +442,90 @@ enum WebLoginCookies {
   }
 }
 
+final class NiconicoWarmup: NSObject, WKNavigationDelegate {
+  static let shared = NiconicoWarmup()
+
+  private var webViews: [String: WKWebView] = [:]
+  private var completions: [String: [() -> Void]] = [:]
+  private var lastFinished: [String: Date] = [:]
+
+  func prewarm(programId rawProgramId: String, completion: (() -> Void)? = nil) {
+    let programId = rawProgramId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !programId.isEmpty,
+          let url = URL(string: "https://live.nicovideo.jp/watch/\(programId)") else {
+      completion?()
+      return
+    }
+    if let last = lastFinished[programId], Date().timeIntervalSince(last) < 30 {
+      WebLoginCookies.sync(completion)
+      return
+    }
+    if let completion {
+      completions[programId, default: []].append(completion)
+    }
+    if let existing = webViews[programId] {
+      existing.load(URLRequest(url: url))
+      DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+        self?.complete(programId: programId)
+      }
+      return
+    }
+
+    let config = WKWebViewConfiguration()
+    config.allowsInlineMediaPlayback = true
+    config.mediaTypesRequiringUserActionForPlayback = []
+    config.websiteDataStore = .default()
+    let web = WKWebView(frame: CGRect(x: -240, y: -240, width: 160, height: 160), configuration: config)
+    web.customUserAgent = NiconicoNativePlayerView.userAgent
+    web.navigationDelegate = self
+    web.isHidden = true
+    web.accessibilityIdentifier = programId
+    webViews[programId] = web
+
+    if let window = UIApplication.shared.connectedScenes
+      .compactMap({ $0 as? UIWindowScene })
+      .flatMap({ $0.windows })
+      .first(where: { $0.isKeyWindow }) {
+      window.addSubview(web)
+    }
+    web.load(URLRequest(url: url))
+    DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+      self?.complete(programId: programId)
+    }
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    complete(programId: webView.accessibilityIdentifier)
+  }
+
+  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+    complete(programId: webView.accessibilityIdentifier)
+  }
+
+  func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+    complete(programId: webView.accessibilityIdentifier)
+  }
+
+  private func complete(programId: String?) {
+    guard let programId, webViews[programId] != nil else { return }
+    lastFinished[programId] = Date()
+    let callbacks = completions.removeValue(forKey: programId) ?? []
+    WebLoginCookies.sync {
+      callbacks.forEach { $0() }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 90) { [weak self] in
+      guard let self,
+            let last = self.lastFinished[programId],
+            Date().timeIntervalSince(last) >= 90 else { return }
+      self.webViews[programId]?.navigationDelegate = nil
+      self.webViews[programId]?.stopLoading()
+      self.webViews[programId]?.removeFromSuperview()
+      self.webViews.removeValue(forKey: programId)
+      self.lastFinished.removeValue(forKey: programId)
+    }
+  }
+}
+
 struct SimpleOAuthToken: Codable {
   let accessToken: String
   let expiresAt: TimeInterval
@@ -1111,6 +1195,9 @@ final class AppState {
     // A stream is usually added straight after logging in / browsing in a web view,
     // so capture that session for the native player about to be created.
     WebLoginCookies.sync()
+    if platform == .niconico {
+      NiconicoWarmup.shared.prewarm(programId: channel)
+    }
     streams.append(StreamItem(id: UUID().uuidString, platform: platform, channel: channel))
     return true
   }
@@ -1937,8 +2024,12 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
     watchPageURL = url
     isLoading = true
-    syncNiconicoWebCookies { [weak self] in
-      self?.fetchWatchPage(url: url)
+    showStatus(loadAttempts == 0 ? "ニコ生セッションを準備中" : "ニコ生再試行中… (\(loadAttempts))")
+    NiconicoWarmup.shared.prewarm(programId: programId) { [weak self] in
+      guard let self, !self.isStopped else { return }
+      self.syncNiconicoWebCookies { [weak self] in
+        self?.fetchWatchPage(url: url)
+      }
     }
   }
 
@@ -2622,7 +2713,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
   }
 
-  private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+  fileprivate static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
 final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable {
@@ -4090,6 +4181,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
+    // Keep YouTube muted for simultaneous playback stability; the shared overlay
+    // still stores the user's preferred level for consistency with other cells.
     web.evaluateJavaScript("window.mvMute && window.mvMute();")
   }
 
@@ -4179,13 +4272,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       window.mvPause=function(){cmd('pauseVideo');};
       window.mvMute=function(){cmd('mute');};
       setInterval(function(){window.mvPlay();}, 5000);
-      /*
-          onStateChange:function(e){ if(e.data===YT.PlayerState.UNSTARTED||e.data===YT.PlayerState.CUED){ try{e.target.playVideo();}catch(x){} } }}});
-      }
-      function apply(){ if(!player||!READY)return; try{ player.playVideo(); player.mute(); }catch(x){} }
-      window.mvPlay=function(){ apply(); };
-      window.mvPause=function(){ try{ player&&player.pauseVideo(); }catch(x){} };
-      */
     </script>
     </body>
     </html>
@@ -4439,14 +4525,17 @@ final class ViewingController: UIViewController {
   private var focused: StreamItem?
   private weak var dragSourceCell: StreamCellView?
   private weak var dragTargetCell: StreamCellView?
+  private let reorderIndicator = UIView()
   private var dragSnapshot: UIView?
   private var dragSourceStream: StreamItem?
+  private var dragInsertIndex: Int?
   private var lastAutoReloadAt = Date.distantPast
 
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.04, alpha: 1)
     configureScroll()
+    configureReorderIndicator()
     reload()
     NotificationCenter.default.addObserver(self, selector: #selector(reloadAndResume), name: .multiViewReloadAndResume, object: nil)
     NotificationCenter.default.addObserver(self, selector: #selector(networkQualityChanged), name: .multiViewNetworkQualityChanged, object: nil)
@@ -4788,6 +4877,18 @@ final class ViewingController: UIViewController {
     }
   }
 
+  private func configureReorderIndicator() {
+    reorderIndicator.backgroundColor = .systemGreen
+    reorderIndicator.layer.cornerRadius = 2
+    reorderIndicator.layer.shadowColor = UIColor.black.cgColor
+    reorderIndicator.layer.shadowOpacity = 0.24
+    reorderIndicator.layer.shadowRadius = 8
+    reorderIndicator.layer.shadowOffset = CGSize(width: 0, height: 3)
+    reorderIndicator.isHidden = true
+    reorderIndicator.alpha = 0
+    view.addSubview(reorderIndicator)
+  }
+
   private func beginReorder(cell: StreamCellView, at location: CGPoint) {
     guard dragSnapshot == nil else { return }
     dragSourceCell = cell
@@ -4803,24 +4904,31 @@ final class ViewingController: UIViewController {
     snapshot.layer.shadowOffset = CGSize(width: 0, height: 8)
     snapshot.transform = CGAffineTransform(scaleX: 1.03, y: 1.03)
     view.addSubview(snapshot)
+    view.bringSubviewToFront(reorderIndicator)
+    view.bringSubviewToFront(snapshot)
     dragSnapshot = snapshot
     updateReorder(at: location)
   }
 
   private func updateReorder(at location: CGPoint) {
     dragSnapshot?.center = location
-    guard let target = reorderCell(at: location), target !== dragSourceCell else {
-      if dragTargetCell !== dragSourceCell {
-        dragTargetCell?.setDropTargetActive(false)
-        dragTargetCell = dragSourceCell
-      }
+    guard let target = reorderCell(at: location),
+          let targetIndex = AppState.shared.streams.firstIndex(where: { $0.id == target.stream.id }) else {
+      dragInsertIndex = nil
+      hideReorderIndicator()
       return
     }
     if target !== dragTargetCell {
       dragTargetCell?.setDropTargetActive(false)
       dragTargetCell = target
-      target.setDropTargetActive(true)
+      if target !== dragSourceCell {
+        target.setDropTargetActive(true)
+      }
     }
+    let frame = target.convert(target.bounds, to: view)
+    let insertAfterTarget = location.y > frame.midY
+    dragInsertIndex = targetIndex + (insertAfterTarget ? 1 : 0)
+    showReorderIndicator(near: frame, after: insertAfterTarget)
   }
 
   private func finishReorder(commit: Bool) {
@@ -4828,12 +4936,15 @@ final class ViewingController: UIViewController {
     let sourceCell = dragSourceCell
     let targetCell = dragTargetCell
     let sourceStream = dragSourceStream
+    let insertIndex = dragInsertIndex
     dragSourceCell = nil
     dragTargetCell = nil
     dragSourceStream = nil
+    dragInsertIndex = nil
 
     sourceCell?.setReorderSourceActive(false)
     targetCell?.setDropTargetActive(false)
+    hideReorderIndicator()
 
     let snapshot = dragSnapshot
     dragSnapshot = nil
@@ -4848,15 +4959,43 @@ final class ViewingController: UIViewController {
 
     guard commit,
           let sourceStream,
-          let targetStream = targetCell?.stream,
-          sourceStream.id != targetStream.id,
           let from = AppState.shared.streams.firstIndex(where: { $0.id == sourceStream.id }),
-          let to = AppState.shared.streams.firstIndex(where: { $0.id == targetStream.id }) else { return }
+          let insertIndex,
+          insertIndex != from,
+          insertIndex != from + 1 else { return }
     var next = AppState.shared.streams
     let moved = next.remove(at: from)
-    let insertIndex = from < to ? to - 1 : to
-    next.insert(moved, at: max(0, min(insertIndex, next.count)))
+    let adjustedInsertIndex = from < insertIndex ? insertIndex - 1 : insertIndex
+    next.insert(moved, at: max(0, min(adjustedInsertIndex, next.count)))
     AppState.shared.streams = next
+  }
+
+  private func showReorderIndicator(near targetFrame: CGRect, after: Bool) {
+    let y = after ? targetFrame.maxY : targetFrame.minY
+    let frame = CGRect(x: targetFrame.minX + 10, y: y - 2, width: max(24, targetFrame.width - 20), height: 4)
+    if reorderIndicator.isHidden {
+      reorderIndicator.frame = frame
+      reorderIndicator.transform = CGAffineTransform(scaleX: 0.86, y: 1)
+      reorderIndicator.isHidden = false
+      UIView.animate(withDuration: 0.18, delay: 0, usingSpringWithDamping: 0.78, initialSpringVelocity: 0.3, options: [.allowUserInteraction, .beginFromCurrentState]) {
+        self.reorderIndicator.alpha = 1
+        self.reorderIndicator.transform = .identity
+      }
+      return
+    }
+    UIView.animate(withDuration: 0.16, delay: 0, options: [.allowUserInteraction, .beginFromCurrentState]) {
+      self.reorderIndicator.frame = frame
+    }
+  }
+
+  private func hideReorderIndicator() {
+    guard !reorderIndicator.isHidden else { return }
+    UIView.animate(withDuration: 0.12, delay: 0, options: [.allowUserInteraction, .beginFromCurrentState]) {
+      self.reorderIndicator.alpha = 0
+    } completion: { _ in
+      self.reorderIndicator.isHidden = true
+      self.reorderIndicator.transform = .identity
+    }
   }
 
   private func reorderCell(at location: CGPoint) -> StreamCellView? {
@@ -4960,7 +5099,6 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     let volume = VolumeOverlay(stream: stream) { value in
       audio?.setPlaybackVolume(value)
     }
-    volume.isHidden = stream.platform == .youtube
     volume.translatesAutoresizingMaskIntoConstraints = false
     addSubview(volume)
 
@@ -4997,8 +5135,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
       volume.widthAnchor.constraint(equalToConstant: 42),
       volume.heightAnchor.constraint(equalTo: heightAnchor, multiplier: 0.62)
     ])
-    let autoHideControls = stream.platform == .youtube ? [focus, remove, comment] : [focus, remove, comment, volume]
-    autoHider = AutoHidingControls(host: self, controls: autoHideControls)
+    autoHider = AutoHidingControls(host: self, controls: [focus, remove, comment, volume])
     let reorder = UILongPressGestureRecognizer(target: self, action: #selector(handleReorderGesture(_:)))
     reorder.minimumPressDuration = 0.45
     reorder.delegate = self
@@ -5285,7 +5422,6 @@ final class FocusedStreamView: UIView {
     let volume = VolumeOverlay(stream: stream) { value in
       audio?.setPlaybackVolume(value)
     }
-    volume.isHidden = stream.platform == .youtube
     volume.translatesAutoresizingMaskIntoConstraints = false
     addSubview(volume)
 
@@ -5367,7 +5503,7 @@ final class FocusedStreamView: UIView {
       ]
     }
     NSLayoutConstraint.activate(constraints)
-    var autoHideControls: [UIView] = stream.platform == .youtube ? [remove] : [remove, volume]
+    var autoHideControls: [UIView] = [remove, volume]
     if let closeButton {
       autoHideControls.append(closeButton)
     }
