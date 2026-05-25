@@ -57,6 +57,7 @@
   var danmakuEl = document.getElementById('danmaku');
   var msgEl = document.getElementById('msg');
   var startEl = document.getElementById('start');
+  var twitcastingAudioOn = false;
   var showAudioButton = audioOn && P.get('start') !== '0';
   var frameEl = null;
   function showMsg(t) { msgEl.textContent = t; msgEl.style.display = 'block'; }
@@ -86,7 +87,7 @@
     if (platform === 'twitch') return 'https://player.twitch.tv/?channel=' + ch + '&' + parentParams() + '&muted=true&autoplay=true&playsinline=true';
     if (platform === 'kick') return 'https://player.kick.com/' + ch + '?autoplay=true&muted=' + ((!audioOn || volume <= 0) ? 'true' : 'false');
     if (platform === 'youtube') return 'https://www.youtube.com/embed/' + ch + '?autoplay=1&mute=' + muteNum + '&playsinline=1&enablejsapi=1&origin=' + encodeURIComponent(location.origin) + '&vq=' + (quality === 'economy' ? 'small' : 'hd720');
-    if (platform === 'twitcasting') return 'https://twitcasting.tv/' + ch + '/embeddedplayer/live?auto_play=true&default_mute=true';
+    if (platform === 'twitcasting') return 'https://twitcasting.tv/' + ch + '/embeddedplayer/live?auto_play=true' + (twitcastingAudioOn ? '' : '&default_mute=true');
     return '';
   }
   function mountPlayer() {
@@ -157,12 +158,22 @@
     if (data && data.type === 'volume') applyVolume(data.volume);
     if (data && data.type === 'play') enableAudio();
   });
+  function remountPlayer() {
+    if (frameEl && frameEl.parentNode) frameEl.parentNode.removeChild(frameEl);
+    frameEl = null;
+    mountPlayer();
+  }
   function enableAudio() {
     if (!frameEl) return;
     audioOn = true;
     if (volume <= 0) volume = 1;
-    sendPlayCommand();
-    applyVolume(volume);
+    if (platform === 'twitcasting') {
+      twitcastingAudioOn = true;
+      remountPlayer();
+    } else {
+      sendPlayCommand();
+      applyVolume(volume);
+    }
     startEl.classList.add('hidden');
   }
   window.MultiViewEnableAudio = enableAudio;

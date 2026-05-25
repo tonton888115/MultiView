@@ -1852,6 +1852,385 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
+// Native Twitch playback, emulating the official app: fetch a PlaybackAccessToken
+// over GraphQL, build the usher.ttvnw.net HLS master playlist, and play it with
+// AVPlayer. Anonymous IRC supplies danmaku comments. Falls back to the web embed.
+final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+  private let stream: StreamItem
+  private let settings: AppSettings
+  private let player = AVPlayer()
+  private let playerLayer = AVPlayerLayer()
+  private let danmakuView = UIView()
+  private let statusLabel = UILabel()
+  private var playbackVolume: Float
+  private var tokenTask: URLSessionDataTask?
+  private var chatSocket: URLSessionWebSocketTask?
+  private var chatChannel: String?
+  private var itemStatusObservation: NSKeyValueObservation?
+  private var itemFailedObserver: NSObjectProtocol?
+  private var fallbackWebView: PlayerWebView?
+  private var isLoading = false
+  private var isStopped = false
+  private var laneCursor = 0
+
+  private static let clientID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+  private static let accessTokenHash = "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712"
+  private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+
+  init(stream: StreamItem, settings: AppSettings) {
+    self.stream = stream
+    self.settings = settings
+    self.playbackVolume = StreamVolumeStore.volume(for: stream)
+    super.init(frame: .zero)
+    backgroundColor = .black
+
+    player.automaticallyWaitsToMinimizeStalling = false
+    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+    playerLayer.player = player
+    playerLayer.videoGravity = .resizeAspect
+    layer.addSublayer(playerLayer)
+
+    danmakuView.isUserInteractionEnabled = false
+    danmakuView.clipsToBounds = true
+    addSubview(danmakuView)
+
+    statusLabel.text = "Twitchをネイティブ再生で読み込み中"
+    statusLabel.textColor = .white.withAlphaComponent(0.72)
+    statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
+    statusLabel.textAlignment = .center
+    statusLabel.numberOfLines = 2
+    statusLabel.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(statusLabel)
+    NSLayoutConstraint.activate([
+      statusLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+      statusLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+      statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 16),
+      statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16)
+    ])
+
+    PlaybackCoordinator.shared.register(self)
+    loadNativeStream()
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    stopPlayback()
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    playerLayer.frame = bounds
+    danmakuView.frame = bounds
+  }
+
+  func resumePlayback() {
+    guard !isStopped else { return }
+    let session = AVAudioSession.sharedInstance()
+    try? session.setCategory(.playback, mode: .default, options: [])
+    try? session.setActive(true)
+    if let fallbackWebView {
+      fallbackWebView.resumePlayback()
+      return
+    }
+    if player.currentItem == nil {
+      loadNativeStream()
+      return
+    }
+    player.isMuted = !settings.playAudio
+    player.volume = settings.playAudio ? playbackVolume : 0
+    player.play()
+  }
+
+  func stopPlayback() {
+    isStopped = true
+    tokenTask?.cancel()
+    tokenTask = nil
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    chatSocket?.cancel(with: .goingAway, reason: nil)
+    chatSocket = nil
+    chatChannel = nil
+    fallbackWebView?.stopPlayback()
+    fallbackWebView?.removeFromSuperview()
+    fallbackWebView = nil
+    itemStatusObservation = nil
+    if let itemFailedObserver {
+      NotificationCenter.default.removeObserver(itemFailedObserver)
+      self.itemFailedObserver = nil
+    }
+  }
+
+  func setPlaybackVolume(_ volume: Float) {
+    playbackVolume = min(1, max(0, volume))
+    player.volume = settings.playAudio ? playbackVolume : 0
+    fallbackWebView?.setPlaybackVolume(playbackVolume)
+  }
+
+  private func loadNativeStream() {
+    guard !isStopped, !isLoading, fallbackWebView == nil else { return }
+    let channel = Self.normalizeChannel(stream.channel)
+    guard !channel.isEmpty else {
+      installFallback("Twitchチャンネル名が不正です")
+      return
+    }
+    isLoading = true
+    showStatus("Twitchをネイティブ再生で読み込み中")
+    requestAccessToken(channel: channel)
+  }
+
+  private func requestAccessToken(channel: String) {
+    guard let url = URL(string: "https://gql.twitch.tv/gql") else {
+      installFallback("Twitch APIに接続できません")
+      return
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue(Self.clientID, forHTTPHeaderField: "Client-ID")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+    let body: [String: Any] = [
+      "operationName": "PlaybackAccessToken",
+      "extensions": [
+        "persistedQuery": [
+          "version": 1,
+          "sha256Hash": Self.accessTokenHash
+        ]
+      ],
+      "variables": [
+        "isLive": true,
+        "login": channel,
+        "isVod": false,
+        "vodID": "",
+        "playerType": "embed"
+      ]
+    ]
+    request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    tokenTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+      guard let self else { return }
+      self.tokenTask = nil
+      if let error {
+        self.installFallback("Twitchトークン取得失敗: \(error.localizedDescription)")
+        return
+      }
+      guard let data,
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let payload = json["data"] as? [String: Any],
+            let token = payload["streamPlaybackAccessToken"] as? [String: Any],
+            let value = token["value"] as? String,
+            let signature = token["signature"] as? String else {
+        self.installFallback("Twitchの配信情報を取得できません")
+        return
+      }
+      guard let usherURL = Self.buildUsherURL(channel: channel, token: value, signature: signature) else {
+        self.installFallback("Twitch再生URLを構築できません")
+        return
+      }
+      self.isLoading = false
+      self.connectTwitchChat(channel: channel)
+      self.play(hlsURL: usherURL)
+    }
+    tokenTask?.resume()
+  }
+
+  private static func buildUsherURL(channel: String, token: String, signature: String) -> URL? {
+    guard let pathChannel = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+          var components = URLComponents(string: "https://usher.ttvnw.net/api/channel/hls/\(pathChannel).m3u8") else {
+      return nil
+    }
+    components.queryItems = [
+      URLQueryItem(name: "sig", value: signature),
+      URLQueryItem(name: "token", value: token),
+      URLQueryItem(name: "allow_source", value: "true"),
+      URLQueryItem(name: "allow_audio_only", value: "true"),
+      URLQueryItem(name: "player", value: "twitchweb"),
+      URLQueryItem(name: "p", value: String(Int.random(in: 0..<1_000_000))),
+      URLQueryItem(name: "type", value: "any"),
+      URLQueryItem(name: "fast_bread", value: "true"),
+      URLQueryItem(name: "playlist_include_framerate", value: "true")
+    ]
+    return components.url
+  }
+
+  private func play(hlsURL: URL) {
+    DispatchQueue.main.async {
+      guard !self.isStopped else { return }
+      self.statusLabel.isHidden = true
+      let asset = AVURLAsset(url: hlsURL, options: [
+        "AVURLAssetHTTPHeaderFieldsKey": self.twitchPlaybackHeaders()
+      ])
+      let item = AVPlayerItem(asset: asset)
+      item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+      item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
+      self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+        if item.status == .failed {
+          DispatchQueue.main.async {
+            self?.installFallback(item.error?.localizedDescription ?? "Twitchネイティブ再生に失敗しました")
+          }
+        } else if item.status == .readyToPlay {
+          DispatchQueue.main.async {
+            self?.resumePlayback()
+          }
+        }
+      }
+      if let itemFailedObserver = self.itemFailedObserver {
+        NotificationCenter.default.removeObserver(itemFailedObserver)
+      }
+      self.itemFailedObserver = NotificationCenter.default.addObserver(
+        forName: .AVPlayerItemFailedToPlayToEndTime,
+        object: item,
+        queue: .main
+      ) { [weak self] notification in
+        let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
+        self?.installFallback(error?.localizedDescription ?? "Twitchネイティブ再生が停止しました")
+      }
+      self.player.replaceCurrentItem(with: item)
+      self.player.isMuted = !self.settings.playAudio
+      self.player.volume = self.settings.playAudio ? self.playbackVolume : 0
+      self.player.play()
+    }
+  }
+
+  private func installFallback(_ reason: String) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil else { return }
+      self.isLoading = false
+      self.showStatus(reason)
+      let web = PlayerWebView(stream: self.stream, settings: self.settings)
+      web.setPlaybackVolume(self.playbackVolume)
+      web.translatesAutoresizingMaskIntoConstraints = false
+      self.insertSubview(web, belowSubview: self.statusLabel)
+      NSLayoutConstraint.activate([
+        web.topAnchor.constraint(equalTo: self.topAnchor),
+        web.leadingAnchor.constraint(equalTo: self.leadingAnchor),
+        web.trailingAnchor.constraint(equalTo: self.trailingAnchor),
+        web.bottomAnchor.constraint(equalTo: self.bottomAnchor)
+      ])
+      self.fallbackWebView = web
+      self.chatSocket?.cancel(with: .goingAway, reason: nil)
+      self.chatSocket = nil
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+        web.resumePlayback()
+      }
+    }
+  }
+
+  private func showStatus(_ text: String) {
+    DispatchQueue.main.async {
+      self.statusLabel.text = text
+      self.statusLabel.isHidden = false
+    }
+  }
+
+  private func twitchPlaybackHeaders() -> [String: String] {
+    [
+      "User-Agent": Self.userAgent,
+      "Referer": "https://player.twitch.tv/",
+      "Origin": "https://player.twitch.tv"
+    ]
+  }
+
+  private func connectTwitchChat(channel: String) {
+    guard settings.showChat, !isStopped, fallbackWebView == nil else { return }
+    chatChannel = channel
+    chatSocket?.cancel(with: .goingAway, reason: nil)
+    guard let url = URL(string: "wss://irc-ws.chat.twitch.tv:443") else { return }
+    let task = URLSession.shared.webSocketTask(with: url)
+    chatSocket = task
+    task.resume()
+    let nick = "justinfan\(Int.random(in: 10000..<1_000_000))"
+    task.send(.string("PASS SCHMOOPIIE")) { _ in }
+    task.send(.string("NICK \(nick)")) { _ in }
+    task.send(.string("JOIN #\(channel)")) { _ in }
+    receiveTwitchChat()
+  }
+
+  private func receiveTwitchChat() {
+    chatSocket?.receive { [weak self] result in
+      guard let self, !self.isStopped else { return }
+      switch result {
+      case .failure:
+        self.chatSocket?.cancel(with: .goingAway, reason: nil)
+        self.chatSocket = nil
+        guard let channel = self.chatChannel else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+          guard let self, !self.isStopped, self.fallbackWebView == nil else { return }
+          self.connectTwitchChat(channel: channel)
+        }
+      case .success(let message):
+        if case .string(let text) = message {
+          self.handleTwitchChat(text)
+        }
+        self.receiveTwitchChat()
+      }
+    }
+  }
+
+  private func handleTwitchChat(_ text: String) {
+    for rawLine in text.components(separatedBy: "\r\n") where !rawLine.isEmpty {
+      if rawLine.hasPrefix("PING") {
+        chatSocket?.send(.string("PONG :tmi.twitch.tv")) { _ in }
+        continue
+      }
+      guard let privmsg = rawLine.range(of: " PRIVMSG "),
+            let bodyRange = rawLine.range(of: " :", range: privmsg.lowerBound..<rawLine.endIndex) else { continue }
+      let message = String(rawLine[bodyRange.upperBound...])
+      emitDanmaku(message)
+    }
+  }
+
+  private func emitDanmaku(_ text: String) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    if settings.danmakuMaxLength > 0, trimmed.count > settings.danmakuMaxLength {
+      return
+    }
+    DispatchQueue.main.async {
+      guard self.danmakuView.bounds.height > 0, self.danmakuView.bounds.width > 0 else { return }
+      let fontSize = CGFloat(self.settings.danmakuFontSize)
+      let lineHeight = fontSize + 8
+      let maxLines = self.settings.danmakuMaxLines > 0
+        ? self.settings.danmakuMaxLines
+        : max(1, Int(self.danmakuView.bounds.height / lineHeight))
+      let label = UILabel()
+      label.text = trimmed
+      label.font = .systemFont(ofSize: fontSize, weight: .bold)
+      label.textColor = UIColor.white.withAlphaComponent(self.settings.danmakuOpacity)
+      label.layer.shadowColor = UIColor.black.cgColor
+      label.layer.shadowRadius = 2
+      label.layer.shadowOpacity = 1
+      label.layer.shadowOffset = CGSize(width: 1, height: 1)
+      label.sizeToFit()
+      let lane = self.laneCursor % maxLines
+      self.laneCursor += 1
+      let y = CGFloat(lane) * lineHeight + 6
+      let startX = self.danmakuView.bounds.width + 12
+      label.frame.origin = CGPoint(x: startX, y: y)
+      self.danmakuView.addSubview(label)
+      let travel = startX + label.bounds.width + 24
+      let pixelsPerSecond = max(35, self.danmakuView.bounds.width * CGFloat(self.settings.danmakuSpeed))
+      let duration = TimeInterval(travel / pixelsPerSecond)
+      UIView.animate(withDuration: duration, delay: 0, options: [.curveLinear]) {
+        label.frame.origin.x = -label.bounds.width - 12
+      } completion: { _ in
+        label.removeFromSuperview()
+      }
+    }
+  }
+
+  private static func normalizeChannel(_ raw: String) -> String {
+    var value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    value = value.replacingOccurrences(of: "^@+", with: "", options: .regularExpression)
+    if let range = value.range(of: "twitch.tv/") {
+      value = String(value[range.upperBound...])
+    }
+    value = value.components(separatedBy: CharacterSet(charactersIn: "/?# ")).first ?? value
+    return value
+  }
+}
+
 final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResumable, PlaybackStoppable, AudioControllable {
   private let playAudio: Bool
   private var playbackVolume: Float = 1
@@ -2296,6 +2675,8 @@ final class StreamCellView: UIView {
       video = NiconicoNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else if stream.platform == .kick {
       video = KickNativePlayerView(stream: stream, settings: AppState.shared.settings)
+    } else if stream.platform == .twitch {
+      video = TwitchNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else {
       video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
     }
@@ -2432,6 +2813,8 @@ final class FocusedStreamView: UIView {
       video = NiconicoNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else if stream.platform == .kick {
       video = KickNativePlayerView(stream: stream, settings: AppState.shared.settings)
+    } else if stream.platform == .twitch {
+      video = TwitchNativePlayerView(stream: stream, settings: AppState.shared.settings)
     } else {
       video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
     }
