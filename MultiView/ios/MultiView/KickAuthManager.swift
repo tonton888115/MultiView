@@ -52,6 +52,19 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
   // https bridge so existing installs work without the user re-entering anything.
   private let callbackScheme = "multiview"
 
+  // id.kick.com / api.kick.com sit behind Cloudflare, which returns a 400 "challenge"
+  // page to requests that don't look like a browser (the default URLSession UA gets
+  // blocked). Sending a full browser-like header set lets the API calls through.
+  private static let browserUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+
+  private static func applyBrowserHeaders(_ request: inout URLRequest) {
+    request.setValue(browserUserAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+    request.setValue("ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7", forHTTPHeaderField: "Accept-Language")
+    request.setValue("https://kick.com", forHTTPHeaderField: "Origin")
+    request.setValue("https://kick.com/", forHTTPHeaderField: "Referer")
+  }
+
   var config: KickOAuthConfig {
     get {
       guard let data = UserDefaults.standard.data(forKey: configKey),
@@ -235,6 +248,7 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
   private func tokenRequest(body: Data, completion: @escaping (Result<KickOAuthToken, Error>) -> Void) {
     var request = URLRequest(url: URL(string: "https://id.kick.com/oauth/token")!)
     request.httpMethod = "POST"
+    Self.applyBrowserHeaders(&request)
     request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
     request.httpBody = body
     URLSession.shared.dataTask(with: request) { data, response, error in
@@ -279,6 +293,7 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
       return
     }
     var request = URLRequest(url: url)
+    Self.applyBrowserHeaders(&request)
     request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
     URLSession.shared.dataTask(with: request) { data, response, error in
       if let error {
@@ -302,8 +317,8 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
   private func postChat(broadcasterID: Int, content: String, accessToken: String, completion: @escaping (Result<Void, Error>) -> Void) {
     var request = URLRequest(url: URL(string: "https://api.kick.com/public/v1/chat")!)
     request.httpMethod = "POST"
+    Self.applyBrowserHeaders(&request)
     request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.httpBody = try? JSONSerialization.data(withJSONObject: [
       "broadcaster_user_id": broadcasterID,

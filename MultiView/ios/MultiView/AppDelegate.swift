@@ -4415,8 +4415,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private let statusLabel = UILabel()
   private var playbackVolume: Float
   private var resolveTask: URLSessionDataTask?
-  private var innerTubeTask: URLSessionDataTask?
   private var sponsorTask: URLSessionDataTask?
+  private var extractorWebView: WKWebView?
+  private var pendingVideoId: String?
   private var itemStatusObservation: NSKeyValueObservation?
   private var timeObserver: Any?
   private var sponsorSegments: [(start: Double, end: Double)] = []
@@ -4433,6 +4434,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+    player.automaticallyWaitsToMinimizeStalling = false
     layer.addSublayer(playerLayer)
 
     statusLabel.text = "YouTubeを読み込み中"
@@ -4503,7 +4505,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   func stopPlayback() {
     isStopped = true
     resolveTask?.cancel(); resolveTask = nil
-    innerTubeTask?.cancel(); innerTubeTask = nil
+    teardownExtractor()
     sponsorTask?.cancel(); sponsorTask = nil
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
@@ -4527,87 +4529,119 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     resolveLiveVideoID(from: raw)
   }
 
-  // Ask YouTube's InnerTube player endpoint (IOS client) for the real media URLs.
-  // The IOS client usually returns an hlsManifestUrl for live and plain (un-ciphered)
-  // muxed URLs for VOD, both of which AVPlayer can play directly.
+  // YouTube now gates raw stream URLs behind a PO token that only its own page JS can
+  // mint, so a bare InnerTube call returns nothing usable (it just fell back to the
+  // ad-laden iframe, which is also why audio fought the other cells). Instead we load
+  // the real watch page in a tiny offscreen WKWebView — YouTube's own JS mints the
+  // tokens — read the playable URL out of ytInitialPlayerResponse, and hand it to
+  // AVPlayer, the same native path Kick/Twitch use (so audio mixes cleanly and there
+  // are no injected ads).
   private func extractStreams(videoId: String) {
     guard !isStopped else { return }
     showStatus("YouTube映像を取得中")
-    guard let url = URL(string: "https://www.youtube.com/youtubei/v1/player?key=\(Self.innerTubeKey)&prettyPrint=false") else {
+    pendingVideoId = videoId
+    let config = WKWebViewConfiguration()
+    config.allowsInlineMediaPlayback = true
+    // The extractor only reads the page; block autoplay so the hidden web view never
+    // emits its own audio (the real playback happens in AVPlayer).
+    config.mediaTypesRequiringUserActionForPlayback = .all
+    config.websiteDataStore = .default()
+    let web = WKWebView(frame: CGRect(x: -20, y: -20, width: 8, height: 8), configuration: config)
+    web.customUserAgent = Self.userAgent
+    web.navigationDelegate = self
+    web.isUserInteractionEnabled = false
+    web.alpha = 0.01
+    extractorWebView = web
+    // WKWebView runs JS most reliably when in the window, so park it offscreen there.
+    if let window = UIApplication.shared.connectedScenes
+      .compactMap({ $0 as? UIWindowScene })
+      .flatMap({ $0.windows })
+      .first(where: { $0.isKeyWindow }) {
+      window.addSubview(web)
+    } else {
+      addSubview(web)
+    }
+    guard let url = URL(string: "https://m.youtube.com/watch?v=\(videoId)") else {
       installEmbedFallback(videoId: videoId)
       return
     }
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue(Self.innerTubeUserAgent, forHTTPHeaderField: "User-Agent")
-    request.setValue("5", forHTTPHeaderField: "X-YouTube-Client-Name")
-    request.setValue(Self.innerTubeClientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
-    let body: [String: Any] = [
-      "videoId": videoId,
-      "contentCheckOk": true,
-      "racyCheckOk": true,
-      "context": [
-        "client": [
-          "clientName": "IOS",
-          "clientVersion": Self.innerTubeClientVersion,
-          "deviceMake": "Apple",
-          "deviceModel": "iPhone16,2",
-          "osName": "iPhone",
-          "osVersion": "17.6.1.21G93",
-          "hl": "ja",
-          "gl": "JP"
-        ]
-      ]
-    ]
-    request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-    innerTubeTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
-      guard let self, !self.isStopped else { return }
-      self.innerTubeTask = nil
-      guard let data,
-            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        DispatchQueue.main.async { self.installEmbedFallback(videoId: videoId) }
-        return
-      }
-      let videoDetails = json["videoDetails"] as? [String: Any]
-      let isLive = (videoDetails?["isLive"] as? Bool) ?? false
-      let streamingData = json["streamingData"] as? [String: Any]
-      let hlsURL = (streamingData?["hlsManifestUrl"] as? String).flatMap { URL(string: $0) }
-      let muxedURL = Self.bestMuxedURL(from: streamingData)
-      DispatchQueue.main.async {
-        guard !self.isStopped else { return }
-        if let hlsURL {
-          self.startPlayback(url: hlsURL, videoId: videoId, isLive: isLive)
-        } else if let muxedURL {
-          self.startPlayback(url: muxedURL, videoId: videoId, isLive: false)
-        } else {
-          self.installEmbedFallback(videoId: videoId)
-        }
-      }
+    web.load(URLRequest(url: url))
+    // If the page never yields a URL, fall back to the embed.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
+      guard let self, !self.isStopped, self.extractorWebView != nil, self.player.currentItem == nil else { return }
+      self.installEmbedFallback(videoId: videoId)
     }
-    innerTubeTask?.resume()
   }
 
-  // Pick a muxed (audio+video) progressive format that exposes a plain URL. AVPlayer
-  // cannot mux separate adaptive video/audio, so we only use the combined "formats".
-  private static func bestMuxedURL(from streamingData: [String: Any]?) -> URL? {
-    guard let formats = streamingData?["formats"] as? [[String: Any]] else { return nil }
+  private func runExtraction(videoId: String, attempt: Int) {
+    guard let web = extractorWebView, !isStopped else { return }
+    web.evaluateJavaScript(Self.extractionJS) { [weak self] result, _ in
+      guard let self, !self.isStopped, self.player.currentItem == nil, self.extractorWebView != nil else { return }
+      if let json = result as? String,
+         let data = json.data(using: .utf8),
+         let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        let isLive = (parsed["isLive"] as? Bool) ?? false
+        if let hls = parsed["hls"] as? String, let url = URL(string: hls) {
+          self.teardownExtractor()
+          self.startPlayback(url: url, videoId: videoId, isLive: isLive)
+          return
+        }
+        if let formats = parsed["formats"] as? [[String: Any]], let best = Self.bestFormatURL(formats) {
+          self.teardownExtractor()
+          self.startPlayback(url: best, videoId: videoId, isLive: false)
+          return
+        }
+      }
+      if attempt < 3 {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+          self?.runExtraction(videoId: videoId, attempt: attempt + 1)
+        }
+      } else {
+        self.installEmbedFallback(videoId: videoId)
+      }
+    }
+  }
+
+  private func teardownExtractor() {
+    extractorWebView?.navigationDelegate = nil
+    extractorWebView?.stopLoading()
+    extractorWebView?.removeFromSuperview()
+    extractorWebView = nil
+  }
+
+  // Only muxed (audio+video) progressive formats are usable by AVPlayer; pick <=720p.
+  private static func bestFormatURL(_ formats: [[String: Any]]) -> URL? {
     let candidates: [(Int, URL)] = formats.compactMap { fmt in
       guard let urlString = fmt["url"] as? String, let url = URL(string: urlString) else { return nil }
-      let height = (fmt["height"] as? Int) ?? ((fmt["itag"] as? Int) ?? 0)
+      let height = (fmt["height"] as? Int) ?? 0
       return (height, url)
     }
     guard !candidates.isEmpty else { return nil }
     let sorted = candidates.sorted { $0.0 < $1.0 }
-    // Cap at 720p so multi-view stays light; fall back to the highest we have.
     return (sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.1
   }
+
+  private static let extractionJS = """
+  (function(){
+    try {
+      var r = window.ytInitialPlayerResponse;
+      if ((!r || !r.streamingData) && window.ytplayer && ytplayer.config && ytplayer.config.args && ytplayer.config.args.player_response) {
+        r = JSON.parse(ytplayer.config.args.player_response);
+      }
+      if (!r || !r.streamingData) return null;
+      var sd = r.streamingData, vd = r.videoDetails || {};
+      var out = { isLive: !!vd.isLive, hls: sd.hlsManifestUrl || null, formats: [] };
+      (sd.formats || []).forEach(function(f){ if (f.url) out.formats.push({ url: f.url, height: f.height || 0 }); });
+      return JSON.stringify(out);
+    } catch (e) { return null; }
+  })();
+  """
 
   private func startPlayback(url: URL, videoId: String, isLive: Bool) {
     guard !isStopped else { return }
     statusLabel.isHidden = true
     let asset = AVURLAsset(url: url, options: [
-      "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": Self.innerTubeUserAgent]
+      "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": Self.userAgent]
     ])
     let item = AVPlayerItem(asset: asset)
     item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
@@ -4631,6 +4665,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   // still plays (less clean, but better than a black cell).
   private func installEmbedFallback(videoId: String) {
     guard !isStopped, fallbackWebView == nil else { return }
+    teardownExtractor()
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
@@ -4740,11 +4775,24 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    guard webView === extractorWebView, !isStopped, let videoId = pendingVideoId else { return }
+    runExtraction(videoId: videoId, attempt: 0)
+  }
+
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+    if webView === extractorWebView, let videoId = pendingVideoId {
+      installEmbedFallback(videoId: videoId)
+      return
+    }
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
   func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+    if webView === extractorWebView, let videoId = pendingVideoId {
+      installEmbedFallback(videoId: videoId)
+      return
+    }
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
@@ -4891,11 +4939,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   fileprivate static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
-  // InnerTube IOS client — currently returns hlsManifestUrl for live and (usually)
-  // un-ciphered muxed URLs for VOD, so AVPlayer can play them with no YouTube UI.
-  private static let innerTubeKey = "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc"
-  private static let innerTubeClientVersion = "19.45.4"
-  private static let innerTubeUserAgent = "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 17_6_1 like Mac OS X; ja_JP)"
 }
 
 final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResumable, PlaybackStoppable, AudioControllable {
@@ -6549,7 +6592,8 @@ final class SettingsController: UITableViewController {
     cell.selectionStyle = .none
     cell.accessoryView = nil
     cell.accessoryType = .none
-
+    cell.editingAccessoryView = nil
+    cell.editingAccessoryType = .none
     cell.showsReorderControl = false
 
     guard let sec = Sec(rawValue: indexPath.section) else { return cell }
@@ -6642,6 +6686,14 @@ final class SettingsController: UITableViewController {
       cell.textLabel?.text = "配信を手動追加"
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
+    }
+    // The table stays in editing mode for drag-reordering, and editing mode shows
+    // editingAccessory* instead of accessory* — without this the switches and quality
+    // controls vanish. Mirror whatever we configured above onto the editing slots.
+    cell.editingAccessoryType = cell.accessoryType
+    if let control = cell.accessoryView {
+      cell.editingAccessoryView = control
+      cell.accessoryView = nil
     }
     return cell
   }
