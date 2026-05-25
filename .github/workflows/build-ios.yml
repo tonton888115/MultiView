@@ -89,17 +89,16 @@ jobs:
               artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
                 owner,
                 repo,
-                name: artifactName,
                 per_page: 100,
               });
-              if (artifacts.some((artifact) => artifact.workflow_run?.id === context.runId)) {
+              if (artifacts.some((artifact) => artifact.name === artifactName && artifact.workflow_run?.id === context.runId)) {
                 break;
               }
               await new Promise((resolve) => setTimeout(resolve, 3000));
             }
 
             for (const artifact of artifacts) {
-              if (artifact.workflow_run?.id === context.runId) {
+              if (artifact.name === artifactName && artifact.workflow_run?.id === context.runId) {
                 continue;
               }
               await github.rest.actions.deleteArtifact({
