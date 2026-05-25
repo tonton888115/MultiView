@@ -94,10 +94,9 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
       Self.finish(completion, .failure(KickAuthError.missingClientId))
       return
     }
-    guard !config.clientSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-      Self.finish(completion, .failure(KickAuthError.missingClientSecret))
-      return
-    }
+    // client_secret is optional: Kick "public" OAuth apps use pure PKCE (no secret),
+    // while "confidential" apps require it. Requiring it unconditionally blocked
+    // public-client users, so we only send it when the user actually provides one.
     guard URL(string: config.redirectURI) != nil else {
       Self.finish(completion, .failure(KickAuthError.invalidRedirectURI))
       return
@@ -201,14 +200,16 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
 
   private func exchangeCode(_ code: String, verifier: String, completion: @escaping (Result<Void, Error>) -> Void) {
     let config = self.config
-    let body = Self.formBody([
+    var params: [String: String] = [
       "grant_type": "authorization_code",
       "client_id": config.clientId,
-      "client_secret": config.clientSecret,
       "redirect_uri": config.redirectURI,
       "code": code,
       "code_verifier": verifier
-    ])
+    ]
+    let secret = config.clientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !secret.isEmpty { params["client_secret"] = secret }
+    let body = Self.formBody(params)
     tokenRequest(body: body) { [weak self] result in
       switch result {
       case .failure(let error):
@@ -221,13 +222,14 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
   }
 
   private func refresh(refreshToken: String, completion: @escaping (Result<KickOAuthToken, Error>) -> Void) {
-    let body = Self.formBody([
+    var params: [String: String] = [
       "grant_type": "refresh_token",
       "client_id": config.clientId,
-      "client_secret": config.clientSecret,
       "refresh_token": refreshToken
-    ])
-    tokenRequest(body: body, completion: completion)
+    ]
+    let secret = config.clientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !secret.isEmpty { params["client_secret"] = secret }
+    tokenRequest(body: Self.formBody(params), completion: completion)
   }
 
   private func tokenRequest(body: Data, completion: @escaping (Result<KickOAuthToken, Error>) -> Void) {

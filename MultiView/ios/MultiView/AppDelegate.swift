@@ -2734,7 +2734,15 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         }
       }
     } catch {
-      showStatus("ニコ生コメント受信失敗: \(error.localizedDescription)")
+      if Task.isCancelled || error is CancellationError { return }
+      // A failed comment segment means the NDGR session/view URI went stale. Rather
+      // than leave a dead "ニコ生コメント受信失敗" error on screen, request a debounced
+      // auto-refresh (ViewingController caps it to once per 45s) so a fresh session is
+      // fetched and the error clears itself.
+      showStatus("ニコ生コメント再取得中…")
+      DispatchQueue.main.async {
+        NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
+      }
     }
   }
 
@@ -4398,32 +4406,34 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
 final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, WKNavigationDelegate {
   private let stream: StreamItem
   private let settings: AppSettings
-  private let web: WKWebView
+  // Video-only playback: we extract the real media URL (HLS for live, a muxed
+  // progressive URL for VOD) via YouTube's InnerTube player endpoint and play it in
+  // AVPlayer, so there is zero YouTube chrome. The iframe embed is only a fallback
+  // for videos we cannot extract (e.g. ciphered VOD formats).
+  private let player = AVPlayer()
+  private let playerLayer = AVPlayerLayer()
   private let statusLabel = UILabel()
   private var playbackVolume: Float
   private var resolveTask: URLSessionDataTask?
+  private var innerTubeTask: URLSessionDataTask?
+  private var sponsorTask: URLSessionDataTask?
+  private var itemStatusObservation: NSKeyValueObservation?
+  private var timeObserver: Any?
+  private var sponsorSegments: [(start: Double, end: Double)] = []
+  private var fallbackWebView: WKWebView?
   private var isStopped = false
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
     self.settings = settings
     self.playbackVolume = StreamVolumeStore.volume(for: stream)
-    let config = WKWebViewConfiguration()
-    config.allowsInlineMediaPlayback = true
-    config.mediaTypesRequiringUserActionForPlayback = []
-    config.websiteDataStore = .default()
-    self.web = WKWebView(frame: .zero, configuration: config)
     super.init(frame: .zero)
     backgroundColor = .black
-    web.isOpaque = false
-    web.backgroundColor = .black
-    web.scrollView.backgroundColor = .black
-    web.scrollView.isScrollEnabled = false
-    web.scrollView.contentInsetAdjustmentBehavior = .never
-    web.customUserAgent = Self.userAgent
-    web.navigationDelegate = self
-    web.translatesAutoresizingMaskIntoConstraints = false
-    addSubview(web)
+
+    playerLayer.player = player
+    playerLayer.videoGravity = .resizeAspect
+    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+    layer.addSublayer(playerLayer)
 
     statusLabel.text = "YouTubeを読み込み中"
     statusLabel.textColor = .white.withAlphaComponent(0.72)
@@ -4433,10 +4443,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     statusLabel.translatesAutoresizingMaskIntoConstraints = false
     addSubview(statusLabel)
     NSLayoutConstraint.activate([
-      web.topAnchor.constraint(equalTo: topAnchor),
-      web.leadingAnchor.constraint(equalTo: leadingAnchor),
-      web.trailingAnchor.constraint(equalTo: trailingAnchor),
-      web.bottomAnchor.constraint(equalTo: bottomAnchor),
       statusLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
       statusLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
       statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 16),
@@ -4454,19 +4460,40 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     stopPlayback()
   }
 
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    playerLayer.frame = bounds
+    fallbackWebView?.frame = bounds
+  }
+
   func resumePlayback() {
     guard !isStopped else { return }
-    web.evaluateJavaScript("window.mvPlay && window.mvPlay();")
+    if let fallbackWebView {
+      fallbackWebView.evaluateJavaScript("window.mvPlay && window.mvPlay();")
+      return
+    }
+    let session = AVAudioSession.sharedInstance()
+    try? session.setCategory(.playback, mode: .default, options: [])
+    try? session.setActive(true)
+    applyVolume()
+    player.play()
   }
 
   func pausePlayback() {
     guard !isStopped else { return }
-    web.evaluateJavaScript("window.mvPause && window.mvPause();")
+    player.pause()
+    fallbackWebView?.evaluateJavaScript("window.mvPause && window.mvPause();")
   }
 
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
-    web.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(Int(playbackVolume * 100)));")
+    applyVolume()
+    fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(Int(playbackVolume * 100)));")
+  }
+
+  private func applyVolume() {
+    player.isMuted = !settings.playAudio || playbackVolume <= 0
+    player.volume = settings.playAudio ? playbackVolume : 0
   }
 
   func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -4475,27 +4502,204 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   func stopPlayback() {
     isStopped = true
-    resolveTask?.cancel()
-    resolveTask = nil
-    web.evaluateJavaScript("window.mvPause && window.mvPause();")
-    web.stopLoading()
-    web.loadHTMLString("", baseURL: nil)
+    resolveTask?.cancel(); resolveTask = nil
+    innerTubeTask?.cancel(); innerTubeTask = nil
+    sponsorTask?.cancel(); sponsorTask = nil
+    if let timeObserver {
+      player.removeTimeObserver(timeObserver)
+      self.timeObserver = nil
+    }
+    itemStatusObservation = nil
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    fallbackWebView?.stopLoading()
+    fallbackWebView?.loadHTMLString("", baseURL: nil)
+    fallbackWebView?.removeFromSuperview()
+    fallbackWebView = nil
   }
 
   private func loadPlayer() {
     let raw = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
     if let videoId = Self.videoID(from: raw) {
-      loadResolvedPlayer(videoId: videoId)
+      extractStreams(videoId: videoId)
       return
     }
     resolveLiveVideoID(from: raw)
   }
 
-  private func loadResolvedPlayer(videoId: String) {
+  // Ask YouTube's InnerTube player endpoint (IOS client) for the real media URLs.
+  // The IOS client usually returns an hlsManifestUrl for live and plain (un-ciphered)
+  // muxed URLs for VOD, both of which AVPlayer can play directly.
+  private func extractStreams(videoId: String) {
+    guard !isStopped else { return }
+    showStatus("YouTube映像を取得中")
+    guard let url = URL(string: "https://www.youtube.com/youtubei/v1/player?key=\(Self.innerTubeKey)&prettyPrint=false") else {
+      installEmbedFallback(videoId: videoId)
+      return
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue(Self.innerTubeUserAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("5", forHTTPHeaderField: "X-YouTube-Client-Name")
+    request.setValue(Self.innerTubeClientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
+    let body: [String: Any] = [
+      "videoId": videoId,
+      "contentCheckOk": true,
+      "racyCheckOk": true,
+      "context": [
+        "client": [
+          "clientName": "IOS",
+          "clientVersion": Self.innerTubeClientVersion,
+          "deviceMake": "Apple",
+          "deviceModel": "iPhone16,2",
+          "osName": "iPhone",
+          "osVersion": "17.6.1.21G93",
+          "hl": "ja",
+          "gl": "JP"
+        ]
+      ]
+    ]
+    request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    innerTubeTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+      guard let self, !self.isStopped else { return }
+      self.innerTubeTask = nil
+      guard let data,
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        DispatchQueue.main.async { self.installEmbedFallback(videoId: videoId) }
+        return
+      }
+      let videoDetails = json["videoDetails"] as? [String: Any]
+      let isLive = (videoDetails?["isLive"] as? Bool) ?? false
+      let streamingData = json["streamingData"] as? [String: Any]
+      let hlsURL = (streamingData?["hlsManifestUrl"] as? String).flatMap { URL(string: $0) }
+      let muxedURL = Self.bestMuxedURL(from: streamingData)
+      DispatchQueue.main.async {
+        guard !self.isStopped else { return }
+        if let hlsURL {
+          self.startPlayback(url: hlsURL, videoId: videoId, isLive: isLive)
+        } else if let muxedURL {
+          self.startPlayback(url: muxedURL, videoId: videoId, isLive: false)
+        } else {
+          self.installEmbedFallback(videoId: videoId)
+        }
+      }
+    }
+    innerTubeTask?.resume()
+  }
+
+  // Pick a muxed (audio+video) progressive format that exposes a plain URL. AVPlayer
+  // cannot mux separate adaptive video/audio, so we only use the combined "formats".
+  private static func bestMuxedURL(from streamingData: [String: Any]?) -> URL? {
+    guard let formats = streamingData?["formats"] as? [[String: Any]] else { return nil }
+    let candidates: [(Int, URL)] = formats.compactMap { fmt in
+      guard let urlString = fmt["url"] as? String, let url = URL(string: urlString) else { return nil }
+      let height = (fmt["height"] as? Int) ?? ((fmt["itag"] as? Int) ?? 0)
+      return (height, url)
+    }
+    guard !candidates.isEmpty else { return nil }
+    let sorted = candidates.sorted { $0.0 < $1.0 }
+    // Cap at 720p so multi-view stays light; fall back to the highest we have.
+    return (sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.1
+  }
+
+  private func startPlayback(url: URL, videoId: String, isLive: Bool) {
+    guard !isStopped else { return }
     statusLabel.isHidden = true
+    let asset = AVURLAsset(url: url, options: [
+      "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": Self.innerTubeUserAgent]
+    ])
+    let item = AVPlayerItem(asset: asset)
+    item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+    itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+      guard let self else { return }
+      if item.status == .failed {
+        DispatchQueue.main.async { self.installEmbedFallback(videoId: videoId) }
+      }
+    }
+    player.replaceCurrentItem(with: item)
+    applyVolume()
+    player.play()
+    // SponsorBlock only applies to VOD (live has no segments).
+    if !isLive {
+      fetchSponsorBlock(videoId: videoId)
+      installSponsorSkipObserver()
+    }
+  }
+
+  // Falls back to the official iframe embed when stream extraction fails so the video
+  // still plays (less clean, but better than a black cell).
+  private func installEmbedFallback(videoId: String) {
+    guard !isStopped, fallbackWebView == nil else { return }
+    if let timeObserver {
+      player.removeTimeObserver(timeObserver)
+      self.timeObserver = nil
+    }
+    itemStatusObservation = nil
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    statusLabel.isHidden = true
+    let config = WKWebViewConfiguration()
+    config.allowsInlineMediaPlayback = true
+    config.mediaTypesRequiringUserActionForPlayback = []
+    config.websiteDataStore = .default()
+    let web = WKWebView(frame: bounds, configuration: config)
+    web.isOpaque = false
+    web.backgroundColor = .black
+    web.scrollView.backgroundColor = .black
+    web.scrollView.isScrollEnabled = false
+    web.scrollView.contentInsetAdjustmentBehavior = .never
+    web.customUserAgent = Self.userAgent
+    web.navigationDelegate = self
+    addSubview(web)
+    fallbackWebView = web
     // A real HTTPS base URL on our own domain gives the embed a valid origin/Referer
     // (loadHTMLString with youtube.com or nil triggers YouTube error 152).
-    web.loadHTMLString(Self.html(videoId: videoId, playAudio: settings.playAudio, volume: playbackVolume), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
+    web.loadHTMLString(Self.embedHTML(videoId: videoId, playAudio: settings.playAudio, volume: playbackVolume), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
+  }
+
+  // MARK: - SponsorBlock (VOD)
+
+  private func fetchSponsorBlock(videoId: String) {
+    let digest = SHA256.hash(data: Data(videoId.utf8))
+    let prefix = String(digest.map { String(format: "%02x", $0) }.joined().prefix(4))
+    var components = URLComponents(string: "https://sponsor.ajay.app/api/skipSegments/\(prefix)")
+    components?.queryItems = [
+      URLQueryItem(name: "categories", value: "[\"sponsor\",\"selfpromo\",\"interaction\",\"intro\",\"outro\",\"preview\",\"music_offtopic\"]"),
+      URLQueryItem(name: "actionTypes", value: "[\"skip\"]")
+    ]
+    guard let url = components?.url else { return }
+    sponsorTask = URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+      guard let self, !self.isStopped, let data,
+            let bucket = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return }
+      let entry = bucket.first { ($0["videoID"] as? String) == videoId }
+      let segments = (entry?["segments"] as? [[String: Any]]) ?? []
+      let parsed: [(start: Double, end: Double)] = segments.compactMap { seg in
+        guard (seg["actionType"] as? String) == "skip",
+              let arr = seg["segment"] as? [Any], arr.count == 2,
+              let s = (arr[0] as? NSNumber)?.doubleValue,
+              let e = (arr[1] as? NSNumber)?.doubleValue, e > s else { return nil }
+        return (s, e)
+      }.sorted { $0.start < $1.start }
+      DispatchQueue.main.async {
+        guard !self.isStopped else { return }
+        self.sponsorSegments = parsed
+      }
+    }
+    sponsorTask?.resume()
+  }
+
+  private func installSponsorSkipObserver() {
+    guard timeObserver == nil else { return }
+    timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.4, preferredTimescale: 600), queue: .main) { [weak self] time in
+      guard let self, !self.isStopped, !self.sponsorSegments.isEmpty else { return }
+      let t = time.seconds
+      guard t.isFinite else { return }
+      for seg in self.sponsorSegments where t >= seg.start && t < seg.end - 0.15 {
+        self.player.seek(to: CMTime(seconds: seg.end + 0.1, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        break
+      }
+    }
   }
 
   private func resolveLiveVideoID(from raw: String) {
@@ -4516,7 +4720,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         return
       }
       if let finalURL = response?.url, let id = Self.videoID(from: finalURL.absoluteString) {
-        DispatchQueue.main.async { self.loadResolvedPlayer(videoId: id) }
+        DispatchQueue.main.async { self.extractStreams(videoId: id) }
         return
       }
       guard let data, let html = String(data: data, encoding: .utf8),
@@ -4524,7 +4728,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         self.showStatus("YouTubeライブ動画IDを取得できません")
         return
       }
-      DispatchQueue.main.async { self.loadResolvedPlayer(videoId: id) }
+      DispatchQueue.main.async { self.extractStreams(videoId: id) }
     }
     resolveTask?.resume()
   }
@@ -4544,9 +4748,13 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
-  private static func html(videoId: String, playAudio: Bool, volume: Float) -> String {
+  // Fallback embed (only used when stream extraction fails). No forced-play loop —
+  // that was making every YouTube cell fight for the audio session and stall. Includes
+  // a lightweight SponsorBlock skipper (no-op for live, which has no segments).
+  private static func embedHTML(videoId: String, playAudio: Bool, volume: Float) -> String {
     let initialVolume = Int(min(1, max(0, volume)) * 100)
     let muted = playAudio && initialVolume > 0 ? "false" : "true"
+    let sbCategories = "%5B%22sponsor%22%2C%22selfpromo%22%2C%22interaction%22%2C%22intro%22%2C%22outro%22%2C%22preview%22%2C%22music_offtopic%22%5D"
     return """
     <!doctype html>
     <html>
@@ -4556,7 +4764,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     <div id="player"></div>
     <script src="https://www.youtube.com/iframe_api"></script>
     <script>
-      var player=null, ready=false, muted=\(muted), volume=\(initialVolume);
+      var player=null, ready=false, muted=\(muted), volume=\(initialVolume), sb=[];
       function applyAudio(){
         if(!player||!ready)return;
         try{
@@ -4568,17 +4776,32 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         if(!player||!ready)return;
         try{applyAudio();player.playVideo();}catch(e){}
       }
+      function loadSB(){
+        try{
+          fetch('https://sponsor.ajay.app/api/skipSegments?videoID=\(videoId)&categories=\(sbCategories)&actionTypes=%5B%22skip%22%5D')
+            .then(function(r){return r.ok?r.json():[];})
+            .then(function(list){sb=(list||[]).filter(function(s){return s.actionType==='skip'&&s.segment;}).map(function(s){return {s:s.segment[0],e:s.segment[1]};});})
+            .catch(function(){});
+        }catch(e){}
+      }
+      function sbTick(){
+        if(!player||!ready||!sb.length)return;
+        try{
+          var t=player.getCurrentTime();
+          for(var i=0;i<sb.length;i++){if(t>=sb[i].s&&t<sb[i].e-0.15){player.seekTo(sb[i].e+0.1,true);break;}}
+        }catch(e){}
+      }
       window.onYouTubeIframeAPIReady=function(){
         player=new YT.Player('player',{
           width:'100%',height:'100%',videoId:'\(videoId)',
           playerVars:{autoplay:1,playsinline:1,controls:0,rel:0,modestbranding:1,fs:0,disablekb:1,iv_load_policy:3,origin:'https://tonton888115.github.io'},
-          events:{onReady:function(){ready=true;play();},onStateChange:function(e){if(e.data===YT.PlayerState.PAUSED||e.data===YT.PlayerState.CUED){setTimeout(play,250);}}}
+          events:{onReady:function(){ready=true;play();loadSB();}}
         });
       };
       window.mvPlay=function(){muted=\(muted);play();};
       window.mvPause=function(){try{player&&player.pauseVideo();}catch(e){}};
       window.mvSetVolume=function(v){volume=Math.max(0,Math.min(100,v|0));muted=(volume<=0)||\(!playAudio ? "true" : "false");applyAudio();};
-      setInterval(play, 5000);
+      setInterval(sbTick, 400);
     </script>
     </body>
     </html>
@@ -4668,6 +4891,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   fileprivate static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+  // InnerTube IOS client — currently returns hlsManifestUrl for live and (usually)
+  // un-ciphered muxed URLs for VOD, so AVPlayer can play them with no YouTube UI.
+  private static let innerTubeKey = "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc"
+  private static let innerTubeClientVersion = "19.45.4"
+  private static let innerTubeUserAgent = "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 17_6_1 like Mac OS X; ja_JP)"
 }
 
 final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResumable, PlaybackStoppable, AudioControllable {
@@ -5934,10 +6162,16 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     return WKWebView(frame: .zero, configuration: config)
   }()
   private var activeSources = [(StreamPlatform, Source)]()
+  fileprivate static let browserUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.04, alpha: 1)
+    // Kick (and others) sit behind Cloudflare bot protection that 400s requests that
+    // don't look like a real browser. A blank WKWebView sends a stripped UA, so
+    // kick.com/following 400s; advertising a real mobile Safari UA lets Cloudflare
+    // serve its JS challenge (which WKWebView, being WebKit, can actually solve).
+    web.customUserAgent = Self.browserUserAgent
     web.navigationDelegate = self
     web.uiDelegate = self
     installStreamURLBridge()
@@ -6145,6 +6379,70 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
   ]
 }
 
+// Niconico has no public OAuth for third-party live posting, so login is web-based.
+// The user_session cookie persists in WKWebsiteDataStore + HTTPCookieStorage and is
+// reused by the native player/comment/post code.
+enum NiconicoSession {
+  static var isLoggedIn: Bool {
+    guard let url = URL(string: "https://live.nicovideo.jp/"),
+          let cookies = HTTPCookieStorage.shared.cookies(for: url) else { return false }
+    return cookies.contains { $0.name == "user_session" && !$0.value.isEmpty }
+  }
+
+  static func logout(completion: @escaping () -> Void) {
+    if let url = URL(string: "https://live.nicovideo.jp/"),
+       let cookies = HTTPCookieStorage.shared.cookies(for: url) {
+      cookies.forEach { HTTPCookieStorage.shared.deleteCookie($0) }
+    }
+    let store = WKWebsiteDataStore.default()
+    store.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
+      let nico = records.filter { $0.displayName.contains("nicovideo") || $0.displayName.contains("nimg") }
+      store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), for: nico) {
+        DispatchQueue.main.async { completion() }
+      }
+    }
+  }
+}
+
+final class NiconicoLoginController: UIViewController, WKNavigationDelegate {
+  private let web: WKWebView = {
+    let config = WKWebViewConfiguration()
+    config.allowsInlineMediaPlayback = true
+    config.mediaTypesRequiringUserActionForPlayback = []
+    config.websiteDataStore = .default()
+    return WKWebView(frame: .zero, configuration: config)
+  }()
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    title = "ニコ生ログイン"
+    view.backgroundColor = .black
+    navigationItem.rightBarButtonItem = UIBarButtonItem(title: "完了", style: .done, target: self, action: #selector(done))
+    web.navigationDelegate = self
+    web.customUserAgent = NiconicoNativePlayerView.userAgent
+    web.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(web)
+    NSLayoutConstraint.activate([
+      web.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      web.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      web.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      web.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+    ])
+    if let url = URL(string: "https://account.nicovideo.jp/login?site=niconico&next_url=%2F") {
+      web.load(URLRequest(url: url))
+    }
+  }
+
+  @objc private func done() {
+    // Pull the fresh login cookie into the native jar the players use, then close.
+    WebLoginCookies.sync { [weak self] in self?.dismiss(animated: true) }
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    WebLoginCookies.sync()
+  }
+}
+
 final class SettingsController: UITableViewController {
   private var platforms: [StreamPlatform] { AppState.shared.settings.platformOrder }
 
@@ -6162,48 +6460,86 @@ final class SettingsController: UITableViewController {
     tableView.reloadData()
   }
 
-  override func numberOfSections(in tableView: UITableView) -> Int { 6 }
+  // Settings are grouped so related items live together and each service's account
+  // setup is its own clearly-labelled section (the old layout mixed playback with
+  // danmaku and scattered OAuth across confusing rows).
+  private enum Sec: Int, CaseIterable {
+    case playback, danmaku, comments, order, kick, twitch, twitcasting, youtube, niconico, add
+  }
+
+  private func switchControl(isOn: Bool, onChange: @escaping (Bool) -> Void) -> UISwitch {
+    let toggle = UISwitch()
+    toggle.isOn = isOn
+    toggle.addAction(UIAction { action in
+      guard let s = action.sender as? UISwitch else { return }
+      onChange(s.isOn)
+    }, for: .valueChanged)
+    return toggle
+  }
+
+  override func viewWillAppear(_ animated: Bool) {
+    super.viewWillAppear(animated)
+    // Refresh login states (e.g. after returning from the niconico web login).
+    reload()
+  }
+
+  override func numberOfSections(in tableView: UITableView) -> Int { Sec.allCases.count }
 
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-    switch section {
-    case 0: return 11
-    case 1: return platforms.count
-    case 2: return 4
-    case 3: return 6
-    case 4: return 3
-    default: return 1
+    guard let sec = Sec(rawValue: section) else { return 0 }
+    switch sec {
+    case .playback: return 4
+    case .danmaku: return 6
+    case .comments: return 1
+    case .order: return platforms.count
+    case .kick: return 4
+    case .twitch: return 3
+    case .twitcasting: return 3
+    case .youtube: return 3
+    case .niconico: return 2
+    case .add: return 1
     }
   }
 
   override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
-    switch section {
-    case 0: return "視聴"
-    case 1: return "サービス順"
-    case 2: return "Kick OAuth"
-    case 3: return "Twitch / ツイキャス OAuth"
-    case 4: return "YouTube OAuth"
-    default: return "追加"
+    guard let sec = Sec(rawValue: section) else { return nil }
+    switch sec {
+    case .playback: return "再生・画質"
+    case .danmaku: return "弾幕"
+    case .comments: return "コメント取得"
+    case .order: return "サービス順"
+    case .kick: return "Kick 連携"
+    case .twitch: return "Twitch 連携"
+    case .twitcasting: return "ツイキャス 連携"
+    case .youtube: return "YouTube 連携"
+    case .niconico: return "ニコ生 連携"
+    case .add: return "追加"
     }
   }
 
   override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
-    if section == 2 {
-      return "Client ID/SecretはあなたのユーザーIDやパスワードではなく、kick.com → Settings → Developer で作るOAuthアプリの値です。そのアプリに Redirect URI「\(KickAuthManager.shared.config.redirectURI)」を登録してください(Redirect URI行をタップでコピー)。コメント投稿に使います。"
-    }
-    if section == 3 {
-      return "Twitchは user:read:chat / user:write:chat、ツイキャスはWrite権限のOAuthアプリを使います。Redirect URI行をタップするとコピーできます。"
-    }
-    if section == 4 {
-      return "YouTubeは youtube.force-ssl スコープでライブチャット投稿に使います。Google Cloud ConsoleのiOS OAuth Client IDに Redirect URI を登録してください。"
-    }
-    if section == 1 {
+    guard let sec = Sec(rawValue: section) else { return nil }
+    switch sec {
+    case .order:
       return "右端の並べ替えハンドルをドラッグして、表示順を自由に変更できます。"
+    case .kick:
+      return "kick.com → Settings → Developer で作るOAuthアプリの Client ID を設定します。Client Secret は確認画面付き(confidential)アプリのみ必要で、PKCE公開アプリでは空のままで構いません。Redirect URI「\(KickAuthManager.shared.config.redirectURI)」をアプリに登録してください(行をタップでコピー)。"
+    case .twitch:
+      return "Twitch Developer Console で user:read:chat / user:write:chat 権限のアプリを作成し、Redirect URI を登録してください(行をタップでコピー)。"
+    case .twitcasting:
+      return "ツイキャスのAPIアプリ(Write権限)の Client ID を設定し、Redirect URI を登録してください(行をタップでコピー)。"
+    case .youtube:
+      return "Google Cloud Console の iOS OAuth Client ID を設定し、youtube.force-ssl スコープでライブチャット投稿に使います(行をタップでRedirectURIをコピー)。"
+    case .niconico:
+      return "ニコ生は公式の外部連携(OAuth)が無いため、Webでログインします。ログイン状態はアプリ内のCookieに保持され、視聴・コメント投稿・コメント受信に使われます。"
+    case .add:
+      let info = Bundle.main.infoDictionary
+      let version = (info?["CFBundleShortVersionString"] as? String) ?? "?"
+      let build = (info?["CFBundleVersion"] as? String) ?? "?"
+      return "MultiView \(version) (build \(build))"
+    default:
+      return nil
     }
-    guard section == numberOfSections(in: tableView) - 1 else { return nil }
-    let info = Bundle.main.infoDictionary
-    let version = (info?["CFBundleShortVersionString"] as? String) ?? "?"
-    let build = (info?["CFBundleVersion"] as? String) ?? "?"
-    return "MultiView \(version) (build \(build))"
   }
 
   override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
@@ -6214,109 +6550,95 @@ final class SettingsController: UITableViewController {
     cell.accessoryView = nil
     cell.accessoryType = .none
 
-    if indexPath.section == 0 && indexPath.row == 0 {
-      cell.textLabel?.text = "音声を有効にして開始"
-      let toggle = UISwitch()
-      toggle.isOn = AppState.shared.settings.playAudio
-      toggle.addAction(UIAction { action in
-        guard let s = action.sender as? UISwitch else { return }
-        var settings = AppState.shared.settings
-        settings.playAudio = s.isOn
-        AppState.shared.settings = settings
-      }, for: .valueChanged)
-      cell.accessoryView = toggle
-    } else if indexPath.section == 0 && indexPath.row == 1 {
-      cell.textLabel?.text = "弾幕を表示"
-      let toggle = UISwitch()
-      toggle.isOn = AppState.shared.settings.showChat
-      toggle.addAction(UIAction { action in
-        guard let s = action.sender as? UISwitch else { return }
-        var settings = AppState.shared.settings
-        settings.showChat = s.isOn
-        AppState.shared.settings = settings
-      }, for: .valueChanged)
-      cell.accessoryView = toggle
-    } else if indexPath.section == 0 && indexPath.row == 2 {
-      cell.textLabel?.text = "レイド先を自動追加"
-      let toggle = UISwitch()
-      toggle.isOn = AppState.shared.settings.autoFollowRaids
-      toggle.addAction(UIAction { action in
-        guard let s = action.sender as? UISwitch else { return }
-        var settings = AppState.shared.settings
-        settings.autoFollowRaids = s.isOn
-        AppState.shared.settings = settings
-      }, for: .valueChanged)
-      cell.accessoryView = toggle
-    } else if indexPath.section == 0 && indexPath.row == 3 {
-      cell.textLabel?.text = "Wi-Fi時の画質"
-      cell.accessoryView = qualityControl(selected: AppState.shared.settings.wifiQuality) { quality in
-        var settings = AppState.shared.settings
-        settings.wifiQuality = quality
-        AppState.shared.settings = settings
+    cell.showsReorderControl = false
+
+    guard let sec = Sec(rawValue: indexPath.section) else { return cell }
+    switch sec {
+    case .playback:
+      switch indexPath.row {
+      case 0:
+        cell.textLabel?.text = "音声を有効にして開始"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.playAudio) { v in
+          var s = AppState.shared.settings; s.playAudio = v; AppState.shared.settings = s
+        }
+      case 1:
+        cell.textLabel?.text = "レイド先を自動追加"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.autoFollowRaids) { v in
+          var s = AppState.shared.settings; s.autoFollowRaids = v; AppState.shared.settings = s
+        }
+      case 2:
+        cell.textLabel?.text = "Wi-Fi時の画質"
+        cell.accessoryView = qualityControl(selected: AppState.shared.settings.wifiQuality) { quality in
+          var s = AppState.shared.settings; s.wifiQuality = quality; AppState.shared.settings = s
+        }
+      default:
+        cell.textLabel?.text = "モバイル通信時の画質"
+        cell.accessoryView = qualityControl(selected: AppState.shared.settings.mobileQuality) { quality in
+          var s = AppState.shared.settings; s.mobileQuality = quality; AppState.shared.settings = s
+        }
       }
-    } else if indexPath.section == 0 && indexPath.row == 4 {
-      cell.textLabel?.text = "モバイル通信時の画質"
-      cell.accessoryView = qualityControl(selected: AppState.shared.settings.mobileQuality) { quality in
-        var settings = AppState.shared.settings
-        settings.mobileQuality = quality
-        AppState.shared.settings = settings
+    case .danmaku:
+      if indexPath.row == 0 {
+        cell.textLabel?.text = "弾幕を表示"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.showChat) { v in
+          var s = AppState.shared.settings; s.showChat = v; AppState.shared.settings = s
+        }
+      } else {
+        cell.textLabel?.text = danmakuTitle(field: indexPath.row - 1)
+        cell.accessoryType = .disclosureIndicator
+        cell.selectionStyle = .default
       }
-    } else if indexPath.section == 0 && indexPath.row == 5 {
+    case .comments:
       cell.textLabel?.text = "CORSプロキシ"
-      cell.detailTextLabel?.text = nil
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
-    } else if indexPath.section == 0 {
-      cell.textLabel?.text = danmakuTitle(row: indexPath.row)
-      cell.accessoryType = .disclosureIndicator
-      cell.selectionStyle = .default
-    } else if indexPath.section == 1 {
-      let platform = platforms[indexPath.row]
-      cell.textLabel?.text = platform.label
+    case .order:
+      cell.textLabel?.text = platforms[indexPath.row].label
       cell.showsReorderControl = true
-    } else if indexPath.section == 2 {
+    case .kick:
       let config = KickAuthManager.shared.config
       switch indexPath.row {
-      case 0:
-        cell.textLabel?.text = KickAuthManager.shared.isSignedIn ? "Kickログアウト" : "Kick OAuthログイン"
-      case 1:
-        cell.textLabel?.text = config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
-      case 2:
-        cell.textLabel?.text = config.clientSecret.isEmpty ? "Client Secret 未設定" : "Client Secret 設定済み"
-      default:
-        cell.textLabel?.text = "Redirect URI \(config.redirectURI)"
+      case 0: cell.textLabel?.text = KickAuthManager.shared.isSignedIn ? "ログアウト" : "ログイン"
+      case 1: cell.textLabel?.text = config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
+      case 2: cell.textLabel?.text = config.clientSecret.isEmpty ? "Client Secret 未設定 (任意)" : "Client Secret 設定済み"
+      default: cell.textLabel?.text = "Redirect URI をコピー"
       }
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
-    } else if indexPath.section == 3 {
+    case .twitch:
       switch indexPath.row {
-      case 0:
-        cell.textLabel?.text = TwitchAuthManager.shared.isSignedIn ? "Twitchログアウト" : "Twitch OAuthログイン"
-      case 1:
-        cell.textLabel?.text = TwitchAuthManager.shared.config.clientId.isEmpty ? "Twitch Client ID 未設定" : "Twitch Client ID 設定済み"
-      case 2:
-        cell.textLabel?.text = "Twitch Redirect URI \(TwitchAuthManager.shared.config.redirectURI)"
-      case 3:
-        cell.textLabel?.text = TwitcastingAuthManager.shared.isSignedIn ? "ツイキャスログアウト" : "ツイキャス OAuthログイン"
-      case 4:
-        cell.textLabel?.text = TwitcastingAuthManager.shared.config.clientId.isEmpty ? "ツイキャス Client ID 未設定" : "ツイキャス Client ID 設定済み"
-      default:
-        cell.textLabel?.text = "ツイキャス Redirect URI \(TwitcastingAuthManager.shared.config.redirectURI)"
+      case 0: cell.textLabel?.text = TwitchAuthManager.shared.isSignedIn ? "ログアウト" : "ログイン"
+      case 1: cell.textLabel?.text = TwitchAuthManager.shared.config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
+      default: cell.textLabel?.text = "Redirect URI をコピー"
       }
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
-    } else if indexPath.section == 4 {
+    case .twitcasting:
       switch indexPath.row {
-      case 0:
-        cell.textLabel?.text = YouTubeAuthManager.shared.isSignedIn ? "YouTubeログアウト" : "YouTube OAuthログイン"
-      case 1:
-        cell.textLabel?.text = YouTubeAuthManager.shared.config.clientId.isEmpty ? "YouTube Client ID 未設定" : "YouTube Client ID 設定済み"
-      default:
-        cell.textLabel?.text = "YouTube Redirect URI \(YouTubeAuthManager.shared.config.redirectURI)"
+      case 0: cell.textLabel?.text = TwitcastingAuthManager.shared.isSignedIn ? "ログアウト" : "ログイン"
+      case 1: cell.textLabel?.text = TwitcastingAuthManager.shared.config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
+      default: cell.textLabel?.text = "Redirect URI をコピー"
       }
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
-    } else {
+    case .youtube:
+      switch indexPath.row {
+      case 0: cell.textLabel?.text = YouTubeAuthManager.shared.isSignedIn ? "ログアウト" : "ログイン"
+      case 1: cell.textLabel?.text = YouTubeAuthManager.shared.config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
+      default: cell.textLabel?.text = "Redirect URI をコピー"
+      }
+      cell.accessoryType = .disclosureIndicator
+      cell.selectionStyle = .default
+    case .niconico:
+      if indexPath.row == 0 {
+        cell.textLabel?.text = NiconicoSession.isLoggedIn ? "ログイン済み（再ログイン）" : "ニコ生にログイン"
+      } else {
+        cell.textLabel?.text = "ログアウト"
+        cell.textLabel?.textColor = NiconicoSession.isLoggedIn ? .systemRed : UIColor.white.withAlphaComponent(0.4)
+      }
+      cell.accessoryType = .disclosureIndicator
+      cell.selectionStyle = .default
+    case .add:
       cell.textLabel?.text = "配信を手動追加"
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
@@ -6325,7 +6647,7 @@ final class SettingsController: UITableViewController {
   }
 
   override func tableView(_ tableView: UITableView, canMoveRowAt indexPath: IndexPath) -> Bool {
-    indexPath.section == 1
+    indexPath.section == Sec.order.rawValue
   }
 
   override func tableView(_ tableView: UITableView, editingStyleForRowAt indexPath: IndexPath) -> UITableViewCell.EditingStyle {
@@ -6337,11 +6659,11 @@ final class SettingsController: UITableViewController {
   }
 
   override func tableView(_ tableView: UITableView, targetIndexPathForMoveFromRowAt sourceIndexPath: IndexPath, toProposedIndexPath proposedDestinationIndexPath: IndexPath) -> IndexPath {
-    proposedDestinationIndexPath.section == 1 ? proposedDestinationIndexPath : sourceIndexPath
+    proposedDestinationIndexPath.section == Sec.order.rawValue ? proposedDestinationIndexPath : sourceIndexPath
   }
 
   override func tableView(_ tableView: UITableView, moveRowAt sourceIndexPath: IndexPath, to destinationIndexPath: IndexPath) {
-    guard sourceIndexPath.section == 1, destinationIndexPath.section == 1 else { return }
+    guard sourceIndexPath.section == Sec.order.rawValue, destinationIndexPath.section == Sec.order.rawValue else { return }
     var settings = AppState.shared.settings
     let moved = settings.platformOrder.remove(at: sourceIndexPath.row)
     settings.platformOrder.insert(moved, at: destinationIndexPath.row)
@@ -6349,36 +6671,42 @@ final class SettingsController: UITableViewController {
   }
 
   override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-    if indexPath.section == 0 && indexPath.row == 5 {
+    guard let sec = Sec(rawValue: indexPath.section) else { return }
+    switch sec {
+    case .danmaku:
+      if indexPath.row >= 1 { editDanmakuValue(field: indexPath.row - 1) }
+    case .comments:
       editProxy()
-    } else if indexPath.section == 0 && (6...10).contains(indexPath.row) {
-      editDanmakuValue(row: indexPath.row)
-    } else if indexPath.section == 2 {
+    case .kick:
       handleKickOAuthRow(indexPath.row)
-    } else if indexPath.section == 3 {
+    case .twitch:
       handleOtherOAuthRow(indexPath.row)
-    } else if indexPath.section == 4 {
+    case .twitcasting:
+      handleOtherOAuthRow(indexPath.row + 3)
+    case .youtube:
       handleYouTubeOAuthRow(indexPath.row)
-    } else if indexPath.section == 5 {
+    case .niconico:
+      handleNiconicoRow(indexPath.row)
+    case .add:
       present(AddStreamController(), animated: true)
+    default:
+      break
     }
   }
 
-  private func danmakuTitle(row: Int) -> String {
+  private func danmakuTitle(field: Int) -> String {
     let settings = AppState.shared.settings
-    switch row {
-    case 6:
+    switch field {
+    case 0:
       return "文字サイズ \(Int(settings.danmakuFontSize))"
-    case 7:
+    case 1:
       return "速度 \(Int((settings.danmakuSpeed / 0.13) * 100))%"
-    case 8:
+    case 2:
       return "透過度 \(Int(settings.danmakuOpacity * 100))%"
-    case 9:
+    case 3:
       return "最大行数 \(settings.danmakuMaxLines == 0 ? "自動" : String(settings.danmakuMaxLines))"
-    case 10:
-      return "最大文字数 \(settings.danmakuMaxLength == 0 ? "無制限" : String(settings.danmakuMaxLength))"
     default:
-      return ""
+      return "最大文字数 \(settings.danmakuMaxLength == 0 ? "無制限" : String(settings.danmakuMaxLength))"
     }
   }
 
@@ -6392,34 +6720,32 @@ final class SettingsController: UITableViewController {
     return control
   }
 
-  private func editDanmakuValue(row: Int) {
+  private func editDanmakuValue(field: Int) {
     let settings = AppState.shared.settings
     let current: String
     let title: String
     let message: String
-    switch row {
-    case 6:
+    switch field {
+    case 0:
       title = "文字サイズ"
       current = String(Int(settings.danmakuFontSize))
       message = "12〜40"
-    case 7:
+    case 1:
       title = "速度"
       current = String(Int((settings.danmakuSpeed / 0.13) * 100))
       message = "100が標準"
-    case 8:
+    case 2:
       title = "透過度"
       current = String(Int(settings.danmakuOpacity * 100))
       message = "30〜100"
-    case 9:
+    case 3:
       title = "最大行数"
       current = String(settings.danmakuMaxLines)
       message = "0で自動"
-    case 10:
+    default:
       title = "最大文字数"
       current = String(settings.danmakuMaxLength)
       message = "0で無制限"
-    default:
-      return
     }
 
     let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
@@ -6432,34 +6758,22 @@ final class SettingsController: UITableViewController {
     alert.addAction(UIAlertAction(title: "保存", style: .default) { [weak self] _ in
       guard let raw = alert.textFields?.first?.text, let value = Double(raw) else { return }
       var settings = AppState.shared.settings
-      switch row {
-      case 6:
+      switch field {
+      case 0:
         settings.danmakuFontSize = min(40, max(12, value.rounded()))
-      case 7:
+      case 1:
         settings.danmakuSpeed = min(300, max(20, value)) / 100 * 0.13
-      case 8:
+      case 2:
         settings.danmakuOpacity = min(100, max(30, value)) / 100
-      case 9:
+      case 3:
         settings.danmakuMaxLines = min(20, max(0, Int(value.rounded())))
-      case 10:
-        settings.danmakuMaxLength = min(500, max(0, Int(value.rounded())))
       default:
-        return
+        settings.danmakuMaxLength = min(500, max(0, Int(value.rounded())))
       }
       AppState.shared.settings = settings
-      self?.tableView.reloadRows(at: [IndexPath(row: row, section: 0)], with: .automatic)
+      self?.tableView.reloadRows(at: [IndexPath(row: field + 1, section: Sec.danmaku.rawValue)], with: .automatic)
     })
     present(alert, animated: true)
-  }
-
-  private func movePlatform(at index: Int, direction: Int) {
-    let destination = index + direction
-    guard platforms.indices.contains(index), platforms.indices.contains(destination) else { return }
-    var settings = AppState.shared.settings
-    let moved = settings.platformOrder.remove(at: index)
-    settings.platformOrder.insert(moved, at: destination)
-    AppState.shared.settings = settings
-    tableView.reloadSections(IndexSet(integer: 1), with: .automatic)
   }
 
   private func editProxy() {
@@ -6485,12 +6799,12 @@ final class SettingsController: UITableViewController {
     case 0:
       if KickAuthManager.shared.isSignedIn {
         KickAuthManager.shared.signOut()
-        tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
+        tableView.reloadData()
         return
       }
       KickAuthManager.shared.signIn(presentationAnchor: view.window) { [weak self] result in
         DispatchQueue.main.async {
-          self?.tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
+          self?.tableView.reloadData()
           if case .failure(let error) = result {
             self?.presentError(error)
           }
@@ -6528,14 +6842,14 @@ final class SettingsController: UITableViewController {
     alert.addAction(UIAlertAction(title: "保存", style: .default) { [weak self] _ in
       config.clientId = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
       KickAuthManager.shared.config = config
-      self?.tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
+      self?.tableView.reloadData()
     })
     present(alert, animated: true)
   }
 
   private func editKickClientSecret() {
     var config = KickAuthManager.shared.config
-    let alert = UIAlertController(title: "Kick Client Secret", message: "Kick Developerで作成したOAuthアプリの Client Secret を貼り付けてください。Kickの現在のtoken/refreshエンドポイントでは必須です。", preferredStyle: .alert)
+    let alert = UIAlertController(title: "Kick Client Secret", message: "確認画面付き(confidential)アプリの場合のみ入力してください。PKCEの公開アプリでは空のままで構いません。", preferredStyle: .alert)
     alert.addTextField { field in
       field.text = config.clientSecret
       field.isSecureTextEntry = true
@@ -6546,7 +6860,7 @@ final class SettingsController: UITableViewController {
     alert.addAction(UIAlertAction(title: "保存", style: .default) { [weak self] _ in
       config.clientSecret = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
       KickAuthManager.shared.config = config
-      self?.tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
+      self?.tableView.reloadData()
     })
     present(alert, animated: true)
   }
@@ -6564,7 +6878,7 @@ final class SettingsController: UITableViewController {
     alert.addAction(UIAlertAction(title: "保存", style: .default) { [weak self] _ in
       config.redirectURI = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
       KickAuthManager.shared.config = config
-      self?.tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
+      self?.tableView.reloadData()
     })
     present(alert, animated: true)
   }
@@ -6574,12 +6888,12 @@ final class SettingsController: UITableViewController {
     case 0:
       if TwitchAuthManager.shared.isSignedIn {
         TwitchAuthManager.shared.signOut()
-        tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+        tableView.reloadData()
         return
       }
       TwitchAuthManager.shared.signIn(presentationAnchor: view.window) { [weak self] result in
         DispatchQueue.main.async {
-          self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+          self?.tableView.reloadData()
           if case .failure(let error) = result { self?.presentError(error) }
         }
       }
@@ -6592,12 +6906,12 @@ final class SettingsController: UITableViewController {
     case 3:
       if TwitcastingAuthManager.shared.isSignedIn {
         TwitcastingAuthManager.shared.signOut()
-        tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+        tableView.reloadData()
         return
       }
       TwitcastingAuthManager.shared.signIn(presentationAnchor: view.window) { [weak self] result in
         DispatchQueue.main.async {
-          self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+          self?.tableView.reloadData()
           if case .failure(let error) = result { self?.presentError(error) }
         }
       }
@@ -6617,12 +6931,12 @@ final class SettingsController: UITableViewController {
     case 0:
       if YouTubeAuthManager.shared.isSignedIn {
         YouTubeAuthManager.shared.signOut()
-        tableView.reloadSections(IndexSet(integer: 4), with: .automatic)
+        tableView.reloadData()
         return
       }
       YouTubeAuthManager.shared.signIn(presentationAnchor: view.window) { [weak self] result in
         DispatchQueue.main.async {
-          self?.tableView.reloadSections(IndexSet(integer: 4), with: .automatic)
+          self?.tableView.reloadData()
           if case .failure(let error) = result { self?.presentError(error) }
         }
       }
@@ -6642,7 +6956,7 @@ final class SettingsController: UITableViewController {
     editText(title: "Twitch Client ID", message: "Twitch Developer Consoleで作成したアプリの Client ID を貼り付けてください。", text: config.clientId, keyboard: .default) { [weak self] value in
       config.clientId = value
       TwitchAuthManager.shared.config = config
-      self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+      self?.tableView.reloadData()
     }
   }
 
@@ -6651,7 +6965,7 @@ final class SettingsController: UITableViewController {
     editText(title: "Twitch Redirect URI", message: nil, text: config.redirectURI, keyboard: .URL) { [weak self] value in
       config.redirectURI = value
       TwitchAuthManager.shared.config = config
-      self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+      self?.tableView.reloadData()
     }
   }
 
@@ -6660,7 +6974,7 @@ final class SettingsController: UITableViewController {
     editText(title: "ツイキャス Client ID", message: "ツイキャスのAPIアプリ設定で発行された Client ID を貼り付けてください。", text: config.clientId, keyboard: .default) { [weak self] value in
       config.clientId = value
       TwitcastingAuthManager.shared.config = config
-      self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+      self?.tableView.reloadData()
     }
   }
 
@@ -6669,7 +6983,7 @@ final class SettingsController: UITableViewController {
     editText(title: "ツイキャス Redirect URI", message: nil, text: config.redirectURI, keyboard: .URL) { [weak self] value in
       config.redirectURI = value
       TwitcastingAuthManager.shared.config = config
-      self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+      self?.tableView.reloadData()
     }
   }
 
@@ -6678,7 +6992,7 @@ final class SettingsController: UITableViewController {
     editText(title: "YouTube Client ID", message: "Google Cloud Consoleで作成したiOS OAuth Client IDを貼り付けてください。", text: config.clientId, keyboard: .default) { [weak self] value in
       config.clientId = value
       YouTubeAuthManager.shared.config = config
-      self?.tableView.reloadSections(IndexSet(integer: 4), with: .automatic)
+      self?.tableView.reloadData()
     }
   }
 
@@ -6687,7 +7001,7 @@ final class SettingsController: UITableViewController {
     editText(title: "YouTube Redirect URI", message: nil, text: config.redirectURI, keyboard: .URL) { [weak self] value in
       config.redirectURI = value
       YouTubeAuthManager.shared.config = config
-      self?.tableView.reloadSections(IndexSet(integer: 4), with: .automatic)
+      self?.tableView.reloadData()
     }
   }
 
@@ -6710,6 +7024,21 @@ final class SettingsController: UITableViewController {
     let alert = UIAlertController(title: "Redirect URI をコピーしました", message: "\(uri)\n\n\(service)のOAuthアプリ設定のCallback/Redirect URIに、この値を登録してください。", preferredStyle: .alert)
     alert.addAction(UIAlertAction(title: "編集", style: .default) { _ in edit() })
     alert.addAction(UIAlertAction(title: "OK", style: .cancel))
+    present(alert, animated: true)
+  }
+
+  private func handleNiconicoRow(_ row: Int) {
+    if row == 0 {
+      // No public OAuth for niconico — log in via the web and persist the cookie.
+      present(UINavigationController(rootViewController: NiconicoLoginController()), animated: true)
+      return
+    }
+    guard NiconicoSession.isLoggedIn else { return }
+    let alert = UIAlertController(title: "ニコ生からログアウト", message: "保存されたログイン情報(Cookie)を削除します。", preferredStyle: .alert)
+    alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
+    alert.addAction(UIAlertAction(title: "ログアウト", style: .destructive) { [weak self] _ in
+      NiconicoSession.logout { self?.tableView.reloadData() }
+    })
     present(alert, animated: true)
   }
 
