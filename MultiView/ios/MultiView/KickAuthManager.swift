@@ -6,7 +6,9 @@ import UIKit
 
 struct KickOAuthConfig: Codable {
   var clientId = ""
-  var redirectURI = "multiview://kick-oauth"
+  // Kick only accepts an https redirect URI, so we register this hosted bridge page
+  // which forwards to the app's custom scheme (captured by ASWebAuthenticationSession).
+  var redirectURI = "https://tonton888115.github.io/MultiView/kick-oauth.html"
 }
 
 struct KickOAuthToken: Codable {
@@ -30,11 +32,18 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
   private var activeSession: ASWebAuthenticationSession?
   private var authAnchor: ASPresentationAnchor?
 
+  // Custom-scheme redirect URIs the Kick portal rejects; migrate them to the hosted
+  // https bridge so existing installs work without the user re-entering anything.
+  private let callbackScheme = "multiview"
+
   var config: KickOAuthConfig {
     get {
       guard let data = UserDefaults.standard.data(forKey: configKey),
-            let config = try? JSONDecoder().decode(KickOAuthConfig.self, from: data) else {
+            var config = try? JSONDecoder().decode(KickOAuthConfig.self, from: data) else {
         return KickOAuthConfig()
+      }
+      if config.redirectURI.isEmpty || config.redirectURI.hasPrefix("multiview://") {
+        config.redirectURI = KickOAuthConfig().redirectURI
       }
       return config
     }
@@ -69,10 +78,13 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
       Self.finish(completion, .failure(KickAuthError.missingClientId))
       return
     }
-    guard let redirectURL = URL(string: config.redirectURI), let callbackScheme = redirectURL.scheme else {
+    guard URL(string: config.redirectURI) != nil else {
       Self.finish(completion, .failure(KickAuthError.invalidRedirectURI))
       return
     }
+    // The redirect URI sent to Kick is the hosted https bridge, but the session
+    // captures the app's custom scheme that the bridge forwards to.
+    let callbackScheme = self.callbackScheme
 
     let verifier = Self.randomVerifier()
     let state = UUID().uuidString

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MultiView Kick OAuth</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0f14;color:#fff;font-family:-apple-system,BlinkMacSystemFont,sans-serif;}
+  .box{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;padding:20px;}
+  a{color:#53fc18;font-weight:700;}
+</style>
+</head>
+<body>
+<div class="box">
+  <div>MultiView に戻っています…</div>
+  <a id="manual" href="#">アプリに戻らない場合はこちらをタップ</a>
+</div>
+<script>
+  // Kick only accepts an https redirect URI, so it lands here and we forward the
+  // authorization result to the app's custom scheme, which ASWebAuthenticationSession captures.
+  (function () {
+    var target = 'multiview://kick-oauth' + (location.search || '') + (location.hash || '');
+    document.getElementById('manual').href = target;
+    location.replace(target);
+  })();
+</script>
+</body>
+</html>

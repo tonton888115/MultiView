@@ -130,6 +130,12 @@ protocol AudioControllable: AnyObject {
   func setPlaybackVolume(_ volume: Float)
 }
 
+// A player that can post a chat comment for its own stream (using the logged-in
+// session it already holds), so a cell can send without leaving the grid.
+protocol CommentPostable: AnyObject {
+  func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void)
+}
+
 final class AutoHidingControls: NSObject, UIGestureRecognizerDelegate {
   private weak var host: UIView?
   private let controls: [UIView]
@@ -1325,7 +1331,7 @@ private final class NativeDanmakuRenderer {
   }
 }
 
-final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable {
   private let stream: StreamItem
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
@@ -1348,6 +1354,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var watchPageURL: URL?
   private var laneCursor = 0
   private var loadAttempts = 0
+  private var streamOpenedAt: Date?
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -1452,6 +1459,43 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     playbackVolume = min(1, max(0, volume))
     player.volume = settings.playAudio ? playbackVolume : 0
     fallbackWebView?.setPlaybackVolume(playbackVolume)
+  }
+
+  func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    let programId = channel.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !programId.isEmpty,
+          let url = URL(string: "https://api.cas.nicovideo.jp/v1/services/live/programs/\(programId)/comments") else {
+      completion(.failure(NSError(domain: "Niconico", code: -1, userInfo: [NSLocalizedDescriptionKey: "番組IDが不正です"])))
+      return
+    }
+    guard let cookieURL = URL(string: "https://live.nicovideo.jp/"),
+          let cookies = HTTPCookieStorage.shared.cookies(for: cookieURL),
+          cookies.contains(where: { $0.name == "user_session" }) else {
+      completion(.failure(NSError(domain: "Niconico", code: 401, userInfo: [NSLocalizedDescriptionKey: "ニコ生にログインしてください"])))
+      return
+    }
+    let elapsed = streamOpenedAt.map { Date().timeIntervalSince($0) } ?? 0
+    let vpos = max(0, Int(elapsed * 100))
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("https://live.nicovideo.jp/watch/\(programId)", forHTTPHeaderField: "Referer")
+    request.setValue(cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; "), forHTTPHeaderField: "Cookie")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: ["message": text, "command": "184", "vpos": String(vpos)])
+    URLSession.shared.dataTask(with: request) { _, response, error in
+      DispatchQueue.main.async {
+        if let error {
+          completion(.failure(error))
+          return
+        }
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+          completion(.failure(NSError(domain: "Niconico", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "投稿失敗 (HTTP \(http.statusCode))"])))
+          return
+        }
+        completion(.success(()))
+      }
+    }.resume()
   }
 
   private func load(channel: String) {
@@ -1626,6 +1670,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
        let uriString = payload["uri"] as? String,
        let uri = URL(string: uriString) {
       loadAttempts = 0
+      if streamOpenedAt == nil { streamOpenedAt = Date() }
       let cookies = parseStreamCookies(payload["cookies"], for: uri)
       applyNiconicoCookies(cookies)
       play(hlsURL: uri, cookies: cookies)
@@ -2148,7 +2193,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
-final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable {
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
@@ -2237,6 +2282,14 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   func pausePlayback() {
     player.pause()
     fallbackWebView?.pausePlayback()
+  }
+
+  func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    guard KickAuthManager.shared.isSignedIn else {
+      completion(.failure(NSError(domain: "Kick", code: 401, userInfo: [NSLocalizedDescriptionKey: "設定でKickにログインしてください"])))
+      return
+    }
+    KickAuthManager.shared.sendChat(channel: stream.channel, content: text, completion: completion)
   }
 
   func stopPlayback() {
@@ -4265,6 +4318,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
   private let commentField = UITextField()
   private let commentStatus = UILabel()
   private var commentBottom: NSLayoutConstraint?
+  private weak var commentPoster: CommentPostable?
 
   init(stream: StreamItem, onFocus: @escaping () -> Void, onReorder: @escaping (StreamCellView, UILongPressGestureRecognizer) -> Void) {
     self.stream = stream
@@ -4291,6 +4345,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
       video = PlayerWebView(stream: stream, settings: AppState.shared.settings)
     }
     let audio = video as? AudioControllable
+    commentPoster = video as? CommentPostable
     video.translatesAutoresizingMaskIntoConstraints = false
     addSubview(video)
 
@@ -4444,26 +4499,22 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
   private func submitComment() {
     let text = commentField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     guard !text.isEmpty else { return }
-    switch stream.platform {
-    case .kick:
-      guard KickAuthManager.shared.isSignedIn else {
-        showCommentStatus("設定でKickにログインしてください")
-        return
-      }
-      KickAuthManager.shared.sendChat(channel: stream.channel, content: text) { [weak self] result in
-        DispatchQueue.main.async {
-          switch result {
-          case .success:
-            self?.commentField.text = ""
-            self?.showCommentStatus("送信しました")
-            self?.setCommentBar(visible: false)
-          case .failure(let error):
-            self?.showCommentStatus(error.localizedDescription)
-          }
-        }
-      }
-    default:
+    guard let poster = commentPoster else {
+      // No native posting for this platform yet — the expanded view can post via
+      // the logged-in chat web.
       showCommentStatus("拡大(⤢)してコメントを送信できます")
+      return
+    }
+    showCommentStatus("送信中…")
+    poster.postComment(text) { [weak self] result in
+      switch result {
+      case .success:
+        self?.commentField.text = ""
+        self?.showCommentStatus("送信しました")
+        self?.setCommentBar(visible: false)
+      case .failure(let error):
+        self?.showCommentStatus(error.localizedDescription)
+      }
     }
   }
 
