@@ -2034,6 +2034,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private var itemFailedObserver: NSObjectProtocol?
   private var fallbackWebView: PlayerWebView?
   private var chatroomID: String?
+  private var kickChannelID: String?
   private var isLoading = false
   private var isStopped = false
   private var laneCursor = 0
@@ -2114,6 +2115,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     socketTask?.cancel(with: .goingAway, reason: nil)
     socketTask = nil
     chatroomID = nil
+    kickChannelID = nil
     fallbackWebView?.stopPlayback()
     fallbackWebView?.removeFromSuperview()
     fallbackWebView = nil
@@ -2166,6 +2168,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         return
       }
       let channelInfo = Self.extractChannelInfo(from: data)
+      self.kickChannelID = channelInfo.channelID
       if let chatroomID = channelInfo.chatroomID {
         self.connectKickComments(chatroomID: chatroomID)
       } else {
@@ -2329,16 +2332,22 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     let task = URLSession.shared.webSocketTask(with: url)
     socketTask = task
     task.resume()
-    let payload: [String: Any] = [
-      "event": "pusher:subscribe",
-      "data": [
-        "auth": "",
-        "channel": "chatrooms.\(chatroomID).v2"
+    // Chat messages arrive on the chatroom channel; host/raid (ChatMove…) and
+    // other channel events arrive on the channel's own Pusher channel, so
+    // subscribe to both.
+    var channels = ["chatrooms.\(chatroomID).v2"]
+    if let channelID = kickChannelID, !channelID.isEmpty {
+      channels.append("channel.\(channelID)")
+    }
+    for channelName in channels {
+      let payload: [String: Any] = [
+        "event": "pusher:subscribe",
+        "data": ["auth": "", "channel": channelName]
       ]
-    ]
-    if let data = try? JSONSerialization.data(withJSONObject: payload),
-       let text = String(data: data, encoding: .utf8) {
-      task.send(.string(text)) { _ in }
+      if let data = try? JSONSerialization.data(withJSONObject: payload),
+         let text = String(data: data, encoding: .utf8) {
+        task.send(.string(text)) { _ in }
+      }
     }
     receiveKickComment()
   }
@@ -2382,10 +2391,20 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     }
     guard let payloadData,
           let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else { return }
-    if settings.autoFollowRaids,
-       (event.localizedCaseInsensitiveContains("raid") || event.localizedCaseInsensitiveContains("host")),
-       let target = RaidAutoFollow.detectTarget(in: payload, preferredPlatform: .kick) {
-      RaidAutoFollow.follow(platform: target.0, channel: target.1, currentChannel: stream.channel)
+    // Kick signals an ending stream's raid/host with ChatMoveToSupportedChannelEvent,
+    // whose name contains neither "raid" nor "host" — so match it explicitly and
+    // pull the destination slug out of the payload.
+    if event.localizedCaseInsensitiveContains("ChatMove")
+      || event.localizedCaseInsensitiveContains("Host")
+      || event.localizedCaseInsensitiveContains("raid") {
+      if settings.autoFollowRaids {
+        if let target = Self.kickHostTarget(in: payload) {
+          RaidAutoFollow.follow(platform: .kick, channel: target, currentChannel: stream.channel)
+        } else if let target = RaidAutoFollow.detectTarget(in: payload, preferredPlatform: .kick) {
+          RaidAutoFollow.follow(platform: target.0, channel: target.1, currentChannel: stream.channel)
+        }
+      }
+      return
     }
     guard event.contains("ChatMessage"),
           let content = (payload["content"] as? String) ?? (payload["message"] as? String) else { return }
@@ -2449,10 +2468,44 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     return output
   }
 
-  private static func extractChannelInfo(from data: Data) -> (hlsURL: URL?, chatroomID: String?) {
-    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return (nil, nil) }
+  // Destination channel of a Kick host/raid (ChatMoveToSupportedChannelEvent).
+  // Prefer the hosted/target object; the top-level `channel` is usually the source,
+  // but RaidAutoFollow.follow ignores it when it equals the current channel.
+  private static func kickHostTarget(in payload: [String: Any]) -> String? {
+    let nestedKeys = ["hosted", "target_channel", "target", "channel_to", "to"]
+    for key in nestedKeys {
+      if let nested = payload[key] as? [String: Any] {
+        if let slug = (nested["slug"] as? String) ?? (nested["username"] as? String), !slug.isEmpty {
+          return slug
+        }
+      }
+      if let slug = payload[key] as? String, !slug.isEmpty {
+        return slug
+      }
+    }
+    if let slug = payload["slug"] as? String, !slug.isEmpty {
+      return slug
+    }
+    if let channel = payload["channel"] as? [String: Any],
+       let slug = (channel["slug"] as? String) ?? (channel["username"] as? String), !slug.isEmpty {
+      return slug
+    }
+    return nil
+  }
+
+  private static func extractChannelInfo(from data: Data) -> (hlsURL: URL?, chatroomID: String?, channelID: String?) {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return (nil, nil, nil) }
     var hlsURL: URL?
     var chatroomID: String?
+    var channelID: String?
+    if let idValue = json["id"] {
+      channelID = Self.stringValue(idValue)
+    }
+    if channelID == nil,
+       let livestream = json["livestream"] as? [String: Any],
+       let cid = livestream["channel_id"] {
+      channelID = Self.stringValue(cid)
+    }
     if let raw = json["playback_url"] as? String {
       hlsURL = URL(string: raw)
     }
@@ -2478,7 +2531,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
        let livestream = json["livestream"] as? [String: Any] {
       chatroomID = Self.stringValue(livestream["chatroom_id"] ?? livestream["chatroomId"])
     }
-    return (hlsURL, chatroomID)
+    return (hlsURL, chatroomID, channelID)
   }
 
   private static func extractChatroomID(from data: Data) -> String? {
