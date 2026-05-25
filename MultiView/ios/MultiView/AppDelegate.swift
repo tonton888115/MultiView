@@ -3,6 +3,8 @@ import WebKit
 import AVFoundation
 import Network
 import ImageIO
+import AuthenticationServices
+import Security
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -436,6 +438,432 @@ enum WebLoginCookies {
         HTTPCookieStorage.shared.setCookie(cookie)
       }
       DispatchQueue.main.async { completion?() }
+    }
+  }
+}
+
+struct SimpleOAuthToken: Codable {
+  let accessToken: String
+  let expiresAt: TimeInterval
+  let userID: String?
+
+  var isValid: Bool {
+    Date().timeIntervalSince1970 < expiresAt
+  }
+}
+
+enum OAuthKeychain {
+  static func load(account: String, service: String = "com.rinng.multiview.oauth") -> SimpleOAuthToken? {
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: account,
+      kSecReturnData as String: true,
+      kSecMatchLimit as String: kSecMatchLimitOne
+    ]
+    var item: CFTypeRef?
+    guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+          let data = item as? Data else { return nil }
+    return try? JSONDecoder().decode(SimpleOAuthToken.self, from: data)
+  }
+
+  static func save(_ token: SimpleOAuthToken?, account: String, service: String = "com.rinng.multiview.oauth") {
+    let base: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: account
+    ]
+    SecItemDelete(base as CFDictionary)
+    guard let token, let data = try? JSONEncoder().encode(token) else { return }
+    var item = base
+    item[kSecValueData as String] = data
+    item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    SecItemAdd(item as CFDictionary, nil)
+  }
+}
+
+struct TwitchOAuthConfig: Codable {
+  var clientId = ""
+  var redirectURI = "multiview://twitch-oauth"
+}
+
+final class TwitchAuthManager: NSObject, ASWebAuthenticationPresentationContextProviding {
+  static let shared = TwitchAuthManager()
+  private let configKey = "twitch.oauth.config.v1"
+  private let tokenAccount = "twitch"
+  private var activeSession: ASWebAuthenticationSession?
+  private var authAnchor: ASPresentationAnchor?
+
+  var config: TwitchOAuthConfig {
+    get {
+      guard let data = UserDefaults.standard.data(forKey: configKey),
+            let config = try? JSONDecoder().decode(TwitchOAuthConfig.self, from: data) else {
+        return TwitchOAuthConfig()
+      }
+      return config
+    }
+    set {
+      if let data = try? JSONEncoder().encode(newValue) {
+        UserDefaults.standard.set(data, forKey: configKey)
+      }
+    }
+  }
+
+  var isSignedIn: Bool { OAuthKeychain.load(account: tokenAccount)?.isValid == true }
+
+  func signOut() {
+    OAuthKeychain.save(nil, account: tokenAccount)
+  }
+
+  func signIn(presentationAnchor: ASPresentationAnchor?, completion: @escaping (Result<Void, Error>) -> Void) {
+    guard let presentationAnchor else {
+      Self.finish(completion, .failure(OAuthServiceError.message("Twitch認証を開始できません")))
+      return
+    }
+    let config = self.config
+    guard !config.clientId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      Self.finish(completion, .failure(OAuthServiceError.message("Twitch Client IDが未設定です")))
+      return
+    }
+    let state = UUID().uuidString
+    var components = URLComponents(string: "https://id.twitch.tv/oauth2/authorize")!
+    components.queryItems = [
+      URLQueryItem(name: "client_id", value: config.clientId),
+      URLQueryItem(name: "redirect_uri", value: config.redirectURI),
+      URLQueryItem(name: "response_type", value: "token"),
+      URLQueryItem(name: "scope", value: "user:read:chat user:write:chat"),
+      URLQueryItem(name: "state", value: state)
+    ]
+    guard let url = components.url else {
+      Self.finish(completion, .failure(OAuthServiceError.message("Twitch認証URLを作成できません")))
+      return
+    }
+    authAnchor = presentationAnchor
+    let session = ASWebAuthenticationSession(url: url, callbackURLScheme: "multiview") { [weak self] callbackURL, error in
+      guard let self else { return }
+      self.activeSession = nil
+      self.authAnchor = nil
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let callbackURL,
+            let values = Self.fragmentValues(callbackURL),
+            values["state"] == state,
+            let accessToken = values["access_token"] else {
+        Self.finish(completion, .failure(OAuthServiceError.message("Twitch認証の戻りURLが不正です")))
+        return
+      }
+      self.validate(accessToken: accessToken) { result in
+        switch result {
+        case .failure(let error):
+          Self.finish(completion, .failure(error))
+        case .success(let userID):
+          let expiresIn = Double(values["expires_in"] ?? "") ?? 3600 * 24 * 30
+          OAuthKeychain.save(SimpleOAuthToken(
+            accessToken: accessToken,
+            expiresAt: Date().timeIntervalSince1970 + max(60, expiresIn - 60),
+            userID: userID
+          ), account: self.tokenAccount)
+          Self.finish(completion, .success(()))
+        }
+      }
+    }
+    session.presentationContextProvider = self
+    session.prefersEphemeralWebBrowserSession = false
+    activeSession = session
+    if !session.start() {
+      activeSession = nil
+      authAnchor = nil
+      Self.finish(completion, .failure(OAuthServiceError.message("Twitch認証を開始できません")))
+    }
+  }
+
+  func sendChat(channel: String, content: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    guard let token = OAuthKeychain.load(account: tokenAccount), token.isValid, let senderID = token.userID else {
+      Self.finish(completion, .failure(OAuthServiceError.message("Twitchにログインしてください")))
+      return
+    }
+    resolveUserID(login: channel, accessToken: token.accessToken) { result in
+      switch result {
+      case .failure(let error):
+        Self.finish(completion, .failure(error))
+      case .success(let broadcasterID):
+        self.postMessage(broadcasterID: broadcasterID, senderID: senderID, message: content, accessToken: token.accessToken, completion: completion)
+      }
+    }
+  }
+
+  func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+    authAnchor ?? ASPresentationAnchor()
+  }
+
+  private func validate(accessToken: String, completion: @escaping (Result<String, Error>) -> Void) {
+    var request = URLRequest(url: URL(string: "https://id.twitch.tv/oauth2/validate")!)
+    request.setValue("OAuth \(accessToken)", forHTTPHeaderField: "Authorization")
+    URLSession.shared.dataTask(with: request) { data, response, error in
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let data,
+            let http = response as? HTTPURLResponse,
+            (200..<300).contains(http.statusCode),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let userID = json["user_id"] as? String else {
+        Self.finish(completion, .failure(OAuthServiceError.message("TwitchユーザーIDを取得できません")))
+        return
+      }
+      Self.finish(completion, .success(userID))
+    }.resume()
+  }
+
+  private func resolveUserID(login rawLogin: String, accessToken: String, completion: @escaping (Result<String, Error>) -> Void) {
+    let login = rawLogin.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      .replacingOccurrences(of: "^@+", with: "", options: .regularExpression)
+      .components(separatedBy: CharacterSet(charactersIn: "/?# ")).first ?? rawLogin
+    var components = URLComponents(string: "https://api.twitch.tv/helix/users")!
+    components.queryItems = [URLQueryItem(name: "login", value: login)]
+    var request = URLRequest(url: components.url!)
+    request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+    request.setValue(config.clientId, forHTTPHeaderField: "Client-Id")
+    URLSession.shared.dataTask(with: request) { data, response, error in
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let data,
+            let http = response as? HTTPURLResponse,
+            (200..<300).contains(http.statusCode),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let rows = json["data"] as? [[String: Any]],
+            let id = rows.first?["id"] as? String else {
+        Self.finish(completion, .failure(OAuthServiceError.message("TwitchチャンネルIDを取得できません")))
+        return
+      }
+      Self.finish(completion, .success(id))
+    }.resume()
+  }
+
+  private func postMessage(broadcasterID: String, senderID: String, message: String, accessToken: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    var request = URLRequest(url: URL(string: "https://api.twitch.tv/helix/chat/messages")!)
+    request.httpMethod = "POST"
+    request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+    request.setValue(config.clientId, forHTTPHeaderField: "Client-Id")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: [
+      "broadcaster_id": broadcasterID,
+      "sender_id": senderID,
+      "message": message
+    ])
+    URLSession.shared.dataTask(with: request) { _, response, error in
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+        Self.finish(completion, .failure(OAuthServiceError.message("Twitchコメント送信に失敗しました")))
+        return
+      }
+      Self.finish(completion, .success(()))
+    }.resume()
+  }
+
+  private static func fragmentValues(_ url: URL) -> [String: String]? {
+    guard let fragment = url.fragment else { return nil }
+    var output: [String: String] = [:]
+    URLComponents(string: "x://callback?\(fragment)")?.queryItems?.forEach { output[$0.name] = $0.value }
+    return output
+  }
+
+  private static func finish<T>(_ completion: @escaping (Result<T, Error>) -> Void, _ result: Result<T, Error>) {
+    DispatchQueue.main.async { completion(result) }
+  }
+}
+
+struct TwitcastingOAuthConfig: Codable {
+  var clientId = ""
+  var redirectURI = "multiview://twitcasting-oauth"
+}
+
+final class TwitcastingAuthManager: NSObject, ASWebAuthenticationPresentationContextProviding {
+  static let shared = TwitcastingAuthManager()
+  private let configKey = "twitcasting.oauth.config.v1"
+  private let tokenAccount = "twitcasting"
+  private var activeSession: ASWebAuthenticationSession?
+  private var authAnchor: ASPresentationAnchor?
+
+  var config: TwitcastingOAuthConfig {
+    get {
+      guard let data = UserDefaults.standard.data(forKey: configKey),
+            let config = try? JSONDecoder().decode(TwitcastingOAuthConfig.self, from: data) else {
+        return TwitcastingOAuthConfig()
+      }
+      return config
+    }
+    set {
+      if let data = try? JSONEncoder().encode(newValue) {
+        UserDefaults.standard.set(data, forKey: configKey)
+      }
+    }
+  }
+
+  var isSignedIn: Bool { OAuthKeychain.load(account: tokenAccount)?.isValid == true }
+
+  func signOut() {
+    OAuthKeychain.save(nil, account: tokenAccount)
+  }
+
+  func signIn(presentationAnchor: ASPresentationAnchor?, completion: @escaping (Result<Void, Error>) -> Void) {
+    guard let presentationAnchor else {
+      Self.finish(completion, .failure(OAuthServiceError.message("ツイキャス認証を開始できません")))
+      return
+    }
+    let config = self.config
+    guard !config.clientId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      Self.finish(completion, .failure(OAuthServiceError.message("ツイキャス Client IDが未設定です")))
+      return
+    }
+    let state = UUID().uuidString
+    var components = URLComponents(string: "https://apiv2.twitcasting.tv/oauth2/authorize")!
+    components.queryItems = [
+      URLQueryItem(name: "client_id", value: config.clientId),
+      URLQueryItem(name: "redirect_uri", value: config.redirectURI),
+      URLQueryItem(name: "response_type", value: "token"),
+      URLQueryItem(name: "state", value: state)
+    ]
+    guard let url = components.url else {
+      Self.finish(completion, .failure(OAuthServiceError.message("ツイキャス認証URLを作成できません")))
+      return
+    }
+    authAnchor = presentationAnchor
+    let session = ASWebAuthenticationSession(url: url, callbackURLScheme: "multiview") { [weak self] callbackURL, error in
+      guard let self else { return }
+      self.activeSession = nil
+      self.authAnchor = nil
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let callbackURL,
+            let values = Self.fragmentValues(callbackURL),
+            values["state"] == state,
+            let accessToken = values["access_token"] else {
+        Self.finish(completion, .failure(OAuthServiceError.message("ツイキャス認証の戻りURLが不正です")))
+        return
+      }
+      let expiresIn = Double(values["expires_in"] ?? "") ?? 3600 * 24 * 30
+      OAuthKeychain.save(SimpleOAuthToken(
+        accessToken: accessToken,
+        expiresAt: Date().timeIntervalSince1970 + max(60, expiresIn - 60),
+        userID: nil
+      ), account: tokenAccount)
+      Self.finish(completion, .success(()))
+    }
+    session.presentationContextProvider = self
+    session.prefersEphemeralWebBrowserSession = false
+    activeSession = session
+    if !session.start() {
+      activeSession = nil
+      authAnchor = nil
+      Self.finish(completion, .failure(OAuthServiceError.message("ツイキャス認証を開始できません")))
+    }
+  }
+
+  func sendChat(channel: String, content: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    guard let token = OAuthKeychain.load(account: tokenAccount), token.isValid else {
+      Self.finish(completion, .failure(OAuthServiceError.message("ツイキャスにログインしてください")))
+      return
+    }
+    resolveMovieID(channel: channel) { result in
+      switch result {
+      case .failure(let error):
+        Self.finish(completion, .failure(error))
+      case .success(let movieID):
+        self.postComment(movieID: movieID, content: content, accessToken: token.accessToken, completion: completion)
+      }
+    }
+  }
+
+  func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+    authAnchor ?? ASPresentationAnchor()
+  }
+
+  private func resolveMovieID(channel: String, completion: @escaping (Result<String, Error>) -> Void) {
+    let user = channel.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let encoded = user.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+          let url = URL(string: "https://frontendapi.twitcasting.tv/users/\(encoded)/latest-movie") else {
+      Self.finish(completion, .failure(OAuthServiceError.message("ツイキャスユーザーIDが不正です")))
+      return
+    }
+    var request = URLRequest(url: url)
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+    URLSession.shared.dataTask(with: request) { data, _, error in
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let data,
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let movie = json["movie"] as? [String: Any],
+            let id = Self.stringValue(movie["id"]) else {
+        Self.finish(completion, .failure(OAuthServiceError.message("ツイキャス配信IDを取得できません")))
+        return
+      }
+      Self.finish(completion, .success(id))
+    }.resume()
+  }
+
+  private func postComment(movieID: String, content: String, accessToken: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    guard let url = URL(string: "https://apiv2.twitcasting.tv/movies/\(movieID)/comments") else {
+      Self.finish(completion, .failure(OAuthServiceError.message("ツイキャス配信IDが不正です")))
+      return
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+    request.setValue("2.0", forHTTPHeaderField: "X-Api-Version")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: ["comment": String(content.prefix(140)), "sns": "none"])
+    URLSession.shared.dataTask(with: request) { _, response, error in
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+        Self.finish(completion, .failure(OAuthServiceError.message("ツイキャスコメント送信に失敗しました")))
+        return
+      }
+      Self.finish(completion, .success(()))
+    }.resume()
+  }
+
+  private static func fragmentValues(_ url: URL) -> [String: String]? {
+    guard let fragment = url.fragment else { return nil }
+    var output: [String: String] = [:]
+    URLComponents(string: "x://callback?\(fragment)")?.queryItems?.forEach { output[$0.name] = $0.value }
+    return output
+  }
+
+  private static func stringValue(_ value: Any?) -> String? {
+    if let value = value as? String { return value }
+    if let value = value as? NSNumber { return value.stringValue }
+    return nil
+  }
+
+  private static func finish<T>(_ completion: @escaping (Result<T, Error>) -> Void, _ result: Result<T, Error>) {
+    DispatchQueue.main.async { completion(result) }
+  }
+}
+
+enum OAuthServiceError: LocalizedError {
+  case message(String)
+
+  var errorDescription: String? {
+    switch self {
+    case .message(let text): return text
     }
   }
 }
@@ -1522,7 +1950,10 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     guard !isStopped, fallbackWebView == nil else { return }
     loadAttempts += 1
     guard loadAttempts <= 2 else {
-      installFallback(reason)
+      showStatus("\(reason)\n再読み込みします")
+      DispatchQueue.main.async {
+        NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
+      }
       return
     }
     showStatus("ニコ生再試行中… (\(loadAttempts))")
@@ -1679,7 +2110,8 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
        let payload = json["data"] as? [String: Any],
        let code = payload["code"] as? String {
       showStatus("ニコ生エラー: \(code)")
-      if code.lowercased().contains("permission") || code.lowercased().contains("resource") {
+      let lower = code.lowercased()
+      if lower.contains("permission") || lower.contains("resource") || lower.contains("auth") || lower.contains("login") || lower.contains("denied") {
         // Usually a just-completed web login whose cookies have not reached the
         // native jar yet — re-sync and retry the whole load before falling back.
         retryOrFallback("ニコ生エラー: \(code)")
@@ -1777,7 +2209,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private func syncNiconicoWebCookies(_ completion: @escaping () -> Void) {
     WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
       cookies
-        .filter { $0.domain.contains("nicovideo.jp") }
+        .filter { $0.domain.contains("nicovideo.jp") || $0.domain.contains("nimg.jp") }
         .forEach { HTTPCookieStorage.shared.setCookie($0) }
       DispatchQueue.main.async(execute: completion)
     }
@@ -2751,7 +3183,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
 // Native Twitch playback, emulating the official app: fetch a PlaybackAccessToken
 // over GraphQL, build the usher.ttvnw.net HLS master playlist, and play it with
 // AVPlayer. Anonymous IRC supplies danmaku comments. Falls back to the web embed.
-final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable {
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
@@ -2868,6 +3300,10 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     playbackVolume = min(1, max(0, volume))
     player.volume = settings.playAudio ? playbackVolume : 0
     fallbackWebView?.setPlaybackVolume(playbackVolume)
+  }
+
+  func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    TwitchAuthManager.shared.sendChat(channel: stream.channel, content: text, completion: completion)
   }
 
   private func loadNativeStream() {
@@ -3196,7 +3632,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 }
 
-final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable {
+final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable {
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
@@ -3310,6 +3746,10 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
     player.volume = settings.playAudio ? playbackVolume : 0
+  }
+
+  func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void) {
+    TwitcastingAuthManager.shared.sendChat(channel: stream.channel, content: text, completion: completion)
   }
 
   private func loadNativeStream() {
@@ -3576,10 +4016,9 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
-// Per-cell YouTube player using the IFrame Player API, so YouTube behaves like the
-// other individual native players (video + audio). It autoplays muted (the only
-// autoplay browsers allow) and then unmutes via the API — which works without a
-// user gesture because the web view disables the user-action playback requirement.
+// Per-cell YouTube playback is intentionally video-only. Multiple YouTube iframe
+// players competing for audio/session control on iOS will pause each other, so we
+// keep the embed muted and minimal for stable simultaneous viewing.
 final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, WKNavigationDelegate {
   private let stream: StreamItem
   private let settings: AppSettings
@@ -3641,9 +4080,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   func resumePlayback() {
     guard !isStopped else { return }
-    let session = AVAudioSession.sharedInstance()
-    try? session.setCategory(.playback, mode: .default, options: [])
-    try? session.setActive(true)
     web.evaluateJavaScript("window.mvPlay && window.mvPlay();")
   }
 
@@ -3654,8 +4090,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
-    let on = settings.playAudio ? playbackVolume : 0
-    web.evaluateJavaScript("window.mvVolume && window.mvVolume(\(on));")
+    web.evaluateJavaScript("window.mvMute && window.mvMute();")
   }
 
   func stopPlayback() {
@@ -3677,12 +4112,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private func loadResolvedPlayer(videoId: String) {
-    let audioOn = settings.playAudio && playbackVolume > 0
-    let volume = Int((settings.playAudio ? playbackVolume : 0) * 100)
     statusLabel.isHidden = true
     // A real HTTPS base URL on our own domain gives the embed a valid origin/Referer
     // (loadHTMLString with youtube.com or nil triggers YouTube error 152).
-    web.loadHTMLString(Self.html(videoId: videoId, audioOn: audioOn, volume: volume), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
+    web.loadHTMLString(Self.html(videoId: videoId), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
   }
 
   private func resolveLiveVideoID(from raw: String) {
@@ -3731,27 +4164,28 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
-  private static func html(videoId: String, audioOn: Bool, volume: Int) -> String {
+  private static func html(videoId: String) -> String {
     """
     <!doctype html>
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-    <style>html,body{margin:0;height:100%;background:#000;overflow:hidden}#p{position:absolute;inset:0}</style></head>
+    <style>html,body{margin:0;height:100%;background:#000;overflow:hidden}iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}</style></head>
     <body>
-    <div id="p"></div>
-    <script src="https://www.youtube.com/iframe_api"></script>
+    <iframe id="p" src="https://www.youtube.com/embed/\(videoId)?autoplay=1&mute=1&playsinline=1&controls=0&rel=0&modestbranding=1&enablejsapi=1&origin=https%3A%2F%2Ftonton888115.github.io" allow="autoplay; encrypted-media; picture-in-picture" playsinline></iframe>
     <script>
-      var player, READY=false, VID="\(videoId)", AUDIO=\(audioOn ? "true" : "false"), VOL=\(volume);
-      function onYouTubeIframeAPIReady(){
-        player=new YT.Player('p',{videoId:VID,host:'https://www.youtube.com',
-          playerVars:{autoplay:1,mute:1,playsinline:1,controls:1,rel:0,modestbranding:1,origin:'https://tonton888115.github.io'},
-          events:{onReady:function(){READY=true;apply();},
+      var frame=document.getElementById('p');
+      function cmd(func,args){try{frame.contentWindow.postMessage(JSON.stringify({event:'command',func:func,args:args||[]}), '*');}catch(e){}}
+      window.mvPlay=function(){cmd('mute');cmd('playVideo');};
+      window.mvPause=function(){cmd('pauseVideo');};
+      window.mvMute=function(){cmd('mute');};
+      setInterval(function(){window.mvPlay();}, 5000);
+      /*
           onStateChange:function(e){ if(e.data===YT.PlayerState.UNSTARTED||e.data===YT.PlayerState.CUED){ try{e.target.playVideo();}catch(x){} } }}});
       }
-      function apply(){ if(!player||!READY)return; try{ player.playVideo(); if(AUDIO){player.unMute();player.setVolume(VOL);} else {player.mute();} }catch(x){} }
+      function apply(){ if(!player||!READY)return; try{ player.playVideo(); player.mute(); }catch(x){} }
       window.mvPlay=function(){ apply(); };
       window.mvPause=function(){ try{ player&&player.pauseVideo(); }catch(x){} };
-      window.mvVolume=function(v){ VOL=Math.round(Math.max(0,Math.min(1,v))*100); AUDIO=VOL>0; apply(); };
+      */
     </script>
     </body>
     </html>
@@ -4526,6 +4960,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     let volume = VolumeOverlay(stream: stream) { value in
       audio?.setPlaybackVolume(value)
     }
+    volume.isHidden = stream.platform == .youtube
     volume.translatesAutoresizingMaskIntoConstraints = false
     addSubview(volume)
 
@@ -4562,7 +4997,8 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
       volume.widthAnchor.constraint(equalToConstant: 42),
       volume.heightAnchor.constraint(equalTo: heightAnchor, multiplier: 0.62)
     ])
-    autoHider = AutoHidingControls(host: self, controls: [focus, remove, comment, volume])
+    let autoHideControls = stream.platform == .youtube ? [focus, remove, comment] : [focus, remove, comment, volume]
+    autoHider = AutoHidingControls(host: self, controls: autoHideControls)
     let reorder = UILongPressGestureRecognizer(target: self, action: #selector(handleReorderGesture(_:)))
     reorder.minimumPressDuration = 0.45
     reorder.delegate = self
@@ -4849,6 +5285,7 @@ final class FocusedStreamView: UIView {
     let volume = VolumeOverlay(stream: stream) { value in
       audio?.setPlaybackVolume(value)
     }
+    volume.isHidden = stream.platform == .youtube
     volume.translatesAutoresizingMaskIntoConstraints = false
     addSubview(volume)
 
@@ -4930,7 +5367,7 @@ final class FocusedStreamView: UIView {
       ]
     }
     NSLayoutConstraint.activate(constraints)
-    var autoHideControls: [UIView] = [remove, volume]
+    var autoHideControls: [UIView] = stream.platform == .youtube ? [remove] : [remove, volume]
     if let closeButton {
       autoHideControls.append(closeButton)
     }
@@ -5271,6 +5708,8 @@ final class SettingsController: UITableViewController {
     tableView.backgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.04, alpha: 1)
     tableView.separatorColor = UIColor.white.withAlphaComponent(0.12)
     tableView.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
+    tableView.isEditing = true
+    tableView.allowsSelectionDuringEditing = true
   }
 
   func reload() {
@@ -5278,13 +5717,14 @@ final class SettingsController: UITableViewController {
     tableView.reloadData()
   }
 
-  override func numberOfSections(in tableView: UITableView) -> Int { 4 }
+  override func numberOfSections(in tableView: UITableView) -> Int { 5 }
 
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     switch section {
     case 0: return 11
     case 1: return platforms.count
     case 2: return 4
+    case 3: return 6
     default: return 1
     }
   }
@@ -5294,6 +5734,7 @@ final class SettingsController: UITableViewController {
     case 0: return "視聴"
     case 1: return "サービス順"
     case 2: return "Kick OAuth"
+    case 3: return "Twitch / ツイキャス OAuth"
     default: return "追加"
     }
   }
@@ -5301,6 +5742,12 @@ final class SettingsController: UITableViewController {
   override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
     if section == 2 {
       return "Client ID/SecretはあなたのユーザーIDやパスワードではなく、kick.com → Settings → Developer で作るOAuthアプリの値です。そのアプリに Redirect URI「\(KickAuthManager.shared.config.redirectURI)」を登録してください(Redirect URI行をタップでコピー)。コメント投稿に使います。"
+    }
+    if section == 3 {
+      return "Twitchは user:read:chat / user:write:chat、ツイキャスはWrite権限のOAuthアプリを使います。Redirect URI行をタップするとコピーできます。"
+    }
+    if section == 1 {
+      return "右端の並べ替えハンドルをドラッグして、表示順を自由に変更できます。"
     }
     guard section == numberOfSections(in: tableView) - 1 else { return nil }
     let info = Bundle.main.infoDictionary
@@ -5376,16 +5823,7 @@ final class SettingsController: UITableViewController {
     } else if indexPath.section == 1 {
       let platform = platforms[indexPath.row]
       cell.textLabel?.text = platform.label
-      let control = UISegmentedControl(items: ["↑", "↓"])
-      control.frame = CGRect(x: 0, y: 0, width: 82, height: 30)
-      control.setEnabled(indexPath.row > 0, forSegmentAt: 0)
-      control.setEnabled(indexPath.row < platforms.count - 1, forSegmentAt: 1)
-      control.addAction(UIAction { [weak self] action in
-        guard let control = action.sender as? UISegmentedControl else { return }
-        self?.movePlatform(at: indexPath.row, direction: control.selectedSegmentIndex == 0 ? -1 : 1)
-        control.selectedSegmentIndex = UISegmentedControl.noSegment
-      }, for: .valueChanged)
-      cell.accessoryView = control
+      cell.showsReorderControl = true
     } else if indexPath.section == 2 {
       let config = KickAuthManager.shared.config
       switch indexPath.row {
@@ -5400,6 +5838,23 @@ final class SettingsController: UITableViewController {
       }
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
+    } else if indexPath.section == 3 {
+      switch indexPath.row {
+      case 0:
+        cell.textLabel?.text = TwitchAuthManager.shared.isSignedIn ? "Twitchログアウト" : "Twitch OAuthログイン"
+      case 1:
+        cell.textLabel?.text = TwitchAuthManager.shared.config.clientId.isEmpty ? "Twitch Client ID 未設定" : "Twitch Client ID 設定済み"
+      case 2:
+        cell.textLabel?.text = "Twitch Redirect URI \(TwitchAuthManager.shared.config.redirectURI)"
+      case 3:
+        cell.textLabel?.text = TwitcastingAuthManager.shared.isSignedIn ? "ツイキャスログアウト" : "ツイキャス OAuthログイン"
+      case 4:
+        cell.textLabel?.text = TwitcastingAuthManager.shared.config.clientId.isEmpty ? "ツイキャス Client ID 未設定" : "ツイキャス Client ID 設定済み"
+      default:
+        cell.textLabel?.text = "ツイキャス Redirect URI \(TwitcastingAuthManager.shared.config.redirectURI)"
+      }
+      cell.accessoryType = .disclosureIndicator
+      cell.selectionStyle = .default
     } else {
       cell.textLabel?.text = "配信を手動追加"
       cell.accessoryType = .disclosureIndicator
@@ -5409,7 +5864,7 @@ final class SettingsController: UITableViewController {
   }
 
   override func tableView(_ tableView: UITableView, canMoveRowAt indexPath: IndexPath) -> Bool {
-    false
+    indexPath.section == 1
   }
 
   override func tableView(_ tableView: UITableView, editingStyleForRowAt indexPath: IndexPath) -> UITableViewCell.EditingStyle {
@@ -5418,6 +5873,10 @@ final class SettingsController: UITableViewController {
 
   override func tableView(_ tableView: UITableView, shouldIndentWhileEditingRowAt indexPath: IndexPath) -> Bool {
     false
+  }
+
+  override func tableView(_ tableView: UITableView, targetIndexPathForMoveFromRowAt sourceIndexPath: IndexPath, toProposedIndexPath proposedDestinationIndexPath: IndexPath) -> IndexPath {
+    proposedDestinationIndexPath.section == 1 ? proposedDestinationIndexPath : sourceIndexPath
   }
 
   override func tableView(_ tableView: UITableView, moveRowAt sourceIndexPath: IndexPath, to destinationIndexPath: IndexPath) {
@@ -5436,6 +5895,8 @@ final class SettingsController: UITableViewController {
     } else if indexPath.section == 2 {
       handleKickOAuthRow(indexPath.row)
     } else if indexPath.section == 3 {
+      handleOtherOAuthRow(indexPath.row)
+    } else if indexPath.section == 4 {
       present(AddStreamController(), animated: true)
     }
   }
@@ -5642,6 +6103,107 @@ final class SettingsController: UITableViewController {
       KickAuthManager.shared.config = config
       self?.tableView.reloadSections(IndexSet(integer: 2), with: .automatic)
     })
+    present(alert, animated: true)
+  }
+
+  private func handleOtherOAuthRow(_ row: Int) {
+    switch row {
+    case 0:
+      if TwitchAuthManager.shared.isSignedIn {
+        TwitchAuthManager.shared.signOut()
+        tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+        return
+      }
+      TwitchAuthManager.shared.signIn(presentationAnchor: view.window) { [weak self] result in
+        DispatchQueue.main.async {
+          self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+          if case .failure(let error) = result { self?.presentError(error) }
+        }
+      }
+    case 1:
+      editTwitchClientID()
+    case 2:
+      let uri = TwitchAuthManager.shared.config.redirectURI
+      UIPasteboard.general.string = uri
+      presentCopiedRedirectAlert(service: "Twitch", uri: uri) { [weak self] in self?.editTwitchRedirectURI() }
+    case 3:
+      if TwitcastingAuthManager.shared.isSignedIn {
+        TwitcastingAuthManager.shared.signOut()
+        tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+        return
+      }
+      TwitcastingAuthManager.shared.signIn(presentationAnchor: view.window) { [weak self] result in
+        DispatchQueue.main.async {
+          self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+          if case .failure(let error) = result { self?.presentError(error) }
+        }
+      }
+    case 4:
+      editTwitcastingClientID()
+    case 5:
+      let uri = TwitcastingAuthManager.shared.config.redirectURI
+      UIPasteboard.general.string = uri
+      presentCopiedRedirectAlert(service: "ツイキャス", uri: uri) { [weak self] in self?.editTwitcastingRedirectURI() }
+    default:
+      break
+    }
+  }
+
+  private func editTwitchClientID() {
+    var config = TwitchAuthManager.shared.config
+    editText(title: "Twitch Client ID", message: "Twitch Developer Consoleで作成したアプリの Client ID を貼り付けてください。", text: config.clientId, keyboard: .default) { [weak self] value in
+      config.clientId = value
+      TwitchAuthManager.shared.config = config
+      self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+    }
+  }
+
+  private func editTwitchRedirectURI() {
+    var config = TwitchAuthManager.shared.config
+    editText(title: "Twitch Redirect URI", message: nil, text: config.redirectURI, keyboard: .URL) { [weak self] value in
+      config.redirectURI = value
+      TwitchAuthManager.shared.config = config
+      self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+    }
+  }
+
+  private func editTwitcastingClientID() {
+    var config = TwitcastingAuthManager.shared.config
+    editText(title: "ツイキャス Client ID", message: "ツイキャスのAPIアプリ設定で発行された Client ID を貼り付けてください。", text: config.clientId, keyboard: .default) { [weak self] value in
+      config.clientId = value
+      TwitcastingAuthManager.shared.config = config
+      self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+    }
+  }
+
+  private func editTwitcastingRedirectURI() {
+    var config = TwitcastingAuthManager.shared.config
+    editText(title: "ツイキャス Redirect URI", message: nil, text: config.redirectURI, keyboard: .URL) { [weak self] value in
+      config.redirectURI = value
+      TwitcastingAuthManager.shared.config = config
+      self?.tableView.reloadSections(IndexSet(integer: 3), with: .automatic)
+    }
+  }
+
+  private func editText(title: String, message: String?, text: String, keyboard: UIKeyboardType, onSave: @escaping (String) -> Void) {
+    let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+    alert.addTextField { field in
+      field.text = text
+      field.keyboardType = keyboard
+      field.autocapitalizationType = .none
+      field.autocorrectionType = .no
+    }
+    alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
+    alert.addAction(UIAlertAction(title: "保存", style: .default) { _ in
+      onSave(alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+    })
+    present(alert, animated: true)
+  }
+
+  private func presentCopiedRedirectAlert(service: String, uri: String, edit: @escaping () -> Void) {
+    let alert = UIAlertController(title: "Redirect URI をコピーしました", message: "\(uri)\n\n\(service)のOAuthアプリ設定のCallback/Redirect URIに、この値を登録してください。", preferredStyle: .alert)
+    alert.addAction(UIAlertAction(title: "編集", style: .default) { _ in edit() })
+    alert.addAction(UIAlertAction(title: "OK", style: .cancel))
     present(alert, animated: true)
   }
 
