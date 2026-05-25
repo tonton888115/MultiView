@@ -3601,7 +3601,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       .filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }
     let audioOn = settings.playAudio && playbackVolume > 0
     let volume = Int((settings.playAudio ? playbackVolume : 0) * 100)
-    web.loadHTMLString(Self.html(videoId: videoId, audioOn: audioOn, volume: volume), baseURL: URL(string: "https://www.youtube.com"))
+    // A real HTTPS base URL on our own domain gives the embed a valid origin/Referer
+    // (loadHTMLString with youtube.com or nil triggers YouTube error 152).
+    web.loadHTMLString(Self.html(videoId: videoId, audioOn: audioOn, volume: volume), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
   }
 
   private static func html(videoId: String, audioOn: Bool, volume: Int) -> String {
@@ -3616,7 +3618,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     <script>
       var player, READY=false, VID="\(videoId)", AUDIO=\(audioOn ? "true" : "false"), VOL=\(volume);
       function onYouTubeIframeAPIReady(){
-        player=new YT.Player('p',{videoId:VID,playerVars:{autoplay:1,mute:1,playsinline:1,controls:1,rel:0,modestbranding:1},
+        player=new YT.Player('p',{videoId:VID,host:'https://www.youtube.com',
+          playerVars:{autoplay:1,mute:1,playsinline:1,controls:1,rel:0,modestbranding:1,origin:'https://tonton888115.github.io'},
           events:{onReady:function(){READY=true;apply();},
           onStateChange:function(e){ if(e.data===YT.PlayerState.UNSTARTED||e.data===YT.PlayerState.CUED){ try{e.target.playVideo();}catch(x){} } }}});
       }
