@@ -108,10 +108,9 @@ jobs:
               });
             }
 
-            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+            const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
               owner,
               repo,
-              workflow_id: 'build-ios.yml',
               per_page: 100,
             });
             for (const run of runs) {
