@@ -35,18 +35,10 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     }
   }
 
-  func applicationWillResignActive(_ application: UIApplication) {
-    configureAudioSession()
-  }
-
-  func applicationDidEnterBackground(_ application: UIApplication) {
-    configureAudioSession()
-  }
-
-  func applicationWillEnterForeground(_ application: UIApplication) {
-    configureAudioSession()
-    resumePlaybackSoon()
-  }
+  // No audio-session work when leaving the foreground: re-activating while another
+  // app is taking over would fight it (and stop the other source). The session
+  // stays active for background audio until iOS interrupts us, and we only reclaim
+  // it when we come back (applicationDidBecomeActive) or the interruption ends.
 
   private func configureAudioSession() {
     let session = AVAudioSession.sharedInstance()
@@ -67,38 +59,34 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
   }
 
   @objc private func playbackSignalReceived(_ notification: Notification) {
-    configureAudioSession()
     if notification.name == AVAudioSession.interruptionNotification {
       guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
             let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
       switch type {
       case .began:
-        // Another app (e.g. a video) grabbed the audio session. Remember it so we
-        // can rebuild and resume once we are frontmost again.
+        // Another app grabbed the audio session. YIELD — do not reactivate the
+        // session here; that fight was killing the other app's audio. Our players
+        // pause automatically; we just remember to recover afterwards.
         needsPlaybackReload = true
       case .ended:
+        // The other source released the session. Only reclaim+rebuild if we are
+        // frontmost; otherwise applicationDidBecomeActive recovers on return so we
+        // never reclaim audio while still in the background.
         if UIApplication.shared.applicationState == .active {
-          // The takeover ended while we are still frontmost (e.g. PiP/inline video
-          // that finished). Honor iOS's resume hint: a full rebuild when it asks us
-          // to resume, otherwise just a light nudge so we don't flash a reload after
-          // an interruption iOS did not want us to resume from.
           needsPlaybackReload = false
-          let shouldResume = (notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
-            .map { AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) } ?? false
-          if shouldResume {
-            reloadAndResumeSoon()
-          } else {
-            resumePlaybackSoon()
-          }
+          configureAudioSession()
+          reloadAndResumeSoon()
         }
-        // If we are not active, applicationDidBecomeActive consumes the flag.
       @unknown default:
         break
       }
       return
     }
-    // Route change (headphones, etc.) — a light resume is enough.
-    resumePlaybackSoon()
+    // Route change (headphones, etc.) — only nudge while frontmost.
+    if UIApplication.shared.applicationState == .active {
+      configureAudioSession()
+      resumePlaybackSoon()
+    }
   }
 
   private func resumePlaybackSoon() {
@@ -373,14 +361,32 @@ final class NetworkQuality {
   private let monitor = NWPathMonitor()
   private let queue = DispatchQueue(label: "MultiView.NetworkQuality")
   private var currentPath: NWPath?
+  private var lastOnCellular: Bool?
+  private var lastChangeAt = Date.distantPast
 
   private init() {
     monitor.pathUpdateHandler = { [weak self] path in
       self?.queue.async {
         self?.currentPath = path
+        self?.detectConnectionChange(path)
       }
     }
     monitor.start(queue: queue)
+  }
+
+  // Tell the app when the connection flips WiFi<->cellular so it can re-pick the
+  // quality for already-playing streams (activeQuality is otherwise only read when
+  // a player is created). Debounced to real transitions.
+  private func detectConnectionChange(_ path: NWPath) {
+    guard path.status == .satisfied else { return }
+    let onCellular = path.usesInterfaceType(.cellular) || path.isExpensive
+    defer { lastOnCellular = onCellular }
+    guard let previous = lastOnCellular, previous != onCellular else { return }
+    guard Date().timeIntervalSince(lastChangeAt) > 4 else { return }
+    lastChangeAt = Date()
+    DispatchQueue.main.async {
+      NotificationCenter.default.post(name: .multiViewNetworkQualityChanged, object: nil)
+    }
   }
 
   func activeQuality(settings: AppSettings) -> PlaybackQuality {
@@ -468,6 +474,9 @@ extension Notification.Name {
   // Posted when audio was taken over by another app/video and control returned,
   // so the viewing tab rebuilds its players (auto-refresh) and resumes playback.
   static let multiViewReloadAndResume = Notification.Name("MultiViewReloadAndResume")
+  // Posted when the connection flips WiFi<->cellular so the viewing tab can rebuild
+  // players at the quality for the new network.
+  static let multiViewNetworkQualityChanged = Notification.Name("MultiViewNetworkQualityChanged")
 }
 
 enum RaidAutoFollow {
@@ -1398,6 +1407,13 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
     watchPageURL = url
     isLoading = true
+    syncNiconicoWebCookies { [weak self] in
+      self?.fetchWatchPage(url: url)
+    }
+  }
+
+  private func fetchWatchPage(url: URL) {
+    guard !isStopped else { return }
     var request = URLRequest(url: url)
     Self.mobileBrowserHeaders(referer: "https://live.nicovideo.jp/").forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
     pageTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
@@ -1613,12 +1629,28 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   }
 
   private static func mobileBrowserHeaders(referer: String) -> [String: String] {
-    [
+    var headers = [
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6",
       "User-Agent": NiconicoNativePlayerView.userAgent,
       "Referer": referer
     ]
+    // Send the user's niconico login cookies. Many programs now require login, and
+    // an anonymous startWatching returns a permission error.
+    if let url = URL(string: "https://live.nicovideo.jp/"),
+       let cookies = HTTPCookieStorage.shared.cookies(for: url), !cookies.isEmpty {
+      headers["Cookie"] = cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+    }
+    return headers
+  }
+
+  private func syncNiconicoWebCookies(_ completion: @escaping () -> Void) {
+    WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+      cookies
+        .filter { $0.domain.contains("nicovideo.jp") }
+        .forEach { HTTPCookieStorage.shared.setCookie($0) }
+      DispatchQueue.main.async(execute: completion)
+    }
   }
 
   private func parseStreamCookies(_ raw: Any?, for url: URL) -> [HTTPCookie] {
@@ -2391,27 +2423,23 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     }
     guard let payloadData,
           let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else { return }
-    // Kick signals an ending stream's raid/host with ChatMoveToSupportedChannelEvent,
-    // whose name contains neither "raid" nor "host" — so match it explicitly and
-    // pull the destination slug out of the payload.
-    if event.localizedCaseInsensitiveContains("ChatMove")
-      || event.localizedCaseInsensitiveContains("Host")
-      || event.localizedCaseInsensitiveContains("raid") {
-      if settings.autoFollowRaids {
-        if let target = Self.kickHostTarget(in: payload) {
-          RaidAutoFollow.follow(platform: .kick, channel: target, currentChannel: stream.channel)
-        } else if let target = RaidAutoFollow.detectTarget(in: payload, preferredPlatform: .kick) {
-          RaidAutoFollow.follow(platform: target.0, channel: target.1, currentChannel: stream.channel)
-        }
+    // Auto-follow a raid/host ONLY from Kick's explicit host events, matched by
+    // their exact class names (from the official app: StreamHostEvent /
+    // StreamHostedEvent / ChatMoveToSupportedChannelEvent). Chat text is never
+    // scanned for keywords — that caused false jumps on ordinary messages.
+    if event.contains("ChatMoveToSupportedChannel")
+      || event.contains("StreamHostEvent")
+      || event.contains("StreamHostedEvent") {
+      // `hosted`/destination is the channel being hosted: the raid target when our
+      // channel raids out, or our own channel on an incoming host (which
+      // RaidAutoFollow.follow ignores — so an incoming host never makes us jump).
+      if settings.autoFollowRaids, let target = Self.kickHostTarget(in: payload) {
+        RaidAutoFollow.follow(platform: .kick, channel: target, currentChannel: stream.channel)
       }
       return
     }
     guard event.contains("ChatMessage"),
           let content = (payload["content"] as? String) ?? (payload["message"] as? String) else { return }
-    if settings.autoFollowRaids,
-       let target = RaidAutoFollow.detectTarget(in: content, preferredPlatform: .kick) {
-      RaidAutoFollow.follow(platform: target.0, channel: target.1, currentChannel: stream.channel)
-    }
     if settings.showChat {
       let tokens = Self.kickDanmakuTokens(content)
       let filterText = Self.kickFilterText(content)
@@ -2468,26 +2496,21 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     return output
   }
 
-  // Destination channel of a Kick host/raid (ChatMoveToSupportedChannelEvent).
-  // Prefer the hosted/target object; the top-level `channel` is usually the source,
-  // but RaidAutoFollow.follow ignores it when it equals the current channel.
+  // The channel being hosted/raided-to, taken from the official Kick host-event
+  // payload shapes: StreamHostEvent has a `hosted` object; the chat-move event has
+  // a destination `channel` object. `host_username` (the source) is intentionally
+  // ignored. Never scans free text, so it cannot pick up a wrong channel name.
   private static func kickHostTarget(in payload: [String: Any]) -> String? {
-    let nestedKeys = ["hosted", "target_channel", "target", "channel_to", "to"]
-    for key in nestedKeys {
-      if let nested = payload[key] as? [String: Any] {
-        if let slug = (nested["slug"] as? String) ?? (nested["username"] as? String), !slug.isEmpty {
-          return slug
-        }
+    for key in ["hosted", "channel"] {
+      if let nested = payload[key] as? [String: Any],
+         let slug = (nested["slug"] as? String) ?? (nested["username"] as? String), !slug.isEmpty {
+        return slug
       }
       if let slug = payload[key] as? String, !slug.isEmpty {
         return slug
       }
     }
     if let slug = payload["slug"] as? String, !slug.isEmpty {
-      return slug
-    }
-    if let channel = payload["channel"] as? [String: Any],
-       let slug = (channel["slug"] as? String) ?? (channel["username"] as? String), !slug.isEmpty {
       return slug
     }
     return nil
@@ -2907,10 +2930,8 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       guard let privmsg = line.range(of: " PRIVMSG "),
             let bodyRange = line.range(of: " :", range: privmsg.lowerBound..<line.endIndex) else { continue }
       let message = String(line[bodyRange.upperBound...])
-      if settings.autoFollowRaids,
-         let target = RaidAutoFollow.detectTarget(in: message, preferredPlatform: .twitch) {
-        RaidAutoFollow.follow(platform: target.0, channel: target.1, currentChannel: stream.channel)
-      }
+      // Raids are detected only from USERNOTICE tags above (twitchRaidTarget) — never
+      // by scanning chat text, which would jump on ordinary messages mentioning a raid.
       if settings.showChat {
         emitDanmaku(Self.twitchDanmakuTokens(message, emotesTag: tags["emotes"]), filterText: message)
       }
@@ -3180,9 +3201,16 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       self.isLoading = false
       guard !self.isStopped else { return }
       self.statusLabel.isHidden = true
-      let asset = AVURLAsset(url: hlsURL, options: [
+      var options: [String: Any] = [
         "AVURLAssetHTTPHeaderFieldsKey": self.twitcastingPlaybackHeaders()
-      ])
+      ]
+      // Pass cookies as objects so AVPlayer applies them to every playlist/segment
+      // request (a manual Cookie header is not always propagated to sub-requests).
+      if let cookieURL = URL(string: "https://twitcasting.tv/"),
+         let cookies = HTTPCookieStorage.shared.cookies(for: cookieURL), !cookies.isEmpty {
+        options[AVURLAssetHTTPCookiesKey] = cookies
+      }
+      let asset = AVURLAsset(url: hlsURL, options: options)
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
@@ -3227,10 +3255,12 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       let channel = self.stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
       guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
             var components = URLComponents(string: "https://twitcasting.tv/\(encoded)/embeddedplayer/live") else { return }
-      let muted = !self.settings.playAudio || self.playbackVolume <= 0
+      // Always start the embed muted: WKWebView blocks autoplay-with-sound, so an
+      // unmuted embed would just stall (the symptom the user saw). Muted autoplay
+      // works; audio is meant to come from the native HLS path anyway.
       components.queryItems = [
         URLQueryItem(name: "auto_play", value: "true"),
-        URLQueryItem(name: "default_mute", value: muted ? "true" : "false")
+        URLQueryItem(name: "default_mute", value: "true")
       ]
       guard let playerURL = components.url else { return }
       let config = WKWebViewConfiguration()
@@ -3276,15 +3306,13 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   }
 
   private func twitcastingPlaybackHeaders() -> [String: String] {
-    var headers = [
+    // No Origin/Cookie header here: the CDN edge returns 401 (NSURL error -1013)
+    // when a cross-origin Origin is present, and cookies are supplied to the asset
+    // via AVURLAssetHTTPCookiesKey instead so they reach every sub-request.
+    [
       "User-Agent": Self.userAgent,
-      "Referer": "https://twitcasting.tv/\(stream.channel)",
-      "Origin": "https://twitcasting.tv"
+      "Referer": "https://twitcasting.tv/\(stream.channel)"
     ]
-    if let cookie = cookieHeader() {
-      headers["Cookie"] = cookie
-    }
-    return headers
   }
 
   private func cookieHeader() -> String? {
@@ -3542,6 +3570,7 @@ final class ViewingController: UIViewController {
     configureScroll()
     reload()
     NotificationCenter.default.addObserver(self, selector: #selector(reloadAndResume), name: .multiViewReloadAndResume, object: nil)
+    NotificationCenter.default.addObserver(self, selector: #selector(networkQualityChanged), name: .multiViewNetworkQualityChanged, object: nil)
   }
 
   deinit {
@@ -3553,6 +3582,14 @@ final class ViewingController: UIViewController {
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
       PlaybackCoordinator.shared.resumeAll()
     }
+  }
+
+  @objc private func networkQualityChanged() {
+    // Rebuild players at the new network's quality — but only when the two profiles
+    // actually differ, otherwise the switch would change nothing.
+    let settings = AppState.shared.settings
+    guard settings.wifiQuality != settings.mobileQuality else { return }
+    reloadAndResume()
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -4658,6 +4695,14 @@ final class SettingsController: UITableViewController {
     case 2: return "Kick OAuth"
     default: return "追加"
     }
+  }
+
+  override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
+    guard section == numberOfSections(in: tableView) - 1 else { return nil }
+    let info = Bundle.main.infoDictionary
+    let version = (info?["CFBundleShortVersionString"] as? String) ?? "?"
+    let build = (info?["CFBundleVersion"] as? String) ?? "?"
+    return "MultiView \(version) (build \(build))"
   }
 
   override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
