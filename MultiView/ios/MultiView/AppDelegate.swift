@@ -63,13 +63,6 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     let center = NotificationCenter.default
     center.addObserver(self, selector: #selector(playbackSignalReceived(_:)), name: AVAudioSession.interruptionNotification, object: nil)
     center.addObserver(self, selector: #selector(playbackSignalReceived(_:)), name: AVAudioSession.routeChangeNotification, object: nil)
-    // バックグラウンドへ移動時は全プレイヤーを明示的に停止 (AVPlayer 自体は
-    // audiovisualBackgroundPlaybackPolicy=.pauses で自動停止するが、念のため)。
-    center.addObserver(self, selector: #selector(applicationEnteredBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
-  }
-
-  @objc private func applicationEnteredBackground() {
-    PlaybackCoordinator.shared.pauseAll()
   }
 
   @objc private func playbackSignalReceived(_ notification: Notification) {
@@ -2239,18 +2232,24 @@ private final class NativeDanmakuRenderer {
     var x: CGFloat = horizontalPadding
     let imageSide = max(18, fontSize * 1.4)
 
+    // UILabel.layer.shadow* は off-screen render を発生させ、複数セル × 多コメントで
+     // GPU 負荷と発熱が増える。視認性に必要な「黒い縁取り」は NSAttributedString の
+     // NSShadowAttributeName で実現すれば、フォントレンダラ内部で完結し off-screen
+     // pass が起きない。
+    let textShadow = NSShadow()
+    textShadow.shadowColor = UIColor.black
+    textShadow.shadowBlurRadius = 2
+    textShadow.shadowOffset = CGSize(width: 1, height: 1)
     for token in tokens {
       switch token {
       case .text(let text):
         guard !text.isEmpty else { continue }
         let label = UILabel()
-        label.text = text
         label.font = .systemFont(ofSize: fontSize, weight: .bold)
-        label.textColor = UIColor.white.withAlphaComponent(CGFloat(opacity))
-        label.layer.shadowColor = UIColor.black.cgColor
-        label.layer.shadowRadius = 2
-        label.layer.shadowOpacity = 1
-        label.layer.shadowOffset = CGSize(width: 1, height: 1)
+        label.attributedText = NSAttributedString(string: text, attributes: [
+          .foregroundColor: UIColor.white.withAlphaComponent(CGFloat(opacity)),
+          .shadow: textShadow
+        ])
         label.sizeToFit()
         label.frame.origin = CGPoint(x: x, y: verticalInset)
         container.addSubview(label)
@@ -2259,10 +2258,14 @@ private final class NativeDanmakuRenderer {
         let imageView = UIImageView(frame: CGRect(x: x + 3, y: max(verticalInset, (lineHeight - imageSide) / 2), width: imageSide, height: imageSide))
         imageView.contentMode = .scaleAspectFit
         imageView.alpha = CGFloat(opacity)
+        // 画像はテキストと違い attributed shadow が使えないので CALayer shadow のまま。
+        // ただし shouldRasterize で 1 度だけビットマップ化し、以降は GPU 合成のみで済ます。
         imageView.layer.shadowColor = UIColor.black.cgColor
         imageView.layer.shadowRadius = 2
         imageView.layer.shadowOpacity = 1
         imageView.layer.shadowOffset = CGSize(width: 1, height: 1)
+        imageView.layer.shouldRasterize = true
+        imageView.layer.rasterizationScale = UIScreen.main.scale
         container.addSubview(imageView)
         loadImage(url, into: imageView)
         x += imageSide + 6
@@ -2447,7 +2450,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
 
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
-    player.audiovisualBackgroundPlaybackPolicy = .pauses
+    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
     layer.addSublayer(playerLayer)
 
     danmakuView.isUserInteractionEnabled = false
@@ -2886,12 +2889,32 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
   }
 
+  // 番組終了の disconnect payload は具体的な code を持つ。
+  // 旧実装は payload 全文を flatten して "end" を contains していたので、
+  // 例えば "endpoint" や "send" 等のごく普通の単語が含まれただけで誤発火していた。
+  // ニコ生公式 WebSocket の END_PROGRAM 系コード (END_PROGRAM / PROGRAM_END /
+  // BROADCAST_ENDED / FINISHED) と、disconnect の reason フィールドに明示的に
+  // ENDED 系の語が単体で出ているケースのみを終了とみなす。
   private static func isProgramEndedPayload(_ payload: [String: Any]) -> Bool {
-    let text = payload
-      .map { "\($0.key)=\($0.value)" }
-      .joined(separator: " ")
-      .lowercased()
-    return text.contains("end") || text.contains("finished") || text.contains("program_end") || text.contains("番組終了")
+    let codeFields = [payload["code"], payload["reason"], payload["type"]]
+      .compactMap { $0 as? String }
+      .map { $0.uppercased() }
+    let endedCodes: Set<String> = [
+      "END_PROGRAM",
+      "PROGRAM_END",
+      "PROGRAM_ENDED",
+      "ENDED",
+      "BROADCAST_ENDED",
+      "FINISHED",
+      "END_ENTERTAINMENT"
+    ]
+    if codeFields.contains(where: { endedCodes.contains($0) }) {
+      return true
+    }
+    // data.programEnded == true のような明示フラグも認める
+    if (payload["programEnded"] as? Bool) == true { return true }
+    if (payload["ended"] as? Bool) == true { return true }
+    return false
   }
 
   private func verifyProgramEndedFromPage(completion: @escaping (Bool) -> Void) {
@@ -2910,20 +2933,19 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }.resume()
   }
 
+  // 旧実装は HTML 全文に「次回の放送をリクエストしませんか」等を contains
+  // 検査していたが、これらはフッター・サイドバー・チャンネル詳細にも出現する
+  // ため、生きてる番組でも常時 true になり、誤って閉鎖していた。
+  // 番組情報 JSON (initial-state / embedded-data の data-props) の中の
+  // "status":"ENDED" / "state":"ENDED" / "endTime" 経過、の明示シグナルだけを採用。
   private static func isEndedWatchPage(_ html: String) -> Bool {
-    let normalized = html
-      .replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
-      .lowercased()
-    let phrases = [
-      "次回の放送をリクエストしませんか",
-      "番組が終了しました",
-      "この番組は終了しました",
-      "放送は終了しました",
-      "program-ended",
-      "program_ended",
-      "request-next-program"
-    ]
-    return phrases.contains { normalized.contains($0.lowercased()) }
+    let entityEnded = html.range(of: #"&quot;(status|state)&quot;\s*:\s*&quot;ENDED&quot;"#, options: .regularExpression)
+    if entityEnded != nil { return true }
+    let plainEnded = html.range(of: #""(status|state)"\s*:\s*"ENDED""#, options: .regularExpression)
+    if plainEnded != nil { return true }
+    if html.contains(#"data-program-status="ENDED""#) { return true }
+    if html.contains(#"&quot;programStatus&quot;:&quot;ENDED&quot;"#) { return true }
+    return false
   }
 
   private func startKeepSeatTimer(interval: TimeInterval) {
@@ -3606,7 +3628,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     backgroundColor = .black
 
     player.automaticallyWaitsToMinimizeStalling = false
-    player.audiovisualBackgroundPlaybackPolicy = .pauses
+    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     layer.addSublayer(playerLayer)
@@ -4268,7 +4290,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     backgroundColor = .black
 
     player.automaticallyWaitsToMinimizeStalling = false
-    player.audiovisualBackgroundPlaybackPolicy = .pauses
+    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     layer.addSublayer(playerLayer)
@@ -4762,7 +4784,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     backgroundColor = .black
 
     player.automaticallyWaitsToMinimizeStalling = false
-    player.audiovisualBackgroundPlaybackPolicy = .pauses
+    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     layer.addSublayer(playerLayer)
@@ -5176,7 +5198,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
-    player.audiovisualBackgroundPlaybackPolicy = .pauses
+    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
     player.automaticallyWaitsToMinimizeStalling = false
     layer.addSublayer(playerLayer)
 
