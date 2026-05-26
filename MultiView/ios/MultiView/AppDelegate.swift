@@ -4782,6 +4782,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var timeObserver: Any?
   private var sponsorSegments: [(start: Double, end: Double)] = []
   private var fallbackWebView: WKWebView?
+  private var triedPiped = false
+  private var triedInvidious = false
   private var isStopped = false
 
   init(stream: StreamItem, settings: AppSettings) {
@@ -4902,6 +4904,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     guard !isStopped else { return }
     showStatus("YouTube映像を取得中")
     pendingVideoId = videoId
+    triedPiped = false
+    triedInvidious = false
     let config = WKWebViewConfiguration()
     config.allowsInlineMediaPlayback = true
     // The extractor only reads the page; block autoplay so the hidden web view never
@@ -4929,7 +4933,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       return
     }
     web.load(URLRequest(url: url))
-    // If the page never yields a URL, fall back to the embed.
+    // If the page never yields a URL, try a stream API before giving up.
     DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
       guard let self, !self.isStopped, self.extractorWebView != nil, self.player.currentItem == nil else { return }
       self.installEmbedFallback(videoId: videoId)
@@ -5082,6 +5086,142 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     return nil
   }
 
+  private func requestPipedStreams(videoId: String, attempt: Int = 0) {
+    guard !isStopped, player.currentItem == nil else { return }
+    let instances = Self.pipedAPIInstances
+    guard instances.indices.contains(attempt) else {
+      requestInvidiousStreams(videoId: videoId)
+      return
+    }
+    guard let url = URL(string: "\(instances[attempt])/streams/\(videoId)") else {
+      requestPipedStreams(videoId: videoId, attempt: attempt + 1)
+      return
+    }
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 8
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    resolveTask?.cancel()
+    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+      guard let self else { return }
+      self.resolveTask = nil
+      if let data,
+         let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+         let stream = Self.extractPipedStream(from: parsed) {
+        DispatchQueue.main.async {
+          guard !self.isStopped, self.player.currentItem == nil else { return }
+          self.teardownExtractor()
+          self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive)
+        }
+        return
+      }
+      DispatchQueue.main.async {
+        self.requestPipedStreams(videoId: videoId, attempt: attempt + 1)
+      }
+    }
+    resolveTask?.resume()
+  }
+
+  private static func extractPipedStream(from parsed: [String: Any]) -> (url: URL, isLive: Bool)? {
+    if let hls = parsed["hls"] as? String, !hls.isEmpty, let url = URL(string: hls) {
+      return (url, true)
+    }
+    let streams = (parsed["videoStreams"] as? [[String: Any]]) ?? []
+    let candidates: [(Int, Int, URL)] = streams.compactMap { stream in
+      let videoOnly = (stream["videoOnly"] as? Bool) ?? true
+      guard !videoOnly,
+            let urlString = stream["url"] as? String,
+            let url = URL(string: urlString) else { return nil }
+      let height = (stream["height"] as? Int)
+        ?? Self.firstInt(in: (stream["quality"] as? String) ?? "")
+      let bitrate = (stream["bitrate"] as? Int) ?? 0
+      return (height, bitrate, url)
+    }
+    guard !candidates.isEmpty else { return nil }
+    let sorted = candidates.sorted {
+      if $0.0 == $1.0 { return $0.1 < $1.1 }
+      return $0.0 < $1.0
+    }
+    return ((sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.2).map { ($0, false) }
+  }
+
+  private static func firstInt(in text: String) -> Int {
+    guard let range = text.range(of: #"\d+"#, options: .regularExpression) else { return 0 }
+    return Int(String(text[range])) ?? 0
+  }
+
+  private func requestInvidiousStreams(videoId: String, attempt: Int = 0) {
+    guard !isStopped, player.currentItem == nil else { return }
+    triedInvidious = true
+    let instances = Self.invidiousAPIInstances
+    guard instances.indices.contains(attempt) else {
+      showStatus("YouTube映像URLを取得できません\n公式UIは表示せず停止しました")
+      teardownExtractor()
+      return
+    }
+    guard let url = URL(string: "\(instances[attempt])/api/v1/videos/\(videoId)") else {
+      requestInvidiousStreams(videoId: videoId, attempt: attempt + 1)
+      return
+    }
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 8
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    resolveTask?.cancel()
+    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+      guard let self else { return }
+      self.resolveTask = nil
+      if let data,
+         let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+         let stream = Self.extractInvidiousStream(from: parsed) {
+        DispatchQueue.main.async {
+          guard !self.isStopped, self.player.currentItem == nil else { return }
+          self.teardownExtractor()
+          self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive)
+        }
+        return
+      }
+      DispatchQueue.main.async {
+        self.requestInvidiousStreams(videoId: videoId, attempt: attempt + 1)
+      }
+    }
+    resolveTask?.resume()
+  }
+
+  private static func extractInvidiousStream(from parsed: [String: Any]) -> (url: URL, isLive: Bool)? {
+    let live = ((parsed["liveNow"] as? Bool) ?? false) || ((parsed["isUpcoming"] as? Bool) ?? false)
+    if let hls = parsed["hlsUrl"] as? String, !hls.isEmpty, let url = URL(string: hls) {
+      return (url, true)
+    }
+    let streams = (parsed["formatStreams"] as? [[String: Any]]) ?? []
+    let candidates: [(Int, URL)] = streams.compactMap { stream in
+      guard let urlString = stream["url"] as? String,
+            let url = URL(string: urlString) else { return nil }
+      let quality = (stream["qualityLabel"] as? String)
+        ?? (stream["quality"] as? String)
+        ?? ""
+      return (firstInt(in: quality), url)
+    }
+    guard !candidates.isEmpty else { return nil }
+    let sorted = candidates.sorted { $0.0 < $1.0 }
+    return ((sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.1).map { ($0, live) }
+  }
+
+  private static let pipedAPIInstances = [
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.yt",
+    "https://pipedapi.leptons.xyz",
+    "https://pipedapi-libre.kavin.rocks",
+    "https://piped-api.privacy.com.de",
+    "https://pipedapi.kavin.rocks"
+  ]
+
+  private static let invidiousAPIInstances = [
+    "https://yewtu.be",
+    "https://inv.nadeko.net",
+    "https://inv.tux.pizza",
+    "https://invidious.fdn.fr",
+    "https://invidious.nerdvpn.de"
+  ]
+
   private func teardownExtractor() {
     extractorWebView?.navigationDelegate = nil
     extractorWebView?.stopLoading()
@@ -5220,10 +5360,21 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
-  // Falls back to the official iframe embed when stream extraction fails so the video
-  // still plays (less clean, but better than a black cell).
+  // Last-resort extraction path. Do not show the official iframe here: that exposes
+  // YouTube chrome/ads and still fails autoplay on some devices.
   private func installEmbedFallback(videoId: String) {
-    guard !isStopped, fallbackWebView == nil else { return }
+    guard !isStopped else { return }
+    if !triedPiped {
+      triedPiped = true
+      showStatus("YouTube代替抽出を試行中")
+      requestPipedStreams(videoId: videoId)
+      return
+    }
+    if !triedInvidious {
+      showStatus("YouTube別系統の代替抽出を試行中")
+      requestInvidiousStreams(videoId: videoId)
+      return
+    }
     teardownExtractor()
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
@@ -5232,25 +5383,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     itemStatusObservation = nil
     player.pause()
     player.replaceCurrentItem(with: nil)
-    statusLabel.isHidden = true
-    let config = WKWebViewConfiguration()
-    config.allowsInlineMediaPlayback = true
-    config.mediaTypesRequiringUserActionForPlayback = []
-    config.websiteDataStore = .default()
-    WebAdBlocker.install(on: config)
-    let web = WKWebView(frame: bounds, configuration: config)
-    web.isOpaque = false
-    web.backgroundColor = .black
-    web.scrollView.backgroundColor = .black
-    web.scrollView.isScrollEnabled = false
-    web.scrollView.contentInsetAdjustmentBehavior = .never
-    web.customUserAgent = Self.userAgent
-    web.navigationDelegate = self
-    addSubview(web)
-    fallbackWebView = web
-    // A real HTTPS base URL on our own domain gives the embed a valid origin/Referer
-    // (loadHTMLString with youtube.com or nil triggers YouTube error 152).
-    web.loadHTMLString(Self.embedHTML(videoId: videoId), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
+    showStatus("YouTube映像URLを取得できません\n公式UIは表示せず停止しました")
   }
 
   // MARK: - SponsorBlock (VOD)
@@ -5878,7 +6011,7 @@ final class ViewingController: UIViewController {
     let spacer = UIView()
     spacer.translatesAutoresizingMaskIntoConstraints = false
 
-    let addButton = playbackButton(title: "追加", icon: "plus", color: UIColor(red: 0.20, green: 0.55, blue: 1.00, alpha: 1)) { [weak self] in
+    let addButton = iconButton(systemName: "plus") { [weak self] in
       self?.present(AddStreamController(), animated: true)
     }
     let playButton = playbackButton(title: "全て再生", icon: "play.fill", color: UIColor(red: 0.20, green: 0.80, blue: 0.45, alpha: 1)) {
@@ -5907,10 +6040,18 @@ final class ViewingController: UIViewController {
       row.trailingAnchor.constraint(equalTo: host.trailingAnchor),
       layoutControl.widthAnchor.constraint(equalToConstant: 96),
       layoutControl.heightAnchor.constraint(equalToConstant: 34),
+      addButton.widthAnchor.constraint(equalToConstant: 38),
       addButton.heightAnchor.constraint(equalToConstant: 36),
       playButton.heightAnchor.constraint(equalToConstant: 36),
       reloadButton.heightAnchor.constraint(equalToConstant: 36)
     ])
+  }
+
+  private func iconButton(systemName: String, action: @escaping () -> Void) -> UIButton {
+    let button = LiquidGlass.makeButton(title: nil, systemImage: systemName, tint: nil)
+    button.addAction(UIAction { _ in action() }, for: .touchUpInside)
+    button.accessibilityLabel = "追加"
+    return button
   }
 
   private func playbackButton(title: String, icon: String, color: UIColor?, action: @escaping () -> Void) -> UIButton {
@@ -7185,7 +7326,7 @@ final class SettingsController: UITableViewController {
     case .youtube:
       return "Google Cloud Console の iOS OAuth Client ID を設定し、youtube.force-ssl スコープでライブチャット投稿に使います(行をタップでRedirectURIをコピー)。"
     case .niconico:
-      return "ニコ生は公式の外部連携(OAuth)が無いため、Webでログインします。ログイン状態はアプリ内のCookieに保持され、視聴・コメント投稿・コメント受信に使われます。"
+      return "ニコ生はログイン必須です。公式の外部連携(OAuth)が無いため、Webでログインします。ログイン状態はアプリ内のCookieに保持され、視聴・コメント投稿・コメント受信に使われます。"
     case .webData:
       return "フォロー・ランキング・視聴タブで使うWebログインCookieと閲覧データを削除します。OAuthトークンとClient ID設定は残ります。"
     case .add:
