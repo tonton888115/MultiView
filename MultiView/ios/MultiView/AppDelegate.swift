@@ -4045,32 +4045,40 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       || normalized == "kick.subscription"
       || normalized == "subscription"
     guard isGift || isSubscription else { return nil }
-    let actor = stringValue(payload["username"])
-      ?? stringValue(payload["login"])
-      ?? stringValue(payload["name"])
-      ?? stringValue(payload["gifter_username"])
-      ?? stringValue(payload["gifter"])
-      ?? stringValue(payload["sender"])
-      ?? stringValue((payload["user"] as? [String: Any])?["username"])
-      ?? stringValue((payload["user"] as? [String: Any])?["login"])
-      ?? stringValue((payload["user"] as? [String: Any])?["name"])
-      ?? stringValue((payload["gifter"] as? [String: Any])?["username"])
-      ?? stringValue((payload["gifter"] as? [String: Any])?["login"])
-      ?? stringValue((payload["gifter"] as? [String: Any])?["name"])
-      ?? ((payload["isAnonymous"] as? Bool) == true ? "匿名" : nil)
+    let user = payload["user"] as? [String: Any]
+    let gifter = payload["gifter"] as? [String: Any]
+    let recipientObject = payload["recipient"] as? [String: Any]
+    let actor = firstString([
+      payload["username"],
+      payload["login"],
+      payload["name"],
+      payload["gifter_username"],
+      payload["gifter"],
+      payload["sender"],
+      user?["username"],
+      user?["login"],
+      user?["name"],
+      gifter?["username"],
+      gifter?["login"],
+      gifter?["name"]
+    ]) ?? ((payload["isAnonymous"] as? Bool) == true ? "匿名" : nil)
     guard let actor else { return nil }
-    let recipient = stringValue(payload["recipient_username"])
-      ?? stringValue(payload["recipient_login"])
-      ?? stringValue(payload["recipient_name"])
-      ?? stringValue((payload["recipient"] as? [String: Any])?["username"])
-      ?? stringValue((payload["recipient"] as? [String: Any])?["login"])
-      ?? stringValue((payload["recipient"] as? [String: Any])?["name"])
-      ?? stringValue((payload["user"] as? [String: Any])?["username"])
-      ?? stringValue((payload["user"] as? [String: Any])?["login"])
-      ?? stringValue((payload["user"] as? [String: Any])?["name"])
-    let count = stringValue(payload["gifted_quantity"])
-      ?? stringValue(payload["quantity"])
-      ?? stringValue(payload["count"])
+    let recipient = firstString([
+      payload["recipient_username"],
+      payload["recipient_login"],
+      payload["recipient_name"],
+      recipientObject?["username"],
+      recipientObject?["login"],
+      recipientObject?["name"],
+      user?["username"],
+      user?["login"],
+      user?["name"]
+    ])
+    let count = firstString([
+      payload["gifted_quantity"],
+      payload["quantity"],
+      payload["count"]
+    ])
     if isGift {
       if let count, count != "0" {
         return "Kick: \(actor) が \(count) 件のサブスクをギフト"
@@ -4175,6 +4183,16 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     if let string = value as? String { return string }
     if let int = value as? Int { return String(int) }
     if let number = value as? NSNumber { return number.stringValue }
+    return nil
+  }
+
+  private static func firstString(_ values: [Any?]) -> String? {
+    for value in values {
+      guard let value, let text = stringValue(value)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+        continue
+      }
+      return text
+    }
     return nil
   }
 
