@@ -6200,13 +6200,13 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     installAlternativeWebFallback(videoId: videoId)
   }
 
-  // 最終フォールバック: YouTube 公式 iframe API を埋め込んだ HTML を WKWebView に
-  // ロードする。embedHTML の方が直接 youtube.com/embed/ ロードより:
-  //   1) controls=0 modestbranding=1 で UI chrome を最小化
-  //   2) mvPlay/mvPause/mvSetVolume で AVPlayer 同等の制御
-  //   3) SponsorBlock スキッパ内蔵 (VOD)
-  //   4) WebAdBlocker のコンテンツルール適用
-  // attempt 引数は予備 (将来 piped.video 等への二段フォールバックに使う)。
+  // 最終フォールバック: 三段構成
+  //  (1) embedHTML を loadHTMLString → YouTube iframe API で再生
+  //  (2) onError code=101/150/152 (埋め込み禁止) → window.location を
+  //      m.youtube.com/watch?v=... に切替 (WKWebView は top-level なので
+  //      X-Frame-Options=SAMEORIGIN は無視される)
+  //  (3) watch ページ読み込み完了時に WKUserScript の CSS 注入で chrome
+  //      (topbar, pivot bar, comments, related 等) を非表示にし、player のみ残す
   private func installAlternativeWebFallback(videoId: String, attempt: Int = 0) {
     guard !isStopped, fallbackWebView == nil else { return }
     teardownExtractor()
@@ -6223,6 +6223,31 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
     WebAdBlocker.install(on: config)
+    // watch ページに遷移したときに chrome を消すための CSS を atDocumentStart
+    // で挿入。embedHTML 自体は selector が一致しないので影響なし。
+    let chromeCSS = """
+    body,html{background:#000!important;overflow:hidden!important;margin:0!important;padding:0!important}
+    ytm-mobile-topbar-renderer,header[role=banner],
+    ytm-pivot-bar-renderer,ytm-pivot-bar,
+    ytm-section-list-renderer,
+    ytm-watch-metadata-section-renderer,
+    ytm-comments-entry-point-header-renderer,ytm-comment-section-renderer,
+    ytm-engagement-panel-section-list-renderer,
+    ytm-feed-filter-chip-bar-renderer,
+    ytm-paid-content-overlay-renderer,
+    ytm-merch-shelf-renderer,
+    ytm-channel-bar-renderer,
+    ytm-cta-fab-renderer,
+    ytm-related-shelf-renderer,
+    ytm-related-watches-renderer,
+    ytm-companion-ad-renderer,
+    ytm-ads-engagement-panel-content-renderer,
+    .pivot-bar-renderer-container{display:none!important}
+    ytm-app,ytm-watch-flexy{background:#000!important}
+    """
+    let chromeJS = "(function(){var s=document.createElement('style');s.textContent=`\(chromeCSS)`;(document.head||document.documentElement).appendChild(s);})();"
+    let chromeScript = WKUserScript(source: chromeJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+    config.userContentController.addUserScript(chromeScript)
     let web = WKWebView(frame: bounds, configuration: config)
     web.isOpaque = false
     web.backgroundColor = .black
@@ -6396,9 +6421,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           case 2: return '動画ID不正';
           case 5: return 'HTML5プレイヤー初期化失敗';
           case 100: return '動画が見つかりません/非公開';
-          case 101:
-          case 150:
-          case 152: return '配信者が埋め込み再生を禁止しています';
           case 153: return 'HTML5再生制限';
           case 157: return 'ネットワーク経路エラー';
           default: return 'YouTube iframe エラー: '+code;
@@ -6410,6 +6432,13 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         el.style.display='flex';
         document.getElementById('player').style.display='none';
       }
+      function recoverViaWatchPage(){
+        // iframe 経由の埋め込みが拒否された動画も、通常の watch ページなら
+        // 再生される (X-Frame-Options=SAMEORIGIN だが WKWebView は top-level
+        // ナビゲーションなのでフレーム制約の対象外)。
+        // chrome の非表示は Swift 側の WKUserScript で CSS 注入する。
+        window.location.href = 'https://m.youtube.com/watch?v=\(videoId)';
+      }
       window.onYouTubeIframeAPIReady=function(){
         player=new YT.Player('player',{
           width:'100%',height:'100%',videoId:'\(videoId)',
@@ -6417,7 +6446,15 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           playerVars:{autoplay:1,playsinline:1,controls:0,rel:0,modestbranding:1,fs:0,disablekb:1,iv_load_policy:3,origin:'https://tonton888115.github.io'},
           events:{
             onReady:function(){ready=true;play();loadSB();},
-            onError:function(e){showError(e.data);}
+            onError:function(e){
+              var code=e.data;
+              // 101/150/152 は埋め込み禁止系。watch ページに切り替えると再生通る。
+              if (code===101 || code===150 || code===152) {
+                recoverViaWatchPage();
+              } else {
+                showError(code);
+              }
+            }
           }
         });
       };
