@@ -3953,13 +3953,12 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     }
     guard let payloadData,
           let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else { return }
-    // Auto-follow a raid/host ONLY from Kick's explicit host events, matched by
-    // their exact class names (from the official app: StreamHostEvent /
-    // StreamHostedEvent / ChatMoveToSupportedChannelEvent). Chat text is never
-    // scanned for keywords — that caused false jumps on ordinary messages.
-    if event.contains("ChatMoveToSupportedChannel")
-      || event.contains("StreamHostEvent")
-      || event.contains("StreamHostedEvent") {
+    // Auto-follow a raid/host ONLY from Kick's explicit host/raid events. Chat text
+    // は走査しない (誤検知の元)。Kick はイベント名を時々変えるので、Raid/Host を
+    // 含む event class を網羅的に拾うようにしている。
+    let normalizedEvent = event.lowercased()
+    let raidEventKeywords = ["chatmovetosupportedchannel", "streamhost", "streamhosted", "streamraid", "raidevent", "hostevent", "chatroomraid"]
+    if raidEventKeywords.contains(where: { normalizedEvent.contains($0) }) {
       // `hosted`/destination is the channel being hosted: the raid target when our
       // channel raids out, or our own channel on an incoming host (which
       // RaidAutoFollow.follow ignores — so an incoming host never makes us jump).
@@ -4113,17 +4112,25 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   // a destination `channel` object. `host_username` (the source) is intentionally
   // ignored. Never scans free text, so it cannot pick up a wrong channel name.
   private static func kickHostTarget(in payload: [String: Any]) -> String? {
-    for key in ["hosted", "channel"] {
-      if let nested = payload[key] as? [String: Any],
-         let slug = (nested["slug"] as? String) ?? (nested["username"] as? String), !slug.isEmpty {
-        return slug
+    // 公式 Kick ペイロードでホスト/レイド先が入る箇所のキー名は版で揺れる:
+    // StreamHostEvent.hosted, ChatMoveToSupportedChannelEvent.channel, RaidEvent.target_channel など。
+    let nestedKeys = ["hosted", "channel", "target_channel", "raid_target", "target", "destination", "to_channel", "host"]
+    for key in nestedKeys {
+      if let nested = payload[key] as? [String: Any] {
+        for slugKey in ["slug", "username", "name"] {
+          if let slug = nested[slugKey] as? String, !slug.isEmpty {
+            return slug
+          }
+        }
       }
       if let slug = payload[key] as? String, !slug.isEmpty {
         return slug
       }
     }
-    if let slug = payload["slug"] as? String, !slug.isEmpty {
-      return slug
+    for directKey in ["slug", "target_slug", "host_slug"] {
+      if let slug = payload[directKey] as? String, !slug.isEmpty {
+        return slug
+      }
     }
     return nil
   }
@@ -5910,9 +5917,12 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }.resume()
   }
 
+  // 2026 年現在 YouTube が生 URL を返さない (SABR / PoToken 強制) ため、
+  // 抽出が全滅した時は最終的に iframe 埋め込みで再生する。WebAdBlocker と
+  // 仕様強制ミュートで広告/同時オーディオ問題を緩和する。
   private static let alternativeWebFallbacks = [
-    "https://piped.video/embed/%@",
-    "https://yewtu.be/embed/%@"
+    "https://www.youtube.com/embed/%@?autoplay=1&playsinline=1&modestbranding=1&rel=0",
+    "https://piped.video/embed/%@"
   ]
 
   private func teardownExtractor() {
@@ -6151,19 +6161,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       requestPipedStreams(videoId: videoId)
       return
     }
-    teardownExtractor()
-    if let timeObserver {
-      player.removeTimeObserver(timeObserver)
-      self.timeObserver = nil
-    }
-    itemStatusObservation = nil
-    player.pause()
-    player.replaceCurrentItem(with: nil)
-    let summary = extractionFailureSummary()
-    showStatus(summary.isEmpty
-      ? "YouTube映像URLを取得できません\n公式UIは表示せず停止しました"
-      : "YouTube抽出失敗\n\(summary)"
-    )
+    // 全ての抽出経路が尽きたら iframe で必ず映像を出す (2026 仕様で生 URL 抽出不能)。
+    noteExtractionFailure("抽出全失敗: iframeへ切替")
+    installAlternativeWebFallback(videoId: videoId)
   }
 
   private func installAlternativeWebFallback(videoId: String, attempt: Int = 0) {
