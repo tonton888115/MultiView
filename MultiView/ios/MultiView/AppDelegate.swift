@@ -4030,21 +4030,48 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
 
   private static func kickSupportAlert(event: String, payload: [String: Any]) -> String? {
     let lower = event.lowercased()
-    guard lower.contains("subscription") || lower.contains("gift") else { return nil }
+    guard !lower.contains("chatmessage") else { return nil }
+    if (payload["isTest"] as? Bool) == true { return nil }
+    let eventName = event.split(separator: "\\").last.map(String.init) ?? event
+    let normalized = eventName.lowercased()
+    let isGift = normalized == "kick.giftsubscription"
+      || normalized == "giftsubscription"
+      || normalized == "giftsubscriptionevent"
+      || normalized == "giftedsubscriptionevent"
+      || normalized == "giftedsubscriptionsevent"
+      || normalized == "luckyuserswhogotgiftsubscriptionsevent"
+    let isSubscription = normalized == "channelsubscriptionevent"
+      || normalized == "subscriptionevent"
+      || normalized == "kick.subscription"
+      || normalized == "subscription"
+    guard isGift || isSubscription else { return nil }
     let actor = stringValue(payload["username"])
+      ?? stringValue(payload["login"])
+      ?? stringValue(payload["name"])
       ?? stringValue(payload["gifter_username"])
       ?? stringValue(payload["gifter"])
       ?? stringValue(payload["sender"])
       ?? stringValue((payload["user"] as? [String: Any])?["username"])
+      ?? stringValue((payload["user"] as? [String: Any])?["login"])
+      ?? stringValue((payload["user"] as? [String: Any])?["name"])
       ?? stringValue((payload["gifter"] as? [String: Any])?["username"])
-      ?? "誰か"
+      ?? stringValue((payload["gifter"] as? [String: Any])?["login"])
+      ?? stringValue((payload["gifter"] as? [String: Any])?["name"])
+      ?? ((payload["isAnonymous"] as? Bool) == true ? "匿名" : nil)
+    guard let actor else { return nil }
     let recipient = stringValue(payload["recipient_username"])
+      ?? stringValue(payload["recipient_login"])
+      ?? stringValue(payload["recipient_name"])
       ?? stringValue((payload["recipient"] as? [String: Any])?["username"])
+      ?? stringValue((payload["recipient"] as? [String: Any])?["login"])
+      ?? stringValue((payload["recipient"] as? [String: Any])?["name"])
       ?? stringValue((payload["user"] as? [String: Any])?["username"])
+      ?? stringValue((payload["user"] as? [String: Any])?["login"])
+      ?? stringValue((payload["user"] as? [String: Any])?["name"])
     let count = stringValue(payload["gifted_quantity"])
       ?? stringValue(payload["quantity"])
       ?? stringValue(payload["count"])
-    if lower.contains("gift") {
+    if isGift {
       if let count, count != "0" {
         return "Kick: \(actor) が \(count) 件のサブスクをギフト"
       }
@@ -5419,7 +5446,27 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         )
       }
     }
+    let task = resolveTask
     resolveTask?.resume()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self, weak task] in
+      guard let self,
+            !self.isStopped,
+            self.player.currentItem == nil,
+            let task,
+            self.resolveTask === task else { return }
+      task.cancel()
+      self.resolveTask = nil
+      self.noteExtractionFailure("\(clientName): 10秒タイムアウト")
+      self.requestYouTubeIClients(
+        videoId: videoId,
+        apiKey: apiKey,
+        baseContext: baseContext,
+        visitorData: visitorData,
+        poToken: poToken,
+        signatureTimestamp: signatureTimestamp,
+        attempt: attempt + 1
+      )
+    }
   }
 
   private static func youtubeIClientContexts(baseContext: [String: Any]?, visitorData explicitVisitorData: String?, preferWeb: Bool) -> [[String: Any]] {
@@ -5585,7 +5632,19 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         self.requestPipedStreams(videoId: videoId, attempt: attempt + 1)
       }
     }
+    let task = resolveTask
     resolveTask?.resume()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self, weak task] in
+      guard let self,
+            !self.isStopped,
+            self.player.currentItem == nil,
+            let task,
+            self.resolveTask === task else { return }
+      task.cancel()
+      self.resolveTask = nil
+      self.noteExtractionFailure("Piped \(url.host ?? ""): 6秒タイムアウト")
+      self.requestPipedStreams(videoId: videoId, attempt: attempt + 1)
+    }
   }
 
   private static func extractPipedStream(from parsed: [String: Any]) -> (url: URL, isLive: Bool)? {
@@ -5663,7 +5722,19 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         self.requestInvidiousStreams(videoId: videoId, attempt: attempt + 1)
       }
     }
+    let task = resolveTask
     resolveTask?.resume()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self, weak task] in
+      guard let self,
+            !self.isStopped,
+            self.player.currentItem == nil,
+            let task,
+            self.resolveTask === task else { return }
+      task.cancel()
+      self.resolveTask = nil
+      self.noteExtractionFailure("Invidious \(url.host ?? ""): 6秒タイムアウト")
+      self.requestInvidiousStreams(videoId: videoId, attempt: attempt + 1)
+    }
   }
 
   private static func extractInvidiousStream(from parsed: [String: Any]) -> (url: URL, isLive: Bool)? {
@@ -5942,12 +6013,12 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     guard !isStopped else { return }
     if !triedPiped {
       triedPiped = true
-      showStatus("YouTube代替抽出を試行中")
+      noteExtractionFailure("通常抽出失敗: Pipedへ切替")
       requestPipedStreams(videoId: videoId)
       return
     }
     if !triedInvidious {
-      showStatus("YouTube別系統の代替抽出を試行中")
+      noteExtractionFailure("Piped失敗: Invidiousへ切替")
       requestInvidiousStreams(videoId: videoId)
       return
     }
