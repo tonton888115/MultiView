@@ -6223,92 +6223,67 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
     WebAdBlocker.install(on: config)
-    // watch ページに遷移したときの整形ロジック。embedHTML には影響しない (該当
-    // セレクタが存在しないため CSS は no-op、JS の setInterval は video 要素が
-    // 出るまで何もしない)。
-    // 戦略:
-    //   1. CSS: player-container-id (YouTube 公式 mobile site の安定 ID。
-    //      PC 検証で確認) を起点に画面全部を占有させ、それ以外を全部隠す。
-    //   2. JS: autoplay 強制 (muted で start → 800ms 後に unmute トライ)。
-    //      mvPlay/mvPause/mvSetVolume を再定義して MultiView 側の volume
-    //      コントロールが watch ページでも効くようにする。
-    //   3. JS: 設定済みスタイルを setInterval で再適用 (YouTube の SPA が
-    //      レイアウト書き換えても元に戻す)。
+    // watch ページに遷移したときの最小整形。重要な制約:
+    //  - YouTube SPA は親要素を display:none にされると player 初期化が壊れる。
+    //    だから「video を含まない要素を全部 hide」のような強い rule は使わない。
+    //  - position:fixed で player container を強制配置するのも、ロード初期の
+    //    layout 計算を壊して thumbnail すら出さなくする。
+    //  - iOS WKWebView は muted autoplay のみ許可。unmute は user gesture
+    //    (cell タップ等) が必要。これは仕様で workaround できない。
+    //
+    // 戦略: 最小限の CSS で topbar/pivot bar だけ消し、レイアウトは YouTube に
+    // 任せる。autoplay は video.play() を muted で繰り返し試行。touchstart で
+    // unmute 試行。MultiView 側 volume slider 用に mvSetVolume を bridge。
     let chromeCSS = """
-    html,body{background:#000!important;margin:0!important;padding:0!important;overflow:hidden!important;height:100vh!important;width:100vw!important}
-    /* video を含まないツリーを全部消す (iOS16.4+ :has サポート) */
-    body > *:not(:has(video)){display:none!important}
-    ytm-app > *:not(:has(video)){display:none!important}
-    ytm-watch > *:not(:has(video)){display:none!important}
-    ytm-watch-flexy > *:not(:has(video)){display:none!important}
-    /* 既知の chrome 要素を明示的に消す */
-    [class*=topbar],[class*=pivot-bar],[class*=metadata-section],
-    [class*=comment-section],[class*=engagement-panel],[class*=related-shelf],
-    [class*=merch-shelf],[class*=channel-bar],[class*=cta-fab],
-    [class*=watch-title],[class*=video-info],[class*=offer-shelf],
-    ytm-mobile-topbar-renderer,ytm-pivot-bar-renderer,
-    header,[role=banner],[role=navigation]{display:none!important}
-    /* player-container-id を viewport いっぱいに */
-    #player-container-id,#player,#movie_player,
-    .html5-video-player,ytm-mobile-watch-player{
-      position:fixed!important;top:0!important;left:0!important;
-      width:100vw!important;height:100vh!important;z-index:99999!important;
-      background:#000!important;margin:0!important;padding:0!important
-    }
-    #player-container-id video,#player video,#movie_player video,video{
-      width:100%!important;height:100%!important;object-fit:contain!important;background:#000!important
-    }
-    ytm-app,ytm-watch,ytm-watch-flexy{background:#000!important}
+    body{background:#000!important}
+    ytm-mobile-topbar-renderer,
+    ytm-pivot-bar-renderer,
+    header[role=banner],
+    [class*=merch-shelf],
+    [class*=paid-content-overlay]{display:none!important}
     """
     let bridgeJS = """
     (function(){
-      // embedHTML には適用しない。m.youtube.com/watch 等の watch ページのみ。
       if (location.pathname.indexOf('/watch') !== 0) return;
-      // CSS 挿入
       var s=document.createElement('style');
       s.textContent=`\(chromeCSS)`;
       (document.head||document.documentElement).appendChild(s);
 
-      var unmuteTriedAt=0;
-      function tryPlay(){
-        var v=document.querySelector('video'); if(!v) return;
-        if(v.paused){
-          v.muted=true;
-          var p=v.play();
-          if(p&&p.then){p.then(function(){
-            if(Date.now()-unmuteTriedAt>2000){
-              unmuteTriedAt=Date.now();
-              setTimeout(function(){try{v.muted=false;}catch(e){}},800);
-            }
-          }).catch(function(){});}
-        }
+      var userActivated = false;
+      function findVideo(){ return document.querySelector('video'); }
+      function tryPlayMuted(){
+        var v=findVideo(); if(!v||!v.paused) return;
+        try{v.muted=true;}catch(e){}
+        var p=v.play(); if(p&&p.catch) p.catch(function(){});
       }
-      function forceLayout(){
-        // SPA がスタイル書き換えるので定期的に再適用
-        var ids=['movie_player','player-container-id','player'];
-        for(var i=0;i<ids.length;i++){
-          var el=document.getElementById(ids[i]);
-          if(el){
-            el.style.setProperty('position','fixed','important');
-            el.style.setProperty('top','0','important');
-            el.style.setProperty('left','0','important');
-            el.style.setProperty('width','100vw','important');
-            el.style.setProperty('height','100vh','important');
-            el.style.setProperty('z-index','99999','important');
-            el.style.setProperty('background','#000','important');
-          }
-        }
+      function activate(){
+        userActivated = true;
+        var v=findVideo(); if(!v) return;
+        try{v.muted=false;}catch(e){}
+        if(v.paused){ var p=v.play(); if(p&&p.catch) p.catch(function(){}); }
       }
-      // ピリオディック実行 (setInterval)
-      setInterval(function(){tryPlay();forceLayout();},800);
-      // MultiView の volume コントロール再定義 (watch page でも cell の音量
-      // スライダーが効くように)
-      window.mvPlay=function(){tryPlay();};
-      window.mvPause=function(){var v=document.querySelector('video');if(v)try{v.pause();}catch(e){}};
+      // muted autoplay を 500ms 間隔で試行 (video 要素が出るまで継続)
+      var tries=0;
+      var pollIv=setInterval(function(){
+        tries++;
+        var v=findVideo();
+        if(v && !v.paused){ /* already playing */ }
+        else tryPlayMuted();
+        if(tries>60) clearInterval(pollIv); // 30 秒で諦め
+      },500);
+      // cell タップで unmute (iOS の user gesture 要件を満たす)
+      document.addEventListener('touchstart', activate, { capture:true });
+      document.addEventListener('click', activate, { capture:true });
+      // MultiView の volume slider bridge
+      window.mvPlay=function(){
+        var v=findVideo(); if(!v) return;
+        if(v.paused){ var p=v.play(); if(p&&p.catch) p.catch(function(){}); }
+      };
+      window.mvPause=function(){ var v=findVideo(); if(v) try{v.pause();}catch(e){} };
       window.mvSetVolume=function(val){
-        var v=document.querySelector('video'); if(!v) return;
+        var v=findVideo(); if(!v) return;
         var n=Math.max(0,Math.min(1,+val||0));
-        try{v.volume=n;v.muted=n<=0;}catch(e){}
+        try{ v.volume=n; if(userActivated) v.muted=(n<=0); }catch(e){}
       };
     })();
     """
