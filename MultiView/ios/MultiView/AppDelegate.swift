@@ -6223,30 +6223,96 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
     WebAdBlocker.install(on: config)
-    // watch ページに遷移したときに chrome を消すための CSS を atDocumentStart
-    // で挿入。embedHTML 自体は selector が一致しないので影響なし。
+    // watch ページに遷移したときの整形ロジック。embedHTML には影響しない (該当
+    // セレクタが存在しないため CSS は no-op、JS の setInterval は video 要素が
+    // 出るまで何もしない)。
+    // 戦略:
+    //   1. CSS: player-container-id (YouTube 公式 mobile site の安定 ID。
+    //      PC 検証で確認) を起点に画面全部を占有させ、それ以外を全部隠す。
+    //   2. JS: autoplay 強制 (muted で start → 800ms 後に unmute トライ)。
+    //      mvPlay/mvPause/mvSetVolume を再定義して MultiView 側の volume
+    //      コントロールが watch ページでも効くようにする。
+    //   3. JS: 設定済みスタイルを setInterval で再適用 (YouTube の SPA が
+    //      レイアウト書き換えても元に戻す)。
     let chromeCSS = """
-    body,html{background:#000!important;overflow:hidden!important;margin:0!important;padding:0!important}
-    ytm-mobile-topbar-renderer,header[role=banner],
-    ytm-pivot-bar-renderer,ytm-pivot-bar,
-    ytm-section-list-renderer,
-    ytm-watch-metadata-section-renderer,
-    ytm-comments-entry-point-header-renderer,ytm-comment-section-renderer,
-    ytm-engagement-panel-section-list-renderer,
-    ytm-feed-filter-chip-bar-renderer,
-    ytm-paid-content-overlay-renderer,
-    ytm-merch-shelf-renderer,
-    ytm-channel-bar-renderer,
-    ytm-cta-fab-renderer,
-    ytm-related-shelf-renderer,
-    ytm-related-watches-renderer,
-    ytm-companion-ad-renderer,
-    ytm-ads-engagement-panel-content-renderer,
-    .pivot-bar-renderer-container{display:none!important}
-    ytm-app,ytm-watch-flexy{background:#000!important}
+    html,body{background:#000!important;margin:0!important;padding:0!important;overflow:hidden!important;height:100vh!important;width:100vw!important}
+    /* video を含まないツリーを全部消す (iOS16.4+ :has サポート) */
+    body > *:not(:has(video)){display:none!important}
+    ytm-app > *:not(:has(video)){display:none!important}
+    ytm-watch > *:not(:has(video)){display:none!important}
+    ytm-watch-flexy > *:not(:has(video)){display:none!important}
+    /* 既知の chrome 要素を明示的に消す */
+    [class*=topbar],[class*=pivot-bar],[class*=metadata-section],
+    [class*=comment-section],[class*=engagement-panel],[class*=related-shelf],
+    [class*=merch-shelf],[class*=channel-bar],[class*=cta-fab],
+    [class*=watch-title],[class*=video-info],[class*=offer-shelf],
+    ytm-mobile-topbar-renderer,ytm-pivot-bar-renderer,
+    header,[role=banner],[role=navigation]{display:none!important}
+    /* player-container-id を viewport いっぱいに */
+    #player-container-id,#player,#movie_player,
+    .html5-video-player,ytm-mobile-watch-player{
+      position:fixed!important;top:0!important;left:0!important;
+      width:100vw!important;height:100vh!important;z-index:99999!important;
+      background:#000!important;margin:0!important;padding:0!important
+    }
+    #player-container-id video,#player video,#movie_player video,video{
+      width:100%!important;height:100%!important;object-fit:contain!important;background:#000!important
+    }
+    ytm-app,ytm-watch,ytm-watch-flexy{background:#000!important}
     """
-    let chromeJS = "(function(){var s=document.createElement('style');s.textContent=`\(chromeCSS)`;(document.head||document.documentElement).appendChild(s);})();"
-    let chromeScript = WKUserScript(source: chromeJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+    let bridgeJS = """
+    (function(){
+      // embedHTML には適用しない。m.youtube.com/watch 等の watch ページのみ。
+      if (location.pathname.indexOf('/watch') !== 0) return;
+      // CSS 挿入
+      var s=document.createElement('style');
+      s.textContent=`\(chromeCSS)`;
+      (document.head||document.documentElement).appendChild(s);
+
+      var unmuteTriedAt=0;
+      function tryPlay(){
+        var v=document.querySelector('video'); if(!v) return;
+        if(v.paused){
+          v.muted=true;
+          var p=v.play();
+          if(p&&p.then){p.then(function(){
+            if(Date.now()-unmuteTriedAt>2000){
+              unmuteTriedAt=Date.now();
+              setTimeout(function(){try{v.muted=false;}catch(e){}},800);
+            }
+          }).catch(function(){});}
+        }
+      }
+      function forceLayout(){
+        // SPA がスタイル書き換えるので定期的に再適用
+        var ids=['movie_player','player-container-id','player'];
+        for(var i=0;i<ids.length;i++){
+          var el=document.getElementById(ids[i]);
+          if(el){
+            el.style.setProperty('position','fixed','important');
+            el.style.setProperty('top','0','important');
+            el.style.setProperty('left','0','important');
+            el.style.setProperty('width','100vw','important');
+            el.style.setProperty('height','100vh','important');
+            el.style.setProperty('z-index','99999','important');
+            el.style.setProperty('background','#000','important');
+          }
+        }
+      }
+      // ピリオディック実行 (setInterval)
+      setInterval(function(){tryPlay();forceLayout();},800);
+      // MultiView の volume コントロール再定義 (watch page でも cell の音量
+      // スライダーが効くように)
+      window.mvPlay=function(){tryPlay();};
+      window.mvPause=function(){var v=document.querySelector('video');if(v)try{v.pause();}catch(e){}};
+      window.mvSetVolume=function(val){
+        var v=document.querySelector('video'); if(!v) return;
+        var n=Math.max(0,Math.min(1,+val||0));
+        try{v.volume=n;v.muted=n<=0;}catch(e){}
+      };
+    })();
+    """
+    let chromeScript = WKUserScript(source: bridgeJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
     config.userContentController.addUserScript(chromeScript)
     let web = WKWebView(frame: bounds, configuration: config)
     web.isOpaque = false
