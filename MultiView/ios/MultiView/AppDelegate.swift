@@ -6349,17 +6349,19 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   // Fallback embed: 抽出失敗時の最終再生経路。YouTube 公式 iframe API を埋め込み、
   // controls=0 / modestbranding=1 で chrome を抑え、SponsorBlock スキップを内蔵、
   // mvSetVolume で cell ごとの音量制御 (0〜1 を 0〜100 に変換) を可能にしている。
-  // 旧実装は force-mute だったが、複数 cell でも各 cell の音量スライダー (player.volume)
-  // で制御できるので、デフォルト最大音量で起動して setPlaybackVolume が後追い設定する。
+  // 2026: youtube.com 経由は埋め込み制限 (onError code=101/150/152 系) で再生不可な
+  // 動画が多いため、host を youtube-nocookie.com に切替。同じ動画でも nocookie
+  // 経由なら通るケースが多い。onError を Swift に通知して状態表示する。
   private static func embedHTML(videoId: String) -> String {
     let sbCategories = "%5B%22sponsor%22%2C%22selfpromo%22%2C%22interaction%22%2C%22intro%22%2C%22outro%22%2C%22preview%22%2C%22music_offtopic%22%5D"
     return """
     <!doctype html>
     <html>
     <head><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-    <style>html,body,#player{margin:0;width:100%;height:100%;background:#000;overflow:hidden}iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}</style></head>
+    <style>html,body,#player{margin:0;width:100%;height:100%;background:#000;overflow:hidden}iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}#err{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#fff;font-family:-apple-system;text-align:center;padding:18px;font-size:13px;line-height:1.5}#err a{color:#9ecbff}</style></head>
     <body>
     <div id="player"></div>
+    <div id="err"></div>
     <script src="https://www.youtube.com/iframe_api"></script>
     <script>
       var player=null, ready=false, pendingVolume=100, sb=[];
@@ -6389,11 +6391,34 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           for(var i=0;i<sb.length;i++){if(t>=sb[i].s&&t<sb[i].e-0.15){player.seekTo(sb[i].e+0.1,true);break;}}
         }catch(e){}
       }
+      function describeError(code){
+        switch(code){
+          case 2: return '動画ID不正';
+          case 5: return 'HTML5プレイヤー初期化失敗';
+          case 100: return '動画が見つかりません/非公開';
+          case 101:
+          case 150:
+          case 152: return '配信者が埋め込み再生を禁止しています';
+          case 153: return 'HTML5再生制限';
+          case 157: return 'ネットワーク経路エラー';
+          default: return 'YouTube iframe エラー: '+code;
+        }
+      }
+      function showError(code){
+        var el=document.getElementById('err');
+        el.innerHTML=describeError(code)+'<br><br><a href="https://www.youtube.com/watch?v=\(videoId)" target="_blank">YouTube アプリで開く</a>';
+        el.style.display='flex';
+        document.getElementById('player').style.display='none';
+      }
       window.onYouTubeIframeAPIReady=function(){
         player=new YT.Player('player',{
           width:'100%',height:'100%',videoId:'\(videoId)',
+          host:'https://www.youtube-nocookie.com',
           playerVars:{autoplay:1,playsinline:1,controls:0,rel:0,modestbranding:1,fs:0,disablekb:1,iv_load_policy:3,origin:'https://tonton888115.github.io'},
-          events:{onReady:function(){ready=true;play();loadSB();}}
+          events:{
+            onReady:function(){ready=true;play();loadSB();},
+            onError:function(e){showError(e.data);}
+          }
         });
       };
       window.mvPlay=function(){play();};
