@@ -2302,7 +2302,7 @@ private enum NativeEventOverlay {
     DispatchQueue.main.async {
       guard root.bounds.width > 0 else { return }
       let panel = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
-      panel.layer.cornerRadius = 12
+      panel.layer.cornerRadius = 10
       panel.clipsToBounds = true
       panel.alpha = 0
       panel.translatesAutoresizingMaskIntoConstraints = false
@@ -2312,35 +2312,56 @@ private enum NativeEventOverlay {
       accent.translatesAutoresizingMaskIntoConstraints = false
       panel.contentView.addSubview(accent)
 
+      let clip = UIView()
+      clip.clipsToBounds = true
+      clip.translatesAutoresizingMaskIntoConstraints = false
+      panel.contentView.addSubview(clip)
+
       let label = UILabel()
       label.text = message
       label.textColor = .white
-      label.font = .systemFont(ofSize: 13, weight: .bold)
-      label.numberOfLines = 2
-      label.lineBreakMode = .byTruncatingTail
-      label.translatesAutoresizingMaskIntoConstraints = false
-      panel.contentView.addSubview(label)
+      label.font = .systemFont(ofSize: root.bounds.width < 260 ? 11 : 12, weight: .bold)
+      label.numberOfLines = 1
+      label.lineBreakMode = .byClipping
+      clip.addSubview(label)
 
       root.addSubview(panel)
       NSLayoutConstraint.activate([
         panel.topAnchor.constraint(equalTo: root.topAnchor, constant: 10),
         panel.centerXAnchor.constraint(equalTo: root.centerXAnchor),
-        panel.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, constant: -28),
-        panel.widthAnchor.constraint(greaterThanOrEqualToConstant: min(260, max(180, root.bounds.width - 60))),
+        panel.widthAnchor.constraint(equalTo: root.widthAnchor, multiplier: 0.88),
+        panel.heightAnchor.constraint(equalToConstant: root.bounds.width < 260 ? 30 : 34),
         accent.leadingAnchor.constraint(equalTo: panel.contentView.leadingAnchor),
         accent.topAnchor.constraint(equalTo: panel.contentView.topAnchor),
         accent.bottomAnchor.constraint(equalTo: panel.contentView.bottomAnchor),
-        accent.widthAnchor.constraint(equalToConstant: 4),
-        label.leadingAnchor.constraint(equalTo: accent.trailingAnchor, constant: 10),
-        label.trailingAnchor.constraint(equalTo: panel.contentView.trailingAnchor, constant: -12),
-        label.topAnchor.constraint(equalTo: panel.contentView.topAnchor, constant: 8),
-        label.bottomAnchor.constraint(equalTo: panel.contentView.bottomAnchor, constant: -8)
+        accent.widthAnchor.constraint(equalToConstant: 3),
+        clip.leadingAnchor.constraint(equalTo: accent.trailingAnchor, constant: 8),
+        clip.trailingAnchor.constraint(equalTo: panel.contentView.trailingAnchor, constant: -10),
+        clip.topAnchor.constraint(equalTo: panel.contentView.topAnchor, constant: 4),
+        clip.bottomAnchor.constraint(equalTo: panel.contentView.bottomAnchor, constant: -4)
       ])
+
+      root.layoutIfNeeded()
+      clip.layoutIfNeeded()
+      let labelSize = label.sizeThatFits(CGSize(width: CGFloat.greatestFiniteMagnitude, height: clip.bounds.height))
+      let labelWidth = max(labelSize.width, clip.bounds.width)
+      label.frame = CGRect(x: 0, y: 0, width: labelWidth, height: clip.bounds.height)
+      if labelSize.width > clip.bounds.width {
+        label.frame.origin.x = clip.bounds.width
+        UIView.animate(
+          withDuration: min(7.0, max(3.8, Double(labelSize.width / 34.0))),
+          delay: 0.35,
+          options: [.curveLinear],
+          animations: {
+            label.frame.origin.x = -labelSize.width
+          }
+        )
+      }
 
       UIView.animate(withDuration: 0.18) {
         panel.alpha = 1
       }
-      UIView.animate(withDuration: 0.25, delay: 4.2, options: []) {
+      UIView.animate(withDuration: 0.25, delay: 5.2, options: []) {
         panel.alpha = 0
       } completion: { _ in
         panel.removeFromSuperview()
@@ -3098,11 +3119,12 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     guard let url = URL(string: uri) else { return }
     do {
       for try await message in protobufMessages(from: url) {
-        if let alert = parseNDGRSupportAlert(fromChunkedMessage: message) {
-          emitSupportAlert(alert)
-        }
         if let text = parseNDGRCommentText(fromChunkedMessage: message) {
           emitDanmaku(text)
+          continue
+        }
+        if let alert = parseNDGRSupportAlert(fromChunkedMessage: message) {
+          emitSupportAlert(alert)
         }
       }
     } catch {
@@ -3178,11 +3200,6 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
 
   private func parseNDGRSupportAlert(fromChunkedMessage data: Data) -> String? {
     let strings = protobufStrings(in: data)
-    let joined = strings.joined(separator: " ")
-    let lower = joined.lowercased()
-    guard lower.contains("gift") || joined.contains("ギフト") || joined.contains("広告") || joined.contains("貢献") else {
-      return nil
-    }
     let useful = strings
       .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
       .filter { text in
@@ -3191,13 +3208,24 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
           && !text.contains("https://")
           && !text.contains("http://")
       }
-    if let sentence = useful.first(where: { $0.contains("ギフト") || $0.contains("pt") || $0.contains("広告") }) {
+    let officialMarkers = [
+      "ギフトを贈りました",
+      "ギフトが贈られました",
+      "ギフトしました",
+      "ニコニ広告しました",
+      "広告しました",
+      "pt貢献",
+      "ptを貢献",
+      "貢献しました"
+    ]
+    let hasOfficialSentence = officialMarkers.contains { marker in useful.contains { $0.contains(marker) } }
+    guard hasOfficialSentence else {
+      return nil
+    }
+    if let sentence = useful.first(where: { text in officialMarkers.contains { text.contains($0) } }) {
       return "ニコ生: \(sentence)"
     }
-    if let name = useful.first(where: { !$0.lowercased().contains("gift") }) {
-      return "ニコ生: \(name) のギフト"
-    }
-    return "ニコ生: ギフトが送られました"
+    return "ニコ生: ギフト/広告が送られました"
   }
 
   private func protobufStrings(in data: Data, depth: Int = 0) -> [String] {
@@ -5142,7 +5170,21 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           return
         }
         if let apiKey = parsed["apiKey"] as? String, !apiKey.isEmpty {
-          self.requestYouTubeIClients(videoId: videoId, apiKey: apiKey, baseContext: parsed["context"] as? [String: Any], attempt: 0)
+          let signatureTimestamp: Int? = {
+            if let value = parsed["signatureTimestamp"] as? Int { return value }
+            if let value = parsed["signatureTimestamp"] as? NSNumber { return value.intValue }
+            if let value = parsed["signatureTimestamp"] as? String { return Int(value) }
+            return nil
+          }()
+          self.requestYouTubeIClients(
+            videoId: videoId,
+            apiKey: apiKey,
+            baseContext: parsed["context"] as? [String: Any],
+            visitorData: parsed["visitorData"] as? String,
+            poToken: parsed["poToken"] as? String,
+            signatureTimestamp: signatureTimestamp,
+            attempt: 0
+          )
           return
         }
       }
@@ -5156,9 +5198,17 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
-  private func requestYouTubeIClients(videoId: String, apiKey: String, baseContext: [String: Any]?, attempt: Int) {
+  private func requestYouTubeIClients(
+    videoId: String,
+    apiKey: String,
+    baseContext: [String: Any]?,
+    visitorData: String?,
+    poToken: String?,
+    signatureTimestamp: Int?,
+    attempt: Int
+  ) {
     guard !isStopped, player.currentItem == nil, extractorWebView != nil else { return }
-    let clients = Self.youtubeIClientContexts(baseContext: baseContext)
+    let clients = Self.youtubeIClientContexts(baseContext: baseContext, visitorData: visitorData, preferWeb: poToken != nil)
     guard clients.indices.contains(attempt) else {
       installEmbedFallback(videoId: videoId)
       return
@@ -5175,17 +5225,28 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
     request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
     request.setValue("https://www.youtube.com/watch?v=\(videoId)", forHTTPHeaderField: "Referer")
-    request.httpBody = try? JSONSerialization.data(withJSONObject: [
+    if let visitorData, !visitorData.isEmpty {
+      request.setValue(visitorData, forHTTPHeaderField: "X-Goog-Visitor-Id")
+    }
+    var contentPlaybackContext: [String: Any] = [
+      "html5Preference": "HTML5_PREF_WANTS"
+    ]
+    if let signatureTimestamp, signatureTimestamp > 0 {
+      contentPlaybackContext["signatureTimestamp"] = signatureTimestamp
+    }
+    var body: [String: Any] = [
       "context": clients[attempt],
       "videoId": videoId,
       "contentCheckOk": true,
       "racyCheckOk": true,
       "playbackContext": [
-        "contentPlaybackContext": [
-          "html5Preference": "HTML5_PREF_WANTS"
-        ]
+        "contentPlaybackContext": contentPlaybackContext
       ]
-    ])
+    ]
+    if let poToken, !poToken.isEmpty {
+      body["serviceIntegrityDimensions"] = ["poToken": poToken]
+    }
+    request.httpBody = try? JSONSerialization.data(withJSONObject: body)
     resolveTask?.cancel()
     resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
       guard let self else { return }
@@ -5201,17 +5262,25 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         return
       }
       DispatchQueue.main.async {
-        self.requestYouTubeIClients(videoId: videoId, apiKey: apiKey, baseContext: baseContext, attempt: attempt + 1)
+        self.requestYouTubeIClients(
+          videoId: videoId,
+          apiKey: apiKey,
+          baseContext: baseContext,
+          visitorData: visitorData,
+          poToken: poToken,
+          signatureTimestamp: signatureTimestamp,
+          attempt: attempt + 1
+        )
       }
     }
     resolveTask?.resume()
   }
 
-  private static func youtubeIClientContexts(baseContext: [String: Any]?) -> [[String: Any]] {
+  private static func youtubeIClientContexts(baseContext: [String: Any]?, visitorData explicitVisitorData: String?, preferWeb: Bool) -> [[String: Any]] {
     let baseClient = (baseContext?["client"] as? [String: Any]) ?? [:]
     let hl = (baseClient["hl"] as? String) ?? "ja"
     let gl = (baseClient["gl"] as? String) ?? "JP"
-    let visitorData = baseClient["visitorData"] as? String
+    let visitorData = explicitVisitorData ?? (baseClient["visitorData"] as? String)
     func context(_ name: String, _ version: String, extra: [String: Any] = [:]) -> [String: Any] {
       var client: [String: Any] = [
         "clientName": name,
@@ -5223,7 +5292,30 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       extra.forEach { client[$0.key] = $0.value }
       return ["client": client]
     }
-    return [
+    let webVersion = (baseClient["clientVersion"] as? String) ?? "2.20240501.01.00"
+    let webClients = [
+      context("WEB_SAFARI", webVersion, extra: [
+        "browserName": "Safari",
+        "browserVersion": "17.6",
+        "osName": "iOS",
+        "osVersion": "17.6"
+      ]),
+      context("MWEB", webVersion),
+      context("WEB", webVersion, extra: [
+        "browserName": "Safari",
+        "browserVersion": "17.6",
+        "osName": "iOS",
+        "osVersion": "17.6",
+        "platform": "MOBILE"
+      ]),
+      context("WEB_EMBEDDED_PLAYER", "1.20240501.01.00", extra: [
+        "thirdParty": ["embedUrl": "https://tonton888115.github.io/MultiView/"]
+      ]),
+      context("TVHTML5_SIMPLY_EMBEDDED_PLAYER", "2.0", extra: [
+        "clientScreen": "EMBED"
+      ])
+    ]
+    let appClients = [
       context("IOS", "20.19.2", extra: [
         "deviceMake": "Apple",
         "deviceModel": "iPhone16,2",
@@ -5238,21 +5330,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         "osName": "Android",
         "osVersion": "15",
         "userAgent": "com.google.android.youtube/20.19.35 (Linux; U; Android 15) gzip"
-      ]),
-      context("WEB_SAFARI", (baseClient["clientVersion"] as? String) ?? "2.20240501.01.00", extra: [
-        "browserName": "Safari",
-        "browserVersion": "17.6",
-        "osName": "iOS",
-        "osVersion": "17.6"
-      ]),
-      context("MWEB", (baseClient["clientVersion"] as? String) ?? "2.20240501.01.00"),
-      context("WEB_EMBEDDED_PLAYER", "1.20240501.01.00", extra: [
-        "thirdParty": ["embedUrl": "https://tonton888115.github.io/MultiView/"]
-      ]),
-      context("TVHTML5_SIMPLY_EMBEDDED_PLAYER", "2.0", extra: [
-        "clientScreen": "EMBED"
       ])
     ]
+    return preferWeb ? webClients + appClients : appClients + webClients
   }
 
   private static func extractPlayableStream(from parsed: [String: Any]) -> (url: URL, isLive: Bool)? {
@@ -5337,7 +5417,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     triedInvidious = true
     let instances = Self.invidiousAPIInstances
     guard instances.indices.contains(attempt) else {
-      installAlternativeWebFallback(videoId: videoId)
+      installEmbedFallback(videoId: videoId)
       return
     }
     guard let url = URL(string: "\(instances[attempt])/api/v1/videos/\(videoId)") else {
@@ -5447,6 +5527,51 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         try { if (window.ytcfg && ytcfg.get) return ytcfg.get(key); } catch(e) {}
         return null;
       }
+      function firstString(values) {
+        for (var i = 0; i < values.length; i++) {
+          var v = values[i];
+          if (typeof v === 'string' && v.length > 0) return v;
+        }
+        return '';
+      }
+      function findInObject(root, names, depth) {
+        if (!root || depth > 7) return '';
+        if (typeof root !== 'object') return '';
+        for (var k in root) {
+          if (!Object.prototype.hasOwnProperty.call(root, k)) continue;
+          var v = root[k];
+          for (var i = 0; i < names.length; i++) {
+            if (k === names[i] && typeof v === 'string' && v.length > 0) return v;
+          }
+          var nested = findInObject(v, names, depth + 1);
+          if (nested) return nested;
+        }
+        return '';
+      }
+      function findScriptValue(patterns) {
+        var scripts = Array.prototype.slice.call(document.scripts || []);
+        for (var p = 0; p < patterns.length; p++) {
+          var pattern = patterns[p];
+          for (var i = 0; i < scripts.length; i++) {
+            var text = scripts[i].textContent || '';
+            var match = text.match(pattern);
+            if (match && match[1]) return match[1];
+          }
+        }
+        return '';
+      }
+      function parseCipher(cipher) {
+        if (!cipher) return null;
+        try {
+          var params = new URLSearchParams(cipher);
+          var url = params.get('url');
+          var sig = params.get('sig') || params.get('signature');
+          var s = params.get('s');
+          var sp = params.get('sp') || 'signature';
+          if (url && sig && !s) return url + (url.indexOf('?') >= 0 ? '&' : '?') + sp + '=' + encodeURIComponent(sig);
+        } catch(e) {}
+        return null;
+      }
       function scriptPlayerResponse() {
         var scripts = Array.prototype.slice.call(document.scripts || []);
         for (var i = 0; i < scripts.length; i++) {
@@ -5479,11 +5604,21 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         r = parseMaybe(r);
         if (!r || !r.streamingData) return null;
         var sd = r.streamingData, vd = r.videoDetails || {};
-        var out = { isLive: !!(vd.isLive || vd.isLiveContent), hls: sd.hlsManifestUrl || null, formats: [] };
+        var out = {
+          isLive: !!(vd.isLive || vd.isLiveContent),
+          hls: sd.hlsManifestUrl || null,
+          formats: [],
+          poToken: findInObject(r, ['poToken'], 0),
+          visitorData: findInObject(r, ['visitorData'], 0),
+          signatureTimestamp: ytcfgValue('STS') || null,
+          sabr: !!sd.serverAbrStreamingUrl
+        };
         function add(f, adaptive) {
-          if (!f || !f.url) return;
+          if (!f) return;
+          var streamURL = f.url || parseCipher(f.signatureCipher || f.cipher);
+          if (!streamURL) return;
           out.formats.push({
-            url: f.url,
+            url: streamURL,
             height: f.height || 0,
             bitrate: f.bitrate || 0,
             mimeType: f.mimeType || '',
@@ -5505,6 +5640,21 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         if (out && (out.hls || out.formats.length)) return JSON.stringify(out);
       }
       var apiKey = ytcfgValue('INNERTUBE_API_KEY') || '';
+      var currentContext = ytcfgValue('INNERTUBE_CONTEXT') || {};
+      var visitorData = firstString([
+        ytcfgValue('VISITOR_DATA'),
+        currentContext.client && currentContext.client.visitorData,
+        findInObject(window.ytInitialPlayerResponse, ['visitorData'], 0),
+        findScriptValue([/"visitorData"\\s*:\\s*"([^"]+)"/])
+      ]);
+      var poToken = firstString([
+        ytcfgValue('PO_TOKEN'),
+        ytcfgValue('PLAYER_PO_TOKEN'),
+        ytcfgValue('INNERTUBE_CONTEXT') && findInObject(ytcfgValue('INNERTUBE_CONTEXT'), ['poToken'], 0),
+        findInObject(window.ytInitialPlayerResponse, ['poToken'], 0),
+        findScriptValue([/"poToken"\\s*:\\s*"([^"]+)"/, /"PO_TOKEN"\\s*:\\s*"([^"]+)"/])
+      ]);
+      var signatureTimestamp = ytcfgValue('STS') || findScriptValue([/"signatureTimestamp"\\s*:\\s*(\\d+)/]);
       var context = ytcfgValue('INNERTUBE_CONTEXT') || {
         client: {
           clientName: 'MWEB',
@@ -5513,7 +5663,15 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           gl: 'JP'
         }
       };
-      return JSON.stringify({apiKey: apiKey, context: context, formats: []});
+      if (visitorData && context.client && !context.client.visitorData) context.client.visitorData = visitorData;
+      return JSON.stringify({
+        apiKey: apiKey,
+        context: context,
+        visitorData: visitorData,
+        poToken: poToken,
+        signatureTimestamp: signatureTimestamp,
+        formats: []
+      });
     } catch (e) { return null; }
   })();
   """
