@@ -63,6 +63,13 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     let center = NotificationCenter.default
     center.addObserver(self, selector: #selector(playbackSignalReceived(_:)), name: AVAudioSession.interruptionNotification, object: nil)
     center.addObserver(self, selector: #selector(playbackSignalReceived(_:)), name: AVAudioSession.routeChangeNotification, object: nil)
+    // バックグラウンドへ移動時は全プレイヤーを明示的に停止 (AVPlayer 自体は
+    // audiovisualBackgroundPlaybackPolicy=.pauses で自動停止するが、念のため)。
+    center.addObserver(self, selector: #selector(applicationEnteredBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
+  }
+
+  @objc private func applicationEnteredBackground() {
+    PlaybackCoordinator.shared.pauseAll()
   }
 
   @objc private func playbackSignalReceived(_ notification: Notification) {
@@ -2426,6 +2433,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var streamOpenedAt: Date?
   private var isEnding = false
   private var lastSupportAlert: (text: String, at: Date)?
+  // NDGR コメントが最後に成功した時刻。VIEW/SEGMENT 両方のループから更新され、
+  // 60 秒成功なしでフル再読み込みへ escalation する閾値判定に使う。
+  private var ndgrLastSuccessAt = Date()
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -2437,7 +2447,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
 
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
-    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+    player.audiovisualBackgroundPlaybackPolicy = .pauses
     layer.addSublayer(playerLayer)
 
     danmakuView.isUserInteractionEnabled = false
@@ -3083,12 +3093,16 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     segmentTasks.values.forEach { $0.cancel() }
     segmentTasks.removeAll()
     activeSegmentURIs.removeAll()
+    ndgrLastSuccessAt = Date()
     ndgrCommentTask = Task { [weak self] in
       guard let self else { return }
       await self.streamNDGRView(viewURI: viewURI)
     }
   }
 
+  // VIEW ストリーム: セグメント URI と nextAt をポーリングする長期接続。
+  // 切断時は指数バックオフで in-place 再接続し、60 秒以上成功していない時のみ
+  // フル再読み込みに escalation する。
   private func streamNDGRView(viewURI: String) async {
     var nextAt: String? = "now"
     var consecutiveFailures = 0
@@ -3115,32 +3129,35 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
           if let at = parseNDGRNextAt(fromChunkedEntry: message) {
             nextAt = String(at)
           }
+          // どれか1メッセージでも届けば「生きてる」と見なし、バックオフをリセット。
+          consecutiveFailures = 0
+          ndgrLastSuccessAt = Date()
         }
-        consecutiveFailures = 0
       } catch {
-        if Task.isCancelled || error is CancellationError {
-          return
-        }
+        if Task.isCancelled || error is CancellationError { return }
         consecutiveFailures += 1
         nextAt = requestAt ?? "now"
-        showStatus("ニコ生コメント取得失敗: \(error.localizedDescription)")
-        if consecutiveFailures >= 3 {
-          // The comment view URI has likely gone stale; rather than retry a dead
-          // endpoint forever, request a full auto-refresh to get a fresh session.
+        let elapsedSinceSuccess = Date().timeIntervalSince(ndgrLastSuccessAt)
+        // 60 秒以上回復していないか、10 連敗したらフル再読み込みに切替。
+        // それ以外は in-place で指数バックオフ (1,2,4,8,16,16,…秒)。
+        if elapsedSinceSuccess > 60 || consecutiveFailures >= 10 {
+          showStatus("ニコ生コメント取得失敗継続: 再読み込み")
           DispatchQueue.main.async {
             NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
           }
           return
         }
-        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        let backoff = min(pow(2.0, Double(consecutiveFailures - 1)), 16.0)
+        showStatus("ニコ生コメント再接続中 (\(consecutiveFailures))")
+        try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
         continue
       }
-      if nextAt == nil {
-        break
-      }
+      if nextAt == nil { break }
     }
   }
 
+  // SEGMENT ストリーム: 個々のコメントセグメント。失敗時は VIEW 側が新しい
+  // セグメント URI を払い出すので、ここでフル再読み込みを呼ばない。
   private func streamNDGRSegment(uri: String) async {
     defer {
       activeSegmentURIs.remove(uri)
@@ -3151,22 +3168,17 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       for try await message in protobufMessages(from: url) {
         if let text = parseNDGRCommentText(fromChunkedMessage: message) {
           emitDanmaku(text)
+          ndgrLastSuccessAt = Date()
           continue
         }
         if let alert = parseNDGRSupportAlert(fromChunkedMessage: message) {
           emitSupportAlert(alert)
+          ndgrLastSuccessAt = Date()
         }
       }
     } catch {
-      if Task.isCancelled || error is CancellationError { return }
-      // A failed comment segment means the NDGR session/view URI went stale. Rather
-      // than leave a dead "ニコ生コメント受信失敗" error on screen, request a debounced
-      // auto-refresh (ViewingController caps it to once per 45s) so a fresh session is
-      // fetched and the error clears itself.
-      showStatus("ニコ生コメント再取得中…")
-      DispatchQueue.main.async {
-        NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
-      }
+      // セグメント単体の失敗は VIEW 側の自動リトライに任せる。
+      // ステータス更新も最小限に (ニコ生再接続中はVIEW側が出す)。
     }
   }
 
@@ -3594,7 +3606,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     backgroundColor = .black
 
     player.automaticallyWaitsToMinimizeStalling = false
-    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+    player.audiovisualBackgroundPlaybackPolicy = .pauses
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     layer.addSublayer(playerLayer)
@@ -4256,7 +4268,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     backgroundColor = .black
 
     player.automaticallyWaitsToMinimizeStalling = false
-    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+    player.audiovisualBackgroundPlaybackPolicy = .pauses
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     layer.addSublayer(playerLayer)
@@ -4750,7 +4762,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     backgroundColor = .black
 
     player.automaticallyWaitsToMinimizeStalling = false
-    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+    player.audiovisualBackgroundPlaybackPolicy = .pauses
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     layer.addSublayer(playerLayer)
@@ -5164,7 +5176,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
-    player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+    player.audiovisualBackgroundPlaybackPolicy = .pauses
     player.automaticallyWaitsToMinimizeStalling = false
     layer.addSublayer(playerLayer)
 
