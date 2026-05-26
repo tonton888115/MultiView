@@ -141,6 +141,10 @@ protocol CommentPostable: AnyObject {
   func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void)
 }
 
+protocol CommentEchoDisplay: AnyObject {
+  func emitOwnComment(_ text: String)
+}
+
 final class AutoHidingControls: NSObject, UIGestureRecognizerDelegate {
   private weak var host: UIView?
   private let controls: [UIView]
@@ -2153,7 +2157,8 @@ private final class NativeDanmakuRenderer {
     filterText: String,
     in root: UIView,
     laneCursor: Int,
-    settings: AppSettings
+    settings: AppSettings,
+    highlighted: Bool = false
   ) -> Int {
     let trimmed = filterText.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return laneCursor }
@@ -2168,7 +2173,13 @@ private final class NativeDanmakuRenderer {
       ? settings.danmakuMaxLines
       : max(1, Int(root.bounds.height / lineHeight))
     let lane = laneCursor % maxLines
-    let comment = makeCommentView(tokens: tokens, fontSize: fontSize, opacity: settings.danmakuOpacity, lineHeight: lineHeight)
+    let comment = makeCommentView(
+      tokens: tokens,
+      fontSize: fontSize,
+      opacity: settings.danmakuOpacity,
+      lineHeight: lineHeight,
+      highlighted: highlighted
+    )
     guard comment.bounds.width > 0 else { return laneCursor }
 
     let y = CGFloat(lane) * lineHeight + 6
@@ -2206,10 +2217,13 @@ private final class NativeDanmakuRenderer {
     tokens: [NativeDanmakuToken],
     fontSize: CGFloat,
     opacity: Double,
-    lineHeight: CGFloat
+    lineHeight: CGFloat,
+    highlighted: Bool
   ) -> UIView {
     let container = UIView()
-    var x: CGFloat = 0
+    let horizontalPadding: CGFloat = highlighted ? 8 : 0
+    let verticalInset: CGFloat = highlighted ? 2 : 0
+    var x: CGFloat = horizontalPadding
     let imageSide = max(18, fontSize * 1.4)
 
     for token in tokens {
@@ -2225,11 +2239,11 @@ private final class NativeDanmakuRenderer {
         label.layer.shadowOpacity = 1
         label.layer.shadowOffset = CGSize(width: 1, height: 1)
         label.sizeToFit()
-        label.frame.origin = CGPoint(x: x, y: 0)
+        label.frame.origin = CGPoint(x: x, y: verticalInset)
         container.addSubview(label)
         x += label.bounds.width
       case .image(let url):
-        let imageView = UIImageView(frame: CGRect(x: x + 3, y: max(0, (lineHeight - imageSide) / 2), width: imageSide, height: imageSide))
+        let imageView = UIImageView(frame: CGRect(x: x + 3, y: max(verticalInset, (lineHeight - imageSide) / 2), width: imageSide, height: imageSide))
         imageView.contentMode = .scaleAspectFit
         imageView.alpha = CGFloat(opacity)
         imageView.layer.shadowColor = UIColor.black.cgColor
@@ -2242,7 +2256,14 @@ private final class NativeDanmakuRenderer {
       }
     }
 
-    container.frame = CGRect(x: 0, y: 0, width: x, height: lineHeight)
+    let width = x + horizontalPadding
+    container.frame = CGRect(x: 0, y: 0, width: width, height: lineHeight + verticalInset * 2)
+    if highlighted {
+      container.layer.borderColor = UIColor.systemYellow.cgColor
+      container.layer.borderWidth = 2
+      container.layer.cornerRadius = 4
+      container.backgroundColor = UIColor.systemYellow.withAlphaComponent(0.12)
+    }
     return container
   }
 
@@ -2370,7 +2391,7 @@ private enum NativeEventOverlay {
   }
 }
 
-final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable {
+final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
   private let stream: StreamItem
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
@@ -3497,6 +3518,21 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
   }
 
+  func emitOwnComment(_ text: String) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    DispatchQueue.main.async {
+      self.laneCursor = NativeDanmakuRenderer.emit(
+        tokens: NativeDanmakuRenderer.textTokens(trimmed),
+        filterText: trimmed,
+        in: self.danmakuView,
+        laneCursor: self.laneCursor,
+        settings: self.settings,
+        highlighted: true
+      )
+    }
+  }
+
   private func emitSupportAlert(_ text: String) {
     let now = Date()
     if let lastSupportAlert, lastSupportAlert.text == text, now.timeIntervalSince(lastSupportAlert.at) < 10 {
@@ -3516,7 +3552,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   fileprivate static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
-final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable {
+final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
@@ -3556,7 +3592,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     statusLabel.textColor = .white.withAlphaComponent(0.72)
     statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
     statusLabel.textAlignment = .center
-    statusLabel.numberOfLines = 2
+    statusLabel.numberOfLines = 0
     statusLabel.translatesAutoresizingMaskIntoConstraints = false
     addSubview(statusLabel)
     NSLayoutConstraint.activate([
@@ -3940,6 +3976,21 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     }
   }
 
+  func emitOwnComment(_ text: String) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    DispatchQueue.main.async {
+      self.laneCursor = NativeDanmakuRenderer.emit(
+        tokens: NativeDanmakuRenderer.textTokens(trimmed),
+        filterText: trimmed,
+        in: self.danmakuView,
+        laneCursor: self.laneCursor,
+        settings: self.settings,
+        highlighted: true
+      )
+    }
+  }
+
   private static func kickDanmakuTokens(_ content: String) -> [NativeDanmakuToken] {
     let pattern = #"\[emote:(\d+):([^\]]+)\]"#
     guard let regex = try? NSRegularExpression(pattern: pattern) else { return [.text(content)] }
@@ -4106,7 +4157,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
 // Native Twitch playback, emulating the official app: fetch a PlaybackAccessToken
 // over GraphQL, build the usher.ttvnw.net HLS master playlist, and play it with
 // AVPlayer. Anonymous IRC supplies danmaku comments. Falls back to the web embed.
-final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable {
+final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
@@ -4524,6 +4575,21 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     }
   }
 
+  func emitOwnComment(_ text: String) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    DispatchQueue.main.async {
+      self.laneCursor = NativeDanmakuRenderer.emit(
+        tokens: NativeDanmakuRenderer.textTokens(trimmed),
+        filterText: trimmed,
+        in: self.danmakuView,
+        laneCursor: self.laneCursor,
+        settings: self.settings,
+        highlighted: true
+      )
+    }
+  }
+
   private static func parseTwitchTags(_ raw: String) -> [String: String] {
     var tags: [String: String] = [:]
     raw.split(separator: ";").forEach { pair in
@@ -4587,7 +4653,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 }
 
-final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable {
+final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
@@ -4909,6 +4975,21 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     }
   }
 
+  func emitOwnComment(_ text: String) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    DispatchQueue.main.async {
+      self.laneCursor = NativeDanmakuRenderer.emit(
+        tokens: NativeDanmakuRenderer.textTokens(trimmed),
+        filterText: trimmed,
+        in: self.danmakuView,
+        laneCursor: self.laneCursor,
+        settings: self.settings,
+        highlighted: true
+      )
+    }
+  }
+
   private func showStatus(_ text: String) {
     DispatchQueue.main.async {
       self.statusLabel.text = text
@@ -4974,7 +5055,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
 
 // Per-cell YouTube playback prefers native AVPlayer URLs. The official iframe is
 // only a muted visual fallback so it cannot compete with Kick/Twitch/native audio.
-final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, WKNavigationDelegate {
+final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate {
   private let stream: StreamItem
   private let settings: AppSettings
   // Video-only playback: we extract the real media URL (HLS for live, a muxed
@@ -4983,6 +5064,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   // for videos we cannot extract (e.g. ciphered VOD formats).
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
+  private let danmakuView = UIView()
   private let statusLabel = UILabel()
   private var playbackVolume: Float
   private var resolveTask: URLSessionDataTask?
@@ -4996,6 +5078,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var triedPiped = false
   private var triedInvidious = false
   private var isStopped = false
+  private var laneCursor = 0
+  private var extractionFailures: [String] = []
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -5010,6 +5094,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     player.automaticallyWaitsToMinimizeStalling = false
     layer.addSublayer(playerLayer)
 
+    danmakuView.isUserInteractionEnabled = false
+    danmakuView.clipsToBounds = true
+    danmakuView.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(danmakuView)
+
     statusLabel.text = "YouTubeを読み込み中"
     statusLabel.textColor = .white.withAlphaComponent(0.72)
     statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
@@ -5018,6 +5107,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     statusLabel.translatesAutoresizingMaskIntoConstraints = false
     addSubview(statusLabel)
     NSLayoutConstraint.activate([
+      danmakuView.leadingAnchor.constraint(equalTo: leadingAnchor),
+      danmakuView.trailingAnchor.constraint(equalTo: trailingAnchor),
+      danmakuView.topAnchor.constraint(equalTo: topAnchor),
+      danmakuView.bottomAnchor.constraint(equalTo: bottomAnchor),
       statusLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
       statusLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
       statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 16),
@@ -5077,6 +5170,21 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     YouTubeAuthManager.shared.sendChat(channel: stream.channel, content: text, completion: completion)
   }
 
+  func emitOwnComment(_ text: String) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    DispatchQueue.main.async {
+      self.laneCursor = NativeDanmakuRenderer.emit(
+        tokens: NativeDanmakuRenderer.textTokens(trimmed),
+        filterText: trimmed,
+        in: self.danmakuView,
+        laneCursor: self.laneCursor,
+        settings: self.settings,
+        highlighted: true
+      )
+    }
+  }
+
   func stopPlayback() {
     isStopped = true
     resolveTask?.cancel(); resolveTask = nil
@@ -5114,6 +5222,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private func extractStreams(videoId: String) {
     guard !isStopped else { return }
     showStatus("YouTube映像を取得中")
+    extractionFailures.removeAll()
     pendingVideoId = videoId
     triedPiped = false
     triedInvidious = false
@@ -5145,8 +5254,13 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
     web.load(URLRequest(url: url))
     // If the page never yields a URL, try a stream API before giving up.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
-      guard let self, !self.isStopped, self.extractorWebView != nil, self.player.currentItem == nil else { return }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 35) { [weak self] in
+      guard let self,
+            !self.isStopped,
+            self.extractorWebView != nil,
+            self.resolveTask == nil,
+            self.player.currentItem == nil else { return }
+      self.noteExtractionFailure("公式ページ: 35秒以内にURL抽出なし")
       self.installEmbedFallback(videoId: videoId)
     }
   }
@@ -5187,6 +5301,17 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           )
           return
         }
+        let hasSabrOnly = (parsed["sabr"] as? Bool) == true
+        let apiKey = (parsed["apiKey"] as? String) ?? ""
+        if hasSabrOnly {
+          self.noteExtractionFailure("公式ページ: SABRのみで通常URLなし")
+        } else if apiKey.isEmpty {
+          self.noteExtractionFailure("公式ページ: API keyなし")
+        } else {
+          self.noteExtractionFailure("公式ページ: 直接URLなし")
+        }
+      } else {
+        self.noteExtractionFailure("公式ページ: JS抽出結果なし")
       }
       if attempt < 3 {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
@@ -5213,6 +5338,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       installEmbedFallback(videoId: videoId)
       return
     }
+    let clientName = ((clients[attempt]["client"] as? [String: Any])?["clientName"] as? String) ?? "UNKNOWN"
+    showStatus("YouTube通常抽出 \(attempt + 1)/\(clients.count)\n\(clientName)")
     var components = URLComponents(string: "https://www.youtube.com/youtubei/v1/player")!
     components.queryItems = [URLQueryItem(name: "key", value: apiKey)]
     guard let url = components.url else {
@@ -5247,10 +5374,26 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       body["serviceIntegrityDimensions"] = ["poToken": poToken]
     }
     request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    request.timeoutInterval = 8
     resolveTask?.cancel()
-    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       guard let self else { return }
       self.resolveTask = nil
+      if let error {
+        DispatchQueue.main.async {
+          self.noteExtractionFailure("\(clientName): \(error.localizedDescription)")
+          self.requestYouTubeIClients(
+            videoId: videoId,
+            apiKey: apiKey,
+            baseContext: baseContext,
+            visitorData: visitorData,
+            poToken: poToken,
+            signatureTimestamp: signatureTimestamp,
+            attempt: attempt + 1
+          )
+        }
+        return
+      }
       if let data,
          let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
          let stream = Self.extractPlayableStream(from: parsed) {
@@ -5262,6 +5405,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         return
       }
       DispatchQueue.main.async {
+        let httpCode = (response as? HTTPURLResponse)?.statusCode
+        let parsed = Self.parseJSONObject(data)
+        self.noteExtractionFailure(Self.youtubeIErrorSummary(clientName: clientName, httpCode: httpCode, parsed: parsed, data: data))
         self.requestYouTubeIClients(
           videoId: videoId,
           apiKey: apiKey,
@@ -5349,24 +5495,78 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     return nil
   }
 
+  private static func youtubeIErrorSummary(clientName: String, httpCode: Int?, parsed: [String: Any]?, data: Data?) -> String {
+    var parts: [String] = [clientName]
+    if let httpCode { parts.append("HTTP \(httpCode)") }
+    if let status = parsed?["playabilityStatus"] as? [String: Any] {
+      if let value = status["status"] as? String, !value.isEmpty { parts.append(value) }
+      if let value = status["reason"] as? String, !value.isEmpty { parts.append(value) }
+      if let value = status["subreason"] as? String, !value.isEmpty { parts.append(value) }
+    }
+    if let sd = parsed?["streamingData"] as? [String: Any] {
+      let formats = ((sd["formats"] as? [Any])?.count ?? 0) + ((sd["adaptiveFormats"] as? [Any])?.count ?? 0)
+      if formats == 0, sd["serverAbrStreamingUrl"] != nil {
+        parts.append("SABRのみ")
+      } else {
+        parts.append("再生可能URLなし")
+      }
+    } else if parsed != nil {
+      parts.append("streamingDataなし")
+    } else if let data, !data.isEmpty {
+      parts.append("JSON解析失敗")
+    } else {
+      parts.append("空レスポンス")
+    }
+    return parts.joined(separator: " / ")
+  }
+
+  private static func parseJSONObject(_ data: Data?) -> [String: Any]? {
+    guard let data else { return nil }
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+  }
+
+  private func noteExtractionFailure(_ message: String) {
+    let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    extractionFailures.append(trimmed)
+    if extractionFailures.count > 8 {
+      extractionFailures.removeFirst(extractionFailures.count - 8)
+    }
+    showStatus("YouTube抽出中\n\(trimmed)")
+  }
+
+  private func extractionFailureSummary() -> String {
+    extractionFailures.suffix(5).joined(separator: "\n")
+  }
+
   private func requestPipedStreams(videoId: String, attempt: Int = 0) {
     guard !isStopped, player.currentItem == nil else { return }
     let instances = Self.pipedAPIInstances
     guard instances.indices.contains(attempt) else {
+      noteExtractionFailure("Piped: 全インスタンス失敗")
       requestInvidiousStreams(videoId: videoId)
       return
     }
     guard let url = URL(string: "\(instances[attempt])/streams/\(videoId)") else {
+      noteExtractionFailure("Piped \(attempt + 1): URL不正")
       requestPipedStreams(videoId: videoId, attempt: attempt + 1)
       return
     }
+    showStatus("YouTube代替抽出 \(attempt + 1)/\(instances.count)\nPiped: \(url.host ?? instances[attempt])")
     var request = URLRequest(url: url)
     request.timeoutInterval = 4
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     resolveTask?.cancel()
-    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       guard let self else { return }
       self.resolveTask = nil
+      if let error {
+        DispatchQueue.main.async {
+          self.noteExtractionFailure("Piped \(url.host ?? ""): \(error.localizedDescription)")
+          self.requestPipedStreams(videoId: videoId, attempt: attempt + 1)
+        }
+        return
+      }
       if let data,
          let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
          let stream = Self.extractPipedStream(from: parsed) {
@@ -5378,6 +5578,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         return
       }
       DispatchQueue.main.async {
+        let httpCode = (response as? HTTPURLResponse)?.statusCode
+        let parsed = Self.parseJSONObject(data)
+        let message = Self.proxyExtractorErrorSummary(name: "Piped", host: url.host, httpCode: httpCode, parsed: parsed, data: data)
+        self.noteExtractionFailure(message)
         self.requestPipedStreams(videoId: videoId, attempt: attempt + 1)
       }
     }
@@ -5417,20 +5621,30 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     triedInvidious = true
     let instances = Self.invidiousAPIInstances
     guard instances.indices.contains(attempt) else {
+      noteExtractionFailure("Invidious: 全インスタンス失敗")
       installEmbedFallback(videoId: videoId)
       return
     }
     guard let url = URL(string: "\(instances[attempt])/api/v1/videos/\(videoId)") else {
+      noteExtractionFailure("Invidious \(attempt + 1): URL不正")
       requestInvidiousStreams(videoId: videoId, attempt: attempt + 1)
       return
     }
+    showStatus("YouTube別系統抽出 \(attempt + 1)/\(instances.count)\nInvidious: \(url.host ?? instances[attempt])")
     var request = URLRequest(url: url)
     request.timeoutInterval = 4
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     resolveTask?.cancel()
-    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       guard let self else { return }
       self.resolveTask = nil
+      if let error {
+        DispatchQueue.main.async {
+          self.noteExtractionFailure("Invidious \(url.host ?? ""): \(error.localizedDescription)")
+          self.requestInvidiousStreams(videoId: videoId, attempt: attempt + 1)
+        }
+        return
+      }
       if let data,
          let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
          let stream = Self.extractInvidiousStream(from: parsed) {
@@ -5442,6 +5656,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         return
       }
       DispatchQueue.main.async {
+        let httpCode = (response as? HTTPURLResponse)?.statusCode
+        let parsed = Self.parseJSONObject(data)
+        let message = Self.proxyExtractorErrorSummary(name: "Invidious", host: url.host, httpCode: httpCode, parsed: parsed, data: data)
+        self.noteExtractionFailure(message)
         self.requestInvidiousStreams(videoId: videoId, attempt: attempt + 1)
       }
     }
@@ -5465,6 +5683,24 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     guard !candidates.isEmpty else { return nil }
     let sorted = candidates.sorted { $0.0 < $1.0 }
     return ((sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.1).map { ($0, live) }
+  }
+
+  private static func proxyExtractorErrorSummary(name: String, host: String?, httpCode: Int?, parsed: [String: Any]?, data: Data?) -> String {
+    var parts: [String] = [name]
+    if let host, !host.isEmpty { parts.append(host) }
+    if let httpCode { parts.append("HTTP \(httpCode)") }
+    if let error = parsed?["error"] as? String, !error.isEmpty {
+      parts.append(error)
+    } else if let message = parsed?["message"] as? String, !message.isEmpty {
+      parts.append(message)
+    } else if parsed != nil {
+      parts.append("再生可能URLなし")
+    } else if let data, !data.isEmpty {
+      parts.append("JSON解析失敗")
+    } else {
+      parts.append("空レスポンス")
+    }
+    return parts.joined(separator: " / ")
   }
 
   private static let pipedAPIInstances = [
@@ -5723,7 +5959,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     itemStatusObservation = nil
     player.pause()
     player.replaceCurrentItem(with: nil)
-    showStatus("YouTube映像URLを取得できません\n公式UIは表示せず停止しました")
+    let summary = extractionFailureSummary()
+    showStatus(summary.isEmpty
+      ? "YouTube映像URLを取得できません\n公式UIは表示せず停止しました"
+      : "YouTube抽出失敗\n\(summary)"
+    )
   }
 
   private func installAlternativeWebFallback(videoId: String, attempt: Int = 0) {
@@ -6704,6 +6944,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
   private let commentStatus = UILabel()
   private var commentBottom: NSLayoutConstraint?
   private weak var commentPoster: CommentPostable?
+  private weak var commentEchoer: CommentEchoDisplay?
 
   init(stream: StreamItem, onFocus: @escaping () -> Void, onReorder: @escaping (StreamCellView, UILongPressGestureRecognizer) -> Void) {
     self.stream = stream
@@ -6731,6 +6972,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     }
     let audio = video as? AudioControllable
     commentPoster = video as? CommentPostable
+    commentEchoer = video as? CommentEchoDisplay
     video.translatesAutoresizingMaskIntoConstraints = false
     addSubview(video)
 
@@ -6895,6 +7137,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
       switch result {
       case .success:
         self?.commentField.text = ""
+        self?.commentEchoer?.emitOwnComment(text)
         self?.showCommentStatus("送信しました")
         self?.setCommentBar(visible: false)
       case .failure(let error):
@@ -7019,6 +7262,7 @@ final class FocusedStreamView: UIView {
   private let input = UITextField()
   private var autoHider: AutoHidingControls?
   private weak var commentPoster: CommentPostable?
+  private weak var commentEchoer: CommentEchoDisplay?
 
   init(stream: StreamItem, onClose: (() -> Void)?) {
     self.stream = stream
@@ -7053,6 +7297,7 @@ final class FocusedStreamView: UIView {
     }
     let audio = video as? AudioControllable
     commentPoster = video as? CommentPostable
+    commentEchoer = video as? CommentEchoDisplay
     video.translatesAutoresizingMaskIntoConstraints = false
     addSubview(video)
 
@@ -7181,6 +7426,7 @@ final class FocusedStreamView: UIView {
           switch result {
           case .success:
             self?.input.text = ""
+            self?.commentEchoer?.emitOwnComment(text)
           case .failure:
             self?.sendWebComment(text)
           }
