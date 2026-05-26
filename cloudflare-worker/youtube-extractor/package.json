@@ -13,6 +13,6 @@
     "youtubei.js": "^17.0.0"
   },
   "devDependencies": {
-    "wrangler": "^3.0.0"
+    "wrangler": "^4.95.0"
   }
 }

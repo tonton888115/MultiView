@@ -5315,13 +5315,66 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     fallbackWebView = nil
   }
 
+  // 自前デプロイの CF Worker (youtubei.js)。ライブ配信は HLS manifest URL を返す
+  // ので AVPlayer ネイティブ再生できる。VOD は CF free 枠の eval 制限により
+  // worker からは {error: vod_requires_iframe_fallback} が返り、iOS は従来の
+  // iframe 経路にフォールバックする。
+  private static let extractionWorkerURL = "https://multiview.rinngo0626.workers.dev/"
+
   private func loadPlayer() {
     let raw = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
     if let videoId = Self.videoID(from: raw) {
-      extractStreams(videoId: videoId)
+      requestWorkerExtraction(videoId: videoId)
       return
     }
     resolveLiveVideoID(from: raw)
+  }
+
+  // Worker (multiview.rinngo0626.workers.dev) を最初に試す。ライブ動画なら HLS
+  // manifest URL が返るので、iframe を一切経由せず AVPlayer ネイティブ再生する。
+  // 失敗 (VOD で iframe fallback 要求 / Worker 障害 / タイムアウト) なら従来の
+  // extractStreams (WebView + InnerTube + iframe fallback chain) に降りる。
+  private func requestWorkerExtraction(videoId: String) {
+    guard !isStopped else { return }
+    showStatus("YouTube抽出中 (Worker)")
+    guard var components = URLComponents(string: Self.extractionWorkerURL) else {
+      extractStreams(videoId: videoId)
+      return
+    }
+    components.queryItems = [URLQueryItem(name: "v", value: videoId)]
+    guard let url = components.url else {
+      extractStreams(videoId: videoId)
+      return
+    }
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 8
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    resolveTask?.cancel()
+    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+      guard let self else { return }
+      DispatchQueue.main.async {
+        guard !self.isStopped, self.player.currentItem == nil else { return }
+        self.resolveTask = nil
+        let parsed = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        if let parsed,
+           let urlStr = parsed["url"] as? String,
+           let streamURL = URL(string: urlStr) {
+          let isLive = (parsed["isLive"] as? Bool) ?? false
+          self.noteExtractionFailure("Worker抽出成功 (\(parsed["kind"] as? String ?? "url"))")
+          self.startPlayback(url: streamURL, videoId: videoId, isLive: isLive)
+          return
+        }
+        // Worker が VOD で error を返した、または到達失敗 → 従来 chain へ
+        if let parsed, let err = parsed["error"] as? String {
+          self.noteExtractionFailure("Worker: \(err)")
+        } else {
+          let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+          self.noteExtractionFailure("Worker到達失敗 (HTTP \(status))")
+        }
+        self.extractStreams(videoId: videoId)
+      }
+    }
+    resolveTask?.resume()
   }
 
   // YouTube now gates raw stream URLs behind a PO token that only its own page JS can
@@ -6369,7 +6422,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         return
       }
       if let finalURL = response?.url, let id = Self.videoID(from: finalURL.absoluteString) {
-        DispatchQueue.main.async { self.extractStreams(videoId: id) }
+        DispatchQueue.main.async { self.requestWorkerExtraction(videoId: id) }
         return
       }
       guard let data, let html = String(data: data, encoding: .utf8),
@@ -6377,7 +6430,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         self.showStatus("YouTubeライブ動画IDを取得できません")
         return
       }
-      DispatchQueue.main.async { self.extractStreams(videoId: id) }
+      DispatchQueue.main.async { self.requestWorkerExtraction(videoId: id) }
     }
     resolveTask?.resume()
   }

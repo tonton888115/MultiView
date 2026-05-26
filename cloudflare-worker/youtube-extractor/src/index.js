@@ -17,16 +17,14 @@
 //
 // Free tier: 100,000 req/day, no payment required.
 
-import { Innertube, UniversalCache, Platform } from 'youtubei.js/cf-worker';
+import { Innertube, Platform } from 'youtubei.js/cf-worker';
 
-// Platform.shim.eval は base.js + processor 連結スクリプトを実行する。
-// data.output は `return process(...)` で終わるので、IIFE で包んで戻り値を取り出す。
-Platform.shim.eval = (data, env) => {
-  const keys = Object.keys(env || {});
-  const vals = keys.map(k => env[k]);
-  const body = `return (function(){ ${data.output} })();`;
-  const fn = new Function(...keys, body);
-  return fn(...vals);
+// CF Worker free 枠は `new Function` を禁止しており、unsafe_eval binding も
+// 別途申請制で使えない。VOD の signature_cipher 解読は不可能。
+// しかしライブ配信 (HLS manifest URL) は cipher 不要なので問題なく動く。
+// shim.eval は呼ばれた時だけ「VOD は CF Worker では非対応」と明示エラーする。
+Platform.shim.eval = () => {
+  throw new Error('VOD_DECIPHER_UNAVAILABLE_ON_CF_FREE');
 };
 
 const CORS = {
@@ -42,11 +40,15 @@ function jsonResponse(body, init = {}) {
   });
 }
 
+// youtubei.js の cf-worker Cache は cache.match に plain string を渡してしまい、
+// CF Worker の Cache API が "Invalid URL" でこける。CF Worker は isolate 起動ごとに
+// 状態を捨てるので、cache 自体を null にして毎回新規セッションで動作させる
+// (cold start で少し遅くなるだけ)。
 let ytPromise = null;
 function getYT() {
   if (!ytPromise) {
     ytPromise = Innertube.create({
-      cache: new UniversalCache(false),
+      cache: null,
       generate_session_locally: true,
       retrieve_player: true
     });
@@ -64,47 +66,59 @@ async function extractURL(videoId) {
     return { error: 'no streaming_data', title };
   }
 
-  // Live: HLS manifest が最優先 (AVPlayer がネイティブ再生)
+  // Live: HLS manifest URL は cipher 不要、そのまま AVPlayer で再生可能。
   if (isLive && sd.hls_manifest_url) {
     return { url: sd.hls_manifest_url, kind: 'hls', isLive: true, title };
   }
-  // VOD: muxed mp4 (audio+video 同梱の 360p itag=18) を decipher
-  const muxed = (sd.formats || []).filter(f => f.has_audio && f.has_video);
-  if (muxed.length) {
-    const best = muxed.sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-    try {
-      const ciphered = await best.decipher(yt.session.player);
-      const url = typeof ciphered === 'string' ? ciphered : (ciphered && (ciphered.url || ciphered.toString())) || null;
-      if (url) {
-        return { url, kind: 'mp4', isLive: false, title, quality: best.quality_label };
-      }
-    } catch (e) {
-      return { error: 'decipher failed: ' + (e.message || e), title };
-    }
+  // ライブでも稀に dash_manifest_url のみのケースがあるので保険として返す。
+  if (isLive && sd.dash_manifest_url) {
+    return { url: sd.dash_manifest_url, kind: 'dash', isLive: true, title };
   }
-  // どこにも muxed が無い場合は SABR only。AVPlayer で直接再生できない。
-  return { error: 'no playable format (SABR only)', sabrOnly: !!sd.server_abr_streaming_url, title };
+  // VOD は CF Worker 内で signature decipher できない (前述の通り)。
+  // iOS 側で iframe フォールバックさせる用に明示エラーを返す。
+  return {
+    error: 'vod_requires_iframe_fallback',
+    isLive: false,
+    title,
+    hint: 'VOD signature decipher is not supported on CF Workers free tier; iOS should use iframe.'
+  };
 }
 
 export default {
   async fetch(request) {
-    if (request.method === 'OPTIONS') return new Response(null, { headers: CORS });
-    const url = new URL(request.url);
-    if (url.pathname === '/health') {
-      return jsonResponse({ ok: true, version: '2026-05-27', engine: 'youtubei.js' });
-    }
-    const videoId = url.searchParams.get('v');
-    if (!videoId || !/^[A-Za-z0-9_-]{6,32}$/.test(videoId)) {
-      return jsonResponse({ error: 'missing or invalid ?v=' }, { status: 400 });
-    }
     try {
-      const result = await extractURL(videoId);
-      if (result.error) {
-        return jsonResponse(result, { status: 502 });
+      if (request.method === 'OPTIONS') return new Response(null, { headers: CORS });
+      const url = new URL(request.url);
+      if (url.pathname === '/health') {
+        return jsonResponse({ ok: true, version: '2026-05-27', engine: 'youtubei.js' });
       }
-      return jsonResponse(result);
-    } catch (e) {
-      return jsonResponse({ error: 'extractor exception: ' + (e.message || e) }, { status: 500 });
+      const videoId = url.searchParams.get('v');
+      if (!videoId || !/^[A-Za-z0-9_-]{6,32}$/.test(videoId)) {
+        return jsonResponse({ error: 'missing or invalid ?v=' }, { status: 400 });
+      }
+      try {
+        const result = await extractURL(videoId);
+        if (result.error) {
+          return jsonResponse(result, { status: 502 });
+        }
+        return jsonResponse(result);
+      } catch (e) {
+        console.error('extractor exception:', e);
+        return jsonResponse({
+          error: 'extractor exception',
+          name: e?.name || null,
+          message: e?.message || String(e),
+          stack: e?.stack ? String(e.stack).split('\n').slice(0, 8).join(' | ') : null
+        }, { status: 500 });
+      }
+    } catch (outer) {
+      console.error('handler outer exception:', outer);
+      return new Response(JSON.stringify({
+        error: 'handler outer',
+        name: outer?.name || null,
+        message: outer?.message || String(outer),
+        stack: outer?.stack ? String(outer.stack).split('\n').slice(0, 8).join(' | ') : null
+      }), { status: 500, headers: { ...CORS, 'Content-Type': 'application/json' } });
     }
   }
 };
