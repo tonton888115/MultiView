@@ -747,7 +747,9 @@ enum OAuthKeychain {
 
 struct TwitchOAuthConfig: Codable {
   var clientId = ""
-  var redirectURI = "multiview://twitch-oauth"
+  // Twitch requires HTTPS redirect URIs. This hosted bridge forwards the OAuth
+  // fragment back to the app's multiview:// custom scheme.
+  var redirectURI = "https://tonton888115.github.io/MultiView/twitch-oauth.html"
 }
 
 final class TwitchAuthManager: NSObject, ASWebAuthenticationPresentationContextProviding {
@@ -760,8 +762,12 @@ final class TwitchAuthManager: NSObject, ASWebAuthenticationPresentationContextP
   var config: TwitchOAuthConfig {
     get {
       guard let data = UserDefaults.standard.data(forKey: configKey),
-            let config = try? JSONDecoder().decode(TwitchOAuthConfig.self, from: data) else {
+            var config = try? JSONDecoder().decode(TwitchOAuthConfig.self, from: data) else {
         return TwitchOAuthConfig()
+      }
+      if config.redirectURI.isEmpty || config.redirectURI.hasPrefix("multiview://") {
+        config.redirectURI = TwitchOAuthConfig().redirectURI
+        self.config = config
       }
       return config
     }
@@ -5378,7 +5384,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     attempt: Int
   ) {
     guard !isStopped, player.currentItem == nil, extractorWebView != nil else { return }
-    let clients = Self.youtubeIClientContexts(baseContext: baseContext, visitorData: visitorData, preferWeb: poToken != nil)
+    let clients = Self.youtubeIClientContexts(baseContext: baseContext, visitorData: visitorData)
     guard clients.indices.contains(attempt) else {
       installEmbedFallback(videoId: videoId)
       return
@@ -5394,7 +5400,16 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+    let contextClient = (clients[attempt]["client"] as? [String: Any]) ?? [:]
+    let clientVersion = (contextClient["clientVersion"] as? String) ?? ""
+    let requestUserAgent = (contextClient["userAgent"] as? String) ?? Self.userAgent
+    request.setValue(requestUserAgent, forHTTPHeaderField: "User-Agent")
+    if let headerClientName = Self.youtubeClientHeaderName(clientName) {
+      request.setValue(headerClientName, forHTTPHeaderField: "X-YouTube-Client-Name")
+    }
+    if !clientVersion.isEmpty {
+      request.setValue(clientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
+    }
     request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
     request.setValue("https://www.youtube.com/watch?v=\(videoId)", forHTTPHeaderField: "Referer")
     if let visitorData, !visitorData.isEmpty {
@@ -5487,7 +5502,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
-  private static func youtubeIClientContexts(baseContext: [String: Any]?, visitorData explicitVisitorData: String?, preferWeb: Bool) -> [[String: Any]] {
+  private static func youtubeIClientContexts(baseContext: [String: Any]?, visitorData explicitVisitorData: String?) -> [[String: Any]] {
     let baseClient = (baseContext?["client"] as? [String: Any]) ?? [:]
     let hl = (baseClient["hl"] as? String) ?? "ja"
     let gl = (baseClient["gl"] as? String) ?? "JP"
@@ -5504,14 +5519,24 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       return ["client": client]
     }
     let webVersion = (baseClient["clientVersion"] as? String) ?? "2.20240501.01.00"
-    let webClients = [
+    let androidVRClient = context("ANDROID_VR", "1.65.10", extra: [
+      "deviceMake": "Oculus",
+      "deviceModel": "Quest 3",
+      "androidSdkVersion": 32,
+      "userAgent": "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+      "osName": "Android",
+      "osVersion": "12L",
+      "timeZone": "UTC",
+      "utcOffsetMinutes": 0
+    ])
+    var webClients: [[String: Any]] = [
+      context("MWEB", webVersion),
       context("WEB_SAFARI", webVersion, extra: [
         "browserName": "Safari",
         "browserVersion": "17.6",
         "osName": "iOS",
         "osVersion": "17.6"
       ]),
-      context("MWEB", webVersion),
       context("WEB", webVersion, extra: [
         "browserName": "Safari",
         "browserVersion": "17.6",
@@ -5526,6 +5551,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         "clientScreen": "EMBED"
       ])
     ]
+    if var baseContext, var client = baseContext["client"] as? [String: Any] {
+      if let visitorData { client["visitorData"] = visitorData }
+      baseContext["client"] = client
+      webClients.append(baseContext)
+    }
     let appClients = [
       context("IOS", "20.19.2", extra: [
         "deviceMake": "Apple",
@@ -5543,7 +5573,25 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         "userAgent": "com.google.android.youtube/20.19.35 (Linux; U; Android 15) gzip"
       ])
     ]
-    return preferWeb ? webClients + appClients : appClients + webClients
+    return ([androidVRClient] + webClients + appClients).reduce(into: [[String: Any]]()) { result, context in
+      let name = ((context["client"] as? [String: Any])?["clientName"] as? String) ?? UUID().uuidString
+      if !result.contains(where: { (($0["client"] as? [String: Any])?["clientName"] as? String) == name }) {
+        result.append(context)
+      }
+    }
+  }
+
+  private static func youtubeClientHeaderName(_ clientName: String) -> String? {
+    switch clientName {
+    case "WEB": return "1"
+    case "MWEB": return "2"
+    case "IOS": return "5"
+    case "WEB_EMBEDDED_PLAYER": return "56"
+    case "TVHTML5_SIMPLY_EMBEDDED_PLAYER": return "85"
+    case "ANDROID": return "3"
+    case "ANDROID_VR": return "28"
+    default: return nil
+    }
   }
 
   private static func extractPlayableStream(from parsed: [String: Any]) -> (url: URL, isLive: Bool)? {
@@ -5816,28 +5864,25 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     extractorWebView = nil
   }
 
-  // Prefer muxed audio+video URLs, but accept video-only adaptive URLs as a last
-  // resort so the cell stays native AVPlayer instead of falling into the iframe UI.
+  // AVPlayer needs a playable stream by itself. YouTube adaptive video-only URLs
+  // look tempting but fail/stall without the paired audio or SABR loader, so only
+  // accept muxed/progressive formats here and let the caller try the next client.
   private static func bestFormatURL(_ formats: [[String: Any]]) -> URL? {
-    let candidates: [(Int, Int, Bool, URL)] = formats.compactMap { fmt in
+    let candidates: [(Int, Int, URL)] = formats.compactMap { fmt in
       guard let urlString = fmt["url"] as? String, let url = URL(string: urlString) else { return nil }
       let height = (fmt["height"] as? Int) ?? 0
       let bitrate = (fmt["bitrate"] as? Int) ?? 0
       let mime = (fmt["mimeType"] as? String) ?? ""
       let hasAudio = !mime.contains("video/") || mime.contains("mp4a") || (fmt["hasAudio"] as? Bool) == true
-      guard mime.contains("video/") else { return nil }
-      return (height, bitrate, hasAudio, url)
+      guard mime.contains("video/"), hasAudio else { return nil }
+      return (height, bitrate, url)
     }
     guard !candidates.isEmpty else { return nil }
     let sorted = candidates.sorted {
-      if $0.2 != $1.2 { return !$0.2 && $1.2 }
       if $0.0 == $1.0 { return $0.1 < $1.1 }
       return $0.0 < $1.0
     }
-    return (sorted.last(where: { $0.0 <= 720 && $0.2 })
-      ?? sorted.last(where: { $0.2 })
-      ?? sorted.last(where: { $0.0 <= 720 })
-      ?? sorted.last)?.3
+    return (sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.2
   }
 
   private static let extractionJS = """
@@ -6029,6 +6074,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   // YouTube chrome/ads and still fails autoplay on some devices.
   private func installEmbedFallback(videoId: String) {
     guard !isStopped else { return }
+    if player.currentItem != nil {
+      itemStatusObservation = nil
+      player.pause()
+      player.replaceCurrentItem(with: nil)
+    }
     if !triedPiped {
       triedPiped = true
       noteExtractionFailure("通常抽出失敗: Pipedへ切替")
@@ -7987,10 +8037,10 @@ final class SettingsController: UITableViewController {
     case .danmaku: return 6
     case .comments: return 1
     case .order: return platforms.count
-    case .kick: return 4
-    case .twitch: return 3
-    case .twitcasting: return 3
-    case .youtube: return 3
+    case .kick: return 5
+    case .twitch: return 4
+    case .twitcasting: return 4
+    case .youtube: return 4
     case .niconico: return 2
     case .webData: return 1
     case .add: return 1
@@ -8024,9 +8074,9 @@ final class SettingsController: UITableViewController {
     case .order:
       return "右端の並べ替えハンドルをドラッグして、表示順を自由に変更できます。"
     case .kick:
-      return "kick.com → Settings → Developer で作るOAuthアプリの Client ID を設定します。Client Secret は確認画面付き(confidential)アプリのみ必要で、PKCE公開アプリでは空のままで構いません。Redirect URI「\(KickAuthManager.shared.config.redirectURI)」をアプリに登録してください(行をタップでコピー)。"
+      return "Kick Developer でOAuthアプリを作成します。Redirect URI「\(KickAuthManager.shared.config.redirectURI)」を登録してください。"
     case .twitch:
-      return "Twitch Developer Console で user:read:chat / user:write:chat 権限のアプリを作成し、Redirect URI を登録してください(行をタップでコピー)。"
+      return "Twitch Developer Console でアプリを作成します。Redirect URI はHTTPS必須なので「\(TwitchAuthManager.shared.config.redirectURI)」を登録してください。"
     case .twitcasting:
       return "ツイキャスのAPIアプリ(Write権限)の Client ID を設定し、Redirect URI を登録してください(行をタップでコピー)。"
     case .youtube:
@@ -8137,8 +8187,9 @@ final class SettingsController: UITableViewController {
       let config = KickAuthManager.shared.config
       switch indexPath.row {
       case 0: cell.textLabel?.text = KickAuthManager.shared.isSignedIn ? "ログアウト" : "ログイン"
-      case 1: cell.textLabel?.text = config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
-      case 2: cell.textLabel?.text = config.clientSecret.isEmpty ? "Client Secret 未設定 (任意)" : "Client Secret 設定済み"
+      case 1: cell.textLabel?.text = "Kick Developer を開く"
+      case 2: cell.textLabel?.text = config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
+      case 3: cell.textLabel?.text = config.clientSecret.isEmpty ? "Client Secret 未設定 (任意)" : "Client Secret 設定済み"
       default: cell.textLabel?.text = "Redirect URI をコピー"
       }
       cell.accessoryType = .disclosureIndicator
@@ -8146,7 +8197,8 @@ final class SettingsController: UITableViewController {
     case .twitch:
       switch indexPath.row {
       case 0: cell.textLabel?.text = TwitchAuthManager.shared.isSignedIn ? "ログアウト" : "ログイン"
-      case 1: cell.textLabel?.text = TwitchAuthManager.shared.config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
+      case 1: cell.textLabel?.text = "Twitch Developer Console を開く"
+      case 2: cell.textLabel?.text = TwitchAuthManager.shared.config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
       default: cell.textLabel?.text = "Redirect URI をコピー"
       }
       cell.accessoryType = .disclosureIndicator
@@ -8154,7 +8206,8 @@ final class SettingsController: UITableViewController {
     case .twitcasting:
       switch indexPath.row {
       case 0: cell.textLabel?.text = TwitcastingAuthManager.shared.isSignedIn ? "ログアウト" : "ログイン"
-      case 1: cell.textLabel?.text = TwitcastingAuthManager.shared.config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
+      case 1: cell.textLabel?.text = "ツイキャス API 管理を開く"
+      case 2: cell.textLabel?.text = TwitcastingAuthManager.shared.config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
       default: cell.textLabel?.text = "Redirect URI をコピー"
       }
       cell.accessoryType = .disclosureIndicator
@@ -8162,7 +8215,8 @@ final class SettingsController: UITableViewController {
     case .youtube:
       switch indexPath.row {
       case 0: cell.textLabel?.text = YouTubeAuthManager.shared.isSignedIn ? "ログアウト" : "ログイン"
-      case 1: cell.textLabel?.text = YouTubeAuthManager.shared.config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
+      case 1: cell.textLabel?.text = "Google Cloud 認証情報を開く"
+      case 2: cell.textLabel?.text = YouTubeAuthManager.shared.config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
       default: cell.textLabel?.text = "Redirect URI をコピー"
       }
       cell.accessoryType = .disclosureIndicator
@@ -8233,7 +8287,7 @@ final class SettingsController: UITableViewController {
     case .twitch:
       handleOtherOAuthRow(indexPath.row)
     case .twitcasting:
-      handleOtherOAuthRow(indexPath.row + 3)
+      handleOtherOAuthRow(indexPath.row + 4)
     case .youtube:
       handleYouTubeOAuthRow(indexPath.row)
     case .niconico:
@@ -8364,10 +8418,12 @@ final class SettingsController: UITableViewController {
         }
       }
     case 1:
-      editKickClientID()
+      openDeveloperURL("https://kick.com/settings/developer")
     case 2:
-      editKickClientSecret()
+      editKickClientID()
     case 3:
+      editKickClientSecret()
+    case 4:
       let uri = KickAuthManager.shared.config.redirectURI
       UIPasteboard.general.string = uri
       let alert = UIAlertController(
@@ -8451,12 +8507,14 @@ final class SettingsController: UITableViewController {
         }
       }
     case 1:
-      editTwitchClientID()
+      openDeveloperURL("https://dev.twitch.tv/console/apps")
     case 2:
+      editTwitchClientID()
+    case 3:
       let uri = TwitchAuthManager.shared.config.redirectURI
       UIPasteboard.general.string = uri
       presentCopiedRedirectAlert(service: "Twitch", uri: uri) { [weak self] in self?.editTwitchRedirectURI() }
-    case 3:
+    case 4:
       if TwitcastingAuthManager.shared.isSignedIn {
         TwitcastingAuthManager.shared.signOut()
         tableView.reloadData()
@@ -8468,9 +8526,11 @@ final class SettingsController: UITableViewController {
           if case .failure(let error) = result { self?.presentError(error) }
         }
       }
-    case 4:
-      editTwitcastingClientID()
     case 5:
+      openDeveloperURL("https://twitcasting.tv/developer.php")
+    case 6:
+      editTwitcastingClientID()
+    case 7:
       let uri = TwitcastingAuthManager.shared.config.redirectURI
       UIPasteboard.general.string = uri
       presentCopiedRedirectAlert(service: "ツイキャス", uri: uri) { [weak self] in self?.editTwitcastingRedirectURI() }
@@ -8494,14 +8554,21 @@ final class SettingsController: UITableViewController {
         }
       }
     case 1:
-      editYouTubeClientID()
+      openDeveloperURL("https://console.cloud.google.com/apis/credentials")
     case 2:
+      editYouTubeClientID()
+    case 3:
       let uri = YouTubeAuthManager.shared.config.redirectURI
       UIPasteboard.general.string = uri
       presentCopiedRedirectAlert(service: "YouTube", uri: uri) { [weak self] in self?.editYouTubeRedirectURI() }
     default:
       break
     }
+  }
+
+  private func openDeveloperURL(_ raw: String) {
+    guard let url = URL(string: raw) else { return }
+    UIApplication.shared.open(url)
   }
 
   private func editTwitchClientID() {
