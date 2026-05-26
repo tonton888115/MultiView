@@ -5246,7 +5246,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   func resumePlayback() {
     guard !isStopped else { return }
     if let fallbackWebView {
-      fallbackWebView.evaluateJavaScript("window.mvPlay && window.mvPlay();")
+      let effective = settings.playAudio ? playbackVolume : 0
+      fallbackWebView.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(effective)); window.mvPlay && window.mvPlay();")
       return
     }
     let session = AVAudioSession.sharedInstance()
@@ -5265,9 +5266,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
     applyVolume()
-    // YouTube fallback is iframe-based; keep it muted so audio output never fights
-    // the same AVAudioSession used by Kick/Twitch/native YouTube playback.
-    fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(0);")
+    // iframe fallback も AVPlayer と同じ音量を尊重する。settings.playAudio が
+    // 偽の時は強制ミュート (AVAudioSession の category は .playback だが
+    // mixWithOthers 未指定なので、複数 cell の音声は端末スピーカーで mix される)。
+    let effective = settings.playAudio ? playbackVolume : 0
+    fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(effective));")
   }
 
   private func applyVolume() {
@@ -6197,14 +6200,15 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     installAlternativeWebFallback(videoId: videoId)
   }
 
+  // 最終フォールバック: YouTube 公式 iframe API を埋め込んだ HTML を WKWebView に
+  // ロードする。embedHTML の方が直接 youtube.com/embed/ ロードより:
+  //   1) controls=0 modestbranding=1 で UI chrome を最小化
+  //   2) mvPlay/mvPause/mvSetVolume で AVPlayer 同等の制御
+  //   3) SponsorBlock スキッパ内蔵 (VOD)
+  //   4) WebAdBlocker のコンテンツルール適用
+  // attempt 引数は予備 (将来 piped.video 等への二段フォールバックに使う)。
   private func installAlternativeWebFallback(videoId: String, attempt: Int = 0) {
     guard !isStopped, fallbackWebView == nil else { return }
-    guard Self.alternativeWebFallbacks.indices.contains(attempt),
-          let url = URL(string: String(format: Self.alternativeWebFallbacks[attempt], videoId)) else {
-      teardownExtractor()
-      showStatus("YouTube映像URLを取得できません")
-      return
-    }
     teardownExtractor()
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
@@ -6213,7 +6217,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     itemStatusObservation = nil
     player.pause()
     player.replaceCurrentItem(with: nil)
-    showStatus("YouTube代替Web再生を読み込み中")
+    showStatus("YouTube公式iframeで再生")
     let config = WKWebViewConfiguration()
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
@@ -6227,11 +6231,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     web.scrollView.contentInsetAdjustmentBehavior = .never
     web.customUserAgent = Self.userAgent
     web.navigationDelegate = self
-    // bounds は cell 配置直後に変わることがあるので、autoresizing で親に追従させる。
     web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     addSubview(web)
     fallbackWebView = web
-    web.load(URLRequest(url: url))
+    web.loadHTMLString(Self.embedHTML(videoId: videoId), baseURL: URL(string: "https://www.youtube.com"))
+    statusLabel.isHidden = true
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
       self?.resumePlayback()
     }
@@ -6342,9 +6346,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
-  // Fallback embed (only used when stream extraction fails). No forced-play loop —
-  // that was making every YouTube cell fight for the audio session and stall. Includes
-  // a lightweight SponsorBlock skipper (no-op for live, which has no segments).
+  // Fallback embed: 抽出失敗時の最終再生経路。YouTube 公式 iframe API を埋め込み、
+  // controls=0 / modestbranding=1 で chrome を抑え、SponsorBlock スキップを内蔵、
+  // mvSetVolume で cell ごとの音量制御 (0〜1 を 0〜100 に変換) を可能にしている。
+  // 旧実装は force-mute だったが、複数 cell でも各 cell の音量スライダー (player.volume)
+  // で制御できるので、デフォルト最大音量で起動して setPlaybackVolume が後追い設定する。
   private static func embedHTML(videoId: String) -> String {
     let sbCategories = "%5B%22sponsor%22%2C%22selfpromo%22%2C%22interaction%22%2C%22intro%22%2C%22outro%22%2C%22preview%22%2C%22music_offtopic%22%5D"
     return """
@@ -6356,12 +6362,12 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     <div id="player"></div>
     <script src="https://www.youtube.com/iframe_api"></script>
     <script>
-      var player=null, ready=false, muted=true, volume=0, sb=[];
+      var player=null, ready=false, pendingVolume=100, sb=[];
       function applyAudio(){
         if(!player||!ready)return;
         try{
-          player.setVolume(0);
-          player.mute();
+          if(pendingVolume<=0){player.mute();player.setVolume(0);}
+          else{player.unMute();player.setVolume(pendingVolume);}
         }catch(e){}
       }
       function play(){
@@ -6390,9 +6396,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           events:{onReady:function(){ready=true;play();loadSB();}}
         });
       };
-      window.mvPlay=function(){muted=true;volume=0;play();};
+      window.mvPlay=function(){play();};
       window.mvPause=function(){try{player&&player.pauseVideo();}catch(e){}};
-      window.mvSetVolume=function(v){muted=true;volume=0;applyAudio();};
+      window.mvSetVolume=function(v){pendingVolume=Math.max(0,Math.min(100,Math.round((+v||0)*100)));applyAudio();};
       setInterval(sbTick, 400);
     </script>
     </body>
