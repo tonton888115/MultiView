@@ -1,0 +1,9 @@
+name = "multiview-youtube"
+main = "src/index.js"
+compatibility_date = "2026-05-26"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+# free tier defaults: 100,000 requests/day, no payment required
