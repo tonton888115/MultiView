@@ -1,0 +1,43 @@
+workflows:
+  ios-unsigned-ipa:
+    name: iOS Unsigned IPA
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    environment:
+      node: 22
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Install JS dependencies
+        working_directory: MultiView
+        script: npm ci
+      - name: Install Ruby gems (CocoaPods)
+        working_directory: MultiView
+        script: bundle install
+      - name: Pod install
+        working_directory: MultiView/ios
+        script: bundle exec pod install
+      - name: Build unsigned app
+        working_directory: MultiView/ios
+        script: |
+          xcodebuild \
+            -workspace MultiView.xcworkspace \
+            -scheme MultiView \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ONLY_ACTIVE_ARCH=NO \
+            clean build
+      - name: Package into .ipa
+        working_directory: MultiView/ios/build/Build/Products/Release-iphoneos
+        script: |
+          mkdir -p Payload
+          cp -R MultiView.app Payload/
+          zip -qry MultiView.ipa Payload
+          ls -lh MultiView.ipa
+    artifacts:
+      - MultiView/ios/build/Build/Products/Release-iphoneos/MultiView.ipa
