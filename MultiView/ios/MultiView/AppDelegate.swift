@@ -6131,6 +6131,16 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     player.replaceCurrentItem(with: item)
     applyVolume()
     player.play()
+    // AVPlayer が .failed に遷移せず ready のまま無音で固まるケース (signatureCipher
+    // 経由の壊れた URL でよく起きる) に備え、6秒以内に再生開始しなければ iframe へ。
+    DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self, weak item] in
+      guard let self, !self.isStopped,
+            self.fallbackWebView == nil,
+            let item, self.player.currentItem === item,
+            self.player.timeControlStatus != .playing else { return }
+      self.noteExtractionFailure("6秒以内に再生されず: iframeへ")
+      self.installEmbedFallback(videoId: videoId)
+    }
     // SponsorBlock only applies to VOD (live has no segments).
     if !isLive {
       fetchSponsorBlock(videoId: videoId)
@@ -6138,8 +6148,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
-  // Last-resort extraction path. Do not show the official iframe here: that exposes
-  // YouTube chrome/ads and still fails autoplay on some devices.
+  // 2026年現在、YouTube は formats[*].url を出さず (signatureCipher のみ)、
+  // hlsManifestUrl も SABR 強制で空のことが多い。Piped/Invidious 含む第三者
+  // API も全滅していることを PC 検証済み。proxy 経路を回しても 10-15秒の
+  // 黒画面を増やすだけなので、抽出失敗 = 直ちに iframe 描画に進む。
   private func installEmbedFallback(videoId: String) {
     guard !isStopped else { return }
     if player.currentItem != nil {
@@ -6147,22 +6159,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       player.pause()
       player.replaceCurrentItem(with: nil)
     }
-    // 2026-05 時点で Piped の proxy.piped.private.coffee は実コンテンツ取得時 502 を
-     // 返すため再生不可。直接 googlevideo URL を返す Invidious を先に試す。
-    if !triedInvidious {
-      triedInvidious = true
-      noteExtractionFailure("通常抽出失敗: Invidiousへ切替")
-      requestInvidiousStreams(videoId: videoId)
-      return
-    }
-    if !triedPiped {
-      triedPiped = true
-      noteExtractionFailure("Invidious失敗: Pipedへ切替")
-      requestPipedStreams(videoId: videoId)
-      return
-    }
-    // 全ての抽出経路が尽きたら iframe で必ず映像を出す (2026 仕様で生 URL 抽出不能)。
-    noteExtractionFailure("抽出全失敗: iframeへ切替")
+    noteExtractionFailure("抽出失敗: iframeで再生")
     installAlternativeWebFallback(videoId: videoId)
   }
 
@@ -6196,6 +6193,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     web.scrollView.contentInsetAdjustmentBehavior = .never
     web.customUserAgent = Self.userAgent
     web.navigationDelegate = self
+    // bounds は cell 配置直後に変わることがあるので、autoresizing で親に追従させる。
+    web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     addSubview(web)
     fallbackWebView = web
     web.load(URLRequest(url: url))
