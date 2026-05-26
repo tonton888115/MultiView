@@ -53,3 +53,12 @@ Write-Host "Downloading IPA from $($ipa.url)"
 Invoke-WebRequest -Uri $ipa.url -OutFile $Output -Headers $headers
 $sizeMB = [math]::Round((Get-Item $Output).Length / 1MB, 2)
 Write-Host "Saved: $Output ($sizeMB MB)"
+
+$icloudDir = Join-Path $env:USERPROFILE 'iCloudDrive\Downloads'
+if (Test-Path $icloudDir) {
+    $icloudPath = Join-Path $icloudDir (Split-Path -Path $Output -Leaf)
+    Copy-Item -Path $Output -Destination $icloudPath -Force
+    Write-Host "Mirrored to iCloud: $icloudPath"
+} else {
+    Write-Warning "iCloud Drive Downloads not found at $icloudDir; skipped mirror."
+}

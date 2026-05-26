@@ -5168,6 +5168,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16)
     ])
     PlaybackCoordinator.shared.register(self)
+    Self.refreshInstanceListsIfNeeded()
     loadPlayer()
   }
 
@@ -5840,17 +5841,57 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     return parts.joined(separator: " / ")
   }
 
-  private static let pipedAPIInstances = [
-    "https://pipedapi.leptons.xyz",
-    "https://pipedapi-libre.kavin.rocks",
-    "https://pipedapi.kavin.rocks"
+  // 2026-05 時点で API が生きている唯一のホスト。公式リストから起動時に補充するため
+  // static var で保持し、refreshInstanceListsIfNeeded() が動的に上書きする。
+  private static var pipedAPIInstances: [String] = [
+    "https://api.piped.private.coffee"
   ]
 
-  private static let invidiousAPIInstances = [
-    "https://yewtu.be",
-    "https://inv.nadeko.net",
-    "https://inv.tux.pizza"
+  private static var invidiousAPIInstances: [String] = [
+    "https://inv.thepixora.com"
   ]
+
+  private static var instancesRefreshStarted = false
+
+  static func refreshInstanceListsIfNeeded() {
+    guard !instancesRefreshStarted else { return }
+    instancesRefreshStarted = true
+    refreshPipedInstances()
+    refreshInvidiousInstances()
+  }
+
+  private static func refreshPipedInstances() {
+    guard let url = URL(string: "https://piped-instances.kavin.rocks") else { return }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 5
+    URLSession.shared.dataTask(with: req) { data, _, _ in
+      guard let data,
+            let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return }
+      let urls = arr.compactMap { $0["api_url"] as? String }.filter { $0.hasPrefix("https://") }
+      guard !urls.isEmpty else { return }
+      DispatchQueue.main.async { pipedAPIInstances = urls }
+    }.resume()
+  }
+
+  private static func refreshInvidiousInstances() {
+    guard let url = URL(string: "https://api.invidious.io/instances.json") else { return }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = 5
+    URLSession.shared.dataTask(with: req) { data, _, _ in
+      guard let data,
+            let arr = try? JSONSerialization.jsonObject(with: data) as? [[Any]] else { return }
+      let urls = arr.compactMap { entry -> String? in
+        guard entry.count >= 2,
+              let dict = entry[1] as? [String: Any],
+              (dict["api"] as? Bool) == true,
+              let uri = dict["uri"] as? String,
+              uri.hasPrefix("https://") else { return nil }
+        return uri
+      }
+      guard !urls.isEmpty else { return }
+      DispatchQueue.main.async { invidiousAPIInstances = urls }
+    }.resume()
+  }
 
   private static let alternativeWebFallbacks = [
     "https://piped.video/embed/%@",
