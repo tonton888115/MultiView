@@ -5,6 +5,8 @@ name: Build iOS (unsigned IPA)
 
 on:
   workflow_dispatch:
+  repository_dispatch:
+    types: [build-ios]
   push:
     branches: [main]
     paths:
