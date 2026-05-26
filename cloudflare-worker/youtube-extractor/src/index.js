@@ -1,52 +1,33 @@
 // MultiView YouTube extractor (Cloudflare Worker, free tier)
 //
-// 2026-05 時点で YouTube は formats[*].url を出さなくなり、SABR + PoToken 必須化が
-// 進んでいる。PoToken なしで成功するパターンは限定的だが、CF Worker のサーバ IP
-// (iOS 端末より「綺麗」と評価されやすい) と複数 InnerTube クライアントの試行で
-// ある程度カバーできる。失敗時は iOS 側で iframe フォールバックする。
+// 2026-05 時点で YouTube は signature_cipher を強制し、第三者 API では生 URL を
+// 返さなくなった。本 Worker は LuanRT/YouTube.js (youtubei.js) を使い、CF Worker
+// 内で base.js を fetch して decipher を完了させ、直接 googlevideo URL を返す。
+// VOD は muxed mp4 (360p)、live は HLS manifest URL を返す。
+// AVPlayer はいずれもネイティブ再生可能。
 //
 // Usage:
-//   GET https://<worker>.workers.dev/?v=<videoId>
-//   GET https://<worker>.workers.dev/?v=<videoId>&prefer=live   (LIVE用にHLS優先)
-//   GET https://<worker>.workers.dev/health
-// Response:
-//   200 { url, type: "hls"|"mp4", isLive, client, title?, quality? }
-//   502 { error, sabrOnly?, lastClient? }
+//   GET /?v=<videoId>
+//   GET /health
+//
+// Response 200:
+//   { url, kind: "mp4"|"hls", isLive, title, quality? }
+// Response 502:
+//   { error, sabrOnly?, info? }
+//
+// Free tier: 100,000 req/day, no payment required.
 
-const CLIENTS = [
-  {
-    name: 'IOS',
-    version: '20.19.2',
-    key: 'AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc',
-    headerName: '5',
-    ua: 'com.google.ios.youtube/20.19.2 (iPhone16,2; U; CPU iOS 18_5_0 like Mac OS X; ja_JP)',
-    extra: { deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.5.0.22F76' }
-  },
-  {
-    name: 'ANDROID',
-    version: '20.19.35',
-    key: 'AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w',
-    headerName: '3',
-    ua: 'com.google.android.youtube/20.19.35 (Linux; U; Android 15) gzip',
-    extra: { androidSdkVersion: 35, deviceMake: 'Google', deviceModel: 'Pixel 9 Pro', osName: 'Android', osVersion: '15' }
-  },
-  {
-    name: 'ANDROID_VR',
-    version: '1.65.10',
-    key: 'AIzaSyC4-Yqz5WHJZSn9pNwbZSgGtV_Le_3FfYY',
-    headerName: '28',
-    ua: 'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-    extra: { deviceMake: 'Oculus', deviceModel: 'Quest 3', androidSdkVersion: 32, osName: 'Android', osVersion: '12L' }
-  },
-  {
-    name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-    version: '2.0',
-    key: 'AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8',
-    headerName: '85',
-    ua: 'Mozilla/5.0 (PlayStation; PlayStation 5/2.26) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0 Safari/605.1.15',
-    extra: { clientScreen: 'EMBED' }
-  }
-];
+import { Innertube, UniversalCache, Platform } from 'youtubei.js/cf-worker';
+
+// Platform.shim.eval は base.js + processor 連結スクリプトを実行する。
+// data.output は `return process(...)` で終わるので、IIFE で包んで戻り値を取り出す。
+Platform.shim.eval = (data, env) => {
+  const keys = Object.keys(env || {});
+  const vals = keys.map(k => env[k]);
+  const body = `return (function(){ ${data.output} })();`;
+  const fn = new Function(...keys, body);
+  return fn(...vals);
+};
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -61,107 +42,69 @@ function jsonResponse(body, init = {}) {
   });
 }
 
-async function callInnertube(client, videoId) {
-  const body = {
-    context: {
-      client: {
-        clientName: client.name,
-        clientVersion: client.version,
-        hl: 'ja',
-        gl: 'JP',
-        userAgent: client.ua,
-        ...client.extra
-      }
-    },
-    videoId,
-    playbackContext: {
-      contentPlaybackContext: {
-        signatureTimestamp: 19500,
-        html5Preference: 'HTML5_PREF_WANTS'
-      }
-    },
-    contentCheckOk: true,
-    racyCheckOk: true
-  };
-  const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${client.key}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': client.ua,
-      'Origin': 'https://www.youtube.com',
-      'X-YouTube-Client-Name': client.headerName,
-      'X-YouTube-Client-Version': client.version,
-      'Accept-Language': 'ja-JP,ja;q=0.9'
-    },
-    body: JSON.stringify(body)
-  });
-  if (!resp.ok) {
-    return { ok: false, status: resp.status };
+let ytPromise = null;
+function getYT() {
+  if (!ytPromise) {
+    ytPromise = Innertube.create({
+      cache: new UniversalCache(false),
+      generate_session_locally: true,
+      retrieve_player: true
+    });
   }
-  return { ok: true, data: await resp.json() };
+  return ytPromise;
 }
 
-function pickPlayableURL(streamingData) {
-  if (!streamingData) return null;
-  if (streamingData.hlsManifestUrl) {
-    return { url: streamingData.hlsManifestUrl, type: 'hls', isLive: true };
+async function extractURL(videoId) {
+  const yt = await getYT();
+  const info = await yt.getInfo(videoId);
+  const isLive = !!info.basic_info?.is_live;
+  const title = info.basic_info?.title || '';
+  const sd = info.streaming_data;
+  if (!sd) {
+    return { error: 'no streaming_data', title };
   }
-  const formats = streamingData.formats || [];
-  const muxed = formats.filter(f => f.url && f.mimeType && f.mimeType.includes('video/'));
+
+  // Live: HLS manifest が最優先 (AVPlayer がネイティブ再生)
+  if (isLive && sd.hls_manifest_url) {
+    return { url: sd.hls_manifest_url, kind: 'hls', isLive: true, title };
+  }
+  // VOD: muxed mp4 (audio+video 同梱の 360p itag=18) を decipher
+  const muxed = (sd.formats || []).filter(f => f.has_audio && f.has_video);
   if (muxed.length) {
-    muxed.sort((a, b) => (b.height || 0) - (a.height || 0));
-    const cap720 = muxed.find(f => (f.height || 0) <= 720) || muxed[muxed.length - 1];
-    return { url: cap720.url, type: 'mp4', isLive: false, quality: cap720.qualityLabel };
+    const best = muxed.sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+    try {
+      const ciphered = await best.decipher(yt.session.player);
+      const url = typeof ciphered === 'string' ? ciphered : (ciphered && (ciphered.url || ciphered.toString())) || null;
+      if (url) {
+        return { url, kind: 'mp4', isLive: false, title, quality: best.quality_label };
+      }
+    } catch (e) {
+      return { error: 'decipher failed: ' + (e.message || e), title };
+    }
   }
-  return null;
+  // どこにも muxed が無い場合は SABR only。AVPlayer で直接再生できない。
+  return { error: 'no playable format (SABR only)', sabrOnly: !!sd.server_abr_streaming_url, title };
 }
 
 export default {
   async fetch(request) {
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: CORS });
-    }
+    if (request.method === 'OPTIONS') return new Response(null, { headers: CORS });
     const url = new URL(request.url);
     if (url.pathname === '/health') {
-      return jsonResponse({ ok: true, clients: CLIENTS.map(c => c.name) });
+      return jsonResponse({ ok: true, version: '2026-05-27', engine: 'youtubei.js' });
     }
     const videoId = url.searchParams.get('v');
     if (!videoId || !/^[A-Za-z0-9_-]{6,32}$/.test(videoId)) {
-      return jsonResponse({ error: 'missing or invalid v param' }, { status: 400 });
+      return jsonResponse({ error: 'missing or invalid ?v=' }, { status: 400 });
     }
-    let lastErr = null;
-    let sawSabr = false;
-    for (const client of CLIENTS) {
-      try {
-        const result = await callInnertube(client, videoId);
-        if (!result.ok) {
-          lastErr = `${client.name}: HTTP ${result.status}`;
-          continue;
-        }
-        const status = result.data.playabilityStatus?.status;
-        if (status && status !== 'OK') {
-          lastErr = `${client.name}: ${status} ${result.data.playabilityStatus?.reason || ''}`;
-          continue;
-        }
-        const sd = result.data.streamingData;
-        if (sd?.serverAbrStreamingUrl) sawSabr = true;
-        const pick = pickPlayableURL(sd);
-        if (pick) {
-          return jsonResponse({
-            ...pick,
-            client: client.name,
-            title: result.data.videoDetails?.title
-          });
-        }
-        lastErr = `${client.name}: no playable URL`;
-      } catch (e) {
-        lastErr = `${client.name}: ${e.message || e}`;
+    try {
+      const result = await extractURL(videoId);
+      if (result.error) {
+        return jsonResponse(result, { status: 502 });
       }
+      return jsonResponse(result);
+    } catch (e) {
+      return jsonResponse({ error: 'extractor exception: ' + (e.message || e) }, { status: 500 });
     }
-    return jsonResponse({
-      error: lastErr || 'all clients failed',
-      sabrOnly: sawSabr,
-      recommendIframe: true
-    }, { status: 502 });
   }
 };

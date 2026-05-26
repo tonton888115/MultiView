@@ -1,62 +1,67 @@
 # MultiView YouTube Extractor (Cloudflare Worker)
 
-YouTube の生 URL 抽出を CF Worker 側で代行する。2026 年 YouTube は PoToken/SABR を
-強制してきており、iOS 単独では URL を取得できないため、サーバ IP 経由で複数の
-InnerTube クライアント (IOS / ANDROID / ANDROID_VR / TV) を回す。
+`youtubei.js` を使って YouTube の直接 googlevideo URL (VOD: muxed mp4 / live: HLS) を
+返す CF Worker。iOS の AVPlayer がネイティブ再生できる URL なので、iframe / embed
+の制約を完全に回避できる。
 
-成功率は完全ではないが、iframe フォールバックより「動画のみ」で再生できる確率が高い。
-失敗した動画は iOS 側で従来通り iframe にフォールバックする。
+## ローカル検証済み (PC)
 
-無料枠: **100,000 req/日**、課金登録不要。
+`tmp/yt-test/test.mjs` 相当の Node.js 版で確認済み:
 
-## デプロイ方法 (2 通り)
+| 動画 | 種類 | 結果 |
+|---|---|---|
+| Rick Astley (`dQw4w9WgXcQ`) | VOD | 360p mp4 / HEAD 200 / video/mp4 / 11.8 MB |
+| Gangnam Style (`9bZkp7q19f0`) | VOD | 360p mp4 / HEAD 200 / video/mp4 / 15.6 MB |
+| テレ朝NEWS24 (`coYw-eVU0Ks`) | Live | HLS manifest / HEAD 200 / application/vnd.apple.mpegurl |
 
-### 方法 A: Cloudflare ダッシュボードに貼り付け (一番簡単、Node 不要)
+→ AVPlayer が直接呑める URL であることを HEAD レスポンスで確認している。
 
-1. https://dash.cloudflare.com → サインアップ (無料)
-2. 左メニュー **Workers & Pages** → **Create** → **Hello World**
-3. Worker 名: `multiview-youtube` (任意) → **Deploy**
-4. 直後の画面で **Edit code** → 既存の Worker コードを全消去
-5. このリポジトリの [`src/index.js`](src/index.js) の内容を全部貼り付け
-6. 右上 **Deploy**
-7. デプロイ URL が表示される: `https://multiview-youtube.<your-subdomain>.workers.dev`
+## 無料デプロイ手順 (wrangler 経由、5分)
 
-### 方法 B: wrangler CLI 経由 (Node.js が入っている人向け)
+### ステップ 1: Node.js + wrangler
 
 ```powershell
-# 一度だけ:
-npm install -g wrangler
-wrangler login   # ブラウザで Cloudflare 認証
-# このディレクトリ (cloudflare-worker/youtube-extractor) で:
-wrangler deploy
+cd C:\Users\rinng\projects\APP\cloudflare-worker\youtube-extractor
+npm install                # youtubei.js + wrangler を取得
+npx wrangler login         # ブラウザで Cloudflare 認証 (無料アカウント可)
 ```
 
-## 動作確認
+### ステップ 2: デプロイ
 
-ブラウザで以下を開く:
-
-```
-https://<your-worker>.workers.dev/health
-→ {"ok":true,"clients":["IOS","ANDROID","ANDROID_VR","TVHTML5_SIMPLY_EMBEDDED_PLAYER"]}
-
-https://<your-worker>.workers.dev/?v=dQw4w9WgXcQ
-→ 200 で {url, type, isLive, client, title} か、
-   502 で {error, sabrOnly, recommendIframe: true}
+```powershell
+npx wrangler deploy
 ```
 
-`recommendIframe: true` が返る動画 = サーバ側でも抽出不能 → iOS の iframe フォールバックに任せる。
+成功すると最後に URL が表示される:
+```
+Published multiview-youtube (XX.XX sec)
+  https://multiview-youtube.<your-subdomain>.workers.dev
+```
 
-## iOS 側との接続
+### ステップ 3: 動作確認
 
-デプロイした URL を MultiView の設定画面 (近日追加予定) に登録する。
-- 設定 → **YouTube抽出 Worker URL** に貼る
-- 抽出経路の優先順: ページ抽出 → CF Worker → iframe フォールバック
+```
+https://<your-worker>/health
+→ {"ok":true,"version":"2026-05-27","engine":"youtubei.js"}
 
-実装が間に合うまでは、CF Worker をテストして「動く動画 / 動かない動画」を把握しておく。
+https://<your-worker>/?v=dQw4w9WgXcQ
+→ {"url":"https://...googlevideo.com/...","kind":"mp4","isLive":false,"title":"Rick Astley - ...","quality":"360p"}
+
+https://<your-worker>/?v=coYw-eVU0Ks    (テレ朝NEWS24 等のライブ)
+→ {"url":"https://manifest.googlevideo.com/...","kind":"hls","isLive":true,"title":"..."}
+```
+
+## 無料枠
+
+- 100,000 requests / day
+- 課金登録不要
+- バンドルサイズ ~1.4MB (cf-worker tier の 1MB 圧縮制限以下)
 
 ## トラブルシュート
 
-- **`health` が出ない**: Worker のルートパスが間違っているか、デプロイ未完了。CF ダッシュボードでログを確認。
-- **CORS エラー**: Worker は `Access-Control-Allow-Origin: *` を返すので、iOS からは問題なく呼べるはず。Web から呼ぶ場合のみ気にする。
-- **すべての動画で 502**: PoToken 強制が厳しくなりすぎている可能性。CF Worker の IP が YouTube に bot 判定されているケースも。worker を再デプロイ (新 IP に変わる可能性) するか、地域変更のため別の CF アカウントでデプロイし直す。
-- **`LOGIN_REQUIRED`**: ANDROID_VR クライアントで頻発。他クライアントに自動で切り替わるので無視して OK。
+- **`Decipher script returned an error`**: YouTube が player.js を変えた可能性。
+  `npm update youtubei.js` で最新化して再デプロイ。
+- **すべての動画で 502**: CF Worker の IP が YouTube に bot 判定された可能性。
+  worker を別 region に再デプロイするか、後述の CF rule で UA を rotate する。
+- **`generate_session_locally`**: 既に有効。CF Worker は origin が無いので
+  PoToken 系の botguard は通常通り走る。
