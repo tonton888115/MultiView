@@ -2295,6 +2295,60 @@ private final class NativeDanmakuRenderer {
   }
 }
 
+private enum NativeEventOverlay {
+  static func show(_ text: String, in root: UIView, tint: UIColor) {
+    let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !message.isEmpty else { return }
+    DispatchQueue.main.async {
+      guard root.bounds.width > 0 else { return }
+      let panel = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+      panel.layer.cornerRadius = 12
+      panel.clipsToBounds = true
+      panel.alpha = 0
+      panel.translatesAutoresizingMaskIntoConstraints = false
+
+      let accent = UIView()
+      accent.backgroundColor = tint
+      accent.translatesAutoresizingMaskIntoConstraints = false
+      panel.contentView.addSubview(accent)
+
+      let label = UILabel()
+      label.text = message
+      label.textColor = .white
+      label.font = .systemFont(ofSize: 13, weight: .bold)
+      label.numberOfLines = 2
+      label.lineBreakMode = .byTruncatingTail
+      label.translatesAutoresizingMaskIntoConstraints = false
+      panel.contentView.addSubview(label)
+
+      root.addSubview(panel)
+      NSLayoutConstraint.activate([
+        panel.topAnchor.constraint(equalTo: root.topAnchor, constant: 10),
+        panel.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+        panel.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, constant: -28),
+        panel.widthAnchor.constraint(greaterThanOrEqualToConstant: min(260, max(180, root.bounds.width - 60))),
+        accent.leadingAnchor.constraint(equalTo: panel.contentView.leadingAnchor),
+        accent.topAnchor.constraint(equalTo: panel.contentView.topAnchor),
+        accent.bottomAnchor.constraint(equalTo: panel.contentView.bottomAnchor),
+        accent.widthAnchor.constraint(equalToConstant: 4),
+        label.leadingAnchor.constraint(equalTo: accent.trailingAnchor, constant: 10),
+        label.trailingAnchor.constraint(equalTo: panel.contentView.trailingAnchor, constant: -12),
+        label.topAnchor.constraint(equalTo: panel.contentView.topAnchor, constant: 8),
+        label.bottomAnchor.constraint(equalTo: panel.contentView.bottomAnchor, constant: -8)
+      ])
+
+      UIView.animate(withDuration: 0.18) {
+        panel.alpha = 1
+      }
+      UIView.animate(withDuration: 0.25, delay: 4.2, options: []) {
+        panel.alpha = 0
+      } completion: { _ in
+        panel.removeFromSuperview()
+      }
+    }
+  }
+}
+
 final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable {
   private let stream: StreamItem
   private let player = AVPlayer()
@@ -2323,6 +2377,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var loadAttempts = 0
   private var streamOpenedAt: Date?
   private var isEnding = false
+  private var lastSupportAlert: (text: String, at: Date)?
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -2840,7 +2895,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
           DispatchQueue.main.async {
-            self?.showStatus(item.error?.localizedDescription ?? "ニコ生の再生に失敗しました")
+            self?.recoverPlaybackError(item.error?.localizedDescription ?? "ニコ生の再生に失敗しました")
           }
         }
       }
@@ -2853,13 +2908,21 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         queue: .main
       ) { [weak self] notification in
         let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
-        self?.showStatus(error?.localizedDescription ?? "ニコ生の再生が停止しました")
+        self?.recoverPlaybackError(error?.localizedDescription ?? "ニコ生の再生が停止しました")
       }
       self.player.replaceCurrentItem(with: item)
       self.player.isMuted = !self.settings.playAudio
       self.player.volume = self.settings.playAudio ? self.playbackVolume : 0
       self.player.play()
     }
+  }
+
+  private func recoverPlaybackError(_ reason: String) {
+    guard !isStopped, !isEnding else { return }
+    showStatus("\(reason)\n自動復旧中")
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    retryOrFallback(reason)
   }
 
   private func niconicoPlaybackHeaders() -> [String: String] {
@@ -3035,6 +3098,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     guard let url = URL(string: uri) else { return }
     do {
       for try await message in protobufMessages(from: url) {
+        if let alert = parseNDGRSupportAlert(fromChunkedMessage: message) {
+          emitSupportAlert(alert)
+        }
         if let text = parseNDGRCommentText(fromChunkedMessage: message) {
           emitDanmaku(text)
         }
@@ -3108,6 +3174,50 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       }
     }
     return nil
+  }
+
+  private func parseNDGRSupportAlert(fromChunkedMessage data: Data) -> String? {
+    let strings = protobufStrings(in: data)
+    let joined = strings.joined(separator: " ")
+    let lower = joined.lowercased()
+    guard lower.contains("gift") || joined.contains("ギフト") || joined.contains("広告") || joined.contains("貢献") else {
+      return nil
+    }
+    let useful = strings
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { text in
+        text.count >= 2
+          && text.count <= 80
+          && !text.contains("https://")
+          && !text.contains("http://")
+      }
+    if let sentence = useful.first(where: { $0.contains("ギフト") || $0.contains("pt") || $0.contains("広告") }) {
+      return "ニコ生: \(sentence)"
+    }
+    if let name = useful.first(where: { !$0.lowercased().contains("gift") }) {
+      return "ニコ生: \(name) のギフト"
+    }
+    return "ニコ生: ギフトが送られました"
+  }
+
+  private func protobufStrings(in data: Data, depth: Int = 0) -> [String] {
+    guard depth < 5 else { return [] }
+    var result: [String] = []
+    for field in protobufFields(data) {
+      if field.number > 0, let text = String(data: field.data, encoding: .utf8), Self.isUsefulProtoString(text) {
+        result.append(text)
+      }
+      result.append(contentsOf: protobufStrings(in: field.data, depth: depth + 1))
+    }
+    return result
+  }
+
+  private static func isUsefulProtoString(_ text: String) -> Bool {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.count >= 2, trimmed.count <= 120 else { return false }
+    return trimmed.unicodeScalars.allSatisfy { scalar in
+      scalar.value == 0x09 || scalar.value == 0x0a || scalar.value == 0x0d || scalar.value >= 0x20
+    }
   }
 
   private func parseWatchData(from html: String) throws -> (webSocketURL: URL, frontendId: String?, endDate: Date?) {
@@ -3357,6 +3467,15 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         label.removeFromSuperview()
       }
     }
+  }
+
+  private func emitSupportAlert(_ text: String) {
+    let now = Date()
+    if let lastSupportAlert, lastSupportAlert.text == text, now.timeIntervalSince(lastSupportAlert.at) < 10 {
+      return
+    }
+    lastSupportAlert = (text, now)
+    NativeEventOverlay.show(text, in: danmakuView, tint: StreamPlatform.niconico.tint)
   }
 
   private func showStatus(_ text: String) {
@@ -3768,6 +3887,10 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       }
       return
     }
+    if let alert = Self.kickSupportAlert(event: event, payload: payload) {
+      NativeEventOverlay.show(alert, in: danmakuView, tint: StreamPlatform.kick.tint)
+      return
+    }
     guard event.contains("ChatMessage"),
           let content = (payload["content"] as? String) ?? (payload["message"] as? String) else { return }
     if settings.showChat {
@@ -3824,6 +3947,34 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       output.replaceSubrange(fullRange, with: name)
     }
     return output
+  }
+
+  private static func kickSupportAlert(event: String, payload: [String: Any]) -> String? {
+    let lower = event.lowercased()
+    guard lower.contains("subscription") || lower.contains("gift") else { return nil }
+    let actor = stringValue(payload["username"])
+      ?? stringValue(payload["gifter_username"])
+      ?? stringValue(payload["gifter"])
+      ?? stringValue(payload["sender"])
+      ?? stringValue((payload["user"] as? [String: Any])?["username"])
+      ?? stringValue((payload["gifter"] as? [String: Any])?["username"])
+      ?? "誰か"
+    let recipient = stringValue(payload["recipient_username"])
+      ?? stringValue((payload["recipient"] as? [String: Any])?["username"])
+      ?? stringValue((payload["user"] as? [String: Any])?["username"])
+    let count = stringValue(payload["gifted_quantity"])
+      ?? stringValue(payload["quantity"])
+      ?? stringValue(payload["count"])
+    if lower.contains("gift") {
+      if let count, count != "0" {
+        return "Kick: \(actor) が \(count) 件のサブスクをギフト"
+      }
+      if let recipient {
+        return "Kick: \(actor) が \(recipient) にサブスクをギフト"
+      }
+      return "Kick: \(actor) がサブスクをギフト"
+    }
+    return "Kick: \(actor) がサブスクしました"
   }
 
   // The channel being hosted/raided-to, taken from the official Kick host-event
@@ -4266,6 +4417,9 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
          let target = Self.twitchRaidTarget(from: line, tags: tags) {
         RaidAutoFollow.follow(platform: target.0, channel: target.1, currentChannel: stream.channel)
       }
+      if let alert = Self.twitchSupportAlert(from: line, tags: tags) {
+        NativeEventOverlay.show(alert, in: danmakuView, tint: StreamPlatform.twitch.tint)
+      }
       guard let privmsg = line.range(of: " PRIVMSG "),
             let bodyRange = line.range(of: " :", range: privmsg.lowerBound..<line.endIndex) else { continue }
       let message = String(line[bodyRange.upperBound...])
@@ -4297,6 +4451,35 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
          let target = RaidAutoFollow.detectTarget(in: String(line[bodyRange.upperBound...]), preferredPlatform: .twitch) {
         return target
       }
+    }
+    return nil
+  }
+
+  private static func twitchSupportAlert(from line: String, tags: [String: String]) -> String? {
+    guard line.lowercased().contains(" usernotice ") else { return nil }
+    let id = tags["msg-id"]?.lowercased() ?? ""
+    guard id.contains("sub") || id.contains("gift") else { return nil }
+    let system = tags["system-msg"]?.replacingOccurrences(of: "\\s", with: " ")
+    let sender = tags["display-name"] ?? tags["login"] ?? "誰か"
+    if id == "subgift" || id == "submysterygift" || id.contains("gift") {
+      let recipient = tags["msg-param-recipient-display-name"] ?? tags["msg-param-recipient-user-name"]
+      let count = tags["msg-param-mass-gift-count"] ?? tags["msg-param-sender-count"]
+      if let system, !system.isEmpty { return "Twitch: \(system)" }
+      if let count, id == "submysterygift" {
+        return "Twitch: \(sender) が \(count) 件のサブスクをギフト"
+      }
+      if let recipient {
+        return "Twitch: \(sender) が \(recipient) にサブスクをギフト"
+      }
+      return "Twitch: \(sender) がサブスクをギフト"
+    }
+    if id == "sub" || id == "resub" {
+      if let system, !system.isEmpty { return "Twitch: \(system)" }
+      let months = tags["msg-param-cumulative-months"] ?? tags["msg-param-months"]
+      if let months, months != "0" {
+        return "Twitch: \(sender) が \(months) か月サブスク"
+      }
+      return "Twitch: \(sender) がサブスクしました"
     }
     return nil
   }
@@ -5098,7 +5281,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       return
     }
     var request = URLRequest(url: url)
-    request.timeoutInterval = 8
+    request.timeoutInterval = 4
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     resolveTask?.cancel()
     resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
@@ -5154,8 +5337,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     triedInvidious = true
     let instances = Self.invidiousAPIInstances
     guard instances.indices.contains(attempt) else {
-      showStatus("YouTube映像URLを取得できません\n公式UIは表示せず停止しました")
-      teardownExtractor()
+      installAlternativeWebFallback(videoId: videoId)
       return
     }
     guard let url = URL(string: "\(instances[attempt])/api/v1/videos/\(videoId)") else {
@@ -5163,7 +5345,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       return
     }
     var request = URLRequest(url: url)
-    request.timeoutInterval = 8
+    request.timeoutInterval = 4
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     resolveTask?.cancel()
     resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
@@ -5206,20 +5388,20 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private static let pipedAPIInstances = [
-    "https://pipedapi.adminforge.de",
-    "https://api.piped.yt",
     "https://pipedapi.leptons.xyz",
     "https://pipedapi-libre.kavin.rocks",
-    "https://piped-api.privacy.com.de",
     "https://pipedapi.kavin.rocks"
   ]
 
   private static let invidiousAPIInstances = [
     "https://yewtu.be",
     "https://inv.nadeko.net",
-    "https://inv.tux.pizza",
-    "https://invidious.fdn.fr",
-    "https://invidious.nerdvpn.de"
+    "https://inv.tux.pizza"
+  ]
+
+  private static let alternativeWebFallbacks = [
+    "https://piped.video/embed/%@",
+    "https://yewtu.be/embed/%@"
   ]
 
   private func teardownExtractor() {
@@ -5384,6 +5566,44 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     player.pause()
     player.replaceCurrentItem(with: nil)
     showStatus("YouTube映像URLを取得できません\n公式UIは表示せず停止しました")
+  }
+
+  private func installAlternativeWebFallback(videoId: String, attempt: Int = 0) {
+    guard !isStopped, fallbackWebView == nil else { return }
+    guard Self.alternativeWebFallbacks.indices.contains(attempt),
+          let url = URL(string: String(format: Self.alternativeWebFallbacks[attempt], videoId)) else {
+      teardownExtractor()
+      showStatus("YouTube映像URLを取得できません")
+      return
+    }
+    teardownExtractor()
+    if let timeObserver {
+      player.removeTimeObserver(timeObserver)
+      self.timeObserver = nil
+    }
+    itemStatusObservation = nil
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    showStatus("YouTube代替Web再生を読み込み中")
+    let config = WKWebViewConfiguration()
+    config.allowsInlineMediaPlayback = true
+    config.mediaTypesRequiringUserActionForPlayback = []
+    config.websiteDataStore = .default()
+    WebAdBlocker.install(on: config)
+    let web = WKWebView(frame: bounds, configuration: config)
+    web.isOpaque = false
+    web.backgroundColor = .black
+    web.scrollView.backgroundColor = .black
+    web.scrollView.isScrollEnabled = false
+    web.scrollView.contentInsetAdjustmentBehavior = .never
+    web.customUserAgent = Self.userAgent
+    web.navigationDelegate = self
+    addSubview(web)
+    fallbackWebView = web
+    web.load(URLRequest(url: url))
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+      self?.resumePlayback()
+    }
   }
 
   // MARK: - SponsorBlock (VOD)
@@ -6011,16 +6231,10 @@ final class ViewingController: UIViewController {
     let spacer = UIView()
     spacer.translatesAutoresizingMaskIntoConstraints = false
 
-    let addButton = iconButton(systemName: "plus") { [weak self] in
+    let addButton = iconButton(systemName: "plus", accessibilityLabel: "追加") { [weak self] in
       self?.present(AddStreamController(), animated: true)
     }
-    let playButton = playbackButton(title: "全て再生", icon: "play.fill", color: UIColor(red: 0.20, green: 0.80, blue: 0.45, alpha: 1)) {
-      PlaybackCoordinator.shared.resumeAll()
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-        PlaybackCoordinator.shared.resumeAll()
-      }
-    }
-    let reloadButton = playbackButton(title: "更新", icon: "arrow.triangle.2.circlepath", color: nil) { [weak self] in
+    let reloadButton = iconButton(systemName: "arrow.triangle.2.circlepath", accessibilityLabel: "更新") { [weak self] in
       self?.reload()
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
         PlaybackCoordinator.shared.resumeAll()
@@ -6029,7 +6243,6 @@ final class ViewingController: UIViewController {
     row.addArrangedSubview(layoutControl)
     row.addArrangedSubview(spacer)
     row.addArrangedSubview(addButton)
-    row.addArrangedSubview(playButton)
     row.addArrangedSubview(reloadButton)
 
     stack.addArrangedSubview(host)
@@ -6042,15 +6255,15 @@ final class ViewingController: UIViewController {
       layoutControl.heightAnchor.constraint(equalToConstant: 34),
       addButton.widthAnchor.constraint(equalToConstant: 38),
       addButton.heightAnchor.constraint(equalToConstant: 36),
-      playButton.heightAnchor.constraint(equalToConstant: 36),
+      reloadButton.widthAnchor.constraint(equalToConstant: 46),
       reloadButton.heightAnchor.constraint(equalToConstant: 36)
     ])
   }
 
-  private func iconButton(systemName: String, action: @escaping () -> Void) -> UIButton {
+  private func iconButton(systemName: String, accessibilityLabel: String, action: @escaping () -> Void) -> UIButton {
     let button = LiquidGlass.makeButton(title: nil, systemImage: systemName, tint: nil)
     button.addAction(UIAction { _ in action() }, for: .touchUpInside)
-    button.accessibilityLabel = "追加"
+    button.accessibilityLabel = accessibilityLabel
     return button
   }
 
