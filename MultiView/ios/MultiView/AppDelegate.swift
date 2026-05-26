@@ -22,6 +22,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     configureAudioSession()
     installPlaybackObservers()
     application.beginReceivingRemoteControlEvents()
+    WebAdBlocker.prepare()
     WebLoginCookies.restore()
     window = UIWindow(frame: UIScreen.main.bounds)
     window?.rootViewController = MainTabController()
@@ -350,6 +351,7 @@ struct AppSettings: Codable {
   var proxyUrl = ""
   var playAudio = true
   var autoFollowRaids = false
+  var blockWebAds = true
   var layoutMode: LayoutMode = .stacked
   var wifiQuality: PlaybackQuality = .high
   var mobileQuality: PlaybackQuality = .economy
@@ -368,6 +370,7 @@ struct AppSettings: Codable {
     proxyUrl = try container.decodeIfPresent(String.self, forKey: .proxyUrl) ?? ""
     playAudio = try container.decodeIfPresent(Bool.self, forKey: .playAudio) ?? true
     autoFollowRaids = try container.decodeIfPresent(Bool.self, forKey: .autoFollowRaids) ?? false
+    blockWebAds = try container.decodeIfPresent(Bool.self, forKey: .blockWebAds) ?? true
     layoutMode = try container.decodeIfPresent(LayoutMode.self, forKey: .layoutMode) ?? .stacked
     wifiQuality = try container.decodeIfPresent(PlaybackQuality.self, forKey: .wifiQuality) ?? .high
     mobileQuality = try container.decodeIfPresent(PlaybackQuality.self, forKey: .mobileQuality) ?? .economy
@@ -549,6 +552,44 @@ enum WebLoginCookies {
   }
 }
 
+enum WebAdBlocker {
+  private static let identifier = "MultiViewWebAdBlocker"
+  private static var ruleList: WKContentRuleList?
+  private static var isCompiling = false
+
+  static func prepare() {
+    guard Store.loadSettings().blockWebAds else { return }
+    compileIfNeeded()
+  }
+
+  static func install(on configuration: WKWebViewConfiguration) {
+    guard Store.loadSettings().blockWebAds else { return }
+    if let ruleList {
+      configuration.userContentController.add(ruleList)
+      return
+    }
+    compileIfNeeded()
+  }
+
+  private static func compileIfNeeded() {
+    guard !isCompiling, ruleList == nil else { return }
+    isCompiling = true
+    WKContentRuleListStore.default().compileContentRuleList(
+      forIdentifier: identifier,
+      encodedContentRuleList: rulesJSON
+    ) { list, _ in
+      isCompiling = false
+      ruleList = list
+    }
+  }
+
+  private static let rulesJSON = """
+  [
+    {"trigger":{"url-filter":".*","resource-type":["image","style-sheet","script","font","raw","media"],"if-domain":["doubleclick.net","googlesyndication.com","googleadservices.com","adservice.google.com","pagead2.googlesyndication.com","ads.youtube.com","imasdk.googleapis.com","pubads.g.doubleclick.net","securepubads.g.doubleclick.net","amazon-adsystem.com","adnxs.com","adsystem.com","taboola.com","outbrain.com"]},"action":{"type":"block"}}
+  ]
+  """
+}
+
 final class NiconicoWarmup: NSObject, WKNavigationDelegate {
   static let shared = NiconicoWarmup()
 
@@ -588,6 +629,7 @@ final class NiconicoWarmup: NSObject, WKNavigationDelegate {
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
+    WebAdBlocker.install(on: config)
     let web = WKWebView(frame: CGRect(x: -240, y: -240, width: 160, height: 160), configuration: config)
     web.customUserAgent = NiconicoNativePlayerView.userAgent
     web.navigationDelegate = self
@@ -1928,6 +1970,7 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
+    WebAdBlocker.install(on: config)
     if stream.platform == .niconico {
       if #available(iOS 13.0, *) {
         config.defaultWebpagePreferences.preferredContentMode = .mobile
@@ -2265,6 +2308,8 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var activeSegmentURIs = Set<String>()
   private var keepSeatTimer: Timer?
   private var endRemovalWorkItem: DispatchWorkItem?
+  private var endCountdownTimer: Timer?
+  private var endCountdownRemaining = 0
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
   private var fallbackWebView: PlayerWebView?
@@ -2277,6 +2322,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var laneCursor = 0
   private var loadAttempts = 0
   private var streamOpenedAt: Date?
+  private var isEnding = false
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -2328,6 +2374,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     keepSeatTimer = nil
     endRemovalWorkItem?.cancel()
     endRemovalWorkItem = nil
+    endCountdownTimer?.invalidate()
+    endCountdownTimer = nil
+    endCountdownRemaining = 0
     ndgrCommentTask?.cancel()
     ndgrCommentTask = nil
     segmentTasks.values.forEach { $0.cancel() }
@@ -2387,8 +2436,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
 
   func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void) {
     let programId = channel.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !programId.isEmpty,
-          let url = URL(string: "https://api.cas.nicovideo.jp/v1/services/live/programs/\(programId)/comments") else {
+    guard !programId.isEmpty else {
       completion(.failure(NSError(domain: "Niconico", code: -1, userInfo: [NSLocalizedDescriptionKey: "番組IDが不正です"])))
       return
     }
@@ -2398,36 +2446,33 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       completion(.failure(NSError(domain: "Niconico", code: 401, userInfo: [NSLocalizedDescriptionKey: "ニコ生にログインしてください"])))
       return
     }
+    guard let socketTask else {
+      completion(.failure(NSError(domain: "Niconico", code: 409, userInfo: [NSLocalizedDescriptionKey: "ニコ生のコメント接続がまだ準備できていません。再読み込み後にもう一度試してください。"])))
+      return
+    }
     let elapsed = streamOpenedAt.map { Date().timeIntervalSince($0) } ?? 0
     let vpos = max(0, Int(elapsed * 100))
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-    request.setValue("https://live.nicovideo.jp/watch/\(programId)", forHTTPHeaderField: "Referer")
-    request.setValue(cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; "), forHTTPHeaderField: "Cookie")
-    request.httpBody = try? JSONSerialization.data(withJSONObject: ["message": text, "command": "184", "vpos": String(vpos)])
-    URLSession.shared.dataTask(with: request) { _, response, error in
+    let payload: [String: Any] = [
+      "type": "postComment",
+      "data": [
+        "text": text,
+        "vpos": vpos
+      ]
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: payload),
+          let json = String(data: data, encoding: .utf8) else {
+      completion(.failure(NSError(domain: "Niconico", code: -2, userInfo: [NSLocalizedDescriptionKey: "コメント内容を送信形式に変換できません"])))
+      return
+    }
+    socketTask.send(.string(json)) { error in
       DispatchQueue.main.async {
         if let error {
           completion(.failure(error))
           return
         }
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-          let message: String
-          if http.statusCode == 404 {
-            message = "投稿先のニコ生番組が見つかりません。番組終了後、または番組IDが違う場合は404になります。"
-          } else if http.statusCode == 401 || http.statusCode == 403 {
-            message = "ニコ生の投稿権限がありません。設定から再ログインしてください。"
-          } else {
-            message = "投稿失敗 (HTTP \(http.statusCode))"
-          }
-          completion(.failure(NSError(domain: "Niconico", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: message])))
-          return
-        }
         completion(.success(()))
       }
-    }.resume()
+    }
   }
 
   private func load(channel: String) {
@@ -2458,7 +2503,18 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   // (re-syncing cookies) a couple of times before giving up to the web fallback —
   // this removes the "expand once and come back" workaround.
   private func retryOrFallback(_ reason: String) {
-    guard !isStopped, fallbackWebView == nil else { return }
+    guard !isStopped, !isEnding, fallbackWebView == nil else { return }
+    verifyProgramEndedFromPage { [weak self] ended in
+      guard let self, !self.isStopped, self.fallbackWebView == nil else { return }
+      if ended {
+        self.beginEndedCountdown("番組が終了しましたので閉じます")
+        return
+      }
+      self.continueRetryOrFallback(reason)
+    }
+  }
+
+  private func continueRetryOrFallback(_ reason: String) {
     loadAttempts += 1
     guard loadAttempts <= 4 else {
       showStatus("\(reason)\n再読み込みします")
@@ -2500,10 +2556,18 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         return
       }
       do {
+        if Self.isEndedWatchPage(html) {
+          self.beginEndedCountdown("番組が終了しましたので閉じます")
+          return
+        }
         let watch = try self.parseWatchData(from: html)
         self.scheduleProgramEndIfNeeded(watch.endDate)
         self.connect(webSocketURL: watch.webSocketURL, frontendId: watch.frontendId)
       } catch {
+        if Self.isEndedWatchPage(html) {
+          self.beginEndedCountdown("番組が終了しましたので閉じます")
+          return
+        }
         self.retryOrFallback("ニコ生の再生情報を取得できません")
       }
     }
@@ -2576,6 +2640,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         }
         self.receiveNext()
       case .failure(let error):
+        if self.isEnding { return }
         self.socketTask = nil
         if self.player.currentItem == nil {
           self.retryOrFallback("ニコ生WebSocket切断: \(error.localizedDescription)")
@@ -2638,7 +2703,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     if type == "disconnect" {
       if let payload = json["data"] as? [String: Any],
          Self.isProgramEndedPayload(payload) {
-        removeEndedProgram("ニコ生番組が終了しました")
+        beginEndedCountdown("番組が終了しましたので閉じます")
         return
       }
       socketTask = nil
@@ -2660,14 +2725,43 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     guard let endDate else { return }
     let delay = endDate.timeIntervalSinceNow
     guard delay > 5 else {
-      removeEndedProgram("ニコ生番組が終了しました")
+      beginEndedCountdown("番組が終了しましたので閉じます")
       return
     }
     let work = DispatchWorkItem { [weak self] in
-      self?.removeEndedProgram("ニコ生番組が終了しました")
+      self?.beginEndedCountdown("番組が終了しましたので閉じます")
     }
     endRemovalWorkItem = work
     DispatchQueue.main.asyncAfter(deadline: .now() + delay + 8, execute: work)
+  }
+
+  private func beginEndedCountdown(_ reason: String) {
+    DispatchQueue.main.async {
+      guard !self.isStopped else { return }
+      self.isEnding = true
+      self.endRemovalWorkItem?.cancel()
+      self.endRemovalWorkItem = nil
+      self.endCountdownTimer?.invalidate()
+      self.endCountdownRemaining = 15
+      self.showStatus("\(reason)\n\(self.endCountdownRemaining)秒後に閉じます")
+      self.player.pause()
+      self.socketTask?.cancel(with: .goingAway, reason: nil)
+      self.socketTask = nil
+      self.endCountdownTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+        guard let self, !self.isStopped else {
+          timer.invalidate()
+          return
+        }
+        self.endCountdownRemaining -= 1
+        if self.endCountdownRemaining <= 0 {
+          timer.invalidate()
+          self.endCountdownTimer = nil
+          self.removeEndedProgram(reason)
+        } else {
+          self.showStatus("\(reason)\n\(self.endCountdownRemaining)秒後に閉じます")
+        }
+      }
+    }
   }
 
   private func removeEndedProgram(_ reason: String) {
@@ -2685,6 +2779,38 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       .joined(separator: " ")
       .lowercased()
     return text.contains("end") || text.contains("finished") || text.contains("program_end") || text.contains("番組終了")
+  }
+
+  private func verifyProgramEndedFromPage(completion: @escaping (Bool) -> Void) {
+    guard let watchPageURL else {
+      completion(false)
+      return
+    }
+    var request = URLRequest(url: watchPageURL)
+    request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+    Self.mobileBrowserHeaders(referer: "https://live.nicovideo.jp/").forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+    URLSession.shared.dataTask(with: request) { data, _, _ in
+      let html = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+      DispatchQueue.main.async {
+        completion(Self.isEndedWatchPage(html))
+      }
+    }.resume()
+  }
+
+  private static func isEndedWatchPage(_ html: String) -> Bool {
+    let normalized = html
+      .replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
+      .lowercased()
+    let phrases = [
+      "次回の放送をリクエストしませんか",
+      "番組が終了しました",
+      "この番組は終了しました",
+      "放送は終了しました",
+      "program-ended",
+      "program_ended",
+      "request-next-program"
+    ]
+    return phrases.contains { normalized.contains($0.lowercased()) }
   }
 
   private func startKeepSeatTimer(interval: TimeInterval) {
@@ -4489,6 +4615,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       config.allowsInlineMediaPlayback = true
       config.mediaTypesRequiringUserActionForPlayback = []
       config.websiteDataStore = .default()
+      WebAdBlocker.install(on: config)
       if #available(iOS 13.0, *) {
         config.defaultWebpagePreferences.preferredContentMode = .mobile
       }
@@ -4781,6 +4908,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     // emits its own audio (the real playback happens in AVPlayer).
     config.mediaTypesRequiringUserActionForPlayback = .all
     config.websiteDataStore = .default()
+    WebAdBlocker.install(on: config)
     let web = WKWebView(frame: CGRect(x: -20, y: -20, width: 8, height: 8), configuration: config)
     web.customUserAgent = Self.userAgent
     web.navigationDelegate = self
@@ -4909,6 +5037,21 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       return ["client": client]
     }
     return [
+      context("IOS", "20.19.2", extra: [
+        "deviceMake": "Apple",
+        "deviceModel": "iPhone16,2",
+        "osName": "iPhone",
+        "osVersion": "18.5.0.22F76",
+        "userAgent": "com.google.ios.youtube/20.19.2 (iPhone16,2; U; CPU iOS 18_5_0 like Mac OS X; ja_JP)"
+      ]),
+      context("ANDROID", "20.19.35", extra: [
+        "androidSdkVersion": 35,
+        "deviceMake": "Google",
+        "deviceModel": "Pixel 9 Pro",
+        "osName": "Android",
+        "osVersion": "15",
+        "userAgent": "com.google.android.youtube/20.19.35 (Linux; U; Android 15) gzip"
+      ]),
       context("WEB_SAFARI", (baseClient["clientVersion"] as? String) ?? "2.20240501.01.00", extra: [
         "browserName": "Safari",
         "browserVersion": "17.6",
@@ -4932,7 +5075,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     if let hls = sd["hlsManifestUrl"] as? String, let url = URL(string: hls) {
       return (url, isLive)
     }
-    let formats = (sd["formats"] as? [[String: Any]]) ?? []
+    let formats = ((sd["formats"] as? [[String: Any]]) ?? []) + ((sd["adaptiveFormats"] as? [[String: Any]]) ?? [])
     if let url = bestFormatURL(formats) {
       return (url, isLive)
     }
@@ -4946,24 +5089,28 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     extractorWebView = nil
   }
 
-  // Only muxed (audio+video) progressive formats match the Kick/Twitch audio path:
-  // AVPlayer owns playback and the iframe never owns audio.
+  // Prefer muxed audio+video URLs, but accept video-only adaptive URLs as a last
+  // resort so the cell stays native AVPlayer instead of falling into the iframe UI.
   private static func bestFormatURL(_ formats: [[String: Any]]) -> URL? {
-    let candidates: [(Int, Int, URL)] = formats.compactMap { fmt in
+    let candidates: [(Int, Int, Bool, URL)] = formats.compactMap { fmt in
       guard let urlString = fmt["url"] as? String, let url = URL(string: urlString) else { return nil }
       let height = (fmt["height"] as? Int) ?? 0
       let bitrate = (fmt["bitrate"] as? Int) ?? 0
       let mime = (fmt["mimeType"] as? String) ?? ""
       let hasAudio = !mime.contains("video/") || mime.contains("mp4a") || (fmt["hasAudio"] as? Bool) == true
-      guard mime.contains("video/"), hasAudio else { return nil }
-      return (height, bitrate, url)
+      guard mime.contains("video/") else { return nil }
+      return (height, bitrate, hasAudio, url)
     }
     guard !candidates.isEmpty else { return nil }
     let sorted = candidates.sorted {
+      if $0.2 != $1.2 { return !$0.2 && $1.2 }
       if $0.0 == $1.0 { return $0.1 < $1.1 }
       return $0.0 < $1.0
     }
-    return (sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.2
+    return (sorted.last(where: { $0.0 <= 720 && $0.2 })
+      ?? sorted.last(where: { $0.2 })
+      ?? sorted.last(where: { $0.0 <= 720 })
+      ?? sorted.last)?.3
   }
 
   private static let extractionJS = """
@@ -5090,6 +5237,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
+    WebAdBlocker.install(on: config)
     let web = WKWebView(frame: bounds, configuration: config)
     web.isOpaque = false
     web.backgroundColor = .black
@@ -5364,6 +5512,7 @@ final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResum
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
+    WebAdBlocker.install(on: config)
     super.init(frame: .zero, configuration: config)
     isOpaque = false
     backgroundColor = .black
@@ -5729,6 +5878,9 @@ final class ViewingController: UIViewController {
     let spacer = UIView()
     spacer.translatesAutoresizingMaskIntoConstraints = false
 
+    let addButton = playbackButton(title: "追加", icon: "plus", color: UIColor(red: 0.20, green: 0.55, blue: 1.00, alpha: 1)) { [weak self] in
+      self?.present(AddStreamController(), animated: true)
+    }
     let playButton = playbackButton(title: "全て再生", icon: "play.fill", color: UIColor(red: 0.20, green: 0.80, blue: 0.45, alpha: 1)) {
       PlaybackCoordinator.shared.resumeAll()
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -5743,6 +5895,7 @@ final class ViewingController: UIViewController {
     }
     row.addArrangedSubview(layoutControl)
     row.addArrangedSubview(spacer)
+    row.addArrangedSubview(addButton)
     row.addArrangedSubview(playButton)
     row.addArrangedSubview(reloadButton)
 
@@ -5754,6 +5907,7 @@ final class ViewingController: UIViewController {
       row.trailingAnchor.constraint(equalTo: host.trailingAnchor),
       layoutControl.widthAnchor.constraint(equalToConstant: 96),
       layoutControl.heightAnchor.constraint(equalToConstant: 34),
+      addButton.heightAnchor.constraint(equalToConstant: 36),
       playButton.heightAnchor.constraint(equalToConstant: 36),
       reloadButton.heightAnchor.constraint(equalToConstant: 36)
     ])
@@ -6361,6 +6515,7 @@ final class FocusedStreamView: UIView {
       let config = WKWebViewConfiguration()
       config.allowsInlineMediaPlayback = true
       config.websiteDataStore = .default()
+      WebAdBlocker.install(on: config)
       chatWeb = WKWebView(frame: .zero, configuration: config)
       chatWeb?.load(URLRequest(url: chatURL))
     } else {
@@ -6613,6 +6768,7 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
+    WebAdBlocker.install(on: config)
     config.preferences.javaScriptCanOpenWindowsAutomatically = true
     return WKWebView(frame: .zero, configuration: config)
   }()
@@ -6899,6 +7055,7 @@ final class NiconicoLoginController: UIViewController, WKNavigationDelegate {
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
+    WebAdBlocker.install(on: config)
     return WKWebView(frame: .zero, configuration: config)
   }()
 
@@ -6979,7 +7136,7 @@ final class SettingsController: UITableViewController {
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     guard let sec = Sec(rawValue: section) else { return 0 }
     switch sec {
-    case .playback: return 4
+    case .playback: return 5
     case .danmaku: return 6
     case .comments: return 1
     case .order: return platforms.count
@@ -7093,6 +7250,14 @@ final class SettingsController: UITableViewController {
           var s = AppState.shared.settings; s.autoFollowRaids = v; AppState.shared.settings = s
         }
       case 2:
+        cell.textLabel?.text = "Web広告ブロック"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.blockWebAds) { v in
+          var s = AppState.shared.settings
+          s.blockWebAds = v
+          AppState.shared.settings = s
+          if v { WebAdBlocker.prepare() }
+        }
+      case 3:
         cell.textLabel?.text = "Wi-Fi時の画質"
         cell.accessoryView = qualityControl(selected: AppState.shared.settings.wifiQuality) { quality in
           var s = AppState.shared.settings; s.wifiQuality = quality; AppState.shared.settings = s
