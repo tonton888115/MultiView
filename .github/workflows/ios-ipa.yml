@@ -1,6 +1,6 @@
 name: Build iOS (unsigned IPA)
 
-# Produces an UNSIGNED .ipa as a downloadable artifact.
+# Produces an unsigned .ipa as a downloadable artifact.
 # Install it on your iPhone with Sideloadly (it re-signs with your free Apple ID).
 
 on:
