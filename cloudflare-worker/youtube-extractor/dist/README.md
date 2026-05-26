@@ -1,1 +1,0 @@
-This folder contains the built output assets for the worker "multiview-youtube" generated at 2026-05-26T23:29:06.666Z.
