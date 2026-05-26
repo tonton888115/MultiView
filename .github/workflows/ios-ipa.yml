@@ -12,7 +12,7 @@ on:
     paths:
       - 'MultiView/**'
       - 'docs/**'
-      - '.github/workflows/build-ios.yml'
+      - '.github/workflows/ios-ipa.yml'
 
 concurrency:
   group: build-ios-${{ github.ref }}
