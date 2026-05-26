@@ -2940,6 +2940,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
+      // LL-HLS 配信時のみライブエッジから4秒位置を狙う(通常HLSはno-op、stallにはならない)。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 4, preferredTimescale: 1)
+      item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
           DispatchQueue.main.async {
@@ -3235,14 +3238,20 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
           && !text.contains("https://")
           && !text.contains("http://")
       }
+    // 公式は「【ギフト貢献N位】Xさんがギフト「Y」を贈りました」「Xさんがニコニ広告しました」など、
+     // 中身が可変な合成文を出す。ギフトの種類名で挟まれて部分文字列も切れるので、特徴的なトークンを広めに拾う。
     let officialMarkers = [
       "ギフトを贈りました",
       "ギフトが贈られました",
       "ギフトしました",
+      "ギフト「",
+      "ギフト貢献",
+      "を贈りました",
       "ニコニ広告しました",
       "広告しました",
       "pt貢献",
       "ptを貢献",
+      "ptを献",
       "貢献しました"
     ]
     let hasOfficialSentence = officialMarkers.contains { marker in useful.contains { $0.contains(marker) } }
@@ -3763,6 +3772,8 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 4, preferredTimescale: 1)
+      item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
           DispatchQueue.main.async {
@@ -4426,6 +4437,9 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
+      // Twitchはfast_bread=trueでLL-HLSが出る場合があるので、ライブエッジ4秒オフセット指定。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 4, preferredTimescale: 1)
+      item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
           DispatchQueue.main.async {
@@ -4890,6 +4904,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 4, preferredTimescale: 1)
+      item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
           DispatchQueue.main.async {
@@ -5655,10 +5671,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   private func requestPipedStreams(videoId: String, attempt: Int = 0) {
     guard !isStopped, player.currentItem == nil else { return }
+    triedPiped = true
     let instances = Self.pipedAPIInstances
     guard instances.indices.contains(attempt) else {
       noteExtractionFailure("Piped: 全インスタンス失敗")
-      requestInvidiousStreams(videoId: videoId)
+      installEmbedFallback(videoId: videoId)
       return
     }
     guard let url = URL(string: "\(instances[attempt])/streams/\(videoId)") else {
@@ -6120,15 +6137,18 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       player.pause()
       player.replaceCurrentItem(with: nil)
     }
-    if !triedPiped {
-      triedPiped = true
-      noteExtractionFailure("通常抽出失敗: Pipedへ切替")
-      requestPipedStreams(videoId: videoId)
+    // 2026-05 時点で Piped の proxy.piped.private.coffee は実コンテンツ取得時 502 を
+     // 返すため再生不可。直接 googlevideo URL を返す Invidious を先に試す。
+    if !triedInvidious {
+      triedInvidious = true
+      noteExtractionFailure("通常抽出失敗: Invidiousへ切替")
+      requestInvidiousStreams(videoId: videoId)
       return
     }
-    if !triedInvidious {
-      noteExtractionFailure("Piped失敗: Invidiousへ切替")
-      requestInvidiousStreams(videoId: videoId)
+    if !triedPiped {
+      triedPiped = true
+      noteExtractionFailure("Invidious失敗: Pipedへ切替")
+      requestPipedStreams(videoId: videoId)
       return
     }
     teardownExtractor()
