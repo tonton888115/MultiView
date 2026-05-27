@@ -1129,7 +1129,7 @@ final class TwitcastingAuthManager: NSObject, ASWebAuthenticationPresentationCon
 
 struct YouTubeOAuthConfig: Codable {
   var clientId = ""
-  var redirectURI = "multiview://youtube-oauth"
+  var redirectURI = ""
 }
 
 struct YouTubeLiveChatMessage {
@@ -1182,12 +1182,17 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
       Self.finish(completion, .failure(OAuthServiceError.message("YouTube Client IDが未設定です")))
       return
     }
+    let redirectURI = Self.effectiveRedirectURI(for: config)
+    guard let callbackScheme = URLComponents(string: redirectURI)?.scheme, !callbackScheme.isEmpty else {
+      Self.finish(completion, .failure(OAuthServiceError.message("YouTube Redirect URIを作成できません。iOS OAuth Client IDを確認してください。")))
+      return
+    }
     let verifier = Self.randomVerifier()
     let state = UUID().uuidString
     var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth")!
     components.queryItems = [
       URLQueryItem(name: "client_id", value: config.clientId),
-      URLQueryItem(name: "redirect_uri", value: config.redirectURI),
+      URLQueryItem(name: "redirect_uri", value: redirectURI),
       URLQueryItem(name: "response_type", value: "code"),
       URLQueryItem(name: "scope", value: "https://www.googleapis.com/auth/youtube.force-ssl"),
       URLQueryItem(name: "state", value: state),
@@ -1201,7 +1206,7 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
       return
     }
     authAnchor = presentationAnchor
-    let session = ASWebAuthenticationSession(url: url, callbackURLScheme: "multiview") { [weak self] callbackURL, error in
+    let session = ASWebAuthenticationSession(url: url, callbackURLScheme: callbackScheme) { [weak self] callbackURL, error in
       guard let self else { return }
       self.activeSession = nil
       self.authAnchor = nil
@@ -1216,7 +1221,7 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
         Self.finish(completion, .failure(OAuthServiceError.message("YouTube認証の戻りURLが不正です")))
         return
       }
-      self.exchangeCode(code, verifier: verifier, completion: completion)
+      self.exchangeCode(code, verifier: verifier, redirectURI: redirectURI, completion: completion)
     }
     session.presentationContextProvider = self
     session.prefersEphemeralWebBrowserSession = false
@@ -1323,13 +1328,36 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
     authAnchor ?? ASPresentationAnchor()
   }
 
-  private func exchangeCode(_ code: String, verifier: String, completion: @escaping (Result<Void, Error>) -> Void) {
+  private static func reversedIOSClientID(from clientID: String) -> String? {
+    let trimmed = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+    let suffix = ".apps.googleusercontent.com"
+    guard trimmed.hasSuffix(suffix), trimmed.count > suffix.count else { return nil }
+    let id = String(trimmed.dropLast(suffix.count))
+    return "com.googleusercontent.apps.\(id)"
+  }
+
+  static func effectiveRedirectURI(for config: YouTubeOAuthConfig) -> String {
+    let raw = config.redirectURI.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !raw.isEmpty, !raw.hasPrefix("multiview://") {
+      return raw
+    }
+    if let scheme = reversedIOSClientID(from: config.clientId) {
+      return "\(scheme):/oauth2redirect/google"
+    }
+    return raw
+  }
+
+  static func defaultRedirectURI(forClientID clientID: String) -> String? {
+    reversedIOSClientID(from: clientID).map { "\($0):/oauth2redirect/google" }
+  }
+
+  private func exchangeCode(_ code: String, verifier: String, redirectURI: String, completion: @escaping (Result<Void, Error>) -> Void) {
     var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
     request.httpMethod = "POST"
     request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
     let body = [
       "client_id": config.clientId,
-      "redirect_uri": config.redirectURI,
+      "redirect_uri": redirectURI,
       "grant_type": "authorization_code",
       "code": code,
       "code_verifier": verifier
@@ -9297,7 +9325,7 @@ final class SettingsController: UITableViewController {
     case 3:
       presentYouTubeSetupGuide()
     case 4:
-      let uri = YouTubeAuthManager.shared.config.redirectURI
+      let uri = YouTubeAuthManager.effectiveRedirectURI(for: YouTubeAuthManager.shared.config)
       UIPasteboard.general.string = uri
       presentCopiedRedirectAlert(service: "YouTube", uri: uri) { [weak self] in self?.editYouTubeRedirectURI() }
     default:
@@ -9350,6 +9378,10 @@ final class SettingsController: UITableViewController {
     var config = YouTubeAuthManager.shared.config
     editText(title: "YouTube Client ID", message: "Google Cloud Consoleで作成したiOS OAuth Client IDを貼り付けてください。", text: config.clientId, keyboard: .default) { [weak self] value in
       config.clientId = value
+      if config.redirectURI.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || config.redirectURI.hasPrefix("multiview://"),
+         let redirectURI = YouTubeAuthManager.defaultRedirectURI(forClientID: value) {
+        config.redirectURI = redirectURI
+      }
       YouTubeAuthManager.shared.config = config
       self?.tableView.reloadData()
     }
@@ -9366,6 +9398,7 @@ final class SettingsController: UITableViewController {
 
   private func presentYouTubeSetupGuide() {
     let config = YouTubeAuthManager.shared.config
+    let redirectURI = YouTubeAuthManager.effectiveRedirectURI(for: config)
     let message = """
     1. Google Cloud Consoleでプロジェクトを開きます。
     2. 「APIとサービス」>「ライブラリ」で YouTube Data API v3 を有効化します。
@@ -9373,8 +9406,10 @@ final class SettingsController: UITableViewController {
     4. 「認証情報」>「認証情報を作成」>「OAuth クライアント ID」を開き、アプリケーションの種類は iOS を選びます。
     5. Bundle ID は com.rinng.multiview を入力します。
     6. 作成された iOS Client ID をこの画面の「Client ID」に貼り付けます。
-    7. Redirect URI は現在「\(config.redirectURI)」です。ログインで redirect_uri エラーが出る場合は、この行をコピーしてGoogle側の許可済みURIに追加するか、Googleが表示するiOS URL schemeに合わせてこの値を編集してください。
+    7. Redirect URI は現在「\(redirectURI)」です。これは Client ID 末尾の .apps.googleusercontent.com を com.googleusercontent.apps... に変換して作ります。
     8. その後「ログイン」を押し、YouTubeアカウントで許可します。
+
+    エラー 400: invalid_request が出る場合は、Web/デスクトップ用Client IDを貼っている、Bundle IDが違う、またはRedirect URIが古い multiview:// のまま残っている可能性があります。
 
     弾幕取得には youtube.force-ssl スコープを使います。コメントが出ない場合は、配信側のチャット無効、ログイン切れ、Client ID誤り、API未有効化を確認してください。
     """
