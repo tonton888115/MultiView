@@ -5347,7 +5347,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       return
     }
     var request = URLRequest(url: url)
-    request.timeoutInterval = 8
+    // Worker 内で youtubei.js が base.js fetch + decipher を行うため、初回は
+    // 数秒かかることがある。短すぎる timeout は iframe フォールバックを
+    // 不必要に誘発する (= ad 経由になる) ので 15 秒余裕を持たせる。
+    request.timeoutInterval = 15
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     resolveTask?.cancel()
     resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
@@ -6440,7 +6443,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     <div id="err"></div>
     <script src="https://www.youtube.com/iframe_api"></script>
     <script>
-      var player=null, READY=false, AUDIO=true, VOL=100, sb=[];
+      var player=null, READY=false, AUDIO=true, VOL=100, sb=[], hasPlayedOnce=false;
       function apply(){
         if(!player||!READY)return;
         try{
@@ -6491,8 +6494,17 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           events:{
             onReady:function(){READY=true;apply();loadSB();},
             onStateChange:function(e){
-              if(e.data===YT.PlayerState.UNSTARTED||e.data===YT.PlayerState.CUED){
-                try{e.target.playVideo();}catch(x){}
+              if(e.data===YT.PlayerState.PLAYING){hasPlayedOnce=true;return;}
+              // 初回再生 (本編) に到達する前の UNSTARTED/CUED/PAUSED で固まる
+              // (典型: 広告→本編 遷移で iframe が PAUSED に張り付く) ケースを
+              // aggressive に retry。一度 PLAYING に入ったら以降は user pause
+              // も尊重するため触らない。
+              if(!hasPlayedOnce && (
+                e.data===YT.PlayerState.UNSTARTED||
+                e.data===YT.PlayerState.CUED||
+                e.data===YT.PlayerState.PAUSED
+              )){
+                setTimeout(function(){try{e.target.playVideo();}catch(x){}},250);
               }
             },
             onError:function(e){showError(e.data);}

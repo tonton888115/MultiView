@@ -66,13 +66,14 @@ async function extractURL(videoId) {
     return { error: 'no streaming_data', title };
   }
 
-  // Live: HLS manifest URL は cipher 不要、そのまま AVPlayer で再生可能。
-  if (isLive && sd.hls_manifest_url) {
-    return { url: sd.hls_manifest_url, kind: 'hls', isLive: true, title };
+  // HLS manifest URL は cipher 不要、そのまま AVPlayer で再生可能。
+  // isLive ゲートを外す: 放送終了後の「アーカイブ」も hls_manifest_url を持つ
+  // ケースがあり (live DVR)、それも iframe 経由広告を回避できる。
+  if (sd.hls_manifest_url) {
+    return { url: sd.hls_manifest_url, kind: 'hls', isLive, title };
   }
-  // ライブでも稀に dash_manifest_url のみのケースがあるので保険として返す。
-  if (isLive && sd.dash_manifest_url) {
-    return { url: sd.dash_manifest_url, kind: 'dash', isLive: true, title };
+  if (sd.dash_manifest_url) {
+    return { url: sd.dash_manifest_url, kind: 'dash', isLive, title };
   }
   // VOD は CF Worker 内で signature decipher できない (前述の通り)。
   // iOS 側で iframe フォールバックさせる用に明示エラーを返す。
