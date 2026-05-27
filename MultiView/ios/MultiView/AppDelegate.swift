@@ -6297,7 +6297,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     addSubview(web)
     fallbackWebView = web
-    web.loadHTMLString(Self.embedHTML(videoId: videoId), baseURL: URL(string: "https://www.youtube.com"))
+    // ★重要★ baseURL は **自分の HTTPS ドメイン** にする。youtube.com や nil を指定
+    // すると YouTube iframe API が embedder origin を不正と判定して error 152 を
+    // 返す (8321d49 で確認済み)。tonton888115.github.io は GitHub Pages 経由で
+    // SSL 有効、Origin として認められる。
+    web.loadHTMLString(Self.embedHTML(videoId: videoId), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
     statusLabel.isHidden = true
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
       self?.resumePlayback()
@@ -6474,9 +6478,12 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         document.getElementById('player').style.display='none';
       }
       window.onYouTubeIframeAPIReady=function(){
+        // host は www.youtube.com (nocookie だと baseURL ドメインと
+        // 不一致になり error 152 を再発)。origin は baseURL のドメイン部分と
+        // 一致させる。
         player=new YT.Player('player',{
           width:'100%',height:'100%',videoId:'\(videoId)',
-          host:'https://www.youtube-nocookie.com',
+          host:'https://www.youtube.com',
           playerVars:{autoplay:1,playsinline:1,controls:0,rel:0,modestbranding:1,fs:0,disablekb:1,iv_load_policy:3,origin:'https://tonton888115.github.io'},
           events:{
             onReady:function(){ready=true;play();loadSB();},
