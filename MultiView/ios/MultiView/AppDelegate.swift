@@ -6413,12 +6413,21 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
-  // Fallback embed: 抽出失敗時の最終再生経路。YouTube 公式 iframe API を埋め込み、
-  // controls=0 / modestbranding=1 で chrome を抑え、SponsorBlock スキップを内蔵、
-  // mvSetVolume で cell ごとの音量制御 (0〜1 を 0〜100 に変換) を可能にしている。
-  // 2026: youtube.com 経由は埋め込み制限 (onError code=101/150/152 系) で再生不可な
-  // 動画が多いため、host を youtube-nocookie.com に切替。同じ動画でも nocookie
-  // 経由なら通るケースが多い。onError を Swift に通知して状態表示する。
+  // Fallback embed: YouTube 公式 iframe API。当時 (8321d49) 動いてた構造を踏襲。
+  //
+  // iOS WebKit の autoplay policy: video.muted=true (初期) でない限り autoplay は
+  // 拒否される。だから playerVars に **mute:1** が必須。mute を抜くと iframe は
+  // サムネ + 再生ボタンで待機状態 (まさにユーザ報告のスピナー)。
+  //
+  // 構造:
+  //  - playerVars: autoplay:1 + **mute:1** で初期 muted の自動再生を許可
+  //  - onReady: playVideo() を呼んで再生開始
+  //  - onStateChange: UNSTARTED/CUED に戻ったら playVideo() を再試行
+  //    (広告挿入後や autoplay 拒否時に CUED で固まるケースの保険)
+  //  - apply(): 音量制御。AUDIO=true なら unMute+setVolume、false なら mute
+  //  - mvVolume bridge は Swift 側 setPlaybackVolume(0-1) を受けて 0-100 に変換
+  //  - onError は err overlay に日本語メッセージ表示 (watch ページ遷移はしない)
+  //  - SponsorBlock スキッパ内蔵 (VOD 用、live では no-op)
   private static func embedHTML(videoId: String) -> String {
     let sbCategories = "%5B%22sponsor%22%2C%22selfpromo%22%2C%22interaction%22%2C%22intro%22%2C%22outro%22%2C%22preview%22%2C%22music_offtopic%22%5D"
     return """
@@ -6431,17 +6440,14 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     <div id="err"></div>
     <script src="https://www.youtube.com/iframe_api"></script>
     <script>
-      var player=null, ready=false, pendingVolume=100, sb=[];
-      function applyAudio(){
-        if(!player||!ready)return;
+      var player=null, READY=false, AUDIO=true, VOL=100, sb=[];
+      function apply(){
+        if(!player||!READY)return;
         try{
-          if(pendingVolume<=0){player.mute();player.setVolume(0);}
-          else{player.unMute();player.setVolume(pendingVolume);}
+          player.playVideo();
+          if(AUDIO){player.unMute();player.setVolume(VOL);}
+          else{player.mute();}
         }catch(e){}
-      }
-      function play(){
-        if(!player||!ready)return;
-        try{applyAudio();player.playVideo();}catch(e){}
       }
       function loadSB(){
         try{
@@ -6452,7 +6458,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         }catch(e){}
       }
       function sbTick(){
-        if(!player||!ready||!sb.length)return;
+        if(!player||!READY||!sb.length)return;
         try{
           var t=player.getCurrentTime();
           for(var i=0;i<sb.length;i++){if(t>=sb[i].s&&t<sb[i].e-0.15){player.seekTo(sb[i].e+0.1,true);break;}}
@@ -6478,22 +6484,28 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         document.getElementById('player').style.display='none';
       }
       window.onYouTubeIframeAPIReady=function(){
-        // host は www.youtube.com (nocookie だと baseURL ドメインと
-        // 不一致になり error 152 を再発)。origin は baseURL のドメイン部分と
-        // 一致させる。
         player=new YT.Player('player',{
           width:'100%',height:'100%',videoId:'\(videoId)',
           host:'https://www.youtube.com',
-          playerVars:{autoplay:1,playsinline:1,controls:0,rel:0,modestbranding:1,fs:0,disablekb:1,iv_load_policy:3,origin:'https://tonton888115.github.io'},
+          playerVars:{autoplay:1,mute:1,playsinline:1,controls:0,rel:0,modestbranding:1,fs:0,disablekb:1,iv_load_policy:3,origin:'https://tonton888115.github.io'},
           events:{
-            onReady:function(){ready=true;play();loadSB();},
+            onReady:function(){READY=true;apply();loadSB();},
+            onStateChange:function(e){
+              if(e.data===YT.PlayerState.UNSTARTED||e.data===YT.PlayerState.CUED){
+                try{e.target.playVideo();}catch(x){}
+              }
+            },
             onError:function(e){showError(e.data);}
           }
         });
       };
-      window.mvPlay=function(){play();};
+      window.mvPlay=function(){apply();};
       window.mvPause=function(){try{player&&player.pauseVideo();}catch(e){}};
-      window.mvSetVolume=function(v){pendingVolume=Math.max(0,Math.min(100,Math.round((+v||0)*100)));applyAudio();};
+      window.mvSetVolume=function(v){
+        var n=Math.max(0,Math.min(1,+v||0));
+        VOL=Math.round(n*100); AUDIO=VOL>0;
+        apply();
+      };
       setInterval(sbTick, 400);
     </script>
     </body>
