@@ -5544,7 +5544,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       if let parsed, let stream = Self.extractPlayableStream(from: parsed) {
         DispatchQueue.main.async {
           guard !self.isStopped, self.player.currentItem == nil else { return }
-          self.showStatus("YouTube HLS取得成功\n\(client.label)")
           self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive)
         }
         return
@@ -5603,7 +5602,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
            let urlStr = parsed["url"] as? String,
            let streamURL = URL(string: urlStr) {
           let isLive = (parsed["isLive"] as? Bool) ?? false
-          self.showStatus("YouTube HLS取得成功\n\(parsed["kind"] as? String ?? "url") / \(parsed["title"] as? String ?? videoId)")
           self.startPlayback(url: streamURL, videoId: videoId, isLive: isLive)
           return
         }
@@ -6508,11 +6506,22 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       guard let self else { return }
       if item.status == .failed {
         DispatchQueue.main.async { self.installEmbedFallback(videoId: videoId) }
+      } else if item.status == .readyToPlay {
+        DispatchQueue.main.async { self.resumePlayback() }
       }
     }
     player.replaceCurrentItem(with: item)
-    applyVolume()
-    player.play()
+    resumePlayback()
+    [0.25, 0.9, 1.8].forEach { delay in
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak item] in
+        guard let self,
+              !self.isStopped,
+              let item,
+              self.player.currentItem === item,
+              self.fallbackWebView == nil else { return }
+        self.resumePlayback()
+      }
+    }
     // AVPlayer が .failed に遷移せず ready のまま無音で固まるケース (signatureCipher
     // 経由の壊れた URL でよく起きる) に備え、6秒以内に再生開始しなければ iframe へ。
     DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self, weak item] in
@@ -7300,8 +7309,14 @@ final class ViewingController: UIViewController {
 
   @objc private func reloadAndResume() {
     reload()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-      PlaybackCoordinator.shared.resumeAll()
+    resumePlaybackAfterReload()
+  }
+
+  private func resumePlaybackAfterReload() {
+    [0.2, 0.6, 1.2, 2.4].forEach { delay in
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+        PlaybackCoordinator.shared.resumeAll()
+      }
     }
   }
 
@@ -7496,9 +7511,7 @@ final class ViewingController: UIViewController {
     }
     let reloadButton = iconButton(systemName: "arrow.triangle.2.circlepath", accessibilityLabel: "更新") { [weak self] in
       self?.reload()
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-        PlaybackCoordinator.shared.resumeAll()
-      }
+      self?.resumePlaybackAfterReload()
     }
     row.addArrangedSubview(layoutControl)
     row.addArrangedSubview(spacer)
@@ -8763,7 +8776,7 @@ final class SettingsController: UITableViewController {
     case .kick: return 5
     case .twitch: return 4
     case .twitcasting: return 4
-    case .youtube: return 4
+    case .youtube: return 5
     case .niconico: return 2
     case .webData: return 1
     case .add: return 1
@@ -8803,7 +8816,7 @@ final class SettingsController: UITableViewController {
     case .twitcasting:
       return "ツイキャスのAPIアプリ(Write権限)の Client ID を設定し、Redirect URI を登録してください(行をタップでコピー)。"
     case .youtube:
-      return "Google Cloud Console の iOS OAuth Client ID を設定し、youtube.force-ssl スコープでライブチャット投稿に使います(行をタップでRedirectURIをコピー)。"
+      return "YouTubeコメント弾幕・投稿には Google Cloud の iOS OAuth Client ID と YouTube Data API v3 が必要です。手順は「設定手順を表示」を開いて確認できます。"
     case .niconico:
       return "ニコ生はログイン必須です。公式の外部連携(OAuth)が無いため、Webでログインします。ログイン状態はアプリ内のCookieに保持され、視聴・コメント投稿・コメント受信に使われます。"
     case .webData:
@@ -8940,6 +8953,7 @@ final class SettingsController: UITableViewController {
       case 0: cell.textLabel?.text = YouTubeAuthManager.shared.isSignedIn ? "ログアウト" : "ログイン"
       case 1: cell.textLabel?.text = "Google Cloud 認証情報を開く"
       case 2: cell.textLabel?.text = YouTubeAuthManager.shared.config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
+      case 3: cell.textLabel?.text = "設定手順を表示"
       default: cell.textLabel?.text = "Redirect URI をコピー"
       }
       cell.accessoryType = .disclosureIndicator
@@ -9281,6 +9295,8 @@ final class SettingsController: UITableViewController {
     case 2:
       editYouTubeClientID()
     case 3:
+      presentYouTubeSetupGuide()
+    case 4:
       let uri = YouTubeAuthManager.shared.config.redirectURI
       UIPasteboard.general.string = uri
       presentCopiedRedirectAlert(service: "YouTube", uri: uri) { [weak self] in self?.editYouTubeRedirectURI() }
@@ -9346,6 +9362,28 @@ final class SettingsController: UITableViewController {
       YouTubeAuthManager.shared.config = config
       self?.tableView.reloadData()
     }
+  }
+
+  private func presentYouTubeSetupGuide() {
+    let config = YouTubeAuthManager.shared.config
+    let message = """
+    1. Google Cloud Consoleでプロジェクトを開きます。
+    2. 「APIとサービス」>「ライブラリ」で YouTube Data API v3 を有効化します。
+    3. 「OAuth同意画面」でアプリを作成します。公開状態がテストの場合は、自分のGoogleアカウントをテストユーザーに追加します。
+    4. 「認証情報」>「認証情報を作成」>「OAuth クライアント ID」を開き、アプリケーションの種類は iOS を選びます。
+    5. Bundle ID は com.rinng.multiview を入力します。
+    6. 作成された iOS Client ID をこの画面の「Client ID」に貼り付けます。
+    7. Redirect URI は現在「\(config.redirectURI)」です。ログインで redirect_uri エラーが出る場合は、この行をコピーしてGoogle側の許可済みURIに追加するか、Googleが表示するiOS URL schemeに合わせてこの値を編集してください。
+    8. その後「ログイン」を押し、YouTubeアカウントで許可します。
+
+    弾幕取得には youtube.force-ssl スコープを使います。コメントが出ない場合は、配信側のチャット無効、ログイン切れ、Client ID誤り、API未有効化を確認してください。
+    """
+    let alert = UIAlertController(title: "YouTube Client ID 設定手順", message: message, preferredStyle: .alert)
+    alert.addAction(UIAlertAction(title: "認証情報を開く", style: .default) { [weak self] _ in
+      self?.openDeveloperURL("https://console.cloud.google.com/apis/credentials")
+    })
+    alert.addAction(UIAlertAction(title: "閉じる", style: .cancel))
+    present(alert, animated: true)
   }
 
   private func editText(title: String, message: String?, text: String, keyboard: UIKeyboardType, onSave: @escaping (String) -> Void) {
