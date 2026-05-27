@@ -6443,15 +6443,27 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     <div id="err"></div>
     <script src="https://www.youtube.com/iframe_api"></script>
     <script>
-      var player=null, READY=false, AUDIO=true, VOL=100, sb=[], hasPlayedOnce=false;
+      var player=null, READY=false, AUDIO=true, VOL=100, sb=[], hasPlayedOnce=false, userGesture=false;
+      // iOS autoplay policy: muted の playVideo() は許可されるが、
+      // user gesture (touchstart) なしの unMute() は autoplay 違反として
+      // 直後に video を pause させる。userGesture フラグで gesture 前は
+      // 必ず mute を維持して video の継続再生を保証する。
       function apply(){
         if(!player||!READY)return;
         try{
           player.playVideo();
-          if(AUDIO){player.unMute();player.setVolume(VOL);}
+          if(AUDIO && userGesture){player.unMute();player.setVolume(VOL);}
           else{player.mute();}
         }catch(e){}
       }
+      // user gesture を検出したら即 unmute トライ
+      function onGesture(){
+        if(userGesture) return;
+        userGesture = true;
+        try{ if(player && READY && AUDIO){player.unMute();player.setVolume(VOL);} }catch(e){}
+      }
+      document.addEventListener('touchstart', onGesture, {capture:true, passive:true});
+      document.addEventListener('click', onGesture, {capture:true});
       function loadSB(){
         try{
           fetch('https://sponsor.ajay.app/api/skipSegments?videoID=\(videoId)&categories=\(sbCategories)&actionTypes=%5B%22skip%22%5D')
