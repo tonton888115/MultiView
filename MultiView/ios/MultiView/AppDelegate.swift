@@ -5252,14 +5252,17 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var liveChatAccessToken: String?
   private var liveChatPageToken: String?
   private var seenLiveChatMessageIDs = Set<String>()
+  private var watchLastMediaTime: Double = -1
+  private var watchLastProgressAt = Date()
   private var laneCursor = 0
   private var extractionFailures: [String] = []
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
     self.settings = settings
-    self.playbackVolume = StreamVolumeStore.volume(for: stream)
-    self.iframeAudioEnabled = settings.playAudio && self.playbackVolume > 0
+    let storedVolume = StreamVolumeStore.volume(for: stream)
+    self.playbackVolume = storedVolume <= 0 ? 1 : storedVolume
+    self.iframeAudioEnabled = true
     super.init(frame: .zero)
     backgroundColor = .black
 
@@ -5334,7 +5337,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
-    iframeAudioEnabled = settings.playAudio && playbackVolume > 0
+    iframeAudioEnabled = true
     if iframeAudioEnabled {
       Self.focusAudio(on: self)
     }
@@ -5348,7 +5351,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private func iframeEffectiveVolume() -> Float {
-    settings.playAudio && iframeAudioEnabled ? playbackVolume : 0
+    iframeAudioEnabled ? max(0.01, playbackVolume) : 0
   }
 
   private static func focusAudio(on active: YouTubeNativePlayerView) {
@@ -5467,6 +5470,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     player.replaceCurrentItem(with: nil)
     fallbackWebView?.stopLoading()
     fallbackWebView?.configuration.userContentController.removeScriptMessageHandler(forName: "youtubeAudio")
+    fallbackWebView?.configuration.userContentController.removeScriptMessageHandler(forName: "youtubeStatus")
     fallbackWebView?.loadHTMLString("", baseURL: nil)
     fallbackWebView?.removeFromSuperview()
     fallbackWebView = nil
@@ -5489,7 +5493,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private func installOfficialEmbed(videoId: String) {
-    installAlternativeWebFallback(videoId: videoId)
+    installWatchPagePlayer(videoId: videoId)
   }
 
   // Worker (multiview.rinngo0626.workers.dev) を最初に試す。ライブ動画なら HLS
@@ -6414,10 +6418,65 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       player.pause()
       player.replaceCurrentItem(with: nil)
     }
-    noteExtractionFailure("抽出失敗: iframeで再生")
-    installAlternativeWebFallback(videoId: videoId)
+    noteExtractionFailure("抽出失敗: YouTubeページで再生")
+    installWatchPagePlayer(videoId: videoId)
   }
 
+  private func installWatchPagePlayer(videoId: String) {
+    guard !isStopped, fallbackWebView == nil else { return }
+    teardownExtractor()
+    if let timeObserver {
+      player.removeTimeObserver(timeObserver)
+      self.timeObserver = nil
+    }
+    itemStatusObservation = nil
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    iframeAudioEnabled = true
+    watchLastMediaTime = -1
+    watchLastProgressAt = Date()
+    showStatus("YouTube watchページで再生準備中\nvideoId=\(videoId)")
+
+    let session = AVAudioSession.sharedInstance()
+    try? session.setCategory(.playback, mode: .default, options: [])
+    try? session.setActive(true)
+
+    let config = WKWebViewConfiguration()
+    config.allowsInlineMediaPlayback = true
+    config.mediaTypesRequiringUserActionForPlayback = []
+    config.websiteDataStore = .default()
+    config.userContentController.add(self, name: "youtubeStatus")
+    config.userContentController.addUserScript(WKUserScript(source: Self.watchPageScript(volume: iframeEffectiveVolume()), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+    WebAdBlocker.install(on: config)
+
+    let web = WKWebView(frame: bounds, configuration: config)
+    web.isOpaque = false
+    web.backgroundColor = .black
+    web.scrollView.backgroundColor = .black
+    web.scrollView.isScrollEnabled = false
+    web.scrollView.contentInsetAdjustmentBehavior = .never
+    web.customUserAgent = Self.userAgent
+    web.navigationDelegate = self
+    web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    insertSubview(web, at: 0)
+    fallbackWebView = web
+
+    guard let url = URL(string: "https://m.youtube.com/watch?v=\(videoId)&app=m&persist_app=1") else {
+      showStatus("YouTube watch URL作成失敗\nvideoId=\(videoId)")
+      return
+    }
+    var request = URLRequest(url: url)
+    request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
+    web.load(request)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+      self?.resumePlayback()
+    }
+  }
+
+  // Legacy iframe fallback kept for comparison. The active path uses the mobile
+  // watch page because many live streams explicitly forbid iframe embedding.
+  //
   // YouTube official iframe player: YouTube 公式 iframe API (embedHTML) を
   // WKWebView に loadHTMLString する。watch ページ遷移や CSS chrome 隠しは
   // 廃止 (player 初期化を壊して thumbnail すら出ない問題があったため)。
@@ -6459,7 +6518,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     web.customUserAgent = Self.userAgent
     web.navigationDelegate = self
     web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    addSubview(web)
+    insertSubview(web, at: 0)
     fallbackWebView = web
     // ★重要★ baseURL は **自分の HTTPS ドメイン** にする。youtube.com や nil を指定
     // すると YouTube iframe API が embedder origin を不正と判定して error 152 を
@@ -6584,14 +6643,137 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-    guard message.name == "youtubeAudio", !isStopped else { return }
-    iframeAudioEnabled = settings.playAudio && playbackVolume > 0
-    if iframeAudioEnabled {
+    guard !isStopped else { return }
+    if message.name == "youtubeAudio" {
+      iframeAudioEnabled = true
       Self.focusAudio(on: self)
       fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(iframeEffectiveVolume()));")
-    } else {
-      fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(0);")
+      return
     }
+    guard message.name == "youtubeStatus",
+          let body = message.body as? [String: Any] else { return }
+    handleYouTubeStatus(body)
+  }
+
+  private func handleYouTubeStatus(_ body: [String: Any]) {
+    let kind = body["kind"] as? String ?? "status"
+    let href = (body["href"] as? String) ?? ""
+    if kind == "error" {
+      let detail = (body["message"] as? String) ?? "unknown"
+      showStatus("YouTubeページエラー\n\(detail)\n\(href)")
+      return
+    }
+    if let text = body["errorText"] as? String, !text.isEmpty {
+      showStatus("YouTubeページ警告\n\(text.prefix(180))")
+      return
+    }
+    let videoCount = (body["videoCount"] as? NSNumber)?.intValue ?? 0
+    let mediaTime = (body["currentTime"] as? NSNumber)?.doubleValue ?? -1
+    let paused = (body["paused"] as? Bool) ?? true
+    let muted = (body["muted"] as? Bool) ?? true
+    let readyState = (body["readyState"] as? NSNumber)?.intValue ?? 0
+    if mediaTime >= 0, mediaTime > watchLastMediaTime + 0.25 {
+      watchLastMediaTime = mediaTime
+      watchLastProgressAt = Date()
+      statusLabel.isHidden = true
+      return
+    }
+    let stalledFor = Date().timeIntervalSince(watchLastProgressAt)
+    if videoCount == 0 {
+      showStatus("YouTube動画要素が見つかりません\n\(href)")
+    } else if stalledFor > 8 {
+      let state = paused ? "paused" : "not paused"
+      let audio = muted ? "muted" : "unmuted"
+      showStatus("YouTube再生が進んでいません\n\(state), \(audio), readyState=\(readyState), t=\(String(format: "%.1f", mediaTime))")
+    }
+  }
+
+  private static func watchPageScript(volume: Float) -> String {
+    let initialVolume = min(1, max(0.01, Double(volume)))
+    return """
+    (function(){
+      if (window.__mvWatchPageInstalled) return;
+      window.__mvWatchPageInstalled = true;
+      var VOL = \(initialVolume);
+      function post(payload) {
+        try { window.webkit.messageHandlers.youtubeStatus.postMessage(payload); } catch (e) {}
+      }
+      function largestVideo() {
+        var videos = Array.prototype.slice.call(document.querySelectorAll('video'));
+        videos.sort(function(a,b){
+          return ((b.clientWidth||0)*(b.clientHeight||0))-((a.clientWidth||0)*(a.clientHeight||0));
+        });
+        return videos[0] || null;
+      }
+      function findErrorText() {
+        var text = '';
+        try { text = (document.body && document.body.innerText) || ''; } catch(e) {}
+        var needles = [
+          'この動画は再生できません',
+          '動画を再生できません',
+          '再生できません',
+          'Video unavailable',
+          'This video is unavailable',
+          '年齢制限',
+          'ログインして年齢を確認',
+          '地域ではご利用いただけません',
+          '配信者が埋め込み再生を禁止'
+        ];
+        for (var i=0; i<needles.length; i++) {
+          var idx = text.indexOf(needles[i]);
+          if (idx >= 0) return text.slice(Math.max(0, idx - 40), idx + 160);
+        }
+        return '';
+      }
+      function forcePlayback() {
+        try {
+          var v = largestVideo();
+          if (v) {
+            v.playsInline = true;
+            v.autoplay = true;
+            v.muted = false;
+            v.volume = VOL;
+            var p = v.play && v.play();
+            if (p && p.catch) p.catch(function(err){
+              post({kind:'error', message:'video.play rejected: '+(err && err.message ? err.message : String(err)), href:location.href});
+            });
+          }
+          var play = document.querySelector('.ytp-large-play-button,button[aria-label*="再生"],button[aria-label*="Play"]');
+          if (play && v && v.paused) play.click();
+        } catch(e) {
+          post({kind:'error', message:String(e), href:location.href});
+        }
+      }
+      function report() {
+        var v = largestVideo();
+        post({
+          kind: 'status',
+          href: location.href,
+          title: document.title || '',
+          videoCount: document.querySelectorAll('video').length,
+          currentTime: v ? v.currentTime : -1,
+          paused: v ? !!v.paused : true,
+          muted: v ? !!v.muted : true,
+          volume: v ? v.volume : 0,
+          readyState: v ? v.readyState : 0,
+          networkState: v ? v.networkState : 0,
+          errorText: findErrorText()
+        });
+      }
+      window.mvPlay = forcePlayback;
+      window.mvPause = function(){};
+      window.mvSetVolume = function(value) {
+        VOL = Math.max(0.01, Math.min(1, Number(value) || 1));
+        forcePlayback();
+      };
+      document.addEventListener('touchstart', forcePlayback, {capture:true, passive:true});
+      document.addEventListener('click', forcePlayback, {capture:true});
+      setInterval(forcePlayback, 800);
+      setInterval(report, 1000);
+      setTimeout(forcePlayback, 250);
+      setTimeout(report, 1200);
+    })();
+    """
   }
 
   // YouTube official embed: YouTube 公式 iframe API。当時 (8321d49) 動いてた構造を踏襲。
