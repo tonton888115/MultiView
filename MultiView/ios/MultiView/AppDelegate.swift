@@ -6253,13 +6253,23 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     installAlternativeWebFallback(videoId: videoId)
   }
 
-  // 最終フォールバック: 三段構成
-  //  (1) embedHTML を loadHTMLString → YouTube iframe API で再生
-  //  (2) onError code=101/150/152 (埋め込み禁止) → window.location を
-  //      m.youtube.com/watch?v=... に切替 (WKWebView は top-level なので
-  //      X-Frame-Options=SAMEORIGIN は無視される)
-  //  (3) watch ページ読み込み完了時に WKUserScript の CSS 注入で chrome
-  //      (topbar, pivot bar, comments, related 等) を非表示にし、player のみ残す
+  // YouTube iframe フォールバック: YouTube 公式 iframe API (embedHTML) を
+  // WKWebView に loadHTMLString する。watch ページ遷移や CSS chrome 隠しは
+  // 廃止 (player 初期化を壊して thumbnail すら出ない問題があったため)。
+  //
+  // 動作仕様:
+  //  - 自動再生は iOS WebKit ルールで「muted 起動 → 'ミュート解除' overlay 表示」
+  //    になる。これは Apple の autoplay policy で回避不能。
+  //  - cell タップで user gesture が発生し、iframe 内 YouTube プレイヤーで
+  //    unmute される (YouTube 側がオーバーレイをタップさせる UI を出す)。
+  //  - cell の音量スライダーは mvSetVolume bridge 経由で iframe player の
+  //    volume を直接設定する (ミュート解除も含む)。
+  //  - 広告は WebAdBlocker のコンテンツルール + embedHTML 内の iv_load_policy=3
+  //    アノテーション無効化で抑制 (YouTube は完全には防げない)。
+  //  - 他配信との衝突: iOS の AVAudioSession (.playback) を全 cell 共有して
+  //    mix される。各 cell の音量スライダーで個別制御する設計。
+  //  - iframe が onError 102/150/152 (埋め込み禁止) を返した場合は、無理に
+  //    watch ページに遷移せず error メッセージを overlay 表示する。
   private func installAlternativeWebFallback(videoId: String, attempt: Int = 0) {
     guard !isStopped, fallbackWebView == nil else { return }
     teardownExtractor()
@@ -6276,72 +6286,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
     WebAdBlocker.install(on: config)
-    // watch ページに遷移したときの最小整形。重要な制約:
-    //  - YouTube SPA は親要素を display:none にされると player 初期化が壊れる。
-    //    だから「video を含まない要素を全部 hide」のような強い rule は使わない。
-    //  - position:fixed で player container を強制配置するのも、ロード初期の
-    //    layout 計算を壊して thumbnail すら出さなくする。
-    //  - iOS WKWebView は muted autoplay のみ許可。unmute は user gesture
-    //    (cell タップ等) が必要。これは仕様で workaround できない。
-    //
-    // 戦略: 最小限の CSS で topbar/pivot bar だけ消し、レイアウトは YouTube に
-    // 任せる。autoplay は video.play() を muted で繰り返し試行。touchstart で
-    // unmute 試行。MultiView 側 volume slider 用に mvSetVolume を bridge。
-    let chromeCSS = """
-    body{background:#000!important}
-    ytm-mobile-topbar-renderer,
-    ytm-pivot-bar-renderer,
-    header[role=banner],
-    [class*=merch-shelf],
-    [class*=paid-content-overlay]{display:none!important}
-    """
-    let bridgeJS = """
-    (function(){
-      if (location.pathname.indexOf('/watch') !== 0) return;
-      var s=document.createElement('style');
-      s.textContent=`\(chromeCSS)`;
-      (document.head||document.documentElement).appendChild(s);
-
-      var userActivated = false;
-      function findVideo(){ return document.querySelector('video'); }
-      function tryPlayMuted(){
-        var v=findVideo(); if(!v||!v.paused) return;
-        try{v.muted=true;}catch(e){}
-        var p=v.play(); if(p&&p.catch) p.catch(function(){});
-      }
-      function activate(){
-        userActivated = true;
-        var v=findVideo(); if(!v) return;
-        try{v.muted=false;}catch(e){}
-        if(v.paused){ var p=v.play(); if(p&&p.catch) p.catch(function(){}); }
-      }
-      // muted autoplay を 500ms 間隔で試行 (video 要素が出るまで継続)
-      var tries=0;
-      var pollIv=setInterval(function(){
-        tries++;
-        var v=findVideo();
-        if(v && !v.paused){ /* already playing */ }
-        else tryPlayMuted();
-        if(tries>60) clearInterval(pollIv); // 30 秒で諦め
-      },500);
-      // cell タップで unmute (iOS の user gesture 要件を満たす)
-      document.addEventListener('touchstart', activate, { capture:true });
-      document.addEventListener('click', activate, { capture:true });
-      // MultiView の volume slider bridge
-      window.mvPlay=function(){
-        var v=findVideo(); if(!v) return;
-        if(v.paused){ var p=v.play(); if(p&&p.catch) p.catch(function(){}); }
-      };
-      window.mvPause=function(){ var v=findVideo(); if(v) try{v.pause();}catch(e){} };
-      window.mvSetVolume=function(val){
-        var v=findVideo(); if(!v) return;
-        var n=Math.max(0,Math.min(1,+val||0));
-        try{ v.volume=n; if(userActivated) v.muted=(n<=0); }catch(e){}
-      };
-    })();
-    """
-    let chromeScript = WKUserScript(source: bridgeJS, injectionTime: .atDocumentStart, forMainFrameOnly: true)
-    config.userContentController.addUserScript(chromeScript)
     let web = WKWebView(frame: bounds, configuration: config)
     web.isOpaque = false
     web.backgroundColor = .black
@@ -6515,6 +6459,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           case 2: return '動画ID不正';
           case 5: return 'HTML5プレイヤー初期化失敗';
           case 100: return '動画が見つかりません/非公開';
+          case 101:
+          case 150:
+          case 152: return '配信者が埋め込み再生を禁止しています';
           case 153: return 'HTML5再生制限';
           case 157: return 'ネットワーク経路エラー';
           default: return 'YouTube iframe エラー: '+code;
@@ -6526,13 +6473,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         el.style.display='flex';
         document.getElementById('player').style.display='none';
       }
-      function recoverViaWatchPage(){
-        // iframe 経由の埋め込みが拒否された動画も、通常の watch ページなら
-        // 再生される (X-Frame-Options=SAMEORIGIN だが WKWebView は top-level
-        // ナビゲーションなのでフレーム制約の対象外)。
-        // chrome の非表示は Swift 側の WKUserScript で CSS 注入する。
-        window.location.href = 'https://m.youtube.com/watch?v=\(videoId)';
-      }
       window.onYouTubeIframeAPIReady=function(){
         player=new YT.Player('player',{
           width:'100%',height:'100%',videoId:'\(videoId)',
@@ -6540,15 +6480,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           playerVars:{autoplay:1,playsinline:1,controls:0,rel:0,modestbranding:1,fs:0,disablekb:1,iv_load_policy:3,origin:'https://tonton888115.github.io'},
           events:{
             onReady:function(){ready=true;play();loadSB();},
-            onError:function(e){
-              var code=e.data;
-              // 101/150/152 は埋め込み禁止系。watch ページに切り替えると再生通る。
-              if (code===101 || code===150 || code===152) {
-                recoverViaWatchPage();
-              } else {
-                showError(code);
-              }
-            }
+            onError:function(e){showError(e.data);}
           }
         });
       };
