@@ -2,16 +2,14 @@
   "name": "multiview-youtube-extractor",
   "version": "0.2.0",
   "private": true,
-  "description": "Cloudflare Worker that uses youtubei.js to extract direct playable YouTube URLs for MultiView",
+  "description": "Cloudflare Worker that resolves YouTube live HLS manifests for MultiView",
   "type": "module",
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "tail": "wrangler tail"
   },
-  "dependencies": {
-    "youtubei.js": "^17.0.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "wrangler": "^4.95.0"
   }

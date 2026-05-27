@@ -5346,8 +5346,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private func applyVolume() {
-    player.isMuted = !settings.playAudio || playbackVolume <= 0
-    player.volume = settings.playAudio ? playbackVolume : 0
+    player.isMuted = false
+    player.volume = max(0.01, playbackVolume)
   }
 
   private func iframeEffectiveVolume() -> Float {
@@ -5493,7 +5493,81 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private func installOfficialEmbed(videoId: String) {
-    installWatchPagePlayer(videoId: videoId)
+    requestNativePlayer(videoId: videoId)
+  }
+
+  private func requestNativePlayer(videoId: String, attempt: Int = 0) {
+    guard !isStopped, player.currentItem == nil else { return }
+    let clients = Self.nativePlayerClients()
+    guard clients.indices.contains(attempt) else {
+      noteExtractionFailure("Native player: manifest取得失敗")
+      installWatchPagePlayer(videoId: videoId)
+      return
+    }
+    let client = clients[attempt]
+    showStatus("YouTube HLS取得中\n\(client.label) \(attempt + 1)/\(clients.count)")
+    guard let url = URL(string: "https://youtubei.googleapis.com/youtubei/v1/player") else {
+      installWatchPagePlayer(videoId: videoId)
+      return
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 10
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue(client.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue(client.headerClientName, forHTTPHeaderField: "X-YouTube-Client-Name")
+    request.setValue(client.version, forHTTPHeaderField: "X-YouTube-Client-Version")
+    request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: [
+      "context": client.context,
+      "videoId": videoId,
+      "contentCheckOk": true,
+      "racyCheckOk": true,
+      "playbackContext": [
+        "contentPlaybackContext": [
+          "html5Preference": "HTML5_PREF_WANTS"
+        ]
+      ]
+    ])
+    resolveTask?.cancel()
+    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+      guard let self else { return }
+      self.resolveTask = nil
+      if let error {
+        DispatchQueue.main.async {
+          self.noteExtractionFailure("\(client.label): \(error.localizedDescription)")
+          self.requestNativePlayer(videoId: videoId, attempt: attempt + 1)
+        }
+        return
+      }
+      let parsed = Self.parseJSONObject(data)
+      if let parsed, let stream = Self.extractPlayableStream(from: parsed) {
+        DispatchQueue.main.async {
+          guard !self.isStopped, self.player.currentItem == nil else { return }
+          self.showStatus("YouTube HLS取得成功\n\(client.label)")
+          self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive)
+        }
+        return
+      }
+      DispatchQueue.main.async {
+        let httpCode = (response as? HTTPURLResponse)?.statusCode
+        self.noteExtractionFailure(Self.youtubeIErrorSummary(clientName: client.label, httpCode: httpCode, parsed: parsed, data: data))
+        self.requestNativePlayer(videoId: videoId, attempt: attempt + 1)
+      }
+    }
+    let task = resolveTask
+    resolveTask?.resume()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self, weak task] in
+      guard let self,
+            !self.isStopped,
+            self.player.currentItem == nil,
+            let task,
+            self.resolveTask === task else { return }
+      task.cancel()
+      self.resolveTask = nil
+      self.noteExtractionFailure("\(client.label): 12秒タイムアウト")
+      self.requestNativePlayer(videoId: videoId, attempt: attempt + 1)
+    }
   }
 
   // Worker (multiview.rinngo0626.workers.dev) を最初に試す。ライブ動画なら HLS
@@ -5504,12 +5578,12 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     guard !isStopped else { return }
     showStatus("YouTube抽出中 (Worker)")
     guard var components = URLComponents(string: Self.extractionWorkerURL) else {
-      extractStreams(videoId: videoId)
+      installWatchPagePlayer(videoId: videoId)
       return
     }
     components.queryItems = [URLQueryItem(name: "v", value: videoId)]
     guard let url = components.url else {
-      extractStreams(videoId: videoId)
+      installWatchPagePlayer(videoId: videoId)
       return
     }
     var request = URLRequest(url: url)
@@ -5529,18 +5603,19 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
            let urlStr = parsed["url"] as? String,
            let streamURL = URL(string: urlStr) {
           let isLive = (parsed["isLive"] as? Bool) ?? false
-          self.noteExtractionFailure("Worker抽出成功 (\(parsed["kind"] as? String ?? "url"))")
+          self.showStatus("YouTube HLS取得成功\n\(parsed["kind"] as? String ?? "url") / \(parsed["title"] as? String ?? videoId)")
           self.startPlayback(url: streamURL, videoId: videoId, isLive: isLive)
           return
         }
-        // Worker が VOD で error を返した、または到達失敗 → 従来 chain へ
+        // Worker が error を返した、または到達失敗 → watch ページ診断へ
         if let parsed, let err = parsed["error"] as? String {
-          self.noteExtractionFailure("Worker: \(err)")
+          let reason = (parsed["reason"] as? String) ?? (parsed["subreason"] as? String) ?? ""
+          self.noteExtractionFailure("Worker: \(err)\n\(reason)")
         } else {
           let status = (response as? HTTPURLResponse)?.statusCode ?? 0
           self.noteExtractionFailure("Worker到達失敗 (HTTP \(status))")
         }
-        self.extractStreams(videoId: videoId)
+        self.installWatchPagePlayer(videoId: videoId)
       }
     }
     resolveTask?.resume()
@@ -5862,6 +5937,54 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         result.append(context)
       }
     }
+  }
+
+  private static func nativePlayerClients() -> [(label: String, headerClientName: String, version: String, userAgent: String, context: [String: Any])] {
+    let iosVersion = "21.17.3"
+    let iosUA = "com.google.ios.youtube/\(iosVersion) (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X; ja_JP)"
+    let androidVersion = "20.19.35"
+    let androidUA = "com.google.android.youtube/\(androidVersion) (Linux; U; Android 15) gzip"
+    return [
+      (
+        label: "IOS",
+        headerClientName: "5",
+        version: iosVersion,
+        userAgent: iosUA,
+        context: [
+          "client": [
+            "clientName": "IOS",
+            "clientVersion": iosVersion,
+            "deviceMake": "Apple",
+            "deviceModel": "iPhone16,2",
+            "osName": "iOS",
+            "osVersion": "17.5.1.21F90",
+            "hl": "ja",
+            "gl": "JP",
+            "userAgent": iosUA
+          ]
+        ]
+      ),
+      (
+        label: "ANDROID",
+        headerClientName: "3",
+        version: androidVersion,
+        userAgent: androidUA,
+        context: [
+          "client": [
+            "clientName": "ANDROID",
+            "clientVersion": androidVersion,
+            "androidSdkVersion": 35,
+            "deviceMake": "Google",
+            "deviceModel": "Pixel 9 Pro",
+            "osName": "Android",
+            "osVersion": "15",
+            "hl": "ja",
+            "gl": "JP",
+            "userAgent": androidUA
+          ]
+        ]
+      )
+    ]
   }
 
   private static func youtubeClientHeaderName(_ clientName: String) -> String? {

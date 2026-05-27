@@ -9,7 +9,5 @@ enabled = true
 # 既存 worker URL https://multiview.rinngo0626.workers.dev に上書きデプロイされる。
 # free tier defaults: 100,000 requests/day, no payment required
 #
-# VOD (muxed mp4) は signature decipher のため `new Function` が要るが、CF Worker
-# free 枠は Code generation from strings を禁止しており、`unsafe_eval` バインディング
-# は別途申請が必要なため使用不可。ライブ配信 (HLS manifest) は cipher 不要なので
-# 通常動作する。Worker は live のみ URL 返し、VOD は iOS 側で iframe にフォールバック。
+# iOS InnerTube player response から live/DVR の HLS manifest URL を返す。
+# VOD の signature cipher 解読や DRM には対応しない。
