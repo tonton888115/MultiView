@@ -1132,6 +1132,18 @@ struct YouTubeOAuthConfig: Codable {
   var redirectURI = "multiview://youtube-oauth"
 }
 
+struct YouTubeLiveChatMessage {
+  let id: String
+  let author: String
+  let text: String
+}
+
+struct YouTubeLiveChatPage {
+  let messages: [YouTubeLiveChatMessage]
+  let nextPageToken: String?
+  let pollingIntervalMillis: Int
+}
+
 final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContextProviding {
   static let shared = YouTubeAuthManager()
   private let configKey = "youtube.oauth.config.v1"
@@ -1238,6 +1250,75 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
     }
   }
 
+  func resolveLiveChat(videoID: String, completion: @escaping (Result<(liveChatID: String, accessToken: String), Error>) -> Void) {
+    guard let token = OAuthKeychain.load(account: tokenAccount), token.isValid else {
+      Self.finish(completion, .failure(OAuthServiceError.message("YouTubeチャット弾幕: YouTubeにログインしてください")))
+      return
+    }
+    resolveLiveChatID(videoID: videoID, accessToken: token.accessToken) { result in
+      switch result {
+      case .failure(let error):
+        Self.finish(completion, .failure(error))
+      case .success(let liveChatID):
+        Self.finish(completion, .success((liveChatID, token.accessToken)))
+      }
+    }
+  }
+
+  func fetchLiveChatMessages(
+    liveChatID: String,
+    pageToken: String?,
+    accessToken: String,
+    completion: @escaping (Result<YouTubeLiveChatPage, Error>) -> Void
+  ) {
+    var components = URLComponents(string: "https://www.googleapis.com/youtube/v3/liveChat/messages")!
+    var items = [
+      URLQueryItem(name: "liveChatId", value: liveChatID),
+      URLQueryItem(name: "part", value: "snippet,authorDetails"),
+      URLQueryItem(name: "maxResults", value: "200"),
+      URLQueryItem(name: "profileImageSize", value: "16")
+    ]
+    if let pageToken, !pageToken.isEmpty {
+      items.append(URLQueryItem(name: "pageToken", value: pageToken))
+    }
+    components.queryItems = items
+    var request = URLRequest(url: components.url!)
+    request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+    URLSession.shared.dataTask(with: request) { data, response, error in
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let data,
+            let http = response as? HTTPURLResponse,
+            (200..<300).contains(http.statusCode),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        let detail = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        Self.finish(completion, .failure(OAuthServiceError.message(detail.isEmpty ? "YouTubeチャット取得失敗 (HTTP \(status))" : "YouTubeチャット取得失敗 (HTTP \(status)): \(detail)")))
+        return
+      }
+      let parsedItems = json["items"] as? [[String: Any]] ?? []
+      let messages = parsedItems.compactMap { item -> YouTubeLiveChatMessage? in
+        guard let id = item["id"] as? String,
+              let snippet = item["snippet"] as? [String: Any] else { return nil }
+        let text = (snippet["displayMessage"] as? String)
+          ?? ((snippet["textMessageDetails"] as? [String: Any])?["messageText"] as? String)
+          ?? ""
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let author = ((item["authorDetails"] as? [String: Any])?["displayName"] as? String) ?? ""
+        return YouTubeLiveChatMessage(id: id, author: author, text: text)
+      }
+      let page = YouTubeLiveChatPage(
+        messages: messages,
+        nextPageToken: json["nextPageToken"] as? String,
+        pollingIntervalMillis: (json["pollingIntervalMillis"] as? Int) ?? 5000
+      )
+      Self.finish(completion, .success(page))
+    }.resume()
+  }
+
   func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
     authAnchor ?? ASPresentationAnchor()
   }
@@ -1327,7 +1408,10 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
             let items = json["items"] as? [[String: Any]],
             let details = items.first?["liveStreamingDetails"] as? [String: Any],
             let liveChatID = details["activeLiveChatId"] as? String else {
-        Self.finish(completion, .failure(OAuthServiceError.message("YouTubeライブチャットIDを取得できません")))
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        let detail = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        Self.finish(completion, .failure(OAuthServiceError.message(detail.isEmpty ? "YouTubeライブチャットIDを取得できません (HTTP \(status))" : "YouTubeライブチャットIDを取得できません (HTTP \(status)): \(detail)")))
         return
       }
       Self.finish(completion, .success(liveChatID))
@@ -2838,54 +2922,30 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private func scheduleProgramEndIfNeeded(_ endDate: Date?) {
     endRemovalWorkItem?.cancel()
     endRemovalWorkItem = nil
-    guard let endDate else { return }
-    let delay = endDate.timeIntervalSinceNow
-    guard delay > 5 else {
-      beginEndedCountdown("番組が終了しましたので閉じます")
-      return
-    }
-    let work = DispatchWorkItem { [weak self] in
-      self?.beginEndedCountdown("番組が終了しましたので閉じます")
-    }
-    endRemovalWorkItem = work
-    DispatchQueue.main.asyncAfter(deadline: .now() + delay + 8, execute: work)
+    // Niconico end timestamps and disconnect payloads can be noisy. Do not
+    // schedule automatic removal; leave the cell under the user's control.
+    _ = endDate
   }
 
   private func beginEndedCountdown(_ reason: String) {
     DispatchQueue.main.async {
       guard !self.isStopped else { return }
-      self.isEnding = true
       self.endRemovalWorkItem?.cancel()
       self.endRemovalWorkItem = nil
       self.endCountdownTimer?.invalidate()
-      self.endCountdownRemaining = 15
-      self.showStatus("\(reason)\n\(self.endCountdownRemaining)秒後に閉じます")
-      self.player.pause()
-      self.socketTask?.cancel(with: .goingAway, reason: nil)
-      self.socketTask = nil
-      self.endCountdownTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
-        guard let self, !self.isStopped else {
-          timer.invalidate()
-          return
-        }
-        self.endCountdownRemaining -= 1
-        if self.endCountdownRemaining <= 0 {
-          timer.invalidate()
-          self.endCountdownTimer = nil
-          self.removeEndedProgram(reason)
-        } else {
-          self.showStatus("\(reason)\n\(self.endCountdownRemaining)秒後に閉じます")
-        }
-      }
+      self.endCountdownTimer = nil
+      self.endCountdownRemaining = 0
+      let message = reason
+        .replacingOccurrences(of: "ので閉じます", with: "")
+        .replacingOccurrences(of: "閉じます", with: "")
+      self.showStatus("\(message)\n自動では閉じません")
     }
   }
 
   private func removeEndedProgram(_ reason: String) {
     DispatchQueue.main.async {
       guard !self.isStopped else { return }
-      self.showStatus(reason)
-      self.stopPlayback()
-      AppState.shared.remove(self.stream)
+      self.showStatus("\(reason)\n自動削除は無効です")
     }
   }
 
@@ -5161,15 +5221,15 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
-// Per-cell YouTube playback prefers native AVPlayer URLs. The official iframe is
-// only a muted visual fallback so it cannot compete with Kick/Twitch/native audio.
-final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate {
+// Per-cell YouTube playback uses the official iframe player. Raw HLS/InnerTube
+// extraction is intentionally kept out of the startup path: it is brittle, slow
+// to fail, and not the supported YouTube integration surface.
+final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, WKScriptMessageHandler {
+  private static let instances = NSHashTable<YouTubeNativePlayerView>.weakObjects()
   private let stream: StreamItem
   private let settings: AppSettings
-  // Video-only playback: we extract the real media URL (HLS for live, a muxed
-  // progressive URL for VOD) via YouTube's InnerTube player endpoint and play it in
-  // AVPlayer, so there is zero YouTube chrome. The iframe embed is only a fallback
-  // for videos we cannot extract (e.g. ciphered VOD formats).
+  // AVPlayer is retained for the older extraction experiments and SponsorBlock
+  // path, but loadPlayer() now goes straight to the official iframe player.
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
   private let danmakuView = UIView()
@@ -5177,6 +5237,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var playbackVolume: Float
   private var resolveTask: URLSessionDataTask?
   private var sponsorTask: URLSessionDataTask?
+  private var chatPollWorkItem: DispatchWorkItem?
   private var extractorWebView: WKWebView?
   private var pendingVideoId: String?
   private var itemStatusObservation: NSKeyValueObservation?
@@ -5186,6 +5247,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var triedPiped = false
   private var triedInvidious = false
   private var isStopped = false
+  private var iframeAudioEnabled = false
+  private var liveChatID: String?
+  private var liveChatAccessToken: String?
+  private var liveChatPageToken: String?
+  private var seenLiveChatMessageIDs = Set<String>()
   private var laneCursor = 0
   private var extractionFailures: [String] = []
 
@@ -5193,6 +5259,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     self.stream = stream
     self.settings = settings
     self.playbackVolume = StreamVolumeStore.volume(for: stream)
+    self.iframeAudioEnabled = settings.playAudio && self.playbackVolume > 0
     super.init(frame: .zero)
     backgroundColor = .black
 
@@ -5225,6 +5292,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16)
     ])
     PlaybackCoordinator.shared.register(self)
+    Self.instances.add(self)
     Self.refreshInstanceListsIfNeeded()
     loadPlayer()
   }
@@ -5234,6 +5302,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   deinit {
+    Self.instances.remove(self)
     stopPlayback()
   }
 
@@ -5246,7 +5315,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   func resumePlayback() {
     guard !isStopped else { return }
     if let fallbackWebView {
-      let effective = settings.playAudio ? playbackVolume : 0
+      let effective = iframeEffectiveVolume()
       fallbackWebView.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(effective)); window.mvPlay && window.mvPlay();")
       return
     }
@@ -5265,17 +5334,32 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
+    iframeAudioEnabled = settings.playAudio && playbackVolume > 0
+    if iframeAudioEnabled {
+      Self.focusAudio(on: self)
+    }
     applyVolume()
-    // iframe fallback も AVPlayer と同じ音量を尊重する。settings.playAudio が
-    // 偽の時は強制ミュート (AVAudioSession の category は .playback だが
-    // mixWithOthers 未指定なので、複数 cell の音声は端末スピーカーで mix される)。
-    let effective = settings.playAudio ? playbackVolume : 0
-    fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(effective));")
+    fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(iframeEffectiveVolume()));")
   }
 
   private func applyVolume() {
     player.isMuted = !settings.playAudio || playbackVolume <= 0
     player.volume = settings.playAudio ? playbackVolume : 0
+  }
+
+  private func iframeEffectiveVolume() -> Float {
+    settings.playAudio && iframeAudioEnabled ? playbackVolume : 0
+  }
+
+  private static func focusAudio(on active: YouTubeNativePlayerView) {
+    for object in instances.allObjects where object !== active {
+      object.muteIframeAudio()
+    }
+  }
+
+  private func muteIframeAudio() {
+    iframeAudioEnabled = false
+    fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(0);")
   }
 
   func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -5297,11 +5381,83 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
+  private func startLiveChatPolling(videoId: String) {
+    guard settings.showChat else { return }
+    chatPollWorkItem?.cancel()
+    liveChatID = nil
+    liveChatAccessToken = nil
+    liveChatPageToken = nil
+    seenLiveChatMessageIDs.removeAll()
+    YouTubeAuthManager.shared.resolveLiveChat(videoID: videoId) { [weak self] result in
+      guard let self, !self.isStopped else { return }
+      switch result {
+      case .failure(let error):
+        self.showStatus(error.localizedDescription)
+      case .success(let chat):
+        self.liveChatID = chat.liveChatID
+        self.liveChatAccessToken = chat.accessToken
+        self.pollLiveChat()
+      }
+    }
+  }
+
+  private func pollLiveChat() {
+    guard settings.showChat,
+          !isStopped,
+          let liveChatID,
+          let liveChatAccessToken else { return }
+    YouTubeAuthManager.shared.fetchLiveChatMessages(
+      liveChatID: liveChatID,
+      pageToken: liveChatPageToken,
+      accessToken: liveChatAccessToken
+    ) { [weak self] result in
+      guard let self, !self.isStopped else { return }
+      switch result {
+      case .failure(let error):
+        self.showStatus(error.localizedDescription)
+        self.scheduleLiveChatPoll(after: 10)
+      case .success(let page):
+        self.liveChatPageToken = page.nextPageToken
+        self.emitLiveChatMessages(page.messages)
+        let delay = max(2.0, Double(page.pollingIntervalMillis) / 1000.0)
+        self.scheduleLiveChatPoll(after: delay)
+      }
+    }
+  }
+
+  private func scheduleLiveChatPoll(after delay: TimeInterval) {
+    chatPollWorkItem?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      self?.pollLiveChat()
+    }
+    chatPollWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+  }
+
+  private func emitLiveChatMessages(_ messages: [YouTubeLiveChatMessage]) {
+    guard !messages.isEmpty else { return }
+    for message in messages {
+      guard !seenLiveChatMessageIDs.contains(message.id) else { continue }
+      seenLiveChatMessageIDs.insert(message.id)
+      laneCursor = NativeDanmakuRenderer.emit(
+        tokens: NativeDanmakuRenderer.textTokens(message.text),
+        filterText: message.text,
+        in: danmakuView,
+        laneCursor: laneCursor,
+        settings: settings
+      )
+    }
+    if seenLiveChatMessageIDs.count > 500 {
+      seenLiveChatMessageIDs.removeAll(keepingCapacity: true)
+    }
+  }
+
   func stopPlayback() {
     isStopped = true
     resolveTask?.cancel(); resolveTask = nil
     teardownExtractor()
     sponsorTask?.cancel(); sponsorTask = nil
+    chatPollWorkItem?.cancel(); chatPollWorkItem = nil
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
@@ -5310,6 +5466,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     player.pause()
     player.replaceCurrentItem(with: nil)
     fallbackWebView?.stopLoading()
+    fallbackWebView?.configuration.userContentController.removeScriptMessageHandler(forName: "youtubeAudio")
     fallbackWebView?.loadHTMLString("", baseURL: nil)
     fallbackWebView?.removeFromSuperview()
     fallbackWebView = nil
@@ -5324,10 +5481,15 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private func loadPlayer() {
     let raw = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
     if let videoId = Self.videoID(from: raw) {
-      requestWorkerExtraction(videoId: videoId)
+      installOfficialEmbed(videoId: videoId)
+      startLiveChatPolling(videoId: videoId)
       return
     }
     resolveLiveVideoID(from: raw)
+  }
+
+  private func installOfficialEmbed(videoId: String) {
+    installAlternativeWebFallback(videoId: videoId)
   }
 
   // Worker (multiview.rinngo0626.workers.dev) を最初に試す。ライブ動画なら HLS
@@ -6014,7 +6176,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   // 抽出が全滅した時は最終的に iframe 埋め込みで再生する。WebAdBlocker と
   // 仕様強制ミュートで広告/同時オーディオ問題を緩和する。
   private static let alternativeWebFallbacks = [
-    "https://www.youtube.com/embed/%@?autoplay=1&playsinline=1&modestbranding=1&rel=0",
+    "https://www.youtube.com/embed/%@?autoplay=1&playsinline=1&rel=0",
     "https://piped.video/embed/%@"
   ]
 
@@ -6256,21 +6418,19 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     installAlternativeWebFallback(videoId: videoId)
   }
 
-  // YouTube iframe フォールバック: YouTube 公式 iframe API (embedHTML) を
+  // YouTube official iframe player: YouTube 公式 iframe API (embedHTML) を
   // WKWebView に loadHTMLString する。watch ページ遷移や CSS chrome 隠しは
   // 廃止 (player 初期化を壊して thumbnail すら出ない問題があったため)。
   //
   // 動作仕様:
-  //  - 自動再生は iOS WebKit ルールで「muted 起動 → 'ミュート解除' overlay 表示」
-  //    になる。これは Apple の autoplay policy で回避不能。
-  //  - cell タップで user gesture が発生し、iframe 内 YouTube プレイヤーで
-  //    unmute される (YouTube 側がオーバーレイをタップさせる UI を出す)。
-  //  - cell の音量スライダーは mvSetVolume bridge 経由で iframe player の
-  //    volume を直接設定する (ミュート解除も含む)。
+  //  - 自動再生は iOS WebKit ルールに合わせて muted 起動する。
+  //  - ネイティブ音量操作で「音声をオン」ボタンを iframe 内に出し、WebView 内の
+  //    user gesture で unmute する。ネイティブ側だけでは iOS が解除を拒否し得る。
+  //  - YouTube セルの音声は focusAudio(on:) で 1 つに絞り、同時出力を避ける。
   //  - 広告は WebAdBlocker のコンテンツルール + embedHTML 内の iv_load_policy=3
   //    アノテーション無効化で抑制 (YouTube は完全には防げない)。
-  //  - 他配信との衝突: iOS の AVAudioSession (.playback) を全 cell 共有して
-  //    mix される。各 cell の音量スライダーで個別制御する設計。
+  //  - 他配信との衝突: YouTube は iframe だけを鳴らし、AVPlayer 抽出音声を
+  //    起動経路から外して二重出力を防ぐ。
   //  - iframe が onError 102/150/152 (埋め込み禁止) を返した場合は、無理に
   //    watch ページに遷移せず error メッセージを overlay 表示する。
   private func installAlternativeWebFallback(videoId: String, attempt: Int = 0) {
@@ -6288,6 +6448,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
+    config.userContentController.add(self, name: "youtubeAudio")
     WebAdBlocker.install(on: config)
     let web = WKWebView(frame: bounds, configuration: config)
     web.isOpaque = false
@@ -6373,7 +6534,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         return
       }
       if let finalURL = response?.url, let id = Self.videoID(from: finalURL.absoluteString) {
-        DispatchQueue.main.async { self.requestWorkerExtraction(videoId: id) }
+        DispatchQueue.main.async {
+          self.installOfficialEmbed(videoId: id)
+          self.startLiveChatPolling(videoId: id)
+        }
         return
       }
       guard let data, let html = String(data: data, encoding: .utf8),
@@ -6381,7 +6545,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         self.showStatus("YouTubeライブ動画IDを取得できません")
         return
       }
-      DispatchQueue.main.async { self.requestWorkerExtraction(videoId: id) }
+      DispatchQueue.main.async {
+        self.installOfficialEmbed(videoId: id)
+        self.startLiveChatPolling(videoId: id)
+      }
     }
     resolveTask?.resume()
   }
@@ -6416,7 +6583,18 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
-  // Fallback embed: YouTube 公式 iframe API。当時 (8321d49) 動いてた構造を踏襲。
+  func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+    guard message.name == "youtubeAudio", !isStopped else { return }
+    iframeAudioEnabled = settings.playAudio && playbackVolume > 0
+    if iframeAudioEnabled {
+      Self.focusAudio(on: self)
+      fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(iframeEffectiveVolume()));")
+    } else {
+      fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(0);")
+    }
+  }
+
+  // YouTube official embed: YouTube 公式 iframe API。当時 (8321d49) 動いてた構造を踏襲。
   //
   // iOS WebKit の autoplay policy: video.muted=true (初期) でない限り autoplay は
   // 拒否される。だから playerVars に **mute:1** が必須。mute を抜くと iframe は
@@ -6436,14 +6614,15 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     return """
     <!doctype html>
     <html>
-    <head><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-    <style>html,body,#player{margin:0;width:100%;height:100%;background:#000;overflow:hidden}iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}#err{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#fff;font-family:-apple-system;text-align:center;padding:18px;font-size:13px;line-height:1.5}#err a{color:#9ecbff}</style></head>
+    <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <style>html,body,#player{margin:0;width:100%;height:100%;background:#000;overflow:hidden}iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}#err{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#fff;font-family:-apple-system;text-align:center;padding:18px;font-size:13px;line-height:1.5}#err a{color:#9ecbff}#audio{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:20;display:none;align-items:center;justify-content:center;padding:10px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.34);background:rgba(18,24,32,.88);color:#fff;font:700 13px -apple-system,BlinkMacSystemFont,sans-serif}</style></head>
     <body>
     <div id="player"></div>
     <div id="err"></div>
+    <button id="audio">音声をオン</button>
     <script src="https://www.youtube.com/iframe_api"></script>
     <script>
-      var player=null, READY=false, AUDIO=true, VOL=100, sb=[], hasPlayedOnce=false, userGesture=false;
+      var player=null, READY=false, AUDIO=false, VOL=0, sb=[], hasPlayedOnce=false, userGesture=false;
       // iOS autoplay policy: muted の playVideo() は許可されるが、
       // user gesture (touchstart) なしの unMute() は autoplay 違反として
       // 直後に video を pause させる。userGesture フラグで gesture 前は
@@ -6455,12 +6634,20 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           if(AUDIO && userGesture){player.unMute();player.setVolume(VOL);}
           else{player.mute();}
         }catch(e){}
+        updateAudioButton();
+      }
+      function updateAudioButton(){
+        var b=document.getElementById('audio');
+        if(!b)return;
+        b.style.display=(AUDIO && !userGesture)?'flex':'none';
       }
       // user gesture を検出したら即 unmute トライ
       function onGesture(){
         if(userGesture) return;
         userGesture = true;
+        try{window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.youtubeAudio.postMessage('focus');}catch(e){}
         try{ if(player && READY && AUDIO){player.unMute();player.setVolume(VOL);} }catch(e){}
+        updateAudioButton();
       }
       document.addEventListener('touchstart', onGesture, {capture:true, passive:true});
       document.addEventListener('click', onGesture, {capture:true});
@@ -6502,7 +6689,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         player=new YT.Player('player',{
           width:'100%',height:'100%',videoId:'\(videoId)',
           host:'https://www.youtube.com',
-          playerVars:{autoplay:1,mute:1,playsinline:1,controls:0,rel:0,modestbranding:1,fs:0,disablekb:1,iv_load_policy:3,origin:'https://tonton888115.github.io'},
+          playerVars:{autoplay:1,mute:1,playsinline:1,controls:1,rel:0,fs:1,iv_load_policy:3,origin:'https://tonton888115.github.io'},
           events:{
             onReady:function(){READY=true;apply();loadSB();},
             onStateChange:function(e){
