@@ -2675,6 +2675,11 @@ private final class NiconicoGiftEffectCache {
   private let queue = DispatchQueue(label: "app.multiview.niconico-gift-cache")
   private var prewarmed = false
   private var inFlight = Set<URL>()
+  private var callbacks: [URL: [(UIImage?) -> Void]] = [:]
+  private var itemThumbnailURLs: [String: URL] = [:]
+  private let itemThumbnailLock = NSLock()
+  private var giftionaryAPIPrewarmed = false
+  private var giftionaryAPIRequestInFlight = false
 
   func prewarmCommonEffects() {
     queue.async {
@@ -2686,27 +2691,103 @@ private final class NiconicoGiftEffectCache {
   }
 
   func prewarmAsset(_ url: URL?) {
-    guard let url, isAllowedGiftAssetURL(url) else { return }
+    loadImage(for: url) { _ in }
+  }
+
+  func prewarmGiftItem(itemID: String?) {
+    prewarmAsset(thumbnailURL(forItemID: itemID))
+  }
+
+  func thumbnailURL(forItemID itemID: String?) -> URL? {
+    guard let itemID = sanitizedItemID(itemID) else { return nil }
+    itemThumbnailLock.lock()
+    let mapped = itemThumbnailURLs[itemID]
+    itemThumbnailLock.unlock()
+    if let mapped {
+      return mapped
+    }
+    return URL(string: "https://secure-dcdn.cdn.nimg.jp/nicoad/res/nage/thumbnail/\(itemID).png")
+  }
+
+  func loadImage(for url: URL?, completion: @escaping (UIImage?) -> Void) {
+    guard let url, isAllowedGiftAssetURL(url) else {
+      DispatchQueue.main.async {
+        completion(nil)
+      }
+      return
+    }
+    if let cached = memoryImages.object(forKey: url as NSURL) {
+      DispatchQueue.main.async {
+        completion(cached)
+      }
+      return
+    }
     queue.async {
-      if self.memoryImages.object(forKey: url as NSURL) != nil { return }
-      if FileManager.default.fileExists(atPath: self.cacheFileURL(for: url).path) { return }
+      if let image = self.diskImage(for: url) {
+        self.memoryImages.setObject(image, forKey: url as NSURL)
+        DispatchQueue.main.async {
+          completion(image)
+        }
+        return
+      }
+      self.callbacks[url, default: []].append(completion)
       if self.inFlight.contains(url) { return }
       self.inFlight.insert(url)
       var request = URLRequest(url: url)
       request.timeoutInterval = 8
       URLSession.shared.dataTask(with: request) { data, response, _ in
-        defer {
-          self.queue.async {
-            self.inFlight.remove(url)
+        var image: UIImage?
+        if let http = response as? HTTPURLResponse,
+           (200..<300).contains(http.statusCode),
+           let data,
+           data.count <= 4_000_000 {
+          image = NativeAnimatedImageDecoder.image(from: data)
+          if let image {
+            self.memoryImages.setObject(image, forKey: url as NSURL)
+            try? FileManager.default.createDirectory(at: self.cacheDirectory(), withIntermediateDirectories: true)
+            try? data.write(to: self.cacheFileURL(for: url), options: [.atomic])
           }
         }
-        guard let http = response as? HTTPURLResponse,
-              (200..<300).contains(http.statusCode),
-              let data,
-              data.count <= 4_000_000,
-              let image = NativeAnimatedImageDecoder.image(from: data) else { return }
-        self.memoryImages.setObject(image, forKey: url as NSURL)
-        try? data.write(to: self.cacheFileURL(for: url), options: [.atomic])
+        self.queue.async {
+          let completions = self.callbacks.removeValue(forKey: url) ?? []
+          self.inFlight.remove(url)
+          DispatchQueue.main.async {
+            completions.forEach { $0(image) }
+          }
+        }
+      }.resume()
+    }
+  }
+
+  func prewarmGiftionaryAPI(headers: [String: String]) {
+    queue.async {
+      guard !self.giftionaryAPIPrewarmed, !self.giftionaryAPIRequestInFlight else { return }
+      guard let cookieHeader = headers["Cookie"], !cookieHeader.isEmpty else { return }
+      guard let url = URL(string: "https://api.gift.nicovideo.jp/v1/my/giftionary/items/recent") else { return }
+      self.giftionaryAPIRequestInFlight = true
+      var request = URLRequest(url: url)
+      request.timeoutInterval = 8
+      headers.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+      URLSession.shared.dataTask(with: request) { data, response, _ in
+        var mappings: [(String, URL)] = []
+        if let http = response as? HTTPURLResponse,
+           (200..<300).contains(http.statusCode),
+           let data,
+           let json = try? JSONSerialization.jsonObject(with: data) {
+          mappings = self.giftionaryItemMappings(in: json)
+        }
+        self.queue.async {
+          self.giftionaryAPIRequestInFlight = false
+          if !mappings.isEmpty {
+            self.giftionaryAPIPrewarmed = true
+          }
+          mappings.forEach { itemID, url in
+            self.itemThumbnailLock.lock()
+            self.itemThumbnailURLs[itemID] = url
+            self.itemThumbnailLock.unlock()
+            self.prewarmAsset(url)
+          }
+        }
       }.resume()
     }
   }
@@ -2717,11 +2798,56 @@ private final class NiconicoGiftEffectCache {
       return cached
     }
     guard isAllowedGiftAssetURL(url) else { return nil }
-    let fileURL = cacheFileURL(for: url)
-    guard let data = try? Data(contentsOf: fileURL),
-          let image = NativeAnimatedImageDecoder.image(from: data) else { return nil }
+    guard let image = diskImage(for: url) else { return nil }
     memoryImages.setObject(image, forKey: url as NSURL)
     return image
+  }
+
+  private func sanitizedItemID(_ itemID: String?) -> String? {
+    guard let itemID = itemID?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !itemID.isEmpty,
+          itemID.count <= 128 else { return nil }
+    let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+    guard itemID.unicodeScalars.allSatisfy({ allowed.contains($0) }) else { return nil }
+    return itemID
+  }
+
+  private func giftionaryItemMappings(in value: Any) -> [(String, URL)] {
+    var result: [(String, URL)] = []
+    func walk(_ value: Any) {
+      if let dict = value as? [String: Any] {
+        if let itemID = sanitizedItemID(dict["itemId"] as? String),
+           let thumbnail = dict["itemThumbnailUrl"] as? String,
+           let url = normalizedGiftAssetURL(thumbnail) {
+          result.append((itemID, url))
+        }
+        dict.values.forEach(walk)
+        return
+      }
+      if let array = value as? [Any] {
+        array.forEach(walk)
+      }
+    }
+    walk(value)
+    return result
+  }
+
+  private func normalizedGiftAssetURL(_ text: String) -> URL? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let url: URL?
+    if trimmed.hasPrefix("/") {
+      url = URL(string: "https://gift.nicovideo.jp\(trimmed)")
+    } else {
+      url = URL(string: trimmed)
+    }
+    guard let url, isAllowedGiftAssetURL(url) else { return nil }
+    return url
+  }
+
+  private func diskImage(for url: URL) -> UIImage? {
+    let fileURL = cacheFileURL(for: url)
+    guard let data = try? Data(contentsOf: fileURL) else { return nil }
+    return NativeAnimatedImageDecoder.image(from: data)
   }
 
   private func isAllowedGiftAssetURL(_ url: URL) -> Bool {
@@ -2773,6 +2899,16 @@ private enum NativeAnimatedImageDecoder {
     let clamped = gif[kCGImagePropertyGIFDelayTime] as? Double
     let value = unclamped ?? clamped ?? 0.1
     return value < 0.02 ? 0.1 : value
+  }
+}
+
+private final class NativeOnceGate {
+  private var didRun = false
+
+  func run(_ body: () -> Void) {
+    guard !didRun else { return }
+    didRun = true
+    body()
   }
 }
 
@@ -3309,7 +3445,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       NiconicoWarmup.shared.prewarm(programId: programId, forceReload: self.loadAttempts > 0) { [weak self] in
         guard let self, !self.isStopped else { return }
         self.syncNiconicoWebCookies { [weak self] in
-          self?.fetchWatchPage(url: url)
+          guard let self else { return }
+          self.prewarmNiconicoGiftAssets()
+          self.fetchWatchPage(url: url)
         }
       }
     }
@@ -3695,6 +3833,37 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     return headers
   }
 
+  private func prewarmNiconicoGiftAssets() {
+    NiconicoGiftEffectCache.shared.prewarmGiftionaryAPI(headers: niconicoGiftAPIHeaders())
+  }
+
+  private func niconicoGiftAPIHeaders() -> [String: String] {
+    var headers: [String: String] = [
+      "Accept": "application/json",
+      "Referer": "https://gift.nicovideo.jp/giftionary",
+      "Origin": "https://gift.nicovideo.jp",
+      "User-Agent": Self.userAgent,
+      "X-Frontend-Id": "148",
+      "X-Frontend-Version": "1.1.58"
+    ]
+    if let cookieHeader = niconicoCookieHeader() {
+      headers["Cookie"] = cookieHeader
+    }
+    return headers
+  }
+
+  private func niconicoCookieHeader() -> String? {
+    let cookies = (HTTPCookieStorage.shared.cookies ?? [])
+      .filter { cookie in
+        let domain = cookie.domain.lowercased()
+        return domain.contains("nicovideo.jp") || domain.contains("nimg.jp")
+      }
+    guard !cookies.isEmpty else { return nil }
+    return cookies
+      .map { "\($0.name)=\($0.value)" }
+      .joined(separator: "; ")
+  }
+
   private static func mobileBrowserHeaders(referer: String) -> [String: String] {
     var headers = [
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -4007,8 +4176,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     ]) ?? "ギフト"
     let rank = intField(fields, 7)
     let giftBar = firstFieldData(fields, number: 8).flatMap(parseNDGRGiftBarUpdate)
-    let assetURL = firstGiftAssetURL(in: data)
+    let assetURL = firstGiftAssetURL(in: data) ?? NiconicoGiftEffectCache.shared.thumbnailURL(forItemID: itemID)
     let style = classifyGiftEffect(itemID: itemID, itemName: itemName, message: message, points: points)
+    NiconicoGiftEffectCache.shared.prewarmGiftItem(itemID: itemID)
 
     let giver = firstNonEmpty([sender, "匿名"])
     let title = compactSupportText("\(giver ?? "匿名") が \(itemName) を贈りました", limit: 44)
@@ -4624,16 +4794,45 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       self.lastSupportAlert = (dedupeText, now)
       NiconicoGiftEffectCache.shared.prewarmAsset(event.assetURL)
       NativeGiftSoundMixer.shared.play(style: event.effectStyle, enabled: self.settings.playAudio, volume: self.playbackVolume)
+      self.showSupportEvent(event)
+    }
+  }
+
+  private func showSupportEvent(_ event: NiconicoSupportEvent) {
+    let present: (UIImage?) -> Void = { [weak self] image in
+      guard let self else { return }
       NativeEventOverlay.showSupport(
         title: event.title,
         subtitle: event.subtitle,
         symbolName: event.symbolName,
         progress: event.giftBar?.progress,
         effectStyle: event.effectStyle,
-        assetImage: NiconicoGiftEffectCache.shared.cachedImage(for: event.assetURL),
+        assetImage: image,
         in: self.danmakuView,
         tint: StreamPlatform.niconico.tint
       )
+    }
+
+    if let cached = NiconicoGiftEffectCache.shared.cachedImage(for: event.assetURL) {
+      present(cached)
+      return
+    }
+
+    guard event.assetURL != nil else {
+      present(nil)
+      return
+    }
+
+    let gate = NativeOnceGate()
+    NiconicoGiftEffectCache.shared.loadImage(for: event.assetURL) { image in
+      gate.run {
+        present(image)
+      }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+      gate.run {
+        present(nil)
+      }
     }
   }
 
