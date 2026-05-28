@@ -2517,6 +2517,166 @@ private enum NativeEventOverlay {
       }
     }
   }
+
+  static func showSupport(
+    title: String,
+    subtitle: String?,
+    symbolName: String,
+    progress: CGFloat?,
+    in root: UIView,
+    tint: UIColor
+  ) {
+    let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+    let subtitle = subtitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !title.isEmpty else { return }
+    DispatchQueue.main.async {
+      guard root.bounds.width > 0 else { return }
+      let panel = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+      panel.layer.cornerRadius = 13
+      panel.layer.borderWidth = 1
+      panel.layer.borderColor = tint.withAlphaComponent(0.42).cgColor
+      panel.clipsToBounds = true
+      panel.alpha = 0
+      panel.transform = CGAffineTransform(translationX: 0, y: -10).scaledBy(x: 0.96, y: 0.96)
+      panel.translatesAutoresizingMaskIntoConstraints = false
+
+      let glow = UIView()
+      glow.backgroundColor = tint.withAlphaComponent(0.2)
+      glow.translatesAutoresizingMaskIntoConstraints = false
+      panel.contentView.addSubview(glow)
+
+      let iconHost = UIView()
+      iconHost.backgroundColor = tint.withAlphaComponent(0.24)
+      iconHost.layer.cornerRadius = 18
+      iconHost.translatesAutoresizingMaskIntoConstraints = false
+      panel.contentView.addSubview(iconHost)
+
+      let icon = UIImageView(image: UIImage(systemName: symbolName) ?? UIImage(systemName: "sparkles"))
+      icon.tintColor = .white
+      icon.contentMode = .scaleAspectFit
+      icon.translatesAutoresizingMaskIntoConstraints = false
+      iconHost.addSubview(icon)
+
+      let titleLabel = UILabel()
+      titleLabel.text = title
+      titleLabel.textColor = .white
+      titleLabel.font = .systemFont(ofSize: root.bounds.width < 260 ? 12 : 14, weight: .heavy)
+      titleLabel.numberOfLines = 1
+      titleLabel.adjustsFontSizeToFitWidth = true
+      titleLabel.minimumScaleFactor = 0.76
+      titleLabel.translatesAutoresizingMaskIntoConstraints = false
+      panel.contentView.addSubview(titleLabel)
+
+      let subtitleLabel = UILabel()
+      subtitleLabel.text = subtitle
+      subtitleLabel.textColor = UIColor.white.withAlphaComponent(0.78)
+      subtitleLabel.font = .systemFont(ofSize: root.bounds.width < 260 ? 10 : 11, weight: .semibold)
+      subtitleLabel.numberOfLines = 1
+      subtitleLabel.adjustsFontSizeToFitWidth = true
+      subtitleLabel.minimumScaleFactor = 0.74
+      subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+      panel.contentView.addSubview(subtitleLabel)
+
+      let barTrack = UIView()
+      barTrack.backgroundColor = UIColor.white.withAlphaComponent(0.16)
+      barTrack.layer.cornerRadius = 2
+      barTrack.clipsToBounds = true
+      barTrack.translatesAutoresizingMaskIntoConstraints = false
+      panel.contentView.addSubview(barTrack)
+
+      let barFill = UIView()
+      barFill.backgroundColor = tint
+      barFill.layer.cornerRadius = 2
+      barFill.translatesAutoresizingMaskIntoConstraints = false
+      barTrack.addSubview(barFill)
+
+      root.addSubview(panel)
+      let panelHeight: CGFloat = subtitle?.isEmpty == false ? 58 : 48
+      let fillWidth = barFill.widthAnchor.constraint(equalToConstant: 0)
+      NSLayoutConstraint.activate([
+        panel.topAnchor.constraint(equalTo: root.topAnchor, constant: 9),
+        panel.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+        panel.widthAnchor.constraint(equalTo: root.widthAnchor, multiplier: 0.9),
+        panel.heightAnchor.constraint(equalToConstant: panelHeight),
+        glow.leadingAnchor.constraint(equalTo: panel.contentView.leadingAnchor),
+        glow.topAnchor.constraint(equalTo: panel.contentView.topAnchor),
+        glow.bottomAnchor.constraint(equalTo: panel.contentView.bottomAnchor),
+        glow.widthAnchor.constraint(equalToConstant: 6),
+        iconHost.leadingAnchor.constraint(equalTo: panel.contentView.leadingAnchor, constant: 12),
+        iconHost.centerYAnchor.constraint(equalTo: panel.contentView.centerYAnchor),
+        iconHost.widthAnchor.constraint(equalToConstant: 36),
+        iconHost.heightAnchor.constraint(equalToConstant: 36),
+        icon.centerXAnchor.constraint(equalTo: iconHost.centerXAnchor),
+        icon.centerYAnchor.constraint(equalTo: iconHost.centerYAnchor),
+        icon.widthAnchor.constraint(equalToConstant: 20),
+        icon.heightAnchor.constraint(equalToConstant: 20),
+        titleLabel.leadingAnchor.constraint(equalTo: iconHost.trailingAnchor, constant: 10),
+        titleLabel.trailingAnchor.constraint(equalTo: panel.contentView.trailingAnchor, constant: -12),
+        titleLabel.topAnchor.constraint(equalTo: panel.contentView.topAnchor, constant: subtitle?.isEmpty == false ? 9 : 13),
+        subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+        subtitleLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+        subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+        barTrack.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+        barTrack.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+        barTrack.bottomAnchor.constraint(equalTo: panel.contentView.bottomAnchor, constant: -7),
+        barTrack.heightAnchor.constraint(equalToConstant: progress == nil ? 0 : 4),
+        barFill.leadingAnchor.constraint(equalTo: barTrack.leadingAnchor),
+        barFill.topAnchor.constraint(equalTo: barTrack.topAnchor),
+        barFill.bottomAnchor.constraint(equalTo: barTrack.bottomAnchor),
+        fillWidth
+      ])
+
+      root.layoutIfNeeded()
+      let clamped = max(0, min(1, progress ?? 0))
+      fillWidth.constant = barTrack.bounds.width * clamped
+      barFill.layer.removeAllAnimations()
+
+      for index in 0..<6 {
+        let sparkle = UIView()
+        sparkle.backgroundColor = tint.withAlphaComponent(0.86)
+        sparkle.layer.cornerRadius = 2
+        sparkle.alpha = 0
+        sparkle.frame = CGRect(
+          x: panel.frame.minX + CGFloat(12 + index * 34),
+          y: panel.frame.maxY - CGFloat(4 + (index % 3) * 12),
+          width: 4,
+          height: 4
+        )
+        root.addSubview(sparkle)
+        UIView.animate(
+          withDuration: 0.72,
+          delay: 0.08 + Double(index) * 0.045,
+          options: [.curveEaseOut]
+        ) {
+          sparkle.alpha = 0.9
+          sparkle.transform = CGAffineTransform(translationX: CGFloat(index % 2 == 0 ? -12 : 12), y: -26).scaledBy(x: 1.8, y: 1.8)
+        } completion: { _ in
+          UIView.animate(withDuration: 0.22) {
+            sparkle.alpha = 0
+          } completion: { _ in
+            sparkle.removeFromSuperview()
+          }
+        }
+      }
+
+      UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseOut]) {
+        panel.alpha = 1
+        panel.transform = .identity
+        root.layoutIfNeeded()
+      }
+      UIView.animate(withDuration: 0.18, delay: 0.24, options: [.autoreverse]) {
+        iconHost.transform = CGAffineTransform(scaleX: 1.16, y: 1.16)
+      } completion: { _ in
+        iconHost.transform = .identity
+      }
+      UIView.animate(withDuration: 0.25, delay: 4.6, options: []) {
+        panel.alpha = 0
+        panel.transform = CGAffineTransform(translationX: 0, y: -8)
+      } completion: { _ in
+        panel.removeFromSuperview()
+      }
+    }
+  }
 }
 
 final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
@@ -2548,9 +2708,66 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var streamOpenedAt: Date?
   private var isEnding = false
   private var lastSupportAlert: (text: String, at: Date)?
+  private var seenSupportEventIDs = Set<String>()
   // NDGR コメントが最後に成功した時刻。VIEW/SEGMENT 両方のループから更新され、
   // 60 秒成功なしでフル再読み込みへ escalation する閾値判定に使う。
   private var ndgrLastSuccessAt = Date()
+
+  private struct NiconicoGiftBarUpdate {
+    let currentLevel: Int?
+    let nextLevelRewardCount: Int?
+    let remainingPointsForNextLevel: Int?
+    let requiredPointsForNextLevel: Int?
+
+    var progress: CGFloat? {
+      guard let requiredPointsForNextLevel, requiredPointsForNextLevel > 0,
+            let remainingPointsForNextLevel else { return nil }
+      let completed = max(0, requiredPointsForNextLevel - remainingPointsForNextLevel)
+      return CGFloat(min(completed, requiredPointsForNextLevel)) / CGFloat(requiredPointsForNextLevel)
+    }
+
+    var summary: String? {
+      var parts: [String] = []
+      if let currentLevel {
+        parts.append("ギフトLv\(currentLevel)")
+      }
+      if let remainingPointsForNextLevel, remainingPointsForNextLevel > 0 {
+        parts.append("次まで\(remainingPointsForNextLevel)pt")
+      }
+      if let nextLevelRewardCount, nextLevelRewardCount > 0 {
+        parts.append("報酬\(nextLevelRewardCount)")
+      }
+      return parts.isEmpty ? nil : parts.joined(separator: " / ")
+    }
+  }
+
+  private struct NiconicoSupportEvent {
+    enum Kind {
+      case gift
+      case nicoad
+      case notification
+      case akashic
+    }
+
+    let id: String?
+    let kind: Kind
+    let title: String
+    let subtitle: String?
+    let giftBar: NiconicoGiftBarUpdate?
+
+    var symbolName: String {
+      switch kind {
+      case .gift:
+        return "gift.fill"
+      case .nicoad:
+        return "megaphone.fill"
+      case .notification:
+        return "bell.badge.fill"
+      case .akashic:
+        return "sparkles"
+      }
+    }
+  }
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -3276,13 +3493,19 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     guard let url = URL(string: uri) else { return }
     do {
       for try await message in protobufMessages(from: url) {
+        var handled = false
         if let text = parseNDGRCommentText(fromChunkedMessage: message) {
           emitDanmaku(text)
-          ndgrLastSuccessAt = Date()
-          continue
+          handled = true
         }
-        if let alert = parseNDGRSupportAlert(fromChunkedMessage: message) {
+        if let event = parseNDGRSupportEvent(fromChunkedMessage: message) {
+          emitSupportEvent(event)
+          handled = true
+        } else if let alert = parseNDGRSupportAlert(fromChunkedMessage: message) {
           emitSupportAlert(alert)
+          handled = true
+        }
+        if handled {
           ndgrLastSuccessAt = Date()
         }
       }
@@ -3348,6 +3571,273 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       }
     }
     return nil
+  }
+
+  private func parseNDGRSupportEvent(fromChunkedMessage data: Data) -> NiconicoSupportEvent? {
+    guard let messageFields = nicoliveMessageFields(fromChunkedMessage: data) else { return nil }
+    let messageID = parseNDGRMessageID(fromChunkedMessage: data)
+
+    if let giftData = firstFieldData(messageFields, number: 8),
+       let event = parseNDGRGift(giftData, id: messageID) {
+      return event
+    }
+    if let nicoadData = firstFieldData(messageFields, number: 9),
+       let event = parseNDGRNicoad(nicoadData, id: messageID) {
+      return event
+    }
+    if let notificationData = firstFieldData(messageFields, number: 23),
+       let event = parseNDGRSimpleNotificationV2(notificationData, id: messageID) {
+      return event
+    }
+    if let akashicData = firstFieldData(messageFields, number: 24),
+       let event = parseNDGRAkashicEvent(akashicData, id: messageID) {
+      return event
+    }
+    if let notificationData = firstFieldData(messageFields, number: 7),
+       let event = parseNDGRLegacySimpleNotification(notificationData, id: messageID) {
+      return event
+    }
+    return nil
+  }
+
+  private func nicoliveMessageFields(fromChunkedMessage data: Data) -> [ProtobufField]? {
+    for field in protobufFields(data) where field.number == 2 {
+      return protobufFields(field.data)
+    }
+    return nil
+  }
+
+  private func parseNDGRMessageID(fromChunkedMessage data: Data) -> String? {
+    guard let metaData = firstFieldData(protobufFields(data), number: 1) else { return nil }
+    let metaFields = protobufFields(metaData)
+    if let id = firstNonEmpty([stringField(metaFields, 1), stringField(metaFields, 2), stringField(metaFields, 3)]) {
+      return id
+    }
+    return protobufStrings(in: metaData)
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .first { text in
+        text.count >= 8
+          && text.count <= 80
+          && text.range(of: #"^[A-Za-z0-9_.:-]+$"#, options: .regularExpression) != nil
+      }
+  }
+
+  private func parseNDGRGift(_ data: Data, id: String?) -> NiconicoSupportEvent? {
+    let fields = protobufFields(data)
+    let itemID = stringField(fields, 1)
+    let sender = stringField(fields, 3)
+    let points = intField(fields, 4)
+    let message = stringField(fields, 5)
+    let itemName = firstNonEmpty([
+      stringField(fields, 6),
+      itemID?.contains("/") == false ? itemID : nil,
+      "ギフト"
+    ]) ?? "ギフト"
+    let rank = intField(fields, 7)
+    let giftBar = firstFieldData(fields, number: 8).flatMap(parseNDGRGiftBarUpdate)
+
+    let giver = firstNonEmpty([sender, "匿名"])
+    let title = compactSupportText("\(giver ?? "匿名") が \(itemName) を贈りました", limit: 44)
+    let subtitle = supportSubtitle([
+      points.map(formatPoints),
+      rank.map { "貢献\($0)位" },
+      compactOptionalSupportText(message, limit: 44),
+      giftBar?.summary
+    ])
+    return NiconicoSupportEvent(id: id, kind: .gift, title: title, subtitle: subtitle, giftBar: giftBar)
+  }
+
+  private func parseNDGRGiftBarUpdate(_ data: Data) -> NiconicoGiftBarUpdate? {
+    let fields = protobufFields(data)
+    let update = NiconicoGiftBarUpdate(
+      currentLevel: intField(fields, 1),
+      nextLevelRewardCount: intField(fields, 2),
+      remainingPointsForNextLevel: intField(fields, 3),
+      requiredPointsForNextLevel: intField(fields, 4)
+    )
+    if update.currentLevel == nil,
+       update.nextLevelRewardCount == nil,
+       update.remainingPointsForNextLevel == nil,
+       update.requiredPointsForNextLevel == nil {
+      return nil
+    }
+    return update
+  }
+
+  private func parseNDGRNicoad(_ data: Data, id: String?) -> NiconicoSupportEvent? {
+    let fields = protobufFields(data)
+    if let v1Data = firstFieldData(fields, number: 2) {
+      let v1Fields = protobufFields(v1Data)
+      let totalPoint = intField(v1Fields, 1)
+      let message = stringField(v1Fields, 2)
+      let title = compactSupportText(firstNonEmpty([message, "ニコニ広告されました"]) ?? "ニコニ広告されました", limit: 50)
+      let subtitle = supportSubtitle([totalPoint.map { "合計\(formatPoints($0))" }])
+      return NiconicoSupportEvent(id: id, kind: .nicoad, title: title, subtitle: subtitle, giftBar: nil)
+    }
+    if let v0Data = firstFieldData(fields, number: 1) {
+      let v0Fields = protobufFields(v0Data)
+      let totalPoint = intField(v0Fields, 3)
+      let latestFields = firstFieldData(v0Fields, number: 1).map(protobufFields) ?? []
+      let advertiser = stringField(latestFields, 1)
+      let latestPoint = intField(latestFields, 2)
+      let message = stringField(latestFields, 3)
+      let titleText = firstNonEmpty([
+        message,
+        advertiser.map { "\($0) がニコニ広告しました" },
+        "ニコニ広告されました"
+      ]) ?? "ニコニ広告されました"
+      let subtitle = supportSubtitle([
+        latestPoint.map { "今回\(formatPoints($0))" },
+        totalPoint.map { "合計\(formatPoints($0))" }
+      ])
+      return NiconicoSupportEvent(id: id, kind: .nicoad, title: compactSupportText(titleText, limit: 50), subtitle: subtitle, giftBar: nil)
+    }
+    return nil
+  }
+
+  private func parseNDGRSimpleNotificationV2(_ data: Data, id: String?) -> NiconicoSupportEvent? {
+    let fields = protobufFields(data)
+    let type = intField(fields, 1)
+    guard let message = stringField(fields, 2),
+          shouldShowSupportNotification(type: type, message: message) else { return nil }
+    let title = compactSupportText(message, limit: 52)
+    let subtitle = supportNotificationLabel(type).map { "ニコ生\($0)" }
+    return NiconicoSupportEvent(id: id, kind: .notification, title: title, subtitle: subtitle, giftBar: nil)
+  }
+
+  private func parseNDGRLegacySimpleNotification(_ data: Data, id: String?) -> NiconicoSupportEvent? {
+    let strings = protobufStrings(in: data)
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+    guard let message = strings.first(where: containsSupportMarker) else { return nil }
+    return NiconicoSupportEvent(
+      id: id,
+      kind: .notification,
+      title: compactSupportText(message, limit: 52),
+      subtitle: "ニコ生通知",
+      giftBar: nil
+    )
+  }
+
+  private func parseNDGRAkashicEvent(_ data: Data, id: String?) -> NiconicoSupportEvent? {
+    let fields = protobufFields(data)
+    let type = stringField(fields, 1)
+    let playID = stringField(fields, 2)
+    let strings = protobufStrings(in: data)
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+    let probe = ([type, playID].compactMap { $0 } + strings).joined(separator: " ")
+    let lowerType = (type ?? "").lowercased()
+    let isSupportEvent = containsSupportMarker(probe)
+      || lowerType.contains("gift")
+      || lowerType.contains("nicoad")
+      || lowerType.contains("support")
+      || lowerType.contains("koken")
+    guard isSupportEvent else { return nil }
+
+    let userFacing = strings.first { text in
+      containsSupportMarker(text) && text != type && text != playID
+    }
+    let titleText: String
+    if let userFacing {
+      titleText = userFacing
+    } else if lowerType.contains("gift") {
+      titleText = "ギフト演出が始まりました"
+    } else if lowerType.contains("nicoad") {
+      titleText = "ニコニ広告演出が始まりました"
+    } else {
+      titleText = "ニコ生演出が始まりました"
+    }
+    let subtitle = type.map { "Akashic: \($0)" }
+    return NiconicoSupportEvent(
+      id: id,
+      kind: .akashic,
+      title: compactSupportText(titleText, limit: 52),
+      subtitle: compactOptionalSupportText(subtitle, limit: 48),
+      giftBar: nil
+    )
+  }
+
+  private func firstFieldData(_ fields: [ProtobufField], number: Int) -> Data? {
+    fields.first(where: { $0.number == number })?.data
+  }
+
+  private func stringField(_ fields: [ProtobufField], _ number: Int) -> String? {
+    fields
+      .filter { $0.number == number }
+      .compactMap { String(data: $0.data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .first { !$0.isEmpty }
+  }
+
+  private func intField(_ fields: [ProtobufField], _ number: Int) -> Int? {
+    fields
+      .filter { $0.number == number }
+      .compactMap { Int(exactly: $0.varint) }
+      .first
+  }
+
+  private func firstNonEmpty(_ values: [String?]) -> String? {
+    values
+      .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .first { !$0.isEmpty }
+  }
+
+  private func supportSubtitle(_ parts: [String?]) -> String? {
+    let text = parts
+      .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+      .joined(separator: " / ")
+    return text.isEmpty ? nil : compactSupportText(text, limit: 74)
+  }
+
+  private func compactOptionalSupportText(_ text: String?, limit: Int) -> String? {
+    guard let text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
+    return compactSupportText(text, limit: limit)
+  }
+
+  private func compactSupportText(_ text: String, limit: Int) -> String {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.count > limit, limit > 3 else { return trimmed }
+    return String(trimmed.prefix(limit - 3)) + "..."
+  }
+
+  private func formatPoints(_ points: Int) -> String {
+    let formatter = NumberFormatter()
+    formatter.numberStyle = .decimal
+    return "\((formatter.string(from: NSNumber(value: points)) ?? String(points)))pt"
+  }
+
+  private func supportNotificationLabel(_ type: Int?) -> String? {
+    switch type {
+    case 7:
+      return "サポーター"
+    case 8:
+      return "レベルアップ"
+    default:
+      return nil
+    }
+  }
+
+  private func shouldShowSupportNotification(type: Int?, message: String) -> Bool {
+    if type == 7 || type == 8 { return true }
+    return containsSupportMarker(message)
+  }
+
+  private func containsSupportMarker(_ text: String) -> Bool {
+    let markers = [
+      "ギフト",
+      "ニコニ広告",
+      "広告しました",
+      "貢献",
+      "サポーター",
+      "レベルアップ",
+      "gift",
+      "nicoad",
+      "support",
+      "koken"
+    ]
+    let lowercased = text.lowercased()
+    return markers.contains { lowercased.contains($0.lowercased()) }
   }
 
   private func parseNDGRSupportAlert(fromChunkedMessage data: Data) -> String? {
@@ -3666,6 +4156,35 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         laneCursor: self.laneCursor,
         settings: self.settings,
         highlighted: true
+      )
+    }
+  }
+
+  private func emitSupportEvent(_ event: NiconicoSupportEvent) {
+    DispatchQueue.main.async {
+      if let id = event.id {
+        if self.seenSupportEventIDs.contains(id) { return }
+        if self.seenSupportEventIDs.count > 500 {
+          self.seenSupportEventIDs.removeAll(keepingCapacity: true)
+        }
+        self.seenSupportEventIDs.insert(id)
+      }
+
+      let dedupeText = "\(event.kind):\(event.title):\(event.subtitle ?? "")"
+      let now = Date()
+      if let lastSupportAlert = self.lastSupportAlert,
+         lastSupportAlert.text == dedupeText,
+         now.timeIntervalSince(lastSupportAlert.at) < 8 {
+        return
+      }
+      self.lastSupportAlert = (dedupeText, now)
+      NativeEventOverlay.showSupport(
+        title: event.title,
+        subtitle: event.subtitle,
+        symbolName: event.symbolName,
+        progress: event.giftBar?.progress,
+        in: self.danmakuView,
+        tint: StreamPlatform.niconico.tint
       )
     }
   }
