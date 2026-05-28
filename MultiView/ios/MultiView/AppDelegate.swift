@@ -1194,7 +1194,7 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
       URLQueryItem(name: "client_id", value: config.clientId),
       URLQueryItem(name: "redirect_uri", value: redirectURI),
       URLQueryItem(name: "response_type", value: "code"),
-      URLQueryItem(name: "scope", value: "https://www.googleapis.com/auth/youtube.force-ssl"),
+      URLQueryItem(name: "scope", value: "https://www.googleapis.com/auth/youtube.readonly"),
       URLQueryItem(name: "state", value: state),
       URLQueryItem(name: "access_type", value: "offline"),
       URLQueryItem(name: "prompt", value: "consent"),
@@ -5529,13 +5529,13 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     let clients = Self.nativePlayerClients()
     guard clients.indices.contains(attempt) else {
       noteExtractionFailure("Native player: manifest取得失敗")
-      installWatchPagePlayer(videoId: videoId)
+      installAlternativeWebFallback(videoId: videoId)
       return
     }
     let client = clients[attempt]
     showStatus("YouTube HLS取得中\n\(client.label) \(attempt + 1)/\(clients.count)")
     guard let url = URL(string: "https://youtubei.googleapis.com/youtubei/v1/player") else {
-      installWatchPagePlayer(videoId: videoId)
+      installAlternativeWebFallback(videoId: videoId)
       return
     }
     var request = URLRequest(url: url)
@@ -5605,12 +5605,12 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     guard !isStopped else { return }
     showStatus("YouTube抽出中 (Worker)")
     guard var components = URLComponents(string: Self.extractionWorkerURL) else {
-      installWatchPagePlayer(videoId: videoId)
+      installAlternativeWebFallback(videoId: videoId)
       return
     }
     components.queryItems = [URLQueryItem(name: "v", value: videoId)]
     guard let url = components.url else {
-      installWatchPagePlayer(videoId: videoId)
+      installAlternativeWebFallback(videoId: videoId)
       return
     }
     var request = URLRequest(url: url)
@@ -5633,7 +5633,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           self.startPlayback(url: streamURL, videoId: videoId, isLive: isLive)
           return
         }
-        // Worker が error を返した、または到達失敗 → watch ページ診断へ
+        // Worker が error を返した、または到達失敗 → iframe fallback へ
         if let parsed, let err = parsed["error"] as? String {
           let reason = (parsed["reason"] as? String) ?? (parsed["subreason"] as? String) ?? ""
           self.noteExtractionFailure("Worker: \(err)\n\(reason)")
@@ -5641,7 +5641,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           let status = (response as? HTTPURLResponse)?.statusCode ?? 0
           self.noteExtractionFailure("Worker到達失敗 (HTTP \(status))")
         }
-        self.installWatchPagePlayer(videoId: videoId)
+        self.installAlternativeWebFallback(videoId: videoId)
       }
     }
     resolveTask?.resume()
@@ -6578,8 +6578,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       player.pause()
       player.replaceCurrentItem(with: nil)
     }
-    noteExtractionFailure("抽出失敗: YouTubeページで再生")
-    installWatchPagePlayer(videoId: videoId)
+    noteExtractionFailure("抽出失敗: YouTube iframe fallback")
+    installAlternativeWebFallback(videoId: videoId)
   }
 
   private func installWatchPagePlayer(videoId: String) {
@@ -9411,7 +9411,9 @@ final class SettingsController: UITableViewController {
 
     エラー 400: invalid_request が出る場合は、Web/デスクトップ用Client IDを貼っている、Bundle IDが違う、またはRedirect URIが古い multiview:// のまま残っている可能性があります。
 
-    弾幕取得には youtube.force-ssl スコープを使います。コメントが出ない場合は、配信側のチャット無効、ログイン切れ、Client ID誤り、API未有効化を確認してください。
+    エラー 403: access_denied が出る場合は、OAuth同意画面の公開状態が「テスト」のままです。Google Cloud Consoleの「OAuth同意画面」>「対象」または「テストユーザー」で、この端末でログインするGoogleアカウントを追加してください。
+
+    弾幕取得だけなら youtube.readonly スコープを使います。コメント投稿まで使う場合は、投稿用に広い権限が必要になります。コメントが出ない場合は、配信側のチャット無効、ログイン切れ、Client ID誤り、API未有効化を確認してください。
     """
     let alert = UIAlertController(title: "YouTube Client ID 設定手順", message: message, preferredStyle: .alert)
     alert.addAction(UIAlertAction(title: "認証情報を開く", style: .default) { [weak self] _ in
