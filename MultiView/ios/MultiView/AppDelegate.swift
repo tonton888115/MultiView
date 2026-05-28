@@ -2444,6 +2444,338 @@ private final class NativeDanmakuRenderer {
   }
 }
 
+private enum NativeGiftEffectStyle: CaseIterable {
+  case gift
+  case premiumGift
+  case heart
+  case star
+  case flower
+  case food
+  case rocket
+  case firework
+  case nicoad
+  case levelUp
+  case akashic
+
+  var heroSymbol: String {
+    switch self {
+    case .gift:
+      return "gift.fill"
+    case .premiumGift:
+      return "crown.fill"
+    case .heart:
+      return "heart.fill"
+    case .star:
+      return "star.fill"
+    case .flower:
+      return "camera.macro"
+    case .food:
+      return "takeoutbag.and.cup.and.straw.fill"
+    case .rocket:
+      return "paperplane.fill"
+    case .firework:
+      return "sparkles"
+    case .nicoad:
+      return "megaphone.fill"
+    case .levelUp:
+      return "arrow.up.circle.fill"
+    case .akashic:
+      return "wand.and.stars"
+    }
+  }
+
+  var particleSymbols: [String] {
+    switch self {
+    case .gift:
+      return ["gift.fill", "sparkle", "circle.fill"]
+    case .premiumGift:
+      return ["crown.fill", "sparkles", "star.fill"]
+    case .heart:
+      return ["heart.fill", "heart.circle.fill", "sparkle"]
+    case .star:
+      return ["star.fill", "sparkles", "circle.fill"]
+    case .flower:
+      return ["camera.macro", "leaf.fill", "sparkle"]
+    case .food:
+      return ["takeoutbag.and.cup.and.straw.fill", "fork.knife.circle.fill", "sparkle"]
+    case .rocket:
+      return ["paperplane.fill", "flame.fill", "sparkles"]
+    case .firework:
+      return ["sparkles", "burst.fill", "star.fill"]
+    case .nicoad:
+      return ["megaphone.fill", "speaker.wave.2.fill", "sparkle"]
+    case .levelUp:
+      return ["arrow.up.circle.fill", "star.fill", "sparkle"]
+    case .akashic:
+      return ["wand.and.stars", "sparkles", "circle.fill"]
+    }
+  }
+
+  var accentColor: UIColor {
+    switch self {
+    case .gift:
+      return UIColor.systemPink
+    case .premiumGift:
+      return UIColor.systemYellow
+    case .heart:
+      return UIColor.systemRed
+    case .star:
+      return UIColor.systemYellow
+    case .flower:
+      return UIColor.systemGreen
+    case .food:
+      return UIColor.systemOrange
+    case .rocket:
+      return UIColor.systemTeal
+    case .firework:
+      return UIColor.systemPurple
+    case .nicoad:
+      return UIColor.systemBlue
+    case .levelUp:
+      return UIColor.systemMint
+    case .akashic:
+      return UIColor.systemIndigo
+    }
+  }
+
+  var soundFrequencies: [Double] {
+    switch self {
+    case .gift:
+      return [660, 880, 1320]
+    case .premiumGift:
+      return [523.25, 783.99, 1046.5, 1567.98]
+    case .heart:
+      return [587.33, 783.99, 1174.66]
+    case .star:
+      return [739.99, 987.77, 1479.98]
+    case .flower:
+      return [523.25, 659.25, 880]
+    case .food:
+      return [440, 554.37, 659.25]
+    case .rocket:
+      return [392, 784, 1568]
+    case .firework:
+      return [659.25, 987.77, 1318.51, 1975.53]
+    case .nicoad:
+      return [349.23, 523.25, 698.46]
+    case .levelUp:
+      return [523.25, 659.25, 783.99, 1046.5]
+    case .akashic:
+      return [440, 739.99, 1108.73, 1479.98]
+    }
+  }
+}
+
+private final class NativeGiftSoundMixer: NSObject, AVAudioPlayerDelegate {
+  static let shared = NativeGiftSoundMixer()
+
+  private var soundCache: [NativeGiftEffectStyle: Data] = [:]
+  private var activePlayers: [AVAudioPlayer] = []
+
+  func prewarm() {
+    NativeGiftEffectStyle.allCases.forEach { style in
+      _ = soundData(for: style)
+    }
+  }
+
+  func play(style: NativeGiftEffectStyle, enabled: Bool, volume: Float) {
+    guard enabled, volume > 0 else { return }
+    let data = soundData(for: style)
+    DispatchQueue.main.async {
+      do {
+        let player = try AVAudioPlayer(data: data)
+        player.delegate = self
+        player.volume = min(0.38, max(0.08, volume * 0.28))
+        player.prepareToPlay()
+        self.activePlayers.append(player)
+        player.play()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+          self.activePlayers.removeAll { $0 === player || !$0.isPlaying }
+        }
+      } catch {
+        self.activePlayers.removeAll { !$0.isPlaying }
+      }
+    }
+  }
+
+  func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+    activePlayers.removeAll { $0 === player || !$0.isPlaying }
+  }
+
+  private func soundData(for style: NativeGiftEffectStyle) -> Data {
+    if let cached = soundCache[style] { return cached }
+    let data = makeWavData(frequencies: style.soundFrequencies, duration: 0.62)
+    soundCache[style] = data
+    return data
+  }
+
+  private func makeWavData(frequencies: [Double], duration: Double) -> Data {
+    let sampleRate = 22_050
+    let sampleCount = max(1, Int(Double(sampleRate) * duration))
+    let dataByteCount = sampleCount * 2
+    var data = Data()
+    appendASCII("RIFF", to: &data)
+    appendUInt32LE(UInt32(36 + dataByteCount), to: &data)
+    appendASCII("WAVE", to: &data)
+    appendASCII("fmt ", to: &data)
+    appendUInt32LE(16, to: &data)
+    appendUInt16LE(1, to: &data)
+    appendUInt16LE(1, to: &data)
+    appendUInt32LE(UInt32(sampleRate), to: &data)
+    appendUInt32LE(UInt32(sampleRate * 2), to: &data)
+    appendUInt16LE(2, to: &data)
+    appendUInt16LE(16, to: &data)
+    appendASCII("data", to: &data)
+    appendUInt32LE(UInt32(dataByteCount), to: &data)
+
+    for index in 0..<sampleCount {
+      let t = Double(index) / Double(sampleRate)
+      let attack = min(1.0, t / 0.025)
+      let release = min(1.0, max(0.0, (duration - t) / 0.18))
+      let envelope = min(attack, release)
+      var value = 0.0
+      for (offset, frequency) in frequencies.enumerated() {
+        let phase = t - Double(offset) * 0.018
+        if phase >= 0 {
+          value += sin(2.0 * .pi * frequency * phase) * (offset == 0 ? 0.7 : 0.38)
+        }
+      }
+      let normalized = max(-1.0, min(1.0, value / max(1.0, Double(frequencies.count)) * envelope))
+      appendInt16LE(Int16(normalized * 18_000), to: &data)
+    }
+    return data
+  }
+
+  private func appendASCII(_ text: String, to data: inout Data) {
+    data.append(contentsOf: text.utf8)
+  }
+
+  private func appendUInt16LE(_ value: UInt16, to data: inout Data) {
+    data.append(contentsOf: [UInt8(value & 0xff), UInt8((value >> 8) & 0xff)])
+  }
+
+  private func appendUInt32LE(_ value: UInt32, to data: inout Data) {
+    data.append(contentsOf: [
+      UInt8(value & 0xff),
+      UInt8((value >> 8) & 0xff),
+      UInt8((value >> 16) & 0xff),
+      UInt8((value >> 24) & 0xff)
+    ])
+  }
+
+  private func appendInt16LE(_ value: Int16, to data: inout Data) {
+    appendUInt16LE(UInt16(bitPattern: value), to: &data)
+  }
+}
+
+private final class NiconicoGiftEffectCache {
+  static let shared = NiconicoGiftEffectCache()
+
+  private let memoryImages = NSCache<NSURL, UIImage>()
+  private let queue = DispatchQueue(label: "app.multiview.niconico-gift-cache")
+  private var prewarmed = false
+  private var inFlight = Set<URL>()
+
+  func prewarmCommonEffects() {
+    queue.async {
+      guard !self.prewarmed else { return }
+      self.prewarmed = true
+      NativeGiftSoundMixer.shared.prewarm()
+      _ = try? FileManager.default.createDirectory(at: self.cacheDirectory(), withIntermediateDirectories: true)
+    }
+  }
+
+  func prewarmAsset(_ url: URL?) {
+    guard let url, isAllowedGiftAssetURL(url) else { return }
+    queue.async {
+      if self.memoryImages.object(forKey: url as NSURL) != nil { return }
+      if FileManager.default.fileExists(atPath: self.cacheFileURL(for: url).path) { return }
+      if self.inFlight.contains(url) { return }
+      self.inFlight.insert(url)
+      var request = URLRequest(url: url)
+      request.timeoutInterval = 8
+      URLSession.shared.dataTask(with: request) { data, response, _ in
+        defer {
+          self.queue.async {
+            self.inFlight.remove(url)
+          }
+        }
+        guard let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode),
+              let data,
+              data.count <= 4_000_000,
+              let image = NativeAnimatedImageDecoder.image(from: data) else { return }
+        self.memoryImages.setObject(image, forKey: url as NSURL)
+        try? data.write(to: self.cacheFileURL(for: url), options: [.atomic])
+      }.resume()
+    }
+  }
+
+  func cachedImage(for url: URL?) -> UIImage? {
+    guard let url else { return nil }
+    if let cached = memoryImages.object(forKey: url as NSURL) {
+      return cached
+    }
+    guard isAllowedGiftAssetURL(url) else { return nil }
+    let fileURL = cacheFileURL(for: url)
+    guard let data = try? Data(contentsOf: fileURL),
+          let image = NativeAnimatedImageDecoder.image(from: data) else { return nil }
+    memoryImages.setObject(image, forKey: url as NSURL)
+    return image
+  }
+
+  private func isAllowedGiftAssetURL(_ url: URL) -> Bool {
+    guard url.scheme == "https",
+          let host = url.host?.lowercased() else { return false }
+    return host.hasSuffix("nicovideo.jp") || host.hasSuffix("nimg.jp") || host.hasSuffix("nico.ms")
+  }
+
+  private func cacheDirectory() -> URL {
+    let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory
+    return base.appendingPathComponent("NiconicoGiftEffects", isDirectory: true)
+  }
+
+  private func cacheFileURL(for url: URL) -> URL {
+    let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
+      .map { String(format: "%02x", $0) }
+      .joined()
+    return cacheDirectory().appendingPathComponent(digest).appendingPathExtension("asset")
+  }
+}
+
+private enum NativeAnimatedImageDecoder {
+  static func image(from data: Data) -> UIImage? {
+    animatedImage(from: data) ?? UIImage(data: data)
+  }
+
+  private static func animatedImage(from data: Data) -> UIImage? {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+    let count = CGImageSourceGetCount(source)
+    guard count > 1 else { return nil }
+
+    var images: [UIImage] = []
+    var duration: TimeInterval = 0
+    for index in 0..<count {
+      guard let cgImage = CGImageSourceCreateImageAtIndex(source, index, nil) else { continue }
+      images.append(UIImage(cgImage: cgImage))
+      duration += frameDuration(at: index, source: source)
+    }
+    guard !images.isEmpty else { return nil }
+    return UIImage.animatedImage(with: images, duration: max(duration, Double(images.count) * 0.08))
+  }
+
+  private static func frameDuration(at index: Int, source: CGImageSource) -> TimeInterval {
+    guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+          let gif = properties[kCGImagePropertyGIFDictionary] as? [CFString: Any] else {
+      return 0.1
+    }
+    let unclamped = gif[kCGImagePropertyGIFUnclampedDelayTime] as? Double
+    let clamped = gif[kCGImagePropertyGIFDelayTime] as? Double
+    let value = unclamped ?? clamped ?? 0.1
+    return value < 0.02 ? 0.1 : value
+  }
+}
+
 private enum NativeEventOverlay {
   static func show(_ text: String, in root: UIView, tint: UIColor) {
     let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2523,6 +2855,8 @@ private enum NativeEventOverlay {
     subtitle: String?,
     symbolName: String,
     progress: CGFloat?,
+    effectStyle: NativeGiftEffectStyle = .gift,
+    assetImage: UIImage? = nil,
     in root: UIView,
     tint: UIColor
   ) {
@@ -2531,29 +2865,32 @@ private enum NativeEventOverlay {
     guard !title.isEmpty else { return }
     DispatchQueue.main.async {
       guard root.bounds.width > 0 else { return }
+      let effectTint = effectStyle.accentColor
       let panel = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
       panel.layer.cornerRadius = 13
       panel.layer.borderWidth = 1
-      panel.layer.borderColor = tint.withAlphaComponent(0.42).cgColor
+      panel.layer.borderColor = effectTint.withAlphaComponent(0.48).cgColor
       panel.clipsToBounds = true
       panel.alpha = 0
       panel.transform = CGAffineTransform(translationX: 0, y: -10).scaledBy(x: 0.96, y: 0.96)
       panel.translatesAutoresizingMaskIntoConstraints = false
 
       let glow = UIView()
-      glow.backgroundColor = tint.withAlphaComponent(0.2)
+      glow.backgroundColor = effectTint.withAlphaComponent(0.22)
       glow.translatesAutoresizingMaskIntoConstraints = false
       panel.contentView.addSubview(glow)
 
       let iconHost = UIView()
-      iconHost.backgroundColor = tint.withAlphaComponent(0.24)
+      iconHost.backgroundColor = effectTint.withAlphaComponent(0.28)
       iconHost.layer.cornerRadius = 18
       iconHost.translatesAutoresizingMaskIntoConstraints = false
       panel.contentView.addSubview(iconHost)
 
-      let icon = UIImageView(image: UIImage(systemName: symbolName) ?? UIImage(systemName: "sparkles"))
-      icon.tintColor = .white
+      let icon = UIImageView(image: assetImage ?? UIImage(systemName: symbolName) ?? UIImage(systemName: effectStyle.heroSymbol) ?? UIImage(systemName: "sparkles"))
+      icon.tintColor = assetImage == nil ? .white : nil
       icon.contentMode = .scaleAspectFit
+      icon.layer.cornerRadius = assetImage == nil ? 0 : 6
+      icon.clipsToBounds = assetImage != nil
       icon.translatesAutoresizingMaskIntoConstraints = false
       iconHost.addSubview(icon)
 
@@ -2585,7 +2922,7 @@ private enum NativeEventOverlay {
       panel.contentView.addSubview(barTrack)
 
       let barFill = UIView()
-      barFill.backgroundColor = tint
+      barFill.backgroundColor = effectTint
       barFill.layer.cornerRadius = 2
       barFill.translatesAutoresizingMaskIntoConstraints = false
       barTrack.addSubview(barFill)
@@ -2631,33 +2968,7 @@ private enum NativeEventOverlay {
       fillWidth.constant = barTrack.bounds.width * clamped
       barFill.layer.removeAllAnimations()
 
-      for index in 0..<6 {
-        let sparkle = UIView()
-        sparkle.backgroundColor = tint.withAlphaComponent(0.86)
-        sparkle.layer.cornerRadius = 2
-        sparkle.alpha = 0
-        sparkle.frame = CGRect(
-          x: panel.frame.minX + CGFloat(12 + index * 34),
-          y: panel.frame.maxY - CGFloat(4 + (index % 3) * 12),
-          width: 4,
-          height: 4
-        )
-        root.addSubview(sparkle)
-        UIView.animate(
-          withDuration: 0.72,
-          delay: 0.08 + Double(index) * 0.045,
-          options: [.curveEaseOut]
-        ) {
-          sparkle.alpha = 0.9
-          sparkle.transform = CGAffineTransform(translationX: CGFloat(index % 2 == 0 ? -12 : 12), y: -26).scaledBy(x: 1.8, y: 1.8)
-        } completion: { _ in
-          UIView.animate(withDuration: 0.22) {
-            sparkle.alpha = 0
-          } completion: { _ in
-            sparkle.removeFromSuperview()
-          }
-        }
-      }
+      emitGiftBurst(in: root, from: panel, style: effectStyle, assetImage: assetImage, tint: effectTint)
 
       UIView.animate(withDuration: 0.22, delay: 0, options: [.curveEaseOut]) {
         panel.alpha = 1
@@ -2674,6 +2985,73 @@ private enum NativeEventOverlay {
         panel.transform = CGAffineTransform(translationX: 0, y: -8)
       } completion: { _ in
         panel.removeFromSuperview()
+      }
+    }
+  }
+
+  private static func emitGiftBurst(
+    in root: UIView,
+    from panel: UIView,
+    style: NativeGiftEffectStyle,
+    assetImage: UIImage?,
+    tint: UIColor
+  ) {
+    let center = CGPoint(x: panel.frame.midX, y: panel.frame.maxY + min(58, root.bounds.height * 0.18))
+    let hero = UIImageView(image: assetImage ?? UIImage(systemName: style.heroSymbol) ?? UIImage(systemName: "sparkles"))
+    hero.tintColor = assetImage == nil ? tint : nil
+    hero.contentMode = .scaleAspectFit
+    hero.alpha = 0
+    hero.frame = CGRect(x: center.x - 30, y: center.y - 30, width: 60, height: 60)
+    hero.layer.shadowColor = UIColor.black.cgColor
+    hero.layer.shadowOpacity = 0.42
+    hero.layer.shadowRadius = 10
+    hero.layer.shadowOffset = CGSize(width: 0, height: 4)
+    root.addSubview(hero)
+
+    UIView.animateKeyframes(withDuration: 1.25, delay: 0.02, options: [.calculationModeCubic]) {
+      UIView.addKeyframe(withRelativeStartTime: 0.0, relativeDuration: 0.18) {
+        hero.alpha = 0.96
+        hero.transform = CGAffineTransform(scaleX: 1.35, y: 1.35).rotated(by: -0.12)
+      }
+      UIView.addKeyframe(withRelativeStartTime: 0.18, relativeDuration: 0.28) {
+        hero.transform = CGAffineTransform(scaleX: 0.98, y: 0.98).rotated(by: 0.08)
+      }
+      UIView.addKeyframe(withRelativeStartTime: 0.58, relativeDuration: 0.42) {
+        hero.alpha = 0
+        hero.transform = CGAffineTransform(translationX: 0, y: -34).scaledBy(x: 0.55, y: 0.55)
+      }
+    } completion: { _ in
+      hero.removeFromSuperview()
+    }
+
+    let symbols = style.particleSymbols
+    for index in 0..<12 {
+      let symbol = symbols[index % symbols.count]
+      let particle = UIImageView(image: UIImage(systemName: symbol) ?? UIImage(systemName: "sparkle"))
+      particle.tintColor = index % 4 == 0 ? UIColor.white : tint
+      particle.contentMode = .scaleAspectFit
+      particle.alpha = 0
+      let side = CGFloat(10 + (index % 4) * 3)
+      particle.frame = CGRect(x: center.x - side / 2, y: center.y - side / 2, width: side, height: side)
+      root.addSubview(particle)
+
+      let angle = CGFloat(index) / 12.0 * .pi * 2.0 - .pi / 2.0
+      let radius = CGFloat(42 + (index % 5) * 12)
+      let dx = cos(angle) * radius
+      let dy = sin(angle) * radius * 0.72
+      UIView.animate(
+        withDuration: 0.78 + Double(index % 3) * 0.08,
+        delay: 0.04 + Double(index) * 0.018,
+        options: [.curveEaseOut]
+      ) {
+        particle.alpha = 0.92
+        particle.transform = CGAffineTransform(translationX: dx, y: dy).rotated(by: angle + 0.7).scaledBy(x: 1.55, y: 1.55)
+      } completion: { _ in
+        UIView.animate(withDuration: 0.22) {
+          particle.alpha = 0
+        } completion: { _ in
+          particle.removeFromSuperview()
+        }
       }
     }
   }
@@ -2754,18 +3132,11 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     let title: String
     let subtitle: String?
     let giftBar: NiconicoGiftBarUpdate?
+    let effectStyle: NativeGiftEffectStyle
+    let assetURL: URL?
 
     var symbolName: String {
-      switch kind {
-      case .gift:
-        return "gift.fill"
-      case .nicoad:
-        return "megaphone.fill"
-      case .notification:
-        return "bell.badge.fill"
-      case .akashic:
-        return "sparkles"
-      }
+      effectStyle.heroSymbol
     }
   }
 
@@ -2776,6 +3147,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     self.playbackVolume = StreamVolumeStore.volume(for: stream)
     super.init(frame: .zero)
     backgroundColor = .black
+    NiconicoGiftEffectCache.shared.prewarmCommonEffects()
 
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
@@ -3635,6 +4007,8 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     ]) ?? "ギフト"
     let rank = intField(fields, 7)
     let giftBar = firstFieldData(fields, number: 8).flatMap(parseNDGRGiftBarUpdate)
+    let assetURL = firstGiftAssetURL(in: data)
+    let style = classifyGiftEffect(itemID: itemID, itemName: itemName, message: message, points: points)
 
     let giver = firstNonEmpty([sender, "匿名"])
     let title = compactSupportText("\(giver ?? "匿名") が \(itemName) を贈りました", limit: 44)
@@ -3644,7 +4018,15 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       compactOptionalSupportText(message, limit: 44),
       giftBar?.summary
     ])
-    return NiconicoSupportEvent(id: id, kind: .gift, title: title, subtitle: subtitle, giftBar: giftBar)
+    return NiconicoSupportEvent(
+      id: id,
+      kind: .gift,
+      title: title,
+      subtitle: subtitle,
+      giftBar: giftBar,
+      effectStyle: style,
+      assetURL: assetURL
+    )
   }
 
   private func parseNDGRGiftBarUpdate(_ data: Data) -> NiconicoGiftBarUpdate? {
@@ -3672,7 +4054,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       let message = stringField(v1Fields, 2)
       let title = compactSupportText(firstNonEmpty([message, "ニコニ広告されました"]) ?? "ニコニ広告されました", limit: 50)
       let subtitle = supportSubtitle([totalPoint.map { "合計\(formatPoints($0))" }])
-      return NiconicoSupportEvent(id: id, kind: .nicoad, title: title, subtitle: subtitle, giftBar: nil)
+      return NiconicoSupportEvent(id: id, kind: .nicoad, title: title, subtitle: subtitle, giftBar: nil, effectStyle: .nicoad, assetURL: nil)
     }
     if let v0Data = firstFieldData(fields, number: 1) {
       let v0Fields = protobufFields(v0Data)
@@ -3690,7 +4072,15 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         latestPoint.map { "今回\(formatPoints($0))" },
         totalPoint.map { "合計\(formatPoints($0))" }
       ])
-      return NiconicoSupportEvent(id: id, kind: .nicoad, title: compactSupportText(titleText, limit: 50), subtitle: subtitle, giftBar: nil)
+      return NiconicoSupportEvent(
+        id: id,
+        kind: .nicoad,
+        title: compactSupportText(titleText, limit: 50),
+        subtitle: subtitle,
+        giftBar: nil,
+        effectStyle: .nicoad,
+        assetURL: nil
+      )
     }
     return nil
   }
@@ -3702,7 +4092,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
           shouldShowSupportNotification(type: type, message: message) else { return nil }
     let title = compactSupportText(message, limit: 52)
     let subtitle = supportNotificationLabel(type).map { "ニコ生\($0)" }
-    return NiconicoSupportEvent(id: id, kind: .notification, title: title, subtitle: subtitle, giftBar: nil)
+    return NiconicoSupportEvent(id: id, kind: .notification, title: title, subtitle: subtitle, giftBar: nil, effectStyle: .levelUp, assetURL: nil)
   }
 
   private func parseNDGRLegacySimpleNotification(_ data: Data, id: String?) -> NiconicoSupportEvent? {
@@ -3715,7 +4105,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       kind: .notification,
       title: compactSupportText(message, limit: 52),
       subtitle: "ニコ生通知",
-      giftBar: nil
+      giftBar: nil,
+      effectStyle: .levelUp,
+      assetURL: nil
     )
   }
 
@@ -3754,8 +4146,60 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       kind: .akashic,
       title: compactSupportText(titleText, limit: 52),
       subtitle: compactOptionalSupportText(subtitle, limit: 48),
-      giftBar: nil
+      giftBar: nil,
+      effectStyle: .akashic,
+      assetURL: firstGiftAssetURL(in: data)
     )
+  }
+
+  private func classifyGiftEffect(itemID: String?, itemName: String, message: String?, points: Int?) -> NativeGiftEffectStyle {
+    let source = [itemID, itemName, message]
+      .compactMap { $0?.lowercased() }
+      .joined(separator: " ")
+    if containsAny(source, ["花火", "firework", "爆", "弾幕"]) {
+      return .firework
+    }
+    if containsAny(source, ["ハート", "heart", "love", "愛"]) {
+      return .heart
+    }
+    if containsAny(source, ["星", "スター", "star"]) {
+      return .star
+    }
+    if containsAny(source, ["花", "桜", "sakura", "flower", "rose", "leaf"]) {
+      return .flower
+    }
+    if containsAny(source, ["肉", "寿司", "ラーメン", "弁当", "ケーキ", "cake", "food", "drink"]) {
+      return .food
+    }
+    if containsAny(source, ["ロケット", "rocket", "ミサイル", "飛行機"]) {
+      return .rocket
+    }
+    if let points, points >= 1_000 {
+      return .premiumGift
+    }
+    return .gift
+  }
+
+  private func firstGiftAssetURL(in data: Data) -> URL? {
+    protobufStrings(in: data)
+      .lazy
+      .compactMap { URL(string: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+      .first { url in
+        guard url.scheme == "https",
+              let host = url.host?.lowercased() else { return false }
+        let allowedHost = host.hasSuffix("nicovideo.jp") || host.hasSuffix("nimg.jp") || host.hasSuffix("nico.ms")
+        let lowerPath = url.path.lowercased()
+        let isImageLike = lowerPath.hasSuffix(".png")
+          || lowerPath.hasSuffix(".jpg")
+          || lowerPath.hasSuffix(".jpeg")
+          || lowerPath.hasSuffix(".gif")
+          || lowerPath.hasSuffix(".webp")
+        return allowedHost && isImageLike
+      }
+  }
+
+  private func containsAny(_ text: String, _ needles: [String]) -> Bool {
+    needles.contains { text.contains($0.lowercased()) }
   }
 
   private func firstFieldData(_ fields: [ProtobufField], number: Int) -> Data? {
@@ -4178,11 +4622,15 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         return
       }
       self.lastSupportAlert = (dedupeText, now)
+      NiconicoGiftEffectCache.shared.prewarmAsset(event.assetURL)
+      NativeGiftSoundMixer.shared.play(style: event.effectStyle, enabled: self.settings.playAudio, volume: self.playbackVolume)
       NativeEventOverlay.showSupport(
         title: event.title,
         subtitle: event.subtitle,
         symbolName: event.symbolName,
         progress: event.giftBar?.progress,
+        effectStyle: event.effectStyle,
+        assetImage: NiconicoGiftEffectCache.shared.cachedImage(for: event.assetURL),
         in: self.danmakuView,
         tint: StreamPlatform.niconico.tint
       )
@@ -4195,7 +4643,17 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       return
     }
     lastSupportAlert = (text, now)
-    NativeEventOverlay.show(text, in: danmakuView, tint: StreamPlatform.niconico.tint)
+    NativeGiftSoundMixer.shared.play(style: .gift, enabled: settings.playAudio, volume: playbackVolume)
+    NativeEventOverlay.showSupport(
+      title: compactSupportText(text, limit: 52),
+      subtitle: nil,
+      symbolName: NativeGiftEffectStyle.gift.heroSymbol,
+      progress: nil,
+      effectStyle: .gift,
+      assetImage: nil,
+      in: danmakuView,
+      tint: StreamPlatform.niconico.tint
+    )
   }
 
   private func showStatus(_ text: String) {
