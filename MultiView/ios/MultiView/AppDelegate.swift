@@ -3778,7 +3778,10 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       guard !self.isStopped else { return }
       self.statusLabel.isHidden = true
       var assetOptions: [String: Any] = [
-        "AVURLAssetHTTPHeaderFieldsKey": self.niconicoPlaybackHeaders()
+        "AVURLAssetHTTPHeaderFieldsKey": self.niconicoPlaybackHeaders(),
+        // Live HLS never needs a precise duration; skipping that analysis trims a
+        // little startup work (Apple notes precise duration can be costly).
+        AVURLAssetPreferPreciseDurationAndTimingKey: false
       ]
       if !cookies.isEmpty {
         assetOptions[AVURLAssetHTTPCookiesKey] = cookies
@@ -5065,7 +5068,9 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       guard !self.isStopped else { return }
       self.statusLabel.isHidden = true
       let asset = AVURLAsset(url: hlsURL, options: [
-        "AVURLAssetHTTPHeaderFieldsKey": self.kickPlaybackHeaders()
+        "AVURLAssetHTTPHeaderFieldsKey": self.kickPlaybackHeaders(),
+        // Live HLS never needs a precise duration; skip that analysis to trim startup.
+        AVURLAssetPreferPreciseDurationAndTimingKey: false
       ])
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
@@ -5737,7 +5742,9 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       guard !self.isStopped else { return }
       self.statusLabel.isHidden = true
       let asset = AVURLAsset(url: hlsURL, options: [
-        "AVURLAssetHTTPHeaderFieldsKey": self.twitchPlaybackHeaders()
+        "AVURLAssetHTTPHeaderFieldsKey": self.twitchPlaybackHeaders(),
+        // Live HLS never needs a precise duration; skip that analysis to trim startup.
+        AVURLAssetPreferPreciseDurationAndTimingKey: false
       ])
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
@@ -6197,7 +6204,9 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       guard !self.isStopped else { return }
       self.statusLabel.isHidden = true
       var options: [String: Any] = [
-        "AVURLAssetHTTPHeaderFieldsKey": self.twitcastingPlaybackHeaders()
+        "AVURLAssetHTTPHeaderFieldsKey": self.twitcastingPlaybackHeaders(),
+        // Live HLS never needs a precise duration; skip that analysis to trim startup.
+        AVURLAssetPreferPreciseDurationAndTimingKey: false
       ]
       // Pass cookies as objects so AVPlayer applies them to every playlist/segment
       // request (a manual Cookie header is not always propagated to sub-requests).
@@ -7702,7 +7711,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     guard !isStopped else { return }
     statusLabel.isHidden = true
     let asset = AVURLAsset(url: url, options: [
-      "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": Self.userAgent]
+      "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": Self.userAgent],
+      // Live HLS never needs a precise duration; skip that analysis to trim startup.
+      AVURLAssetPreferPreciseDurationAndTimingKey: false
     ])
     let item = AVPlayerItem(asset: asset)
     item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
