@@ -352,7 +352,6 @@ enum PlaybackQuality: String, Codable {
 
 struct AppSettings: Codable {
   var showChat = true
-  var proxyUrl = ""
   var playAudio = true
   var autoFollowRaids = false
   var blockWebAds = true
@@ -371,7 +370,6 @@ struct AppSettings: Codable {
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     showChat = try container.decodeIfPresent(Bool.self, forKey: .showChat) ?? true
-    proxyUrl = try container.decodeIfPresent(String.self, forKey: .proxyUrl) ?? ""
     playAudio = try container.decodeIfPresent(Bool.self, forKey: .playAudio) ?? true
     autoFollowRaids = try container.decodeIfPresent(Bool.self, forKey: .autoFollowRaids) ?? false
     blockWebAds = try container.decodeIfPresent(Bool.self, forKey: .blockWebAds) ?? true
@@ -2135,8 +2133,7 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
       URLQueryItem(name: "mlen", value: String(settings.danmakuMaxLength)),
       URLQueryItem(name: "audio", value: settings.playAudio ? "1" : "0"),
       URLQueryItem(name: "quality", value: NetworkQuality.shared.activeQuality(settings: settings).rawValue),
-      URLQueryItem(name: "vol", value: String(StreamVolumeStore.volume(for: stream))),
-      URLQueryItem(name: "proxy", value: settings.proxyUrl.trimmingCharacters(in: .whitespacesAndNewlines))
+      URLQueryItem(name: "vol", value: String(StreamVolumeStore.volume(for: stream)))
     ]
     if let url = components.url {
       load(URLRequest(url: url))
@@ -3285,6 +3282,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     backgroundColor = .black
     NiconicoGiftEffectCache.shared.prewarmCommonEffects()
 
+    // Match the other native players: don't let AVPlayer build a large startup
+    // buffer, so live playback stays close to the edge (lower latency).
+    player.automaticallyWaitsToMinimizeStalling = false
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
@@ -8327,163 +8327,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   fileprivate static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
-final class MultiPlayerWebView: WKWebView, WKScriptMessageHandler, PlaybackResumable, PlaybackStoppable, AudioControllable {
-  private let playAudio: Bool
-  private var playbackVolume: Float = 1
-  private var isStopped = false
-
-  init(streams: [StreamItem], settings: AppSettings) {
-    playAudio = settings.playAudio
-    let config = WKWebViewConfiguration()
-    config.allowsInlineMediaPlayback = true
-    config.mediaTypesRequiringUserActionForPlayback = []
-    config.websiteDataStore = .default()
-    WebAdBlocker.install(on: config)
-    super.init(frame: .zero, configuration: config)
-    isOpaque = false
-    backgroundColor = .black
-    scrollView.backgroundColor = .black
-    scrollView.contentInsetAdjustmentBehavior = .never
-    configuration.userContentController.add(self, name: "multiview")
-    PlaybackCoordinator.shared.register(self)
-    load(streams: streams, settings: settings)
-  }
-
-  required init?(coder: NSCoder) {
-    fatalError("init(coder:) has not been implemented")
-  }
-
-  deinit {
-    configuration.userContentController.removeScriptMessageHandler(forName: "multiview")
-  }
-
-  private func load(streams: [StreamItem], settings: AppSettings) {
-    let encodedStreams = streams
-      .map { "\($0.platform.rawValue):\($0.channel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.channel)" }
-      .joined(separator: ",")
-    var components = URLComponents(string: "https://tonton888115.github.io/MultiView/multiview.html")!
-    components.queryItems = [
-      URLQueryItem(name: "streams", value: encodedStreams),
-      URLQueryItem(name: "volumes", value: Self.encodedVolumes(for: streams)),
-      URLQueryItem(name: "layout", value: settings.layoutMode.rawValue),
-      URLQueryItem(name: "audio", value: settings.playAudio ? "1" : "0"),
-      URLQueryItem(name: "quality", value: NetworkQuality.shared.activeQuality(settings: settings).rawValue),
-      URLQueryItem(name: "chat", value: settings.showChat ? "1" : "0"),
-      URLQueryItem(name: "proxy", value: settings.proxyUrl.trimmingCharacters(in: .whitespacesAndNewlines)),
-      URLQueryItem(name: "fs", value: String(settings.danmakuFontSize)),
-      URLQueryItem(name: "sp", value: String(settings.danmakuSpeed)),
-      URLQueryItem(name: "op", value: String(settings.danmakuOpacity)),
-      URLQueryItem(name: "ml", value: String(settings.danmakuMaxLines)),
-      URLQueryItem(name: "mlen", value: String(settings.danmakuMaxLength))
-    ]
-    if let url = components.url {
-      load(URLRequest(url: url))
-    }
-  }
-
-  func resumePlayback() {
-    guard !isStopped else { return }
-    let shouldMute = playAudio ? "false" : "true"
-    let volume = playAudio ? playbackVolume : 0
-    let script = """
-    (function(){
-      document.body.classList.add('audio-started');
-      document.querySelectorAll('video,audio').forEach(function(media){
-        try {
-          media.muted = \(shouldMute);
-          media.volume = \(volume);
-          var play = media.play && media.play();
-          if (play && play.catch) play.catch(function(){});
-        } catch(e) {}
-      });
-      document.querySelectorAll('iframe').forEach(function(frame){
-        try { frame.contentWindow.postMessage({type:'volume', volume:\(volume)}, '*'); } catch(e) {}
-        try { frame.contentWindow.postMessage({type:'play'}, '*'); } catch(e) {}
-      });
-    })();
-    """
-    evaluateJavaScript(script)
-  }
-
-  func setPlaybackVolume(_ volume: Float) {
-    playbackVolume = min(1, max(0, volume))
-    resumePlayback()
-  }
-
-  func pausePlayback() {
-    guard !isStopped else { return }
-    evaluateJavaScript("""
-    (function(){
-      document.querySelectorAll('video,audio').forEach(function(m){ try { m.pause(); } catch(e) {} });
-      document.querySelectorAll('iframe').forEach(function(f){
-        try { f.contentWindow.postMessage({type:'pause'}, '*'); } catch(e) {}
-        try { f.contentWindow.postMessage(JSON.stringify({event:'command',func:'pauseVideo',args:[]}), '*'); } catch(e) {}
-      });
-    })();
-    """)
-  }
-
-  func setStreamVolume(_ volume: Float, for stream: StreamItem) {
-    let safeKey = Self.jsString(Self.streamKey(for: stream))
-    let safeVolume = min(1, max(0, volume))
-    evaluateJavaScript("""
-    (function(){
-      var payload = {type:'volume', key:'\(safeKey)', volume:\(safeVolume)};
-      window.dispatchEvent(new MessageEvent('message', {data: payload}));
-    })();
-    """)
-  }
-
-  func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-    guard message.name == "multiview",
-          let payload = message.body as? [String: Any],
-          let type = payload["type"] as? String,
-          type == "remove",
-          let platformRaw = payload["platform"] as? String,
-          let platform = StreamPlatform(rawValue: platformRaw),
-          let channel = payload["channel"] as? String else { return }
-    if let stream = AppState.shared.streams.first(where: {
-      $0.platform == platform && $0.channel.lowercased() == channel.lowercased()
-    }) {
-      AppState.shared.remove(stream)
-    }
-  }
-
-  func stopPlayback() {
-    isStopped = true
-    stopLoading()
-    evaluateJavaScript("""
-    document.querySelectorAll('video,audio').forEach(function(media){
-      try { media.pause(); media.src = ''; media.load(); } catch(e) {}
-    });
-    document.querySelectorAll('iframe').forEach(function(frame){
-      try { frame.src = 'about:blank'; } catch(e) {}
-    });
-    """)
-    loadHTMLString("", baseURL: nil)
-  }
-
-  private static func streamKey(for stream: StreamItem) -> String {
-    "\(stream.platform.rawValue):\(stream.channel.lowercased())"
-  }
-
-  private static func encodedVolumes(for streams: [StreamItem]) -> String {
-    streams
-      .map {
-        let key = streamKey(for: $0).addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? streamKey(for: $0)
-        return "\(key)=\(StreamVolumeStore.volume(for: $0))"
-      }
-      .joined(separator: ",")
-  }
-
-  private static func jsString(_ text: String) -> String {
-    text
-      .replacingOccurrences(of: "\\", with: "\\\\")
-      .replacingOccurrences(of: "'", with: "\\'")
-      .replacingOccurrences(of: "\n", with: " ")
-  }
-}
-
 final class ViewingController: UIViewController {
   private let scrollView = UIScrollView()
   private let stack = UIStackView()
@@ -8567,12 +8410,9 @@ final class ViewingController: UIViewController {
       PlaybackCoordinator.shared.resumeAll()
       return
     }
-    if streams.contains(where: { $0.platform.usesIndividualPlayer }) {
-      addHybridPlayers(streams)
-      PlaybackCoordinator.shared.resumeAll()
-      return
-    }
-    addUnifiedPlayer(streams)
+    // Every platform now has a dedicated per-cell native player, so all streams go
+    // through addCells (grid / stacked). The old single-WebView fallback is gone.
+    addCells(streams)
     PlaybackCoordinator.shared.resumeAll()
   }
 
@@ -8622,50 +8462,6 @@ final class ViewingController: UIViewController {
     stack.addArrangedSubview(cell)
     cell.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: 9 / 16).isActive = true
     cell.heightAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
-  }
-
-  private func addUnifiedPlayer(_ streams: [StreamItem]) {
-    let web = MultiPlayerWebView(streams: streams, settings: AppState.shared.settings)
-    let host = UIView()
-    host.backgroundColor = .black
-    host.translatesAutoresizingMaskIntoConstraints = false
-    web.translatesAutoresizingMaskIntoConstraints = false
-    host.addSubview(web)
-    stack.addArrangedSubview(host)
-    NSLayoutConstraint.activate([
-      web.topAnchor.constraint(equalTo: host.topAnchor),
-      web.leadingAnchor.constraint(equalTo: host.leadingAnchor),
-      web.trailingAnchor.constraint(equalTo: host.trailingAnchor),
-      web.bottomAnchor.constraint(equalTo: host.bottomAnchor),
-      host.heightAnchor.constraint(equalTo: view.safeAreaLayoutGuide.heightAnchor)
-    ])
-  }
-
-  private func addHybridPlayers(_ streams: [StreamItem]) {
-    let individual = streams.filter { $0.platform.usesIndividualPlayer }
-    let embeddable = streams.filter { !$0.platform.usesIndividualPlayer }
-    if !embeddable.isEmpty {
-      let web = MultiPlayerWebView(streams: embeddable, settings: AppState.shared.settings)
-      let host = UIView()
-      host.backgroundColor = .black
-      host.translatesAutoresizingMaskIntoConstraints = false
-      web.translatesAutoresizingMaskIntoConstraints = false
-      host.addSubview(web)
-      stack.addArrangedSubview(host)
-      let rows = AppState.shared.settings.layoutMode == .grid ? ceil(Double(embeddable.count) / 2.0) : Double(embeddable.count)
-      let heightMultiplier = AppState.shared.settings.layoutMode == .grid ? CGFloat(rows) * 9 / 32 : CGFloat(rows) * 9 / 16
-      NSLayoutConstraint.activate([
-        web.topAnchor.constraint(equalTo: host.topAnchor),
-        web.leadingAnchor.constraint(equalTo: host.leadingAnchor),
-        web.trailingAnchor.constraint(equalTo: host.trailingAnchor),
-        web.bottomAnchor.constraint(equalTo: host.bottomAnchor),
-        host.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: heightMultiplier),
-        host.heightAnchor.constraint(greaterThanOrEqualToConstant: embeddable.count == 1 ? 220 : 180)
-      ])
-    }
-    if !individual.isEmpty {
-      addCells(individual)
-    }
   }
 
   private func addCells(_ streams: [StreamItem]) {
@@ -8815,10 +8611,14 @@ final class ViewingController: UIViewController {
   }
 
   private func addGrid(_ streams: [StreamItem]) {
-    // Full pairs go two-up; a trailing odd stream gets its own full-width row so no
-    // empty space is left beside it.
+    // Pairs go two-up; the trailing stream(s) get their own full-width row so they
+    // read as the "main" view and no empty space is left beside a cell.
+    //   - odd count : the last 1 stream is full-width (大きい表示 末尾1つ)
+    //   - even count: the last 2 streams are full-width, stacked (大きい表示 2つ)
+    let bigCount = streams.count % 2 == 0 ? 2 : 1
+    let pairedCount = streams.count - bigCount
     var index = 0
-    while index + 2 <= streams.count {
+    while index + 1 < pairedCount {
       let row = UIStackView()
       row.axis = .horizontal
       row.spacing = 10
@@ -8830,8 +8630,9 @@ final class ViewingController: UIViewController {
       row.heightAnchor.constraint(greaterThanOrEqualToConstant: 150).isActive = true
       index += 2
     }
-    if index < streams.count {
+    while index < streams.count {
       addStackedCell(streams[index])
+      index += 1
     }
   }
 
@@ -9949,7 +9750,7 @@ final class SettingsController: UITableViewController {
   // setup is its own clearly-labelled section (the old layout mixed playback with
   // danmaku and scattered OAuth across confusing rows).
   private enum Sec: Int, CaseIterable {
-    case playback, danmaku, comments, order, kick, twitch, twitcasting, youtube, niconico, webData, add
+    case playback, danmaku, order, kick, twitch, twitcasting, youtube, niconico, webData, add
   }
 
   private func switchControl(isOn: Bool, onChange: @escaping (Bool) -> Void) -> UISwitch {
@@ -9975,7 +9776,6 @@ final class SettingsController: UITableViewController {
     switch sec {
     case .playback: return 5
     case .danmaku: return 6
-    case .comments: return 1
     case .order: return platforms.count
     case .kick: return 5
     case .twitch: return 4
@@ -9992,7 +9792,6 @@ final class SettingsController: UITableViewController {
     switch sec {
     case .playback: return "再生・画質"
     case .danmaku: return "弾幕"
-    case .comments: return "コメント取得"
     case .order: return "サービス順"
     case .kick: return "Kick 連携"
     case .twitch: return "Twitch 連携"
@@ -10116,10 +9915,6 @@ final class SettingsController: UITableViewController {
         cell.accessoryType = .disclosureIndicator
         cell.selectionStyle = .default
       }
-    case .comments:
-      cell.textLabel?.text = "CORSプロキシ"
-      cell.accessoryType = .disclosureIndicator
-      cell.selectionStyle = .default
     case .order:
       cell.textLabel?.text = platforms[indexPath.row].label
       cell.showsReorderControl = true
@@ -10221,8 +10016,6 @@ final class SettingsController: UITableViewController {
     switch sec {
     case .danmaku:
       if indexPath.row >= 1 { editDanmakuValue(field: indexPath.row - 1) }
-    case .comments:
-      editProxy()
     case .kick:
       handleKickOAuthRow(indexPath.row)
     case .twitch:
@@ -10320,24 +10113,6 @@ final class SettingsController: UITableViewController {
       }
       AppState.shared.settings = settings
       self?.tableView.reloadRows(at: [IndexPath(row: field + 1, section: Sec.danmaku.rawValue)], with: .automatic)
-    })
-    present(alert, animated: true)
-  }
-
-  private func editProxy() {
-    let alert = UIAlertController(title: "CORSプロキシ", message: "Kick / ツイキャスの弾幕取得に使います", preferredStyle: .alert)
-    alert.addTextField { field in
-      field.placeholder = "https://xxx.workers.dev/?url="
-      field.text = AppState.shared.settings.proxyUrl
-      field.keyboardType = .URL
-      field.autocapitalizationType = .none
-      field.autocorrectionType = .no
-    }
-    alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
-    alert.addAction(UIAlertAction(title: "保存", style: .default) { _ in
-      var settings = AppState.shared.settings
-      settings.proxyUrl = alert.textFields?.first?.text ?? ""
-      AppState.shared.settings = settings
     })
     present(alert, animated: true)
   }
