@@ -3972,8 +3972,8 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   }
 
   // VIEW ストリーム: セグメント URI と nextAt をポーリングする長期接続。
-  // 切断時は指数バックオフで in-place 再接続し、60 秒以上成功していない時のみ
-  // フル再読み込みに escalation する。
+  // 切断時は指数バックオフで in-place 再接続し、20 秒以上成功していない (または3連敗)
+  // 時はフル再読み込みに escalation する (「コメント再接続中」を長居させない)。
   private func streamNDGRView(viewURI: String) async {
     var nextAt: String? = "now"
     var consecutiveFailures = 0
@@ -4009,9 +4009,11 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         consecutiveFailures += 1
         nextAt = requestAt ?? "now"
         let elapsedSinceSuccess = Date().timeIntervalSince(ndgrLastSuccessAt)
-        // 60 秒以上回復していないか、10 連敗したらフル再読み込みに切替。
-        // それ以外は in-place で指数バックオフ (1,2,4,8,16,16,…秒)。
-        if elapsedSinceSuccess > 60 || consecutiveFailures >= 10 {
+        // 「コメント再接続中」を長く居座らせないよう早めにフル再読み込みへescalateする
+        // (ユーザーが手動で更新ボタンを押す動作の自動化)。20秒以上回復しないか3連敗で切替。
+        // それ以外は in-place で指数バックオフ (1,2,4,…秒)。フル再読み込み自体は
+        // ViewingController 側で45秒に1回までデバウンスされるためループにはならない。
+        if elapsedSinceSuccess > 20 || consecutiveFailures >= 3 {
           showStatus("ニコ生コメント取得失敗継続: 再読み込み")
           DispatchQueue.main.async {
             NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
@@ -8414,10 +8416,16 @@ final class ViewingController: UIViewController {
     }
     addPlaybackBar()
     if let focused, streams.contains(focused) {
-      stack.addArrangedSubview(FocusedStreamView(stream: focused, onClose: { [weak self] in
+      let focusedView = FocusedStreamView(stream: focused, onClose: { [weak self] in
         self?.focused = nil
         self?.reload()
-      }))
+      })
+      stack.addArrangedSubview(focusedView)
+      // 展開（1配信フル表示）は画面いっぱいに広げる。以前は最小640pt固定で、縦長端末だと
+      // 画面を埋めず小さく見えていた。再生バー＋余白分を引いた可視領域の高さに合わせる。
+      focusedView.heightAnchor.constraint(
+        equalTo: scrollView.frameLayoutGuide.heightAnchor, constant: -80
+      ).isActive = true
       PlaybackCoordinator.shared.resumeAll()
       return
     }
@@ -9164,13 +9172,23 @@ final class FocusedStreamView: UIView {
       config.websiteDataStore = .default()
       WebAdBlocker.install(on: config)
       chatWeb = WKWebView(frame: .zero, configuration: config)
+      // YouTube の live_chat 埋め込みはモバイルWeb非対応で、WKWebView標準UA(モバイル)では
+      // 「チャットをご利用いただけません。ブラウザのバージョンが古いようです」と出て表示されない。
+      // デスクトップ Safari の UA を名乗るとデスクトップ版 live_chat が返り、正しく表示される。
+      if stream.platform == .youtube {
+        chatWeb?.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
+      }
       chatWeb?.load(URLRequest(url: chatURL))
     } else {
       chatWeb = nil
     }
     super.init(frame: .zero)
     backgroundColor = .black
-    heightAnchor.constraint(greaterThanOrEqualToConstant: 640).isActive = true
+    // 高さは ViewingController 側で可視領域いっぱいに設定する。ここでは最低限のフロアだけ
+    // （必須より低い優先度なので、全画面表示の equalTo 制約と衝突しない）。
+    let minHeight = heightAnchor.constraint(greaterThanOrEqualToConstant: 320)
+    minHeight.priority = UILayoutPriority(749)
+    minHeight.isActive = true
 
     let video: UIView
     if stream.platform == .niconico {
