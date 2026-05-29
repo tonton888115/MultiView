@@ -118,32 +118,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
   }
 }
 
-protocol PlaybackResumable: AnyObject {
-  func resumePlayback()
-  func pausePlayback()
-}
-
-extension PlaybackResumable {
-  func pausePlayback() {}
-}
-
-protocol PlaybackStoppable: AnyObject {
-  func stopPlayback()
-}
-
-protocol AudioControllable: AnyObject {
-  func setPlaybackVolume(_ volume: Float)
-}
-
-// A player that can post a chat comment for its own stream (using the logged-in
-// session it already holds), so a cell can send without leaving the grid.
-protocol CommentPostable: AnyObject {
-  func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void)
-}
-
-protocol CommentEchoDisplay: AnyObject {
-  func emitOwnComment(_ text: String)
-}
+// Player capability protocols are defined in Protocols.swift.
 
 final class AutoHidingControls: NSObject, UIGestureRecognizerDelegate {
   private weak var host: UIView?
