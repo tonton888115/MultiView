@@ -3282,9 +3282,11 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     backgroundColor = .black
     NiconicoGiftEffectCache.shared.prewarmCommonEffects()
 
-    // Match the other native players: don't let AVPlayer build a large startup
-    // buffer, so live playback stays close to the edge (lower latency).
-    player.automaticallyWaitsToMinimizeStalling = false
+    // ニコ生は automaticallyWaitsToMinimizeStalling=false (常時ライブエッジ) だと回線の
+    // 揺れで頻繁にストールし、フレームレートがガクガク＋「見られるまで遅い」になっていた
+    // (ce716c1 の低遅延化で発生)。低遅延よりも滑らかさを優先し、AVPlayer にバッファ管理を
+    // 任せる (true)。他プラットフォームは挙動が安定しているため false のまま据え置く。
+    player.automaticallyWaitsToMinimizeStalling = true
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
