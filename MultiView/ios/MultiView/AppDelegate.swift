@@ -3972,8 +3972,8 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   }
 
   // VIEW ストリーム: セグメント URI と nextAt をポーリングする長期接続。
-  // 切断時は指数バックオフで in-place 再接続し、20 秒以上成功していない (または3連敗)
-  // 時はフル再読み込みに escalation する (「コメント再接続中」を長居させない)。
+  // 切断時は指数バックオフで in-place 再接続し、本当に停止した時 (60秒途絶 または10連敗)
+  // だけフル再読み込みに escalation する。短い瞬断で発火させると映像ごと作り直して重い。
   private func streamNDGRView(viewURI: String) async {
     var nextAt: String? = "now"
     var consecutiveFailures = 0
@@ -4009,11 +4009,10 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         consecutiveFailures += 1
         nextAt = requestAt ?? "now"
         let elapsedSinceSuccess = Date().timeIntervalSince(ndgrLastSuccessAt)
-        // 「コメント再接続中」を長く居座らせないよう早めにフル再読み込みへescalateする
-        // (ユーザーが手動で更新ボタンを押す動作の自動化)。20秒以上回復しないか3連敗で切替。
-        // それ以外は in-place で指数バックオフ (1,2,4,…秒)。フル再読み込み自体は
-        // ViewingController 側で45秒に1回までデバウンスされるためループにはならない。
-        if elapsedSinceSuccess > 20 || consecutiveFailures >= 3 {
+        // コメントが本当に停止した時だけフル再読み込みへescalate。短い瞬断で連発すると
+        // 映像ごと作り直して「ニコ生セッションを準備中」連発＋カクつきになるため控えめに。
+        // (成功から60秒途絶 または 10連敗)。それ以外は in-place の指数バックオフで粘る。
+        if elapsedSinceSuccess > 60 || consecutiveFailures >= 10 {
           showStatus("ニコ生コメント取得失敗継続: 再読み込み")
           DispatchQueue.main.async {
             NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
@@ -9274,30 +9273,32 @@ final class FocusedStreamView: UIView {
     send.translatesAutoresizingMaskIntoConstraints = false
     addSubview(send)
 
+    // 拡大表示は「ブラウザ(チャット)を大きく上に・プレイヤーを小さく下に」配置する。
+    // 以前は逆 (プレイヤー全面＋下にチャット小窓) で、チャットが小さく見にくかった。
     var constraints: [NSLayoutConstraint] = [
-      video.topAnchor.constraint(equalTo: topAnchor),
+      chatPanel.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+      chatPanel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+      chatPanel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+      chatPanel.bottomAnchor.constraint(equalTo: input.topAnchor, constant: -8),
+      input.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+      input.bottomAnchor.constraint(equalTo: video.topAnchor, constant: -8),
+      input.heightAnchor.constraint(equalToConstant: 40),
+      send.leadingAnchor.constraint(equalTo: input.trailingAnchor, constant: 8),
+      send.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+      send.centerYAnchor.constraint(equalTo: input.centerYAnchor),
+      send.widthAnchor.constraint(equalToConstant: 54),
       video.leadingAnchor.constraint(equalTo: leadingAnchor),
       video.trailingAnchor.constraint(equalTo: trailingAnchor),
       video.bottomAnchor.constraint(equalTo: bottomAnchor),
+      video.heightAnchor.constraint(equalTo: widthAnchor, multiplier: 9.0 / 16.0),
       remove.topAnchor.constraint(equalTo: topAnchor, constant: 10),
       remove.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
       remove.widthAnchor.constraint(equalToConstant: 36),
       remove.heightAnchor.constraint(equalToConstant: 36),
       volume.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-      volume.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -80),
+      volume.centerYAnchor.constraint(equalTo: video.centerYAnchor),
       volume.widthAnchor.constraint(equalToConstant: 42),
-      volume.heightAnchor.constraint(equalTo: heightAnchor, multiplier: 0.42),
-      chatPanel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-      chatPanel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-      chatPanel.bottomAnchor.constraint(equalTo: input.topAnchor, constant: -8),
-      chatPanel.heightAnchor.constraint(equalTo: heightAnchor, multiplier: 0.38),
-      input.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-      input.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-      input.heightAnchor.constraint(equalToConstant: 40),
-      send.leadingAnchor.constraint(equalTo: input.trailingAnchor, constant: 8),
-      send.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-      send.centerYAnchor.constraint(equalTo: input.centerYAnchor),
-      send.widthAnchor.constraint(equalToConstant: 54)
+      volume.heightAnchor.constraint(equalTo: video.heightAnchor, multiplier: 0.7)
     ]
     if let closeButton {
       constraints += [
