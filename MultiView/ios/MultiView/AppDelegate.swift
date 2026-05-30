@@ -8320,7 +8320,6 @@ final class ViewingController: UIViewController {
   private let scrollView = UIScrollView()
   private let stack = UIStackView()
   private var focused: StreamItem?
-  private var focusedOverlay: FocusedStreamView?
   private weak var dragSourceCell: StreamCellView?
   private weak var dragTargetCell: StreamCellView?
   private let reorderIndicator = UIView()
@@ -8386,44 +8385,29 @@ final class ViewingController: UIViewController {
   func reload() {
     guard isViewLoaded else { return }
     clearStack()
-    removeFocusedOverlay()
     let streams = AppState.shared.streams
     if streams.isEmpty {
       stack.addArrangedSubview(emptyView())
       return
     }
+    addPlaybackBar()
     if let focused, streams.contains(focused) {
-      // 展開（1配信フル表示）はスクロール/スタックを介さず VC の view に直接ピン留めして
-      // 画面いっぱいに固定する。スタックの .fill 配分とフル高さ制約が競合してビューが潰れ、
-      // チャットがプレイヤーサイズまで小さくなる問題を回避する。
-      let overlay = FocusedStreamView(stream: focused, onClose: { [weak self] in
+      let focusedView = FocusedStreamView(stream: focused, onClose: { [weak self] in
         self?.focused = nil
         self?.reload()
       })
-      overlay.translatesAutoresizingMaskIntoConstraints = false
-      view.addSubview(overlay)
-      NSLayoutConstraint.activate([
-        overlay.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-        overlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-        overlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-        overlay.bottomAnchor.constraint(equalTo: view.bottomAnchor)
-      ])
-      focusedOverlay = overlay
+      stack.addArrangedSubview(focusedView)
+      // 展開（1配信フル表示）は可視領域いっぱいに広げる（再生バー＋余白分を引いた高さ）。
+      focusedView.heightAnchor.constraint(
+        equalTo: scrollView.frameLayoutGuide.heightAnchor, constant: -80
+      ).isActive = true
       PlaybackCoordinator.shared.resumeAll()
       return
     }
-    addPlaybackBar()
     // Every platform now has a dedicated per-cell native player, so all streams go
     // through addCells (grid / stacked). The old single-WebView fallback is gone.
     addCells(streams)
     PlaybackCoordinator.shared.resumeAll()
-  }
-
-  private func removeFocusedOverlay() {
-    guard let overlay = focusedOverlay else { return }
-    stopPlayback(in: overlay)
-    overlay.removeFromSuperview()
-    focusedOverlay = nil
   }
 
   private func clearStack() {
