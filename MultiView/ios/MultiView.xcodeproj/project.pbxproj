@@ -13,6 +13,7 @@
 		A1B2C3D4E5F60718293A4B5D /* KickAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* KickAuthManager.swift */; };
 		A1B2C3D4E5F60718293A4C02 /* Protocols.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4C01 /* Protocols.swift */; };
 		A1B2C3D4E5F60718293A4C12 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4C11 /* Models.swift */; };
+		A1B2C3D4E5F60718293A4C22 /* StreamPlatform.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4C21 /* StreamPlatform.swift */; };
 		81AB9BB82411601600AC10FF /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */; };
 /* End PBXBuildFile section */
 
@@ -28,6 +29,7 @@
 		A1B2C3D4E5F60718293A4B5C /* KickAuthManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = KickAuthManager.swift; path = MultiView/KickAuthManager.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4C01 /* Protocols.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Protocols.swift; path = MultiView/Protocols.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4C11 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Models.swift; path = MultiView/Models.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4C21 /* StreamPlatform.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StreamPlatform.swift; path = MultiView/StreamPlatform.swift; sourceTree = "<group>"; };
 		81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = LaunchScreen.storyboard; path = MultiView/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
@@ -52,6 +54,7 @@
 				A1B2C3D4E5F60718293A4B5C /* KickAuthManager.swift */,
 				A1B2C3D4E5F60718293A4C01 /* Protocols.swift */,
 				A1B2C3D4E5F60718293A4C11 /* Models.swift */,
+				A1B2C3D4E5F60718293A4C21 /* StreamPlatform.swift */,
 				13B07FB61A68108700A75B9A /* Info.plist */,
 				81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */,
 				13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */,
@@ -240,6 +243,7 @@
 				A1B2C3D4E5F60718293A4B5D /* KickAuthManager.swift in Sources */,
 				A1B2C3D4E5F60718293A4C02 /* Protocols.swift in Sources */,
 				A1B2C3D4E5F60718293A4C12 /* Models.swift in Sources */,
+				A1B2C3D4E5F60718293A4C22 /* StreamPlatform.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
