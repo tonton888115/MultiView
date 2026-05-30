@@ -288,77 +288,7 @@ enum StreamPlatform: String, CaseIterable, Codable {
   }
 }
 
-struct StreamItem: Codable, Equatable {
-  let id: String
-  let platform: StreamPlatform
-  let channel: String
-}
-
-enum LayoutMode: String, Codable {
-  case stacked
-  case grid
-}
-
-enum PlaybackQuality: String, Codable {
-  case high
-  case economy
-
-  var label: String {
-    switch self {
-    case .high: return "高画質"
-    case .economy: return "エコノミー"
-    }
-  }
-
-  var preferredPeakBitRate: Double {
-    switch self {
-    case .high: return 0
-    case .economy: return 900_000
-    }
-  }
-
-  var niconicoQuality: String {
-    switch self {
-    case .high: return "abr"
-    case .economy: return "low"
-    }
-  }
-}
-
-struct AppSettings: Codable {
-  var showChat = true
-  var playAudio = true
-  var autoFollowRaids = false
-  var blockWebAds = true
-  var layoutMode: LayoutMode = .stacked
-  var wifiQuality: PlaybackQuality = .high
-  var mobileQuality: PlaybackQuality = .economy
-  var danmakuFontSize = 20.0
-  var danmakuSpeed = 0.13
-  var danmakuOpacity = 0.9
-  var danmakuMaxLines = 0
-  var danmakuMaxLength = 0
-  var platformOrder = StreamPlatform.allCases
-
-  init() {}
-
-  init(from decoder: Decoder) throws {
-    let container = try decoder.container(keyedBy: CodingKeys.self)
-    showChat = try container.decodeIfPresent(Bool.self, forKey: .showChat) ?? true
-    playAudio = try container.decodeIfPresent(Bool.self, forKey: .playAudio) ?? true
-    autoFollowRaids = try container.decodeIfPresent(Bool.self, forKey: .autoFollowRaids) ?? false
-    blockWebAds = try container.decodeIfPresent(Bool.self, forKey: .blockWebAds) ?? true
-    layoutMode = try container.decodeIfPresent(LayoutMode.self, forKey: .layoutMode) ?? .stacked
-    wifiQuality = try container.decodeIfPresent(PlaybackQuality.self, forKey: .wifiQuality) ?? .high
-    mobileQuality = try container.decodeIfPresent(PlaybackQuality.self, forKey: .mobileQuality) ?? .economy
-    danmakuFontSize = try container.decodeIfPresent(Double.self, forKey: .danmakuFontSize) ?? 20
-    danmakuSpeed = try container.decodeIfPresent(Double.self, forKey: .danmakuSpeed) ?? 0.13
-    danmakuOpacity = try container.decodeIfPresent(Double.self, forKey: .danmakuOpacity) ?? 0.9
-    danmakuMaxLines = try container.decodeIfPresent(Int.self, forKey: .danmakuMaxLines) ?? 0
-    danmakuMaxLength = try container.decodeIfPresent(Int.self, forKey: .danmakuMaxLength) ?? 0
-    platformOrder = try container.decodeIfPresent([StreamPlatform].self, forKey: .platformOrder) ?? StreamPlatform.allCases
-  }
-}
+// StreamItem / LayoutMode / PlaybackQuality / AppSettings are defined in Models.swift.
 
 final class NetworkQuality {
   static let shared = NetworkQuality()
