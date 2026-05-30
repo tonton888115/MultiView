@@ -3427,7 +3427,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   private func startLiveChatPolling(videoId: String) {
     guard settings.showChat else { return }
-    chatPollWorkItem?.cancel()
+    chatPollWorkItem?.cancel(); chatPollWorkItem = nil
     liveChatID = nil
     liveChatAccessToken = nil
     liveChatPageToken = nil
@@ -3485,8 +3485,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     let fresh = messages.filter { !seenLiveChatMessageIDs.contains($0.id) }
     guard !fresh.isEmpty else { return }
     fresh.forEach { seenLiveChatMessageIDs.insert($0.id) }
-    if seenLiveChatMessageIDs.count > 800 {
-      seenLiveChatMessageIDs.removeAll(keepingCapacity: true)
+    // Trim the dedupe set without fully clearing it — a full reset let the very next
+    // poll re-show messages whose IDs were just forgotten. Keep the current batch's IDs.
+    if seenLiveChatMessageIDs.count > 2000 {
+      seenLiveChatMessageIDs = Set(fresh.map { $0.id })
     }
     pendingChatMessages.append(contentsOf: fresh)
     // A long stall can return a big backlog; cap it so we don't drip hundreds slowly.
@@ -3512,7 +3514,24 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       settings: settings
     )
     guard !pendingChatMessages.isEmpty else { return }
-    let spacing = min(max(lastChatPollInterval / Double(pendingChatMessages.count), 0.18), 0.9)
+    // Cap the emit rate to what the danmaku lanes can hold (lane count × one comment's
+    // screen-crossing time). A busy chat polled in big batches otherwise exceeds lane
+    // capacity and comments overlap on the same lane.
+    let laneCapacity: TimeInterval = {
+      let width = danmakuView.bounds.width
+      guard width > 0 else { return 0.25 }
+      let speed = max(35, width * CGFloat(settings.danmakuSpeed))
+      let travel = width * 2 + 24
+      let passTime = TimeInterval(travel / speed)
+      let fontSize = CGFloat(settings.danmakuFontSize > 0 ? settings.danmakuFontSize : 17)
+      let lineHeight = fontSize + 8
+      let maxLines = settings.danmakuMaxLines > 0
+        ? settings.danmakuMaxLines
+        : max(1, Int(danmakuView.bounds.height / lineHeight))
+      return passTime / Double(maxLines)
+    }()
+    let burstSpacing = lastChatPollInterval / Double(pendingChatMessages.count + 1)
+    let spacing = min(max(max(burstSpacing, laneCapacity), 0.18), 0.9)
     let work = DispatchWorkItem { [weak self] in self?.dripNextChatMessage() }
     chatDripWorkItem = work
     DispatchQueue.main.asyncAfter(deadline: .now() + spacing, execute: work)
