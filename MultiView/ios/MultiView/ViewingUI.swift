@@ -847,12 +847,22 @@ final class FocusedStreamView: UIView {
       if stream.platform == .youtube {
         chatWeb?.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
       }
-      chatWeb?.load(URLRequest(url: chatURL))
+      // 読み込みは super.init 後に少し遅らせて開始する（下記）。展開直後はネイティブ
+      // プレイヤーの起動を優先し、重いチャット watch ページと帯域を奪い合わせない。
     } else {
       chatWeb = nil
     }
     super.init(frame: .zero)
     backgroundColor = .black
+    // 展開直後の主役は映像。重いチャット watch ページの読み込みは僅かに遅らせ、ネイティブ
+    // プレイヤーの起動（クッキー同期→watchページ取得→HLSバッファ）に帯域/CPUを先に使わせる。
+    // 体感では即時に近いが、起動時の通信競合を避けて初回フレーム表示を早める。
+    if let chatURL {
+      let request = URLRequest(url: chatURL)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+        self?.chatWeb?.load(request)
+      }
+    }
     // 高さは ViewingController 側で可視領域いっぱいに設定する。ここでは最低限のフロアだけ
     // （必須より低い優先度なので、全画面表示の equalTo 制約と衝突しない）。
     let minHeight = heightAnchor.constraint(greaterThanOrEqualToConstant: 320)
