@@ -8320,6 +8320,7 @@ final class ViewingController: UIViewController {
   private let scrollView = UIScrollView()
   private let stack = UIStackView()
   private var focused: StreamItem?
+  private var focusedOverlay: FocusedStreamView?
   private weak var dragSourceCell: StreamCellView?
   private weak var dragTargetCell: StreamCellView?
   private let reorderIndicator = UIView()
@@ -8385,30 +8386,44 @@ final class ViewingController: UIViewController {
   func reload() {
     guard isViewLoaded else { return }
     clearStack()
+    removeFocusedOverlay()
     let streams = AppState.shared.streams
     if streams.isEmpty {
       stack.addArrangedSubview(emptyView())
       return
     }
-    addPlaybackBar()
     if let focused, streams.contains(focused) {
-      let focusedView = FocusedStreamView(stream: focused, onClose: { [weak self] in
+      // 展開（1配信フル表示）はスクロール/スタックを介さず VC の view に直接ピン留めして
+      // 画面いっぱいに固定する。スタックの .fill 配分とフル高さ制約が競合してビューが潰れ、
+      // チャットがプレイヤーサイズまで小さくなる問題を回避する。
+      let overlay = FocusedStreamView(stream: focused, onClose: { [weak self] in
         self?.focused = nil
         self?.reload()
       })
-      stack.addArrangedSubview(focusedView)
-      // 展開（1配信フル表示）は画面いっぱいに広げる。以前は最小640pt固定で、縦長端末だと
-      // 画面を埋めず小さく見えていた。再生バー＋余白分を引いた可視領域の高さに合わせる。
-      focusedView.heightAnchor.constraint(
-        equalTo: scrollView.frameLayoutGuide.heightAnchor, constant: -80
-      ).isActive = true
+      overlay.translatesAutoresizingMaskIntoConstraints = false
+      view.addSubview(overlay)
+      NSLayoutConstraint.activate([
+        overlay.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+        overlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+        overlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+        overlay.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+      ])
+      focusedOverlay = overlay
       PlaybackCoordinator.shared.resumeAll()
       return
     }
+    addPlaybackBar()
     // Every platform now has a dedicated per-cell native player, so all streams go
     // through addCells (grid / stacked). The old single-WebView fallback is gone.
     addCells(streams)
     PlaybackCoordinator.shared.resumeAll()
+  }
+
+  private func removeFocusedOverlay() {
+    guard let overlay = focusedOverlay else { return }
+    stopPlayback(in: overlay)
+    overlay.removeFromSuperview()
+    focusedOverlay = nil
   }
 
   private func clearStack() {
@@ -9294,6 +9309,11 @@ final class FocusedStreamView: UIView {
       ]
     }
     NSLayoutConstraint.activate(constraints)
+    // close/remove/volume は chatPanel より先に addSubview したため、上に来たチャットパネルに
+    // 隠れて見えなくなる（×ボタンが出ない不具合）。操作ボタン群を最前面に出す。
+    bringSubviewToFront(volume)
+    bringSubviewToFront(remove)
+    if let closeButton { bringSubviewToFront(closeButton) }
     var autoHideControls: [UIView] = [remove, volume]
     if let closeButton {
       autoHideControls.append(closeButton)
