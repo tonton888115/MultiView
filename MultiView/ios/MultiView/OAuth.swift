@@ -14,6 +14,16 @@ struct SimpleOAuthToken: Codable {
   let accessToken: String
   let expiresAt: TimeInterval
   let userID: String?
+  let refreshToken: String?
+
+  // refreshToken defaults to nil so existing call sites (and old stored tokens that
+  // predate this field) keep compiling/decoding unchanged.
+  init(accessToken: String, expiresAt: TimeInterval, userID: String?, refreshToken: String? = nil) {
+    self.accessToken = accessToken
+    self.expiresAt = expiresAt
+    self.userID = userID
+    self.refreshToken = refreshToken
+  }
 
   var isValid: Bool {
     Date().timeIntervalSince1970 < expiresAt
@@ -539,21 +549,24 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
   }
 
   func sendChat(channel: String, content: String, completion: @escaping (Result<Void, Error>) -> Void) {
-    guard let token = OAuthKeychain.load(account: tokenAccount), token.isValid else {
-      Self.finish(completion, .failure(OAuthServiceError.message("YouTubeにログインしてください")))
-      return
-    }
-    resolveVideoID(from: channel) { result in
+    withValidAccessToken { result in
       switch result {
       case .failure(let error):
         Self.finish(completion, .failure(error))
-      case .success(let videoID):
-        self.resolveLiveChatID(videoID: videoID, accessToken: token.accessToken) { chatResult in
-          switch chatResult {
+      case .success(let accessToken):
+        self.resolveVideoID(from: channel) { result in
+          switch result {
           case .failure(let error):
             Self.finish(completion, .failure(error))
-          case .success(let liveChatID):
-            self.postMessage(liveChatID: liveChatID, message: content, accessToken: token.accessToken, completion: completion)
+          case .success(let videoID):
+            self.resolveLiveChatID(videoID: videoID, accessToken: accessToken) { chatResult in
+              switch chatResult {
+              case .failure(let error):
+                Self.finish(completion, .failure(error))
+              case .success(let liveChatID):
+                self.postMessage(liveChatID: liveChatID, message: content, accessToken: accessToken, completion: completion)
+              }
+            }
           }
         }
       }
@@ -561,18 +574,82 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
   }
 
   func resolveLiveChat(videoID: String, completion: @escaping (Result<(liveChatID: String, accessToken: String), Error>) -> Void) {
-    guard let token = OAuthKeychain.load(account: tokenAccount), token.isValid else {
-      Self.finish(completion, .failure(OAuthServiceError.message("YouTubeチャット弾幕: YouTubeにログインしてください")))
-      return
-    }
-    resolveLiveChatID(videoID: videoID, accessToken: token.accessToken) { result in
+    withValidAccessToken { result in
       switch result {
       case .failure(let error):
         Self.finish(completion, .failure(error))
-      case .success(let liveChatID):
-        Self.finish(completion, .success((liveChatID, token.accessToken)))
+      case .success(let accessToken):
+        self.resolveLiveChatID(videoID: videoID, accessToken: accessToken) { result in
+          switch result {
+          case .failure(let error):
+            Self.finish(completion, .failure(error))
+          case .success(let liveChatID):
+            Self.finish(completion, .success((liveChatID, accessToken)))
+          }
+        }
       }
     }
+  }
+
+  // Returns a usable access token, transparently refreshing via the stored refresh
+  // token when the current one has expired. YouTube access tokens last ~1h, which is
+  // why the danmaku used to stop (and only a manual re-login fixed it).
+  private func withValidAccessToken(completion: @escaping (Result<String, Error>) -> Void) {
+    guard let token = OAuthKeychain.load(account: tokenAccount) else {
+      Self.finish(completion, .failure(OAuthServiceError.message("YouTubeチャット弾幕: YouTubeにログインしてください")))
+      return
+    }
+    if token.isValid {
+      Self.finish(completion, .success(token.accessToken))
+      return
+    }
+    guard let refreshToken = token.refreshToken else {
+      Self.finish(completion, .failure(OAuthServiceError.message("YouTubeログインの期限が切れました。設定から一度だけ再ログインしてください（以降は自動更新されます）")))
+      return
+    }
+    refreshAccessToken(refreshToken) { result in
+      switch result {
+      case .success(let newToken):
+        OAuthKeychain.save(newToken, account: self.tokenAccount)
+        Self.finish(completion, .success(newToken.accessToken))
+      case .failure(let error):
+        Self.finish(completion, .failure(error))
+      }
+    }
+  }
+
+  private func refreshAccessToken(_ refreshToken: String, completion: @escaping (Result<SimpleOAuthToken, Error>) -> Void) {
+    var request = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
+    request.httpMethod = "POST"
+    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    request.httpBody = Self.formBody([
+      "client_id": config.clientId,
+      "grant_type": "refresh_token",
+      "refresh_token": refreshToken
+    ])
+    URLSession.shared.dataTask(with: request) { data, response, error in
+      if let error {
+        Self.finish(completion, .failure(error))
+        return
+      }
+      guard let data,
+            let http = response as? HTTPURLResponse,
+            (200..<300).contains(http.statusCode),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let accessToken = json["access_token"] as? String else {
+        Self.finish(completion, .failure(OAuthServiceError.message("YouTubeトークン更新に失敗しました。設定から再ログインしてください")))
+        return
+      }
+      let expiresIn = json["expires_in"] as? Double ?? 3600
+      // A refresh response usually omits refresh_token; keep the existing one.
+      let newRefresh = (json["refresh_token"] as? String) ?? refreshToken
+      Self.finish(completion, .success(SimpleOAuthToken(
+        accessToken: accessToken,
+        expiresAt: Date().timeIntervalSince1970 + max(60, expiresIn - 60),
+        userID: nil,
+        refreshToken: newRefresh
+      )))
+    }.resume()
   }
 
   func fetchLiveChatMessages(
@@ -685,7 +762,8 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
       OAuthKeychain.save(SimpleOAuthToken(
         accessToken: accessToken,
         expiresAt: Date().timeIntervalSince1970 + max(60, expiresIn - 60),
-        userID: nil
+        userID: nil,
+        refreshToken: json["refresh_token"] as? String
       ), account: self.tokenAccount)
       Self.finish(completion, .success(()))
     }.resume()
