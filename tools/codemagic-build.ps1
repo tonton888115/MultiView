@@ -50,7 +50,11 @@ $outDir = Split-Path -Path $Output -Parent
 if ($outDir -and -not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 
 Write-Host "Downloading IPA from $($ipa.url)"
-Invoke-WebRequest -Uri $ipa.url -OutFile $Output -Headers $headers
+# curl.exe を使う: 成果物URLは api.codemagic.io（要 x-auth-token）→ S3 プリサインURL へ
+# クロスホスト301する。Invoke-WebRequest は x-auth-token を S3 にも転送してしまい署名auth
+# が壊れ ExpiredToken/Forbidden になる。curl -L はクロスホスト時に認証ヘッダを落とすので正しい。
+& curl.exe -sS -L --fail -H "x-auth-token: $token" -o $Output $ipa.url
+if ($LASTEXITCODE -ne 0) { throw "IPA download failed (curl exit $LASTEXITCODE)" }
 $sizeMB = [math]::Round((Get-Item $Output).Length / 1MB, 2)
 Write-Host "Saved: $Output ($sizeMB MB)"
 
