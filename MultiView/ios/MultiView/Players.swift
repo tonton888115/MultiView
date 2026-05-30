@@ -883,11 +883,15 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   }
 
   private func protobufMessages(from url: URL) -> AsyncThrowingStream<Data, Error> {
-    AsyncThrowingStream { continuation in
+    // Capture headers up front so the streaming Task doesn't retain self. The stream's
+    // continuation holds the Task, so capturing self here would form a retain cycle that
+    // keeps the player view alive after the stream is removed.
+    let headers = niconicoPlaybackHeaders()
+    return AsyncThrowingStream { continuation in
       let task = Task {
         do {
           var request = URLRequest(url: url)
-          self.niconicoPlaybackHeaders().forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
+          headers.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
           let (bytes, response) = try await URLSession.shared.bytes(for: request)
           if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw NSError(
@@ -3530,8 +3534,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         : max(1, Int(danmakuView.bounds.height / lineHeight))
       return passTime / Double(maxLines)
     }()
+    // Spread the batch across ~one poll interval (burstSpacing) but never faster than the
+    // lanes can absorb (laneCapacity). The upper cap is generous so small batches fill the
+    // gap until the next poll instead of draining early and leaving a blank.
     let burstSpacing = lastChatPollInterval / Double(pendingChatMessages.count + 1)
-    let spacing = min(max(max(burstSpacing, laneCapacity), 0.18), 0.9)
+    let spacing = min(max(max(burstSpacing, laneCapacity), 0.18), 2.5)
     let work = DispatchWorkItem { [weak self] in self?.dripNextChatMessage() }
     chatDripWorkItem = work
     DispatchQueue.main.asyncAfter(deadline: .now() + spacing, execute: work)

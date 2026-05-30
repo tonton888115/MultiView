@@ -17,7 +17,11 @@ enum NativeDanmakuToken {
 }
 
 final class NativeDanmakuRenderer {
-  private static let imageCache = NSCache<NSURL, UIImage>()
+  private static let imageCache: NSCache<NSURL, UIImage> = {
+    let cache = NSCache<NSURL, UIImage>()
+    cache.countLimit = 240
+    return cache
+  }()
 
   static func emit(
     tokens: [NativeDanmakuToken],
@@ -39,7 +43,28 @@ final class NativeDanmakuRenderer {
     let maxLines = settings.danmakuMaxLines > 0
       ? settings.danmakuMaxLines
       : max(1, Int(root.bounds.height / lineHeight))
-    let lane = laneCursor % maxLines
+    // Pick a lane whose frontmost comment has already entered far enough that a new one
+    // (which starts off the right edge) won't overlap it. Uses the presentation layer
+    // because UIView.animate sets `frame` to the END position immediately, so the model
+    // frame can't tell us where a comment currently is on screen.
+    let lane: Int = {
+      let clearThreshold = root.bounds.width - 36
+      var laneFront = [Int: CGFloat]()
+      for sub in root.subviews {
+        let f = sub.layer.presentation()?.frame ?? sub.frame
+        let subLane = Int((f.minY - 6) / lineHeight)
+        guard subLane >= 0, subLane < maxLines else { continue }
+        laneFront[subLane] = max(laneFront[subLane] ?? -.greatestFiniteMagnitude, f.maxX)
+      }
+      for offset in 0..<maxLines {
+        let candidate = (laneCursor + offset) % maxLines
+        if (laneFront[candidate] ?? -.greatestFiniteMagnitude) < clearThreshold {
+          return candidate
+        }
+      }
+      // Every lane still has a comment near the entry edge: use the one with the most room.
+      return laneFront.min(by: { $0.value < $1.value })?.key ?? (laneCursor % maxLines)
+    }()
     let comment = makeCommentView(
       tokens: tokens,
       fontSize: fontSize,
