@@ -3288,6 +3288,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var liveChatAccessToken: String?
   private var liveChatPageToken: String?
   private var seenLiveChatMessageIDs = Set<String>()
+  // YouTube live chat is polled (batches arrive every few seconds). Queue them and
+  // drip one at a time so a batch doesn't stampede the screen all at once.
+  private var pendingChatMessages: [YouTubeLiveChatMessage] = []
+  private var chatDripWorkItem: DispatchWorkItem?
+  private var lastChatPollInterval: TimeInterval = 5
   private var watchLastMediaTime: Double = -1
   private var watchLastProgressAt = Date()
   private var laneCursor = 0
@@ -3427,6 +3432,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     liveChatAccessToken = nil
     liveChatPageToken = nil
     seenLiveChatMessageIDs.removeAll()
+    pendingChatMessages.removeAll()
+    chatDripWorkItem?.cancel(); chatDripWorkItem = nil
     YouTubeAuthManager.shared.resolveLiveChat(videoID: videoId) { [weak self] result in
       guard let self, !self.isStopped else { return }
       switch result {
@@ -3457,8 +3464,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         self.scheduleLiveChatPoll(after: 10)
       case .success(let page):
         self.liveChatPageToken = page.nextPageToken
-        self.emitLiveChatMessages(page.messages)
         let delay = max(2.0, Double(page.pollingIntervalMillis) / 1000.0)
+        self.lastChatPollInterval = delay
+        self.emitLiveChatMessages(page.messages)
         self.scheduleLiveChatPoll(after: delay)
       }
     }
@@ -3474,21 +3482,40 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private func emitLiveChatMessages(_ messages: [YouTubeLiveChatMessage]) {
-    guard !messages.isEmpty else { return }
-    for message in messages {
-      guard !seenLiveChatMessageIDs.contains(message.id) else { continue }
-      seenLiveChatMessageIDs.insert(message.id)
-      laneCursor = NativeDanmakuRenderer.emit(
-        tokens: NativeDanmakuRenderer.textTokens(message.text),
-        filterText: message.text,
-        in: danmakuView,
-        laneCursor: laneCursor,
-        settings: settings
-      )
-    }
-    if seenLiveChatMessageIDs.count > 500 {
+    let fresh = messages.filter { !seenLiveChatMessageIDs.contains($0.id) }
+    guard !fresh.isEmpty else { return }
+    fresh.forEach { seenLiveChatMessageIDs.insert($0.id) }
+    if seenLiveChatMessageIDs.count > 800 {
       seenLiveChatMessageIDs.removeAll(keepingCapacity: true)
     }
+    pendingChatMessages.append(contentsOf: fresh)
+    // A long stall can return a big backlog; cap it so we don't drip hundreds slowly.
+    if pendingChatMessages.count > 80 {
+      pendingChatMessages.removeFirst(pendingChatMessages.count - 80)
+    }
+    if chatDripWorkItem == nil {
+      dripNextChatMessage()
+    }
+  }
+
+  // Emit one queued message, then schedule the next so a polled batch is spread over
+  // roughly one poll interval instead of all appearing at the same instant.
+  private func dripNextChatMessage() {
+    chatDripWorkItem = nil
+    guard !isStopped, settings.showChat, !pendingChatMessages.isEmpty else { return }
+    let message = pendingChatMessages.removeFirst()
+    laneCursor = NativeDanmakuRenderer.emit(
+      tokens: NativeDanmakuRenderer.textTokens(message.text),
+      filterText: message.text,
+      in: danmakuView,
+      laneCursor: laneCursor,
+      settings: settings
+    )
+    guard !pendingChatMessages.isEmpty else { return }
+    let spacing = min(max(lastChatPollInterval / Double(pendingChatMessages.count), 0.18), 0.9)
+    let work = DispatchWorkItem { [weak self] in self?.dripNextChatMessage() }
+    chatDripWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + spacing, execute: work)
   }
 
   func stopPlayback() {
@@ -3497,6 +3524,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     teardownExtractor()
     sponsorTask?.cancel(); sponsorTask = nil
     chatPollWorkItem?.cancel(); chatPollWorkItem = nil
+    chatDripWorkItem?.cancel(); chatDripWorkItem = nil
+    pendingChatMessages.removeAll()
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
