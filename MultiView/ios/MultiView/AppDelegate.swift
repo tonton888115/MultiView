@@ -1309,12 +1309,12 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
 
 }
 
-private enum NativeDanmakuToken {
+enum NativeDanmakuToken {
   case text(String)
   case image(URL)
 }
 
-private final class NativeDanmakuRenderer {
+final class NativeDanmakuRenderer {
   private static let imageCache = NSCache<NSURL, UIImage>()
 
   static func emit(
@@ -1491,7 +1491,7 @@ private final class NativeDanmakuRenderer {
   }
 }
 
-private enum NativeGiftEffectStyle: CaseIterable {
+enum NativeGiftEffectStyle: CaseIterable {
   case gift
   case premiumGift
   case heart
@@ -1613,7 +1613,7 @@ private enum NativeGiftEffectStyle: CaseIterable {
   }
 }
 
-private final class NativeGiftSoundMixer: NSObject, AVAudioPlayerDelegate {
+final class NativeGiftSoundMixer: NSObject, AVAudioPlayerDelegate {
   static let shared = NativeGiftSoundMixer()
 
   private var soundCache: [NativeGiftEffectStyle: Data] = [:]
@@ -1715,7 +1715,7 @@ private final class NativeGiftSoundMixer: NSObject, AVAudioPlayerDelegate {
   }
 }
 
-private final class NiconicoGiftEffectCache {
+final class NiconicoGiftEffectCache {
   static let shared = NiconicoGiftEffectCache()
 
   private let memoryImages = NSCache<NSURL, UIImage>()
@@ -1916,7 +1916,7 @@ private final class NiconicoGiftEffectCache {
   }
 }
 
-private enum NativeAnimatedImageDecoder {
+enum NativeAnimatedImageDecoder {
   static func image(from data: Data) -> UIImage? {
     animatedImage(from: data) ?? UIImage(data: data)
   }
@@ -1949,7 +1949,7 @@ private enum NativeAnimatedImageDecoder {
   }
 }
 
-private final class NativeOnceGate {
+final class NativeOnceGate {
   private var didRun = false
 
   func run(_ body: () -> Void) {
@@ -1959,7 +1959,7 @@ private final class NativeOnceGate {
   }
 }
 
-private enum NativeEventOverlay {
+enum NativeEventOverlay {
   static func show(_ text: String, in root: UIView, tint: UIColor) {
     let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !message.isEmpty else { return }
