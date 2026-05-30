@@ -62,9 +62,12 @@ final class NativeDanmakuRenderer {
           return candidate
         }
       }
-      // Every lane still has a comment near the entry edge: use the one with the most room.
-      return laneFront.min(by: { $0.value < $1.value })?.key ?? (laneCursor % maxLines)
+      // Every lane still has a comment near the entry edge: signal "no room".
+      return -1
     }()
+    // Screen is full — drop this comment instead of stacking it on an occupied lane, so a
+    // busy chat stays readable (a clearing flow, not a wall of overlapping text).
+    guard lane >= 0 else { return laneCursor }
     let comment = makeCommentView(
       tokens: tokens,
       fontSize: fontSize,
