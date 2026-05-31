@@ -54,6 +54,10 @@ struct AppSettings: Codable {
   var danmakuMaxLines = 0
   var danmakuMaxLength = 0
   var niconicoLowLatency = false
+  var giftSoundEnabled = true
+  var niconicoShowGift = true
+  var niconicoShowNicoad = true
+  var niconicoShowNotification = true
   var platformOrder = StreamPlatform.allCases
 
   init() {}
@@ -73,6 +77,10 @@ struct AppSettings: Codable {
     danmakuMaxLines = try container.decodeIfPresent(Int.self, forKey: .danmakuMaxLines) ?? 0
     danmakuMaxLength = try container.decodeIfPresent(Int.self, forKey: .danmakuMaxLength) ?? 0
     niconicoLowLatency = try container.decodeIfPresent(Bool.self, forKey: .niconicoLowLatency) ?? false
+    giftSoundEnabled = try container.decodeIfPresent(Bool.self, forKey: .giftSoundEnabled) ?? true
+    niconicoShowGift = try container.decodeIfPresent(Bool.self, forKey: .niconicoShowGift) ?? true
+    niconicoShowNicoad = try container.decodeIfPresent(Bool.self, forKey: .niconicoShowNicoad) ?? true
+    niconicoShowNotification = try container.decodeIfPresent(Bool.self, forKey: .niconicoShowNotification) ?? true
     platformOrder = try container.decodeIfPresent([StreamPlatform].self, forKey: .platformOrder) ?? StreamPlatform.allCases
   }
 }

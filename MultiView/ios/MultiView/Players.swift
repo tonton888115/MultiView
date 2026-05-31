@@ -1610,6 +1610,12 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
 
   private func emitSupportEvent(_ event: NiconicoSupportEvent) {
     DispatchQueue.main.async {
+      // 種別ごとの表示オン/オフ(設定)。OFFの種別はここで弾く。
+      switch event.kind {
+      case .gift: guard self.settings.niconicoShowGift else { return }
+      case .nicoad: guard self.settings.niconicoShowNicoad else { return }
+      case .notification, .akashic: guard self.settings.niconicoShowNotification else { return }
+      }
       if let id = event.id {
         if self.seenSupportEventIDs.contains(id) { return }
         if self.seenSupportEventIDs.count > 500 {
@@ -1627,7 +1633,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       }
       self.lastSupportAlert = (dedupeText, now)
       NiconicoGiftEffectCache.shared.prewarmAsset(event.assetURL)
-      NativeGiftSoundMixer.shared.play(style: event.effectStyle, enabled: self.settings.playAudio, volume: self.playbackVolume)
+      NativeGiftSoundMixer.shared.play(style: event.effectStyle, enabled: self.settings.giftSoundEnabled, volume: self.playbackVolume)
       self.showSupportEvent(event)
     }
   }
@@ -1676,7 +1682,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       return
     }
     lastSupportAlert = (text, now)
-    NativeGiftSoundMixer.shared.play(style: .gift, enabled: settings.playAudio, volume: playbackVolume)
+    NativeGiftSoundMixer.shared.play(style: .gift, enabled: settings.giftSoundEnabled, volume: playbackVolume)
     NativeEventOverlay.showSupport(
       title: compactSupportText(text, limit: 52),
       subtitle: nil,

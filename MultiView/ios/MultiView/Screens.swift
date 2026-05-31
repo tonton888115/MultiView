@@ -423,7 +423,7 @@ final class SettingsController: UITableViewController {
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     guard let sec = Sec(rawValue: section) else { return 0 }
     switch sec {
-    case .playback: return 6
+    case .playback: return 10
     case .danmaku: return 6
     case .order: return platforms.count
     case .kick: return 5
@@ -552,10 +552,30 @@ final class SettingsController: UITableViewController {
         cell.accessoryView = qualityControl(selected: AppState.shared.settings.mobileQuality) { quality in
           var s = AppState.shared.settings; s.mobileQuality = quality; AppState.shared.settings = s
         }
-      default:
+      case 5:
         cell.textLabel?.text = "ニコ生 低遅延 (カクつくことがあります)"
         cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoLowLatency) { v in
           var s = AppState.shared.settings; s.niconicoLowLatency = v; AppState.shared.settings = s
+        }
+      case 6:
+        cell.textLabel?.text = "ギフト通知音"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.giftSoundEnabled) { v in
+          var s = AppState.shared.settings; s.giftSoundEnabled = v; AppState.shared.settings = s
+        }
+      case 7:
+        cell.textLabel?.text = "ニコ生 ギフト通知を表示"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoShowGift) { v in
+          var s = AppState.shared.settings; s.niconicoShowGift = v; AppState.shared.settings = s
+        }
+      case 8:
+        cell.textLabel?.text = "ニコ生 ニコニ広告を表示"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoShowNicoad) { v in
+          var s = AppState.shared.settings; s.niconicoShowNicoad = v; AppState.shared.settings = s
+        }
+      default:
+        cell.textLabel?.text = "ニコ生 お知らせ通知を表示"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoShowNotification) { v in
+          var s = AppState.shared.settings; s.niconicoShowNotification = v; AppState.shared.settings = s
         }
       }
     case .danmaku:
