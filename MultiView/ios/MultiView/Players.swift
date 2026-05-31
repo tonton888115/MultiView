@@ -1774,18 +1774,24 @@ final class KickLowLatencyLoader: NSObject, AVAssetResourceLoaderDelegate {
     var req = URLRequest(url: real)
     headers.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
     session.dataTask(with: req) { data, response, error in
-      guard let data, error == nil else {
-        loadingRequest.finishLoading(with: error ?? NSError(domain: "KickLL", code: -1))
+      if let error {
+        loadingRequest.finishLoading(with: error)
         return
       }
-      var outData = data
-      let text = String(data: data, encoding: .utf8)
-      if let text, text.hasPrefix("#EXTM3U") {
-        outData = Data(Self.rewritePlaylist(text).utf8)
-        loadingRequest.contentInformationRequest?.contentType = "application/vnd.apple.mpegurl"
-      } else if let mime = (response as? HTTPURLResponse)?.mimeType {
-        loadingRequest.contentInformationRequest?.contentType = mime
+      // このローダーへの要求は必ずプレイリスト(マスター/メディア)。セグメント(.ts)はhttps直取得。
+      // 非2xx(トークン失効の403等)やプレイリスト以外(HTMLエラー本文)を有効データとして
+      // AVPlayerへ渡すと不正データで詰まる(=「開けません」)ため、ここで明示的に失敗させ、
+      // 上位の再取得リトライ(handleNativeFailure)へ繋ぐ。Codex指摘①。
+      let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+      guard (200..<300).contains(status), let data,
+            let text = String(data: data, encoding: .utf8), text.hasPrefix("#EXTM3U") else {
+        loadingRequest.finishLoading(with: NSError(
+          domain: "KickLL", code: status == 0 ? -1 : status,
+          userInfo: [NSLocalizedDescriptionKey: "Kickプレイリスト取得失敗(HTTP \(status))"]))
+        return
       }
+      let outData = Data(Self.rewritePlaylist(text).utf8)
+      loadingRequest.contentInformationRequest?.contentType = "application/vnd.apple.mpegurl"
       loadingRequest.contentInformationRequest?.contentLength = Int64(outData.count)
       loadingRequest.contentInformationRequest?.isByteRangeAccessSupported = false
       loadingRequest.dataRequest?.respond(with: outData)
@@ -1825,6 +1831,12 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private var kickChannelID: String?
   private var liveCatchUpTimer: Timer?
   private var lowLatencyLoader: KickLowLatencyLoader?
+  // 直近のplayback_url(素HLS再試行用)、再生世代(古いitemのKVO/通知を無視)、
+  // ネイティブ再取得リトライ回数(トークン失効時に新URL取得。上限超過でのみweb UIへ)。Codex指摘②③④。
+  private var currentHLSURL: URL?
+  private var playbackGeneration = 0
+  private var nativeRetryCount = 0
+  private let maxNativeRetries = 2
   private lazy var stallWatchdog = StallWatchdog(player: player) { [weak self] in
     self?.recoverFromStall()
   }
@@ -2019,6 +2031,9 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     DispatchQueue.main.async {
       guard !self.isStopped else { return }
       self.statusLabel.isHidden = true
+      self.currentHLSURL = hlsURL
+      self.playbackGeneration += 1
+      let generation = self.playbackGeneration
       let headers = self.kickPlaybackHeaders()
       let assetURL: URL
       if lowLatency, var llComponents = URLComponents(url: hlsURL, resolvingAgainstBaseURL: false) {
@@ -2049,20 +2064,16 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
-          DispatchQueue.main.async {
-            guard let self else { return }
-            if lowLatency {
-              // 低遅延ローダーで開けなかった→素のHLSでネイティブ再試行(web UIに落とす前に)。
-              self.play(hlsURL: hlsURL, lowLatency: false)
-            } else {
-              self.installFallback(item.error?.localizedDescription ?? "Kickネイティブ再生に失敗しました")
-            }
-          }
+          self?.handleNativeFailure(
+            item.error?.localizedDescription ?? "Kickネイティブ再生に失敗しました",
+            wasLowLatency: lowLatency, generation: generation)
         } else if item.status == .readyToPlay {
           DispatchQueue.main.async {
-            self?.resumePlayback()
-            self?.startLiveCatchUp()
-            self?.stallWatchdog.start()
+            guard let self, generation == self.playbackGeneration else { return }
+            self.nativeRetryCount = 0   // 再生成功で再取得カウンタをリセット(長時間再生でも枯渇しない)
+            self.resumePlayback()
+            self.startLiveCatchUp()
+            self.stallWatchdog.start()
           }
         }
       }
@@ -2074,8 +2085,11 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         object: item,
         queue: .main
       ) { [weak self] notification in
+        // しばらく再生後に停止 → web UIへ即落とさず、素HLS再試行→playback_url再取得を試す。Codex指摘②。
         let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
-        self?.installFallback(error?.localizedDescription ?? "Kickネイティブ再生が停止しました")
+        self?.handleNativeFailure(
+          error?.localizedDescription ?? "Kickネイティブ再生が停止しました",
+          wasLowLatency: lowLatency, generation: generation)
       }
       self.player.replaceCurrentItem(with: item)
       self.player.isMuted = !self.settings.playAudio
@@ -2114,11 +2128,50 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
               toleranceAfter: .zero) { _ in }
   }
 
+  // 失敗item/通知/タイマー/ウォッチドッグ/ローダーを一掃(再接続・再試行前の後始末)。Codex指摘④。
+  private func teardownPlayback() {
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = nil
+    stallWatchdog.stop()
+    lowLatencyLoader = nil
+    itemStatusObservation = nil
+    if let obs = itemFailedObserver {
+      NotificationCenter.default.removeObserver(obs)
+      itemFailedObserver = nil
+    }
+    player.replaceCurrentItem(with: nil)
+  }
+
+  // ネイティブ再生失敗の共通処理。web UIへ落とす前に: ①低遅延ローダー失敗→素HLS再試行
+  // ②素HLSも失敗(=playback_url/トークン失効の可能性)→チャンネル再取得で新URLを取り直し再生。
+  // 上限(maxNativeRetries)超過時のみ web UI フォールバック。古い世代の失敗通知は無視。Codex指摘②③。
+  private func handleNativeFailure(_ reason: String, wasLowLatency: Bool, generation: Int) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil,
+            generation == self.playbackGeneration else { return }
+      if wasLowLatency, let url = self.currentHLSURL {
+        self.play(hlsURL: url, lowLatency: false)
+        return
+      }
+      if self.nativeRetryCount < self.maxNativeRetries {
+        self.nativeRetryCount += 1
+        self.teardownPlayback()
+        self.channelTask?.cancel()
+        self.channelTask = nil
+        self.isLoading = false
+        self.showStatus("Kick再接続中(\(self.nativeRetryCount)/\(self.maxNativeRetries))")
+        self.loadNativeStream()
+        return
+      }
+      self.installFallback(reason)
+    }
+  }
+
   // ストール検知時のネイティブ再接続(webviewフォールバックではなく Kick HLS を取り直す)。
   private func recoverFromStall() {
     guard !isStopped, fallbackWebView == nil else { return }
     showStatus("再生が止まったため再接続中")
-    player.replaceCurrentItem(with: nil)
+    teardownPlayback()
     channelTask?.cancel()
     channelTask = nil
     isLoading = false
