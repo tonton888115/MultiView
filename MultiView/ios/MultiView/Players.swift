@@ -616,7 +616,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       // LL-HLS 配信時のみライブエッジから一定位置を狙う(通常HLSはno-op)。設定「ニコ生 低遅延」
       // ON で 4→1.5 秒に詰める(LL-HLS配信なら遅延が縮む。通常HLSなら効かないのでローダーが別途必要)。
       item.configuredTimeOffsetFromLive = self.settings.niconicoLowLatency
-        ? CMTime(seconds: 1.5, preferredTimescale: 600)
+        ? CMTime(seconds: 1.0, preferredTimescale: 600)
         : CMTime(seconds: 4, preferredTimescale: 1)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -2702,8 +2702,9 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
-      // Twitchはfast_bread=trueでLL-HLSが出る場合があるので、ライブエッジ4秒オフセット指定。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 4, preferredTimescale: 1)
+      // Twitchはfast_bread=trueでLL-HLSが出るので configuredTimeOffsetFromLive が効く。
+      // ライブエッジから2秒(従来4秒)に詰めて低遅延化。LL-HLSが出ない配信ではno-op。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
@@ -3171,7 +3172,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 4, preferredTimescale: 1)
+      // LL-HLS配信なら効く。4→2秒に詰めて低遅延化(通常HLSはno-op)。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
@@ -4721,6 +4723,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     ])
     let item = AVPlayerItem(asset: asset)
     item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+    if isLive {
+      // YouTube ライブが LL-HLS なら効く(通常HLSはno-op・無害)。ライブエッジ2秒を狙う。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
+      item.automaticallyPreservesTimeOffsetFromLive = true
+    }
     itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
       guard let self else { return }
       if item.status == .failed {
