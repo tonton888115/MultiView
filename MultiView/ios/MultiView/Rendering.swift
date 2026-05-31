@@ -457,6 +457,7 @@ final class NiconicoGiftEffectCache {
   private let itemThumbnailLock = NSLock()
   private var giftionaryAPIPrewarmed = false
   private var giftionaryAPIRequestInFlight = false
+  private var giftionaryAPILastAttempt = Date.distantPast
 
   func prewarmCommonEffects() {
     queue.async {
@@ -541,6 +542,9 @@ final class NiconicoGiftEffectCache {
       guard !self.giftionaryAPIPrewarmed, !self.giftionaryAPIRequestInFlight else { return }
       guard let cookieHeader = headers["Cookie"], !cookieHeader.isEmpty else { return }
       guard let url = URL(string: "https://api.gift.nicovideo.jp/v1/my/giftionary/items/recent") else { return }
+      // 失敗時(prewarmed=false のまま)も、展開ごとに critical path で叩き続けないよう最低120秒空ける。
+      guard Date().timeIntervalSince(self.giftionaryAPILastAttempt) > 120 else { return }
+      self.giftionaryAPILastAttempt = Date()
       self.giftionaryAPIRequestInFlight = true
       var request = URLRequest(url: url)
       request.timeoutInterval = 8

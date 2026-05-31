@@ -1902,7 +1902,10 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 4, preferredTimescale: 1)
+      // Kick は低遅延HLS(LL-HLS)。ライブ端からのオフセットを 4→2 秒へ詰めて公式アプリとの
+      // 遅延差を縮める(automaticallyWaitsToMinimizeStalling=false と整合)。回線が細いと
+      // リバッファ寄りになるトレードオフ。通常HLSではこのプロパティは no-op。要実機A/B。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {

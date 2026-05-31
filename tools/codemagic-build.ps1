@@ -3,7 +3,7 @@ param(
     [string]$AppId      = '6a15829322edf308d423b90f',
     [string]$WorkflowId = 'ios-unsigned-ipa',
     [string]$Branch     = 'main',
-    [string]$Output     = (Join-Path $PSScriptRoot '..\artifacts\MultiView.ipa'),
+    [string]$Output     = '',
     [int]$PollSeconds   = 20,
     [int]$TimeoutMinutes = 60
 )
@@ -17,6 +17,20 @@ if (-not (Test-Path $tokenPath)) {
 $token = (Get-Content -Path $tokenPath -Raw).Trim()
 $headers = @{ 'x-auth-token' = $token }
 $jsonHeaders = $headers + @{ 'Content-Type' = 'application/json' }
+
+# IPAファイル名にビルド版数を付与する（同名キャッシュ衝突＝「入れたのに更新されない」を防ぐ）。
+if ([string]::IsNullOrEmpty($Output)) {
+    $pbxPath = Join-Path $PSScriptRoot '..\MultiView\ios\MultiView.xcodeproj\project.pbxproj'
+    $pbxText = Get-Content -Path $pbxPath -Raw
+    $marketing = [regex]::Match($pbxText, 'MARKETING_VERSION\s*=\s*([0-9][0-9.]*)').Groups[1].Value
+    $buildNum  = [regex]::Match($pbxText, 'CURRENT_PROJECT_VERSION\s*=\s*([0-9]+)').Groups[1].Value
+    if ([string]::IsNullOrEmpty($marketing) -or [string]::IsNullOrEmpty($buildNum)) {
+        throw "MARKETING_VERSION / CURRENT_PROJECT_VERSION を project.pbxproj から取得できませんでした"
+    }
+    $ipaName = "MultiView-$marketing-b$buildNum.ipa"
+    $Output  = Join-Path $PSScriptRoot "..\artifacts\$ipaName"
+    Write-Host "Versioned IPA name: $ipaName"
+}
 
 Write-Host "Triggering build: app=$AppId workflow=$WorkflowId branch=$Branch"
 $body = @{ appId = $AppId; workflowId = $WorkflowId; branch = $Branch } | ConvertTo-Json
@@ -63,6 +77,9 @@ if (Test-Path $icloudDir) {
     $icloudPath = Join-Path $icloudDir (Split-Path -Path $Output -Leaf)
     Copy-Item -Path $Output -Destination $icloudPath -Force
     Write-Host "Mirrored to iCloud: $icloudPath"
+    # 紛らわしいバージョン無しの旧ファイルは消す（同名キャッシュの元）。
+    $staleGeneric = Join-Path $icloudDir 'MultiView.ipa'
+    if (Test-Path $staleGeneric) { Remove-Item $staleGeneric -Force; Write-Host "Removed stale: $staleGeneric" }
 } else {
     Write-Warning "iCloud Drive Downloads not found at $icloudDir; skipped mirror."
 }
