@@ -1,43 +1,30 @@
 # MultiView — 複数配信の同時視聴アプリ (iOS / sideload)
 
-multikick のように **Kick / Twitch / YouTube / ニコ生 / ツイキャス** の配信をグリッドで同時視聴し、
-コメントを **ニコニコ生放送風に右→左へ流す弾幕** で表示する iOS アプリです。
+[English](README.en.md) ｜ 日本語
 
-Windows だけで開発でき、**クラウドの Mac (GitHub Actions) で未署名 IPA をビルド**して、
-**Sideloadly** で自分の Apple ID により iPhone へインストールします。
+**Kick / Twitch / YouTube / ニコ生 / ツイキャス** の配信をグリッドで**同時視聴**し、コメントを
+**ニコ生風に右→左へ流す弾幕**で表示する iOS アプリです。各サービスは**ネイティブプレイヤー**で再生し、
+拡大表示・ドラッグ並べ替え・端末間引き継ぎ(QR)などに対応します。
+
+Windows だけで開発でき、**クラウドの Mac (Codemagic) で未署名 IPA をビルド**し、**LiveContainer**
+（推奨）または Sideloadly で iPhone にインストールします。
 
 リポジトリ: **https://github.com/tonton888115/MultiView** (public)
+
+> ⚠️ 個人利用・自分のアカウントでのサイドロード前提のツールです。各サービスの利用規約は各自で確認してください。
 
 ---
 
 ## 主な機能
 
 - **下タブ 4 つ**: フォロー / ランキング / 視聴 / 設定
-- **ランキングタブ**: [ikioi-ranking](https://ikioi-ranking.com) を表示し、配信をタップするだけで同時視聴に追加
-- **フォロータブ**: 各サービスにログインして、フォロー中の配信をタップで追加
-- **視聴タブ**: グリッド同時視聴。セルの **⛶** で拡大すると、動画の下にチャット(入力欄付き)が出る
-- **弾幕**: ニコ生風に右→左へ流れるコメント
-- **Dr.Maggot 風フィルタ**: NG ワード / NG ユーザー / 最大文字数、弾幕の速度・不透明度・文字サイズ・最大行数
-- **自己完結**: プレイヤー HTML をアプリに内蔵。**GitHub Pages も URL 入力も不要**
-
----
-
-## 構成
-
-```
-APP/                    ← git リポジトリのルート
-├─ MultiView/           ← React Native アプリ
-│  ├─ App.tsx           ← タブ・グリッド・状態
-│  └─ src/
-│     ├─ playerHtml.ts  ← 内蔵プレイヤー(埋め込み+弾幕+チャット受信)
-│     ├─ components/    ← タブ・グリッド・セル・設定 など
-│     └─ parseStreamUrl.ts ← ランキング等のリンク→配信判定
-├─ cloudflare-worker/   ← (任意) Kick/ツイキャスのコメント用 CORS プロキシ
-└─ .github/workflows/   ← 未署名 IPA を作る CI
-```
-
-プレイヤーは `source={{ html, baseUrl }}` でアプリ内 HTML を読み込みます。Twitch の埋め込み要件
-(`parent`)は `baseUrl` のホスト (`multiview.local`) を使って満たしています。
+- **視聴タブ**: グリッド同時視聴。セルの **⤢** で 1 配信を拡大、長押しで並べ替え、**×** で削除
+- **ネイティブ再生**: 5 サービスそれぞれ専用プレイヤー（YouTube は HLS 抽出、Kick/Twitch/ツイキャスは HLS、ニコ生は番組ページの HLS + コメント WebSocket）
+- **弾幕**: ニコ生風に右→左へ流れるコメント（表示/速度/不透明度/文字サイズ/最大行数/最大文字数を設定可）。ニコ生はギフト演出も表示
+- **コメント送信**: 可能なサービスはアプリ内入力欄から、未対応は拡大時の公式チャットからログインして送信
+- **端末間引き継ぎ**: 視聴タブの QR ボタンで、開いているタブ一式を iPad↔iPhone に引き継ぎ（QR スキャン or クリップボード、サーバ不要）
+- **低遅延チューニング**: Kick は IVS プレイリストを横取りして低遅延化、ニコ生は設定で低遅延トグル
+- **画質**: Wi-Fi / モバイルで別々に高画質/エコノミーを設定
 
 ---
 
@@ -45,83 +32,92 @@ APP/                    ← git リポジトリのルート
 
 | サービス | 映像 | 弾幕(右→左) | コメント送信 |
 |---|---|---|---|
-| Twitch | ✅ | ✅ 匿名受信 | ✅ 拡大時に公式チャット(ログイン) |
-| Kick | ✅ | ⚠️ Worker 任意 | ✅ 拡大時にネイティブ(ログイン) |
-| YouTube | ✅ | ✖️ (API 必要) | ✅ 拡大時に公式ライブチャット(ログイン) |
-| ツイキャス | ✅ | ⚠️ best-effort | ✅ 拡大時にネイティブ(ログイン) |
-| ニコ生 | △ 番組ページを直接表示 | 純正コメント | ✅ 番組ページ内で入力 |
-
-> ニコ生のライブは公式 iframe 埋め込みが無いため番組ページを直接表示します(純正の映像+コメント)。
-> YouTube のライブチャット弾幕は API が必要なため未対応(視聴とチャット入力は可能)。
+| Twitch | ✅ ネイティブ HLS | ✅ 匿名受信 | ✅ 拡大時に公式チャット(ログイン) |
+| Kick | ✅ ネイティブ HLS (低遅延化) | ✅ Pusher 受信 | ✅ ネイティブ(OAuth ログイン) |
+| YouTube | ✅ HLS 抽出 | △ Data API + OAuth が必要 | ✅ 拡大時に公式ライブチャット(ログイン) |
+| ツイキャス | ✅ ネイティブ HLS | ⚠️ best-effort | ✅ ネイティブ(OAuth ログイン) |
+| ニコ生 | ✅ HLS + 純正コメント | 純正コメント + ギフト | ✅ ネイティブ(要 user_session ログイン) |
 
 ---
 
-## ビルド & インストール
+## 開発 & ビルド（Windows）
 
-### 1. 変更を push (リポジトリは作成済み)
+- アプリ本体は **`MultiView/ios/MultiView/*.swift`**（UIKit ネイティブ）。RN プロジェクトの足回りを流用しつつ、UI は完全ネイティブです。
+- iOS のビルドには Mac が必要なので **Codemagic**（クラウド Mac）で未署名 IPA を作ります。GitHub Actions は使いません。
 
 ```powershell
-git add -A
-git commit -m "変更内容"
-git push
+# 1. 変更を main にコミット & プッシュ
+git add -A; git commit -m "変更内容"; git push origin main
+
+# 2. Codemagic でビルド → IPA を artifacts と iCloud にDL
+#    (バージョン付きファイル名 MultiView-<version>-b<build>.ipa で出力されます)
+tools\codemagic-build.ps1
 ```
 
-> public なので GitHub Actions の macOS ビルドは無料です。
+> Codemagic の API トークンは `~/.codemagic/token` に保存しておきます（`codemagic.yaml` の `ios-unsigned-ipa` ワークフローをビルド）。
 
-### 2. 未署名 IPA をビルド
+---
 
-**Actions タブ → 「Build iOS (unsigned IPA)」**(`MultiView/` を push すると自動実行)。
-完了後、実行画面下部の **Artifacts** から `MultiView-unsigned-ipa` をDL → 展開して `MultiView.ipa` を取得。
+## インストール（iloader + LiveContainer 推奨）
 
-### 3. Sideloadly でインストール
+無料 Apple ID の「7日失効・同時3アプリ」を避けやすく、再インストールも楽なので **LiveContainer** を推奨します。
 
-1. Windows に **Sideloadly** (https://sideloadly.io) と **Apple 配布版**の iTunes / iCloud を入れる。
-2. iPhone を USB 接続。iOS 16+ は **設定 → プライバシーとセキュリティ → デベロッパモード** を ON。
-3. Sideloadly に `MultiView.ipa` をドラッグ → Apple ID 入力 → **Start**。
-4. iPhone の **設定 → 一般 → VPN とデバイス管理** で自分の Apple ID を信頼 → 起動。
+1. **LiveContainer を導入**: [SideStore](https://sidestore.io) もしくは [AltStore](https://altstore.io) で LiveContainer をインストール。Windows からは [**iloader**](https://github.com/nab138/iloader) を使うと導入が簡単です。
+2. **IPA を入れる**: ビルドした `MultiView-<version>-b<build>.ipa` を iPhone に渡し（iCloud Drive など）、LiveContainer の **Apps → +** から取り込む。既にある場合は**置換(replace)**、データ(ログイン Cookie)は消さない。
+3. 起動 → 設定フッターの **`MultiView x.y.z (build N)`** で版数を確認。
 
-> 無料 Apple ID は **7 日で署名失効**(都度再インストール)、**同時 3 アプリ**まで。
-
-**初回起動後すぐ使えます**(URL 入力などの初期設定は不要)。
+> 💡 **更新時はファイル名にバージョンを付ける**（`MultiView-1.1.12-b21.ipa` など）。同名 `MultiView.ipa` だと iPhone 側のキャッシュで「入れたのに更新されない」事故が起きます。`tools\codemagic-build.ps1` は自動でバージョン名を付け、古い IPA を消します。
+>
+> **代替**: [Sideloadly](https://sideloadly.io) で直接インストールも可。無料 Apple ID は 7 日で署名失効・同時 3 アプリまで。
 
 ---
 
 ## 使い方
 
-- **ランキング / フォロー** タブで配信をタップ → 視聴タブに追加。
-- **＋**(視聴タブ右下)で手動追加も可能(サービス選択 + チャンネル/動画ID/番組ID)。
-  - Kick / Twitch … チャンネル名、YouTube … 動画ID、ツイキャス … ユーザーID、ニコ生 … 番組ID
-- グリッドは画面数で自動調整、**横向きで列が増えます**。セル右上の **×** で削除、**⛶** で拡大。
-- 拡大すると動画の下にチャット(入力欄付き)が出ます。投稿には各サービスへのログインが必要。
-- **設定**タブで弾幕の表示・NG フィルタ・速度などを調整。
-- 同時視聴は **4 画面程度**が快適です。音声はミュート起動なので、聞きたい配信をタップして解除。
+- **ランキング / フォロー** タブで配信をタップ → 視聴タブに追加（**＋**で手動追加も可: サービス選択 + チャンネル名 / 動画ID / ユーザーID / 番組ID）。
+- グリッドは画面数で自動調整、**横向きで列が増えます**。セルの **⤢** で拡大、長押しで並べ替え、**×** で削除。
+- 拡大すると動画の下にチャット(入力欄付き)。投稿には各サービスへのログインが必要。
+- **設定**タブ: 音声/レイド自動追加/Web広告ブロック/画質/弾幕/ニコ生低遅延/各サービスの OAuth 連携。
 
 ---
 
-## (任意) Kick / ツイキャスの弾幕を安定させる
+## OAuth ログイン（各自の Client ID が必要）
 
-Kick の `chatroom_id` 取得やツイキャスのコメント取得は CORS で弾かれることがあります。
-無料の Cloudflare Worker を立てると安定します。
+アプリ内からのコメント送信や YouTube 弾幕などは各サービスの **OAuth アプリ登録**が要ります。**アプリには Client ID/Secret は同梱されていません**（既定は空）。各自で developer console に登録し、**設定タブから自分の Client ID を入力**してください。
 
-1. https://workers.cloudflare.com で Worker を作成し `cloudflare-worker/worker.js` を貼って Deploy。
-2. **設定タブ → CORS プロキシ** に `https://xxx.workers.dev/?url=` を設定。
-
-> Kick は bot 対策が強く Worker 経由でも弾かれることがあります。ツイキャスは概ね動きます。
+- リダイレクト URI の既定は作者の GitHub Pages の中継ページ（`https://tonton888115.github.io/MultiView/*.html`、コードを `multiview://` に戻すだけの静的ページ）を指します。**独立して使うなら自分でホストした中継ページ**に差し替え推奨。
+- YouTube は iOS クライアント ID（リバースドメイン redirect）方式。Kick は OAuth2.1 PKCE、ツイキャスは OAuth2.0。
+- トークンは iOS の **Keychain** に保存されます。
 
 ---
 
-## フェーズ2 (未実装): アプリ内の統一入力欄から API 送信
+## YouTube 抽出用 Cloudflare Worker（任意）
 
-現在のコメント送信は「拡大時に各サービスのチャット UI でログインして入力」方式です。
-「アプリ内の 1 つの入力欄から送る」には各サービスの **OAuth アプリ登録(client ID)** が必要
-(Kick = OAuth2.1 PKCE、ツイキャス = OAuth2.0)。client ID を用意できれば実装します。
+YouTube のライブ/DVR は **`cloudflare-worker/youtube-extractor`** の Worker が HLS manifest を返します。既定では作者の Worker（`multiview.rinngo0626.workers.dev`）を使いますが、**他人が大量に使うと作者の無料枠(10万req/日)を消費**します。自分で運用するなら:
+
+```sh
+cd cloudflare-worker/youtube-extractor
+npm i && npx wrangler deploy   # 自分の *.workers.dev にデプロイ
+```
+
+デプロイ後、`Players.swift` の `extractionWorkerURL` を自分の Worker URL に変更してください。Worker に秘密情報はありません（InnerTube 利用・API キー不要）。
+
+---
+
+## セキュリティ / 公開について
+
+- ✅ **ハードコードされた秘密情報なし**: API キー・パスワード・トークンはコードに含まれません。OAuth の Client ID/Secret は**ユーザーが入力**（既定は空）、アクセストークンは Keychain 保存。Worker にも秘密情報なし。
+- ⚠️ **公開で露出する個人識別子（秘密ではない）**: Worker URL（`*.rinngo0626.workers.dev`）、リダイレクト中継ページ（`tonton888115.github.io`）、Bundle ID（`com.rinng.multiview`）。public リポジトリなので元々公開情報です。
+- ⚠️ **他人が使う場合の論点**: ①YouTube 再生は作者の Worker を叩く（枠消費）→ 各自デプロイ推奨 ②OAuth は各自の Client ID が必要 ③リダイレクト中継ページを共用すると OAuth code が一瞬その静的ページを通る（独立運用なら自前ホスト推奨）。
+- 結論: **ソース公開自体は安全**（秘密の流出なし）。共有インフラ(Worker/中継ページ)を他人に使われたくなければ、各自デプロイ＆自分の Client ID を案内してください。
 
 ---
 
 ## 既知の制限
 
-- **iOS ビルドは Windows 単体では不可** — クラウド Mac (本リポジトリの GitHub Actions) が必要。
-- **無料 Apple ID**: 7 日失効・同時 3 アプリ。継続運用は毎週再署名 or AltStore。
-- **YouTube 弾幕**は未対応(ライブチャット API が必要)。視聴とチャット入力は可能。
-- **同時視聴数**: 端末性能次第で 3〜4 画面が実用上限。
-- 配信/チャットは各サイトの仕様変更で壊れることがあります(その場合は `src/playerHtml.ts` を修正して再ビルド)。
+- **iOS ビルドは Windows 単体不可** — クラウド Mac (Codemagic) が必要。
+- **無料 Apple ID**: 署名は 7 日失効。LiveContainer 運用だと再インストール負担が小さい。
+- **YouTube 弾幕**は Data API + OAuth が必要（視聴・チャット入力は可能）。
+- **Kick の遅延**: 公式アプリは Amazon IVS 専用プレイヤーで ~2秒。本アプリは AVPlayer + 標準 HLS のため ~5秒前後が下限（プレイリスト書き換えで短縮済み）。
+- 同時視聴は端末性能次第で **3〜4 画面**が実用上限。
+- 配信/チャットは各サイトの仕様変更で壊れることがあります。
