@@ -1710,6 +1710,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private var fallbackWebView: PlayerWebView?
   private var chatroomID: String?
   private var kickChannelID: String?
+  private var liveCatchUpTimer: Timer?
   private var isLoading = false
   private var isStopped = false
   private var laneCursor = 0
@@ -1796,6 +1797,8 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
 
   func stopPlayback() {
     isStopped = true
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = nil
     channelTask?.cancel()
     channelTask = nil
     player.pause()
@@ -1915,7 +1918,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         } else if item.status == .readyToPlay {
           DispatchQueue.main.async {
             self?.resumePlayback()
-            self?.catchUpToLiveEdge()
+            self?.startLiveCatchUp()
           }
         }
       }
@@ -1937,29 +1940,41 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     }
   }
 
-  // Kick の playback_url は標準HLS寄りで、AVPlayer 既定はライブ端から数セグメント後ろ
-  // (体感10秒前後)に着く。configuredTimeOffsetFromLive は LL-HLS でしか効かないため、
-  // 再生開始時に一度だけライブ端付近(端から約4秒手前=多少バッファを残す)へシークして詰める。
-  // 端ぴったりは回線揺れで即ストールするので4秒マージン。Kickのみ・要実機A/B・戻すのは容易。
+  // リバースエンジニアリング結果: Kick=Amazon IVS の標準HLS(v3)で、実セグメントは2秒なのに
+  // TARGETDURATION=6。AVPlayer は TARGETDURATION 基準でライブ端から約3倍(≒18秒)後ろに居座る
+  // ため、2秒セグメントが端近くにあっても遅延が大きい(体感10秒超)。LL-HLSタグは無いので
+  // configuredTimeOffsetFromLive は効かない。対策: 再生中に周期的にシーク可能範囲の端付近
+  // (端から3秒手前=多少のバッファ)へ寄せて遅延を詰める。Kickのみ・要実機A/B・戻すのは容易。
+  private func startLiveCatchUp() {
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+      self?.catchUpToLiveEdge()
+    }
+    catchUpToLiveEdge()
+  }
+
   private func catchUpToLiveEdge() {
-    guard !isStopped,
+    guard !isStopped, fallbackWebView == nil,
+          player.timeControlStatus == .playing,
           let item = player.currentItem,
           let liveRange = item.seekableTimeRanges.last?.timeRangeValue,
           liveRange.duration.isNumeric else { return }
     let liveEdge = CMTimeAdd(liveRange.start, liveRange.duration)
     let current = item.currentTime()
     let behind = CMTimeGetSeconds(CMTimeSubtract(liveEdge, current))
-    guard behind > 7 else { return }
-    let target = CMTimeSubtract(liveEdge, CMTime(seconds: 4, preferredTimescale: 1))
+    guard behind > 6 else { return }
+    let target = CMTimeSubtract(liveEdge, CMTime(seconds: 3, preferredTimescale: 1))
     guard CMTimeCompare(target, current) > 0 else { return }
     item.seek(to: target,
-              toleranceBefore: CMTime(seconds: 1.5, preferredTimescale: 600),
-              toleranceAfter: CMTime(seconds: 1.5, preferredTimescale: 600)) { _ in }
+              toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
+              toleranceAfter: .zero) { _ in }
   }
 
   private func installFallback(_ reason: String) {
     DispatchQueue.main.async {
       guard !self.isStopped, self.fallbackWebView == nil else { return }
+      self.liveCatchUpTimer?.invalidate()
+      self.liveCatchUpTimer = nil
       self.showStatus(reason)
       let web = PlayerWebView(stream: self.stream, settings: self.settings)
       web.setPlaybackVolume(self.playbackVolume)
