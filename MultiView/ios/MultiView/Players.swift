@@ -1915,6 +1915,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         } else if item.status == .readyToPlay {
           DispatchQueue.main.async {
             self?.resumePlayback()
+            self?.catchUpToLiveEdge()
           }
         }
       }
@@ -1934,6 +1935,26 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       self.player.volume = self.settings.playAudio ? self.playbackVolume : 0
       self.player.play()
     }
+  }
+
+  // Kick の playback_url は標準HLS寄りで、AVPlayer 既定はライブ端から数セグメント後ろ
+  // (体感10秒前後)に着く。configuredTimeOffsetFromLive は LL-HLS でしか効かないため、
+  // 再生開始時に一度だけライブ端付近(端から約4秒手前=多少バッファを残す)へシークして詰める。
+  // 端ぴったりは回線揺れで即ストールするので4秒マージン。Kickのみ・要実機A/B・戻すのは容易。
+  private func catchUpToLiveEdge() {
+    guard !isStopped,
+          let item = player.currentItem,
+          let liveRange = item.seekableTimeRanges.last?.timeRangeValue,
+          liveRange.duration.isNumeric else { return }
+    let liveEdge = CMTimeAdd(liveRange.start, liveRange.duration)
+    let current = item.currentTime()
+    let behind = CMTimeGetSeconds(CMTimeSubtract(liveEdge, current))
+    guard behind > 7 else { return }
+    let target = CMTimeSubtract(liveEdge, CMTime(seconds: 4, preferredTimescale: 1))
+    guard CMTimeCompare(target, current) > 0 else { return }
+    item.seek(to: target,
+              toleranceBefore: CMTime(seconds: 1.5, preferredTimescale: 600),
+              toleranceAfter: CMTime(seconds: 1.5, preferredTimescale: 600)) { _ in }
   }
 
   private func installFallback(_ reason: String) {
