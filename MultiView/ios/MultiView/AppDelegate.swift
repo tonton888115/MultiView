@@ -1194,7 +1194,13 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
 
   func load(stream: StreamItem, settings: AppSettings) {
     if stream.platform == .niconico {
-      var request = URLRequest(url: URL(string: "https://live.nicovideo.jp/watch/\(stream.channel)")!)
+      let programId = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard let escaped = programId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+            let url = URL(string: "https://live.nicovideo.jp/watch/\(escaped)") else {
+        loadHTMLString("<html><body style=\"background:#000;color:#fff;font-family:-apple-system;padding:16px\">ニコ生番組IDが不正です</body></html>", baseURL: nil)
+        return
+      }
+      var request = URLRequest(url: url)
       Self.mobileBrowserHeaders(referer: "https://live.nicovideo.jp/").forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
       load(request)
       return

@@ -97,6 +97,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   // NDGR コメントが最後に成功した時刻。VIEW/SEGMENT 両方のループから更新され、
   // 60 秒成功なしでフル再読み込みへ escalation する閾値判定に使う。
   private var ndgrLastSuccessAt = Date()
+  private var ndgrReconnectStartedAt: Date?
   private lazy var stallWatchdog = StallWatchdog(player: player) { [weak self] in
     self?.recoverPlaybackError("再生が止まったため再接続中")
   }
@@ -213,6 +214,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     endCountdownRemaining = 0
     ndgrCommentTask?.cancel()
     ndgrCommentTask = nil
+    ndgrReconnectStartedAt = nil
     segmentTasks.values.forEach { $0.cancel() }
     segmentTasks.removeAll()
     activeSegmentURIs.removeAll()
@@ -852,6 +854,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     segmentTasks.removeAll()
     activeSegmentURIs.removeAll()
     ndgrLastSuccessAt = Date()
+    ndgrReconnectStartedAt = nil
     ndgrCommentTask = Task { [weak self] in
       guard let self else { return }
       await self.streamNDGRView(viewURI: viewURI)
@@ -859,8 +862,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   }
 
   // VIEW ストリーム: セグメント URI と nextAt をポーリングする長期接続。
-  // 切断時は指数バックオフで in-place 再接続し、本当に停止した時 (60秒途絶 または10連敗)
-  // だけフル再読み込みに escalation する。短い瞬断で発火させると映像ごと作り直して重い。
+  // 切断時は in-place 再接続し、コメント取得だけが詰まった状態を長く残さない。
   private func streamNDGRView(viewURI: String) async {
     var nextAt: String? = "now"
     var consecutiveFailures = 0
@@ -875,7 +877,12 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       guard let url = components.url else { return }
       nextAt = nil
       do {
-        for try await message in protobufMessages(from: url) {
+        var receivedMessage = false
+        for try await message in protobufMessages(from: url, timeoutInterval: 12) {
+          if consecutiveFailures > 0 {
+            clearNDGRReconnectStatus()
+          }
+          receivedMessage = true
           if let segmentURI = parseNDGRSegmentURI(fromChunkedEntry: message), !activeSegmentURIs.contains(segmentURI) {
             activeSegmentURIs.insert(segmentURI)
             let task = Task { [weak self] in
@@ -889,29 +896,42 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
           }
           // どれか1メッセージでも届けば「生きてる」と見なし、バックオフをリセット。
           consecutiveFailures = 0
+          ndgrReconnectStartedAt = nil
           ndgrLastSuccessAt = Date()
+        }
+        if !receivedMessage || nextAt == nil {
+          throw NSError(
+            domain: "NiconicoNativePlayerView",
+            code: -3,
+            userInfo: [NSLocalizedDescriptionKey: "NDGR VIEW stream closed"]
+          )
         }
       } catch {
         if Task.isCancelled || error is CancellationError { return }
         consecutiveFailures += 1
         nextAt = requestAt ?? "now"
-        let elapsedSinceSuccess = Date().timeIntervalSince(ndgrLastSuccessAt)
+        let now = Date()
+        if ndgrReconnectStartedAt == nil {
+          ndgrReconnectStartedAt = now
+        }
+        let elapsedSinceSuccess = now.timeIntervalSince(ndgrLastSuccessAt)
+        let elapsedSinceReconnect = now.timeIntervalSince(ndgrReconnectStartedAt ?? now)
         // コメントが本当に停止した時だけフル再読み込みへescalate。短い瞬断で連発すると
         // 映像ごと作り直して「ニコ生セッションを準備中」連発＋カクつきになるため控えめに。
-        // (成功から60秒途絶 または 10連敗)。それ以外は in-place の指数バックオフで粘る。
-        if elapsedSinceSuccess > 60 || consecutiveFailures >= 10 {
-          showStatus("ニコ生コメント取得失敗継続: 再読み込み")
+        // 一方で「再接続中(1)」のまま無通信で固まるケースは、VIEW stream を短い
+        // idle timeout で切り、再接続開始から12秒/3連敗で早めに再読み込みへ上げる。
+        if elapsedSinceSuccess > 20 || elapsedSinceReconnect > 12 || consecutiveFailures >= 3 {
+          showStatus("ニコ生コメント取得失敗: 再読み込み")
           DispatchQueue.main.async {
             NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
           }
           return
         }
-        let backoff = min(pow(2.0, Double(consecutiveFailures - 1)), 16.0)
+        let backoff = min(pow(2.0, Double(consecutiveFailures - 1)), 4.0)
         showStatus("ニコ生コメント再接続中 (\(consecutiveFailures))")
         try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
         continue
       }
-      if nextAt == nil { break }
     }
   }
 
@@ -947,7 +967,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
   }
 
-  private func protobufMessages(from url: URL) -> AsyncThrowingStream<Data, Error> {
+  private func protobufMessages(from url: URL, timeoutInterval: TimeInterval = 60) -> AsyncThrowingStream<Data, Error> {
     // Capture headers up front so the streaming Task doesn't retain self. The stream's
     // continuation holds the Task, so capturing self here would form a retain cycle that
     // keeps the player view alive after the stream is removed.
@@ -955,7 +975,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     return AsyncThrowingStream { continuation in
       let task = Task {
         do {
-          var request = URLRequest(url: url)
+          var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeoutInterval)
           headers.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
           let (bytes, response) = try await URLSession.shared.bytes(for: request)
           if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
@@ -977,6 +997,14 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         }
       }
       continuation.onTermination = { _ in task.cancel() }
+    }
+  }
+
+  private func clearNDGRReconnectStatus() {
+    DispatchQueue.main.async {
+      if self.statusLabel.text?.hasPrefix("ニコ生コメント再接続中") == true {
+        self.statusLabel.isHidden = true
+      }
     }
   }
 
@@ -1837,6 +1865,12 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private var playbackGeneration = 0
   private var nativeRetryCount = 0
   private let maxNativeRetries = 2
+  // 連続ストールでアグレッシブな低遅延(LLローダー+ライブ端追従)を一時停止し安定優先へ切替。
+  // 一定時間ストール無しで自動復帰(次回再接続からLL有効)。Codex#1 part2。
+  private var stallCount = 0
+  private var stableMode = false
+  private var stallCountResetWork: DispatchWorkItem?
+  private var stableModeResetWork: DispatchWorkItem?
   private lazy var stallWatchdog = StallWatchdog(player: player) { [weak self] in
     self?.recoverFromStall()
   }
@@ -1927,6 +1961,10 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   func stopPlayback() {
     isStopped = true
     stallWatchdog.stop()
+    stallCountResetWork?.cancel()
+    stallCountResetWork = nil
+    stableModeResetWork?.cancel()
+    stableModeResetWork = nil
     liveCatchUpTimer?.invalidate()
     liveCatchUpTimer = nil
     lowLatencyLoader = nil
@@ -2034,9 +2072,11 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       self.currentHLSURL = hlsURL
       self.playbackGeneration += 1
       let generation = self.playbackGeneration
+      // 安定モード中は低遅延ローダーを使わず素HLS(ライブ端から自然に離れ=ストール抑制)。Codex#1 part2。
+      let useLowLatency = lowLatency && !self.stableMode
       let headers = self.kickPlaybackHeaders()
       let assetURL: URL
-      if lowLatency, var llComponents = URLComponents(url: hlsURL, resolvingAgainstBaseURL: false) {
+      if useLowLatency, var llComponents = URLComponents(url: hlsURL, resolvingAgainstBaseURL: false) {
         llComponents.scheme = KickLowLatencyLoader.scheme
         assetURL = llComponents.url ?? hlsURL
       } else {
@@ -2066,11 +2106,12 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         if item.status == .failed {
           self?.handleNativeFailure(
             item.error?.localizedDescription ?? "Kickネイティブ再生に失敗しました",
-            wasLowLatency: lowLatency, generation: generation)
+            wasLowLatency: useLowLatency, generation: generation)
         } else if item.status == .readyToPlay {
           DispatchQueue.main.async {
             guard let self, generation == self.playbackGeneration else { return }
             self.nativeRetryCount = 0   // 再生成功で再取得カウンタをリセット(長時間再生でも枯渇しない)
+            self.scheduleStableModeReset()
             self.resumePlayback()
             self.startLiveCatchUp()
             self.stallWatchdog.start()
@@ -2089,7 +2130,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
         self?.handleNativeFailure(
           error?.localizedDescription ?? "Kickネイティブ再生が停止しました",
-          wasLowLatency: lowLatency, generation: generation)
+          wasLowLatency: useLowLatency, generation: generation)
       }
       self.player.replaceCurrentItem(with: item)
       self.player.isMuted = !self.settings.playAudio
@@ -2104,6 +2145,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   // configuredTimeOffsetFromLive は効かない。対策: 再生中に周期的にシーク可能範囲の端付近
   // (端から3秒手前=多少のバッファ)へ寄せて遅延を詰める。Kickのみ・要実機A/B・戻すのは容易。
   private func startLiveCatchUp() {
+    guard !stableMode else { return }   // 安定モードではライブ端追従せずバッファ温存(ストール抑制)
     liveCatchUpTimer?.invalidate()
     liveCatchUpTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
       self?.catchUpToLiveEdge()
@@ -2130,6 +2172,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
 
   // 失敗item/通知/タイマー/ウォッチドッグ/ローダーを一掃(再接続・再試行前の後始末)。Codex指摘④。
   private func teardownPlayback() {
+    playbackGeneration += 1
     liveCatchUpTimer?.invalidate()
     liveCatchUpTimer = nil
     stallWatchdog.stop()
@@ -2167,10 +2210,45 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     }
   }
 
+  // 安定モードで一定時間ストール無しなら低遅延へ自動復帰(ネットワーク回復時)。次回再接続からLL有効。
+  private func scheduleStableModeReset() {
+    guard stableMode else { return }
+    stallCountResetWork?.cancel()
+    stallCountResetWork = nil
+    stableModeResetWork?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, !self.isStopped else { return }
+      self.stableMode = false
+      self.stallCount = 0
+    }
+    stableModeResetWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 120, execute: work)
+  }
+
+  private func scheduleStallCountReset() {
+    guard !stableMode, stallCount > 0 else { return }
+    stallCountResetWork?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, !self.isStopped, !self.stableMode else { return }
+      self.stallCount = 0
+    }
+    stallCountResetWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 45, execute: work)
+  }
+
   // ストール検知時のネイティブ再接続(webviewフォールバックではなく Kick HLS を取り直す)。
   private func recoverFromStall() {
     guard !isStopped, fallbackWebView == nil else { return }
-    showStatus("再生が止まったため再接続中")
+    stallCount += 1
+    if stallCount >= 2 {
+      stableMode = true        // 連続ストール→安定モードへ
+      stallCountResetWork?.cancel()
+      stallCountResetWork = nil
+    } else {
+      scheduleStallCountReset()
+    }
+    stableModeResetWork?.cancel()
+    showStatus(stableMode ? "再生が不安定なため安定モードで再接続中" : "再生が止まったため再接続中")
     teardownPlayback()
     channelTask?.cancel()
     channelTask = nil
@@ -3579,15 +3657,13 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
-// Per-cell YouTube playback uses the official iframe player. Raw HLS/InnerTube
-// extraction is intentionally kept out of the startup path: it is brittle, slow
-// to fail, and not the supported YouTube integration surface.
+// Per-cell YouTube playback first tries native HLS via InnerTube, then falls back
+// to the official iframe. Older Worker/WebView/Piped extraction paths were removed
+// because they were no longer called and only added startup/network noise.
 final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, WKScriptMessageHandler {
   private static let instances = NSHashTable<YouTubeNativePlayerView>.weakObjects()
   private let stream: StreamItem
   private let settings: AppSettings
-  // AVPlayer is retained for the older extraction experiments and SponsorBlock
-  // path, but loadPlayer() now goes straight to the official iframe player.
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
   private let danmakuView = UIView()
@@ -3596,14 +3672,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var resolveTask: URLSessionDataTask?
   private var sponsorTask: URLSessionDataTask?
   private var chatPollWorkItem: DispatchWorkItem?
-  private var extractorWebView: WKWebView?
-  private var pendingVideoId: String?
   private var itemStatusObservation: NSKeyValueObservation?
   private var timeObserver: Any?
   private var sponsorSegments: [(start: Double, end: Double)] = []
   private var fallbackWebView: WKWebView?
-  private var triedPiped = false
-  private var triedInvidious = false
   private var isStopped = false
   private var iframeAudioEnabled = false
   private var liveChatID: String?
@@ -3615,8 +3687,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var pendingChatMessages: [YouTubeLiveChatMessage] = []
   private var chatDripWorkItem: DispatchWorkItem?
   private var lastChatPollInterval: TimeInterval = 5
-  private var watchLastMediaTime: Double = -1
-  private var watchLastProgressAt = Date()
   private var laneCursor = 0
   private var extractionFailures: [String] = []
 
@@ -3659,7 +3729,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     ])
     PlaybackCoordinator.shared.register(self)
     Self.instances.add(self)
-    Self.refreshInstanceListsIfNeeded()
     loadPlayer()
   }
 
@@ -3880,7 +3949,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   func stopPlayback() {
     isStopped = true
     resolveTask?.cancel(); resolveTask = nil
-    teardownExtractor()
     sponsorTask?.cancel(); sponsorTask = nil
     chatPollWorkItem?.cancel(); chatPollWorkItem = nil
     chatDripWorkItem?.cancel(); chatDripWorkItem = nil
@@ -3894,17 +3962,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     player.replaceCurrentItem(with: nil)
     fallbackWebView?.stopLoading()
     fallbackWebView?.configuration.userContentController.removeScriptMessageHandler(forName: "youtubeAudio")
-    fallbackWebView?.configuration.userContentController.removeScriptMessageHandler(forName: "youtubeStatus")
     fallbackWebView?.loadHTMLString("", baseURL: nil)
     fallbackWebView?.removeFromSuperview()
     fallbackWebView = nil
   }
-
-  // 自前デプロイの CF Worker (youtubei.js)。ライブ配信は HLS manifest URL を返す
-  // ので AVPlayer ネイティブ再生できる。VOD は CF free 枠の eval 制限により
-  // worker からは {error: vod_requires_iframe_fallback} が返り、iOS は従来の
-  // iframe 経路にフォールバックする。
-  private static let extractionWorkerURL = "https://multiview.rinngo0626.workers.dev/"
 
   private func loadPlayer() {
     let raw = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3993,374 +4054,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
-  // Worker (multiview.rinngo0626.workers.dev) を最初に試す。ライブ動画なら HLS
-  // manifest URL が返るので、iframe を一切経由せず AVPlayer ネイティブ再生する。
-  // 失敗 (VOD で iframe fallback 要求 / Worker 障害 / タイムアウト) なら従来の
-  // extractStreams (WebView + InnerTube + iframe fallback chain) に降りる。
-  private func requestWorkerExtraction(videoId: String) {
-    guard !isStopped else { return }
-    showStatus("YouTube抽出中 (Worker)")
-    guard var components = URLComponents(string: Self.extractionWorkerURL) else {
-      installAlternativeWebFallback(videoId: videoId)
-      return
-    }
-    components.queryItems = [URLQueryItem(name: "v", value: videoId)]
-    guard let url = components.url else {
-      installAlternativeWebFallback(videoId: videoId)
-      return
-    }
-    var request = URLRequest(url: url)
-    // Worker 内で youtubei.js が base.js fetch + decipher を行うため、初回は
-    // 数秒かかることがある。短すぎる timeout は iframe フォールバックを
-    // 不必要に誘発する (= ad 経由になる) ので 15 秒余裕を持たせる。
-    request.timeoutInterval = 15
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
-    resolveTask?.cancel()
-    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-      guard let self else { return }
-      DispatchQueue.main.async {
-        guard !self.isStopped, self.player.currentItem == nil else { return }
-        self.resolveTask = nil
-        let parsed = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-        if let parsed,
-           let urlStr = parsed["url"] as? String,
-           let streamURL = URL(string: urlStr) {
-          let isLive = (parsed["isLive"] as? Bool) ?? false
-          self.startPlayback(url: streamURL, videoId: videoId, isLive: isLive)
-          return
-        }
-        // Worker が error を返した、または到達失敗 → iframe fallback へ
-        if let parsed, let err = parsed["error"] as? String {
-          let reason = (parsed["reason"] as? String) ?? (parsed["subreason"] as? String) ?? ""
-          self.noteExtractionFailure("Worker: \(err)\n\(reason)")
-        } else {
-          let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-          self.noteExtractionFailure("Worker到達失敗 (HTTP \(status))")
-        }
-        self.installAlternativeWebFallback(videoId: videoId)
-      }
-    }
-    resolveTask?.resume()
-  }
-
-  // YouTube now gates raw stream URLs behind a PO token that only its own page JS can
-  // mint, so a bare InnerTube call returns nothing usable (it just fell back to the
-  // ad-laden iframe, which is also why audio fought the other cells). Instead we load
-  // the real watch page in a tiny offscreen WKWebView — YouTube's own JS mints the
-  // tokens — read the playable URL out of ytInitialPlayerResponse, and hand it to
-  // AVPlayer, the same native path Kick/Twitch use (so audio mixes cleanly and there
-  // are no injected ads).
-  private func extractStreams(videoId: String) {
-    guard !isStopped else { return }
-    showStatus("YouTube映像を取得中")
-    extractionFailures.removeAll()
-    pendingVideoId = videoId
-    triedPiped = false
-    triedInvidious = false
-    let config = WKWebViewConfiguration()
-    config.allowsInlineMediaPlayback = true
-    // The extractor only reads the page; block autoplay so the hidden web view never
-    // emits its own audio (the real playback happens in AVPlayer).
-    config.mediaTypesRequiringUserActionForPlayback = .all
-    config.websiteDataStore = .default()
-    WebAdBlocker.install(on: config)
-    let web = WKWebView(frame: CGRect(x: -20, y: -20, width: 8, height: 8), configuration: config)
-    web.customUserAgent = Self.userAgent
-    web.navigationDelegate = self
-    web.isUserInteractionEnabled = false
-    web.alpha = 0.01
-    extractorWebView = web
-    // WKWebView runs JS most reliably when in the window, so park it offscreen there.
-    if let window = UIApplication.shared.connectedScenes
-      .compactMap({ $0 as? UIWindowScene })
-      .flatMap({ $0.windows })
-      .first(where: { $0.isKeyWindow }) {
-      window.addSubview(web)
-    } else {
-      addSubview(web)
-    }
-    guard let url = URL(string: "https://m.youtube.com/watch?v=\(videoId)") else {
-      installEmbedFallback(videoId: videoId)
-      return
-    }
-    web.load(URLRequest(url: url))
-    // If the page never yields a URL, try a stream API before giving up.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 35) { [weak self] in
-      guard let self,
-            !self.isStopped,
-            self.extractorWebView != nil,
-            self.resolveTask == nil,
-            self.player.currentItem == nil else { return }
-      self.noteExtractionFailure("公式ページ: 35秒以内にURL抽出なし")
-      self.installEmbedFallback(videoId: videoId)
-    }
-  }
-
-  private func runExtraction(videoId: String, attempt: Int) {
-    guard let web = extractorWebView, !isStopped else { return }
-    web.evaluateJavaScript(Self.extractionJS) { [weak self] result, _ in
-      guard let self, !self.isStopped, self.player.currentItem == nil, self.extractorWebView != nil else { return }
-      if let json = result as? String,
-         let data = json.data(using: .utf8),
-         let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-        let isLive = (parsed["isLive"] as? Bool) ?? false
-        if let hls = parsed["hls"] as? String, let url = URL(string: hls) {
-          self.teardownExtractor()
-          self.startPlayback(url: url, videoId: videoId, isLive: isLive)
-          return
-        }
-        if let formats = parsed["formats"] as? [[String: Any]], let best = Self.bestFormatURL(formats) {
-          self.teardownExtractor()
-          self.startPlayback(url: best, videoId: videoId, isLive: false)
-          return
-        }
-        if let apiKey = parsed["apiKey"] as? String, !apiKey.isEmpty {
-          let signatureTimestamp: Int? = {
-            if let value = parsed["signatureTimestamp"] as? Int { return value }
-            if let value = parsed["signatureTimestamp"] as? NSNumber { return value.intValue }
-            if let value = parsed["signatureTimestamp"] as? String { return Int(value) }
-            return nil
-          }()
-          self.requestYouTubeIClients(
-            videoId: videoId,
-            apiKey: apiKey,
-            baseContext: parsed["context"] as? [String: Any],
-            visitorData: parsed["visitorData"] as? String,
-            poToken: parsed["poToken"] as? String,
-            signatureTimestamp: signatureTimestamp,
-            attempt: 0
-          )
-          return
-        }
-        let hasSabrOnly = (parsed["sabr"] as? Bool) == true
-        let apiKey = (parsed["apiKey"] as? String) ?? ""
-        if hasSabrOnly {
-          self.noteExtractionFailure("公式ページ: SABRのみで通常URLなし")
-        } else if apiKey.isEmpty {
-          self.noteExtractionFailure("公式ページ: API keyなし")
-        } else {
-          self.noteExtractionFailure("公式ページ: 直接URLなし")
-        }
-      } else {
-        self.noteExtractionFailure("公式ページ: JS抽出結果なし")
-      }
-      if attempt < 3 {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-          self?.runExtraction(videoId: videoId, attempt: attempt + 1)
-        }
-      } else {
-        self.installEmbedFallback(videoId: videoId)
-      }
-    }
-  }
-
-  private func requestYouTubeIClients(
-    videoId: String,
-    apiKey: String,
-    baseContext: [String: Any]?,
-    visitorData: String?,
-    poToken: String?,
-    signatureTimestamp: Int?,
-    attempt: Int
-  ) {
-    guard !isStopped, player.currentItem == nil, extractorWebView != nil else { return }
-    let clients = Self.youtubeIClientContexts(baseContext: baseContext, visitorData: visitorData)
-    guard clients.indices.contains(attempt) else {
-      installEmbedFallback(videoId: videoId)
-      return
-    }
-    let clientName = ((clients[attempt]["client"] as? [String: Any])?["clientName"] as? String) ?? "UNKNOWN"
-    showStatus("YouTube通常抽出 \(attempt + 1)/\(clients.count)\n\(clientName)")
-    var components = URLComponents(string: "https://www.youtube.com/youtubei/v1/player")!
-    components.queryItems = [URLQueryItem(name: "key", value: apiKey)]
-    guard let url = components.url else {
-      installEmbedFallback(videoId: videoId)
-      return
-    }
-    var request = URLRequest(url: url)
-    request.httpMethod = "POST"
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    let contextClient = (clients[attempt]["client"] as? [String: Any]) ?? [:]
-    let clientVersion = (contextClient["clientVersion"] as? String) ?? ""
-    let requestUserAgent = (contextClient["userAgent"] as? String) ?? Self.userAgent
-    request.setValue(requestUserAgent, forHTTPHeaderField: "User-Agent")
-    if let headerClientName = Self.youtubeClientHeaderName(clientName) {
-      request.setValue(headerClientName, forHTTPHeaderField: "X-YouTube-Client-Name")
-    }
-    if !clientVersion.isEmpty {
-      request.setValue(clientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
-    }
-    request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
-    request.setValue("https://www.youtube.com/watch?v=\(videoId)", forHTTPHeaderField: "Referer")
-    if let visitorData, !visitorData.isEmpty {
-      request.setValue(visitorData, forHTTPHeaderField: "X-Goog-Visitor-Id")
-    }
-    var contentPlaybackContext: [String: Any] = [
-      "html5Preference": "HTML5_PREF_WANTS"
-    ]
-    if let signatureTimestamp, signatureTimestamp > 0 {
-      contentPlaybackContext["signatureTimestamp"] = signatureTimestamp
-    }
-    var body: [String: Any] = [
-      "context": clients[attempt],
-      "videoId": videoId,
-      "contentCheckOk": true,
-      "racyCheckOk": true,
-      "playbackContext": [
-        "contentPlaybackContext": contentPlaybackContext
-      ]
-    ]
-    if let poToken, !poToken.isEmpty {
-      body["serviceIntegrityDimensions"] = ["poToken": poToken]
-    }
-    request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-    request.timeoutInterval = 8
-    resolveTask?.cancel()
-    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-      guard let self else { return }
-      self.resolveTask = nil
-      if let error {
-        DispatchQueue.main.async {
-          self.noteExtractionFailure("\(clientName): \(error.localizedDescription)")
-          self.requestYouTubeIClients(
-            videoId: videoId,
-            apiKey: apiKey,
-            baseContext: baseContext,
-            visitorData: visitorData,
-            poToken: poToken,
-            signatureTimestamp: signatureTimestamp,
-            attempt: attempt + 1
-          )
-        }
-        return
-      }
-      if let data,
-         let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-         let stream = Self.extractPlayableStream(from: parsed) {
-        DispatchQueue.main.async {
-          guard !self.isStopped, self.player.currentItem == nil else { return }
-          self.teardownExtractor()
-          self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive)
-        }
-        return
-      }
-      DispatchQueue.main.async {
-        let httpCode = (response as? HTTPURLResponse)?.statusCode
-        let parsed = Self.parseJSONObject(data)
-        self.noteExtractionFailure(Self.youtubeIErrorSummary(clientName: clientName, httpCode: httpCode, parsed: parsed, data: data))
-        self.requestYouTubeIClients(
-          videoId: videoId,
-          apiKey: apiKey,
-          baseContext: baseContext,
-          visitorData: visitorData,
-          poToken: poToken,
-          signatureTimestamp: signatureTimestamp,
-          attempt: attempt + 1
-        )
-      }
-    }
-    let task = resolveTask
-    resolveTask?.resume()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self, weak task] in
-      guard let self,
-            !self.isStopped,
-            self.player.currentItem == nil,
-            let task,
-            self.resolveTask === task else { return }
-      task.cancel()
-      self.resolveTask = nil
-      self.noteExtractionFailure("\(clientName): 10秒タイムアウト")
-      self.requestYouTubeIClients(
-        videoId: videoId,
-        apiKey: apiKey,
-        baseContext: baseContext,
-        visitorData: visitorData,
-        poToken: poToken,
-        signatureTimestamp: signatureTimestamp,
-        attempt: attempt + 1
-      )
-    }
-  }
-
-  private static func youtubeIClientContexts(baseContext: [String: Any]?, visitorData explicitVisitorData: String?) -> [[String: Any]] {
-    let baseClient = (baseContext?["client"] as? [String: Any]) ?? [:]
-    let hl = (baseClient["hl"] as? String) ?? "ja"
-    let gl = (baseClient["gl"] as? String) ?? "JP"
-    let visitorData = explicitVisitorData ?? (baseClient["visitorData"] as? String)
-    func context(_ name: String, _ version: String, extra: [String: Any] = [:]) -> [String: Any] {
-      var client: [String: Any] = [
-        "clientName": name,
-        "clientVersion": version,
-        "hl": hl,
-        "gl": gl
-      ]
-      if let visitorData { client["visitorData"] = visitorData }
-      extra.forEach { client[$0.key] = $0.value }
-      return ["client": client]
-    }
-    let webVersion = (baseClient["clientVersion"] as? String) ?? "2.20240501.01.00"
-    let androidVRClient = context("ANDROID_VR", "1.65.10", extra: [
-      "deviceMake": "Oculus",
-      "deviceModel": "Quest 3",
-      "androidSdkVersion": 32,
-      "userAgent": "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-      "osName": "Android",
-      "osVersion": "12L",
-      "timeZone": "UTC",
-      "utcOffsetMinutes": 0
-    ])
-    var webClients: [[String: Any]] = [
-      context("MWEB", webVersion),
-      context("WEB_SAFARI", webVersion, extra: [
-        "browserName": "Safari",
-        "browserVersion": "17.6",
-        "osName": "iOS",
-        "osVersion": "17.6"
-      ]),
-      context("WEB", webVersion, extra: [
-        "browserName": "Safari",
-        "browserVersion": "17.6",
-        "osName": "iOS",
-        "osVersion": "17.6",
-        "platform": "MOBILE"
-      ]),
-      context("WEB_EMBEDDED_PLAYER", "1.20240501.01.00", extra: [
-        "thirdParty": ["embedUrl": "https://tonton888115.github.io/MultiView/"]
-      ]),
-      context("TVHTML5_SIMPLY_EMBEDDED_PLAYER", "2.0", extra: [
-        "clientScreen": "EMBED"
-      ])
-    ]
-    if var baseContext, var client = baseContext["client"] as? [String: Any] {
-      if let visitorData { client["visitorData"] = visitorData }
-      baseContext["client"] = client
-      webClients.append(baseContext)
-    }
-    let appClients = [
-      context("IOS", "20.19.2", extra: [
-        "deviceMake": "Apple",
-        "deviceModel": "iPhone16,2",
-        "osName": "iPhone",
-        "osVersion": "18.5.0.22F76",
-        "userAgent": "com.google.ios.youtube/20.19.2 (iPhone16,2; U; CPU iOS 18_5_0 like Mac OS X; ja_JP)"
-      ]),
-      context("ANDROID", "20.19.35", extra: [
-        "androidSdkVersion": 35,
-        "deviceMake": "Google",
-        "deviceModel": "Pixel 9 Pro",
-        "osName": "Android",
-        "osVersion": "15",
-        "userAgent": "com.google.android.youtube/20.19.35 (Linux; U; Android 15) gzip"
-      ])
-    ]
-    return ([androidVRClient] + webClients + appClients).reduce(into: [[String: Any]]()) { result, context in
-      let name = ((context["client"] as? [String: Any])?["clientName"] as? String) ?? UUID().uuidString
-      if !result.contains(where: { (($0["client"] as? [String: Any])?["clientName"] as? String) == name }) {
-        result.append(context)
-      }
-    }
-  }
-
   private static func nativePlayerClients() -> [(label: String, headerClientName: String, version: String, userAgent: String, context: [String: Any])] {
     let iosVersion = "21.17.3"
     let iosUA = "com.google.ios.youtube/\(iosVersion) (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X; ja_JP)"
@@ -4407,19 +4100,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         ]
       )
     ]
-  }
-
-  private static func youtubeClientHeaderName(_ clientName: String) -> String? {
-    switch clientName {
-    case "WEB": return "1"
-    case "MWEB": return "2"
-    case "IOS": return "5"
-    case "WEB_EMBEDDED_PLAYER": return "56"
-    case "TVHTML5_SIMPLY_EMBEDDED_PLAYER": return "85"
-    case "ANDROID": return "3"
-    case "ANDROID_VR": return "28"
-    default: return nil
-    }
   }
 
   private static func extractPlayableStream(from parsed: [String: Any]) -> (url: URL, isLive: Bool)? {
@@ -4476,266 +4156,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     showStatus("YouTube抽出中\n\(trimmed)")
   }
 
-  private func extractionFailureSummary() -> String {
-    extractionFailures.suffix(5).joined(separator: "\n")
-  }
-
-  private func requestPipedStreams(videoId: String, attempt: Int = 0) {
-    guard !isStopped, player.currentItem == nil else { return }
-    triedPiped = true
-    let instances = Self.pipedAPIInstances
-    guard instances.indices.contains(attempt) else {
-      noteExtractionFailure("Piped: 全インスタンス失敗")
-      installEmbedFallback(videoId: videoId)
-      return
-    }
-    guard let url = URL(string: "\(instances[attempt])/streams/\(videoId)") else {
-      noteExtractionFailure("Piped \(attempt + 1): URL不正")
-      requestPipedStreams(videoId: videoId, attempt: attempt + 1)
-      return
-    }
-    showStatus("YouTube代替抽出 \(attempt + 1)/\(instances.count)\nPiped: \(url.host ?? instances[attempt])")
-    var request = URLRequest(url: url)
-    request.timeoutInterval = 4
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
-    resolveTask?.cancel()
-    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-      guard let self else { return }
-      self.resolveTask = nil
-      if let error {
-        DispatchQueue.main.async {
-          self.noteExtractionFailure("Piped \(url.host ?? ""): \(error.localizedDescription)")
-          self.requestPipedStreams(videoId: videoId, attempt: attempt + 1)
-        }
-        return
-      }
-      if let data,
-         let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-         let stream = Self.extractPipedStream(from: parsed) {
-        DispatchQueue.main.async {
-          guard !self.isStopped, self.player.currentItem == nil else { return }
-          self.teardownExtractor()
-          self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive)
-        }
-        return
-      }
-      DispatchQueue.main.async {
-        let httpCode = (response as? HTTPURLResponse)?.statusCode
-        let parsed = Self.parseJSONObject(data)
-        let message = Self.proxyExtractorErrorSummary(name: "Piped", host: url.host, httpCode: httpCode, parsed: parsed, data: data)
-        self.noteExtractionFailure(message)
-        self.requestPipedStreams(videoId: videoId, attempt: attempt + 1)
-      }
-    }
-    let task = resolveTask
-    resolveTask?.resume()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self, weak task] in
-      guard let self,
-            !self.isStopped,
-            self.player.currentItem == nil,
-            let task,
-            self.resolveTask === task else { return }
-      task.cancel()
-      self.resolveTask = nil
-      self.noteExtractionFailure("Piped \(url.host ?? ""): 6秒タイムアウト")
-      self.requestPipedStreams(videoId: videoId, attempt: attempt + 1)
-    }
-  }
-
-  private static func extractPipedStream(from parsed: [String: Any]) -> (url: URL, isLive: Bool)? {
-    if let hls = parsed["hls"] as? String, !hls.isEmpty, let url = URL(string: hls) {
-      return (url, true)
-    }
-    let streams = (parsed["videoStreams"] as? [[String: Any]]) ?? []
-    let candidates: [(Int, Int, URL)] = streams.compactMap { stream in
-      let videoOnly = (stream["videoOnly"] as? Bool) ?? true
-      guard !videoOnly,
-            let urlString = stream["url"] as? String,
-            let url = URL(string: urlString) else { return nil }
-      let height = (stream["height"] as? Int)
-        ?? Self.firstInt(in: (stream["quality"] as? String) ?? "")
-      let bitrate = (stream["bitrate"] as? Int) ?? 0
-      return (height, bitrate, url)
-    }
-    guard !candidates.isEmpty else { return nil }
-    let sorted = candidates.sorted {
-      if $0.0 == $1.0 { return $0.1 < $1.1 }
-      return $0.0 < $1.0
-    }
-    return ((sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.2).map { ($0, false) }
-  }
-
-  private static func firstInt(in text: String) -> Int {
-    guard let range = text.range(of: #"\d+"#, options: .regularExpression) else { return 0 }
-    return Int(String(text[range])) ?? 0
-  }
-
-  private func requestInvidiousStreams(videoId: String, attempt: Int = 0) {
-    guard !isStopped, player.currentItem == nil else { return }
-    triedInvidious = true
-    let instances = Self.invidiousAPIInstances
-    guard instances.indices.contains(attempt) else {
-      noteExtractionFailure("Invidious: 全インスタンス失敗")
-      installEmbedFallback(videoId: videoId)
-      return
-    }
-    guard let url = URL(string: "\(instances[attempt])/api/v1/videos/\(videoId)") else {
-      noteExtractionFailure("Invidious \(attempt + 1): URL不正")
-      requestInvidiousStreams(videoId: videoId, attempt: attempt + 1)
-      return
-    }
-    showStatus("YouTube別系統抽出 \(attempt + 1)/\(instances.count)\nInvidious: \(url.host ?? instances[attempt])")
-    var request = URLRequest(url: url)
-    request.timeoutInterval = 4
-    request.setValue("application/json", forHTTPHeaderField: "Accept")
-    resolveTask?.cancel()
-    resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-      guard let self else { return }
-      self.resolveTask = nil
-      if let error {
-        DispatchQueue.main.async {
-          self.noteExtractionFailure("Invidious \(url.host ?? ""): \(error.localizedDescription)")
-          self.requestInvidiousStreams(videoId: videoId, attempt: attempt + 1)
-        }
-        return
-      }
-      if let data,
-         let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-         let stream = Self.extractInvidiousStream(from: parsed) {
-        DispatchQueue.main.async {
-          guard !self.isStopped, self.player.currentItem == nil else { return }
-          self.teardownExtractor()
-          self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive)
-        }
-        return
-      }
-      DispatchQueue.main.async {
-        let httpCode = (response as? HTTPURLResponse)?.statusCode
-        let parsed = Self.parseJSONObject(data)
-        let message = Self.proxyExtractorErrorSummary(name: "Invidious", host: url.host, httpCode: httpCode, parsed: parsed, data: data)
-        self.noteExtractionFailure(message)
-        self.requestInvidiousStreams(videoId: videoId, attempt: attempt + 1)
-      }
-    }
-    let task = resolveTask
-    resolveTask?.resume()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self, weak task] in
-      guard let self,
-            !self.isStopped,
-            self.player.currentItem == nil,
-            let task,
-            self.resolveTask === task else { return }
-      task.cancel()
-      self.resolveTask = nil
-      self.noteExtractionFailure("Invidious \(url.host ?? ""): 6秒タイムアウト")
-      self.requestInvidiousStreams(videoId: videoId, attempt: attempt + 1)
-    }
-  }
-
-  private static func extractInvidiousStream(from parsed: [String: Any]) -> (url: URL, isLive: Bool)? {
-    let live = ((parsed["liveNow"] as? Bool) ?? false) || ((parsed["isUpcoming"] as? Bool) ?? false)
-    if let hls = parsed["hlsUrl"] as? String, !hls.isEmpty, let url = URL(string: hls) {
-      return (url, true)
-    }
-    let streams = (parsed["formatStreams"] as? [[String: Any]]) ?? []
-    let candidates: [(Int, URL)] = streams.compactMap { stream in
-      guard let urlString = stream["url"] as? String,
-            let url = URL(string: urlString) else { return nil }
-      let quality = (stream["qualityLabel"] as? String)
-        ?? (stream["quality"] as? String)
-        ?? ""
-      return (firstInt(in: quality), url)
-    }
-    guard !candidates.isEmpty else { return nil }
-    let sorted = candidates.sorted { $0.0 < $1.0 }
-    return ((sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.1).map { ($0, live) }
-  }
-
-  private static func proxyExtractorErrorSummary(name: String, host: String?, httpCode: Int?, parsed: [String: Any]?, data: Data?) -> String {
-    var parts: [String] = [name]
-    if let host, !host.isEmpty { parts.append(host) }
-    if let httpCode { parts.append("HTTP \(httpCode)") }
-    if let error = parsed?["error"] as? String, !error.isEmpty {
-      parts.append(error)
-    } else if let message = parsed?["message"] as? String, !message.isEmpty {
-      parts.append(message)
-    } else if parsed != nil {
-      parts.append("再生可能URLなし")
-    } else if let data, !data.isEmpty {
-      parts.append("JSON解析失敗")
-    } else {
-      parts.append("空レスポンス")
-    }
-    return parts.joined(separator: " / ")
-  }
-
-  // 2026-05 時点で API が生きている唯一のホスト。公式リストから起動時に補充するため
-  // static var で保持し、refreshInstanceListsIfNeeded() が動的に上書きする。
-  private static var pipedAPIInstances: [String] = [
-    "https://api.piped.private.coffee"
-  ]
-
-  private static var invidiousAPIInstances: [String] = [
-    "https://inv.thepixora.com"
-  ]
-
-  private static var instancesRefreshStarted = false
-
-  static func refreshInstanceListsIfNeeded() {
-    guard !instancesRefreshStarted else { return }
-    instancesRefreshStarted = true
-    refreshPipedInstances()
-    refreshInvidiousInstances()
-  }
-
-  private static func refreshPipedInstances() {
-    guard let url = URL(string: "https://piped-instances.kavin.rocks") else { return }
-    var req = URLRequest(url: url)
-    req.timeoutInterval = 5
-    URLSession.shared.dataTask(with: req) { data, _, _ in
-      guard let data,
-            let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return }
-      let urls = arr.compactMap { $0["api_url"] as? String }.filter { $0.hasPrefix("https://") }
-      guard !urls.isEmpty else { return }
-      DispatchQueue.main.async { pipedAPIInstances = urls }
-    }.resume()
-  }
-
-  private static func refreshInvidiousInstances() {
-    guard let url = URL(string: "https://api.invidious.io/instances.json") else { return }
-    var req = URLRequest(url: url)
-    req.timeoutInterval = 5
-    URLSession.shared.dataTask(with: req) { data, _, _ in
-      guard let data,
-            let arr = try? JSONSerialization.jsonObject(with: data) as? [[Any]] else { return }
-      let urls = arr.compactMap { entry -> String? in
-        guard entry.count >= 2,
-              let dict = entry[1] as? [String: Any],
-              (dict["api"] as? Bool) == true,
-              let uri = dict["uri"] as? String,
-              uri.hasPrefix("https://") else { return nil }
-        return uri
-      }
-      guard !urls.isEmpty else { return }
-      DispatchQueue.main.async { invidiousAPIInstances = urls }
-    }.resume()
-  }
-
-  // 2026 年現在 YouTube が生 URL を返さない (SABR / PoToken 強制) ため、
-  // 抽出が全滅した時は最終的に iframe 埋め込みで再生する。WebAdBlocker と
-  // 仕様強制ミュートで広告/同時オーディオ問題を緩和する。
-  private static let alternativeWebFallbacks = [
-    "https://www.youtube.com/embed/%@?autoplay=1&playsinline=1&rel=0",
-    "https://piped.video/embed/%@"
-  ]
-
-  private func teardownExtractor() {
-    extractorWebView?.navigationDelegate = nil
-    extractorWebView?.stopLoading()
-    extractorWebView?.removeFromSuperview()
-    extractorWebView = nil
-  }
-
   // AVPlayer needs a playable stream by itself. YouTube adaptive video-only URLs
   // look tempting but fail/stall without the paired audio or SABR loader, so only
   // accept muxed/progressive formats here and let the caller try the next client.
@@ -4756,167 +4176,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
     return (sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.2
   }
-
-  private static let extractionJS = """
-  (function(){
-    try {
-      function parseMaybe(value) {
-        if (!value) return null;
-        if (typeof value === 'string') { try { return JSON.parse(value); } catch(e) { return null; } }
-        return value;
-      }
-      function ytcfgValue(key) {
-        try { if (window.ytcfg && ytcfg.get) return ytcfg.get(key); } catch(e) {}
-        return null;
-      }
-      function firstString(values) {
-        for (var i = 0; i < values.length; i++) {
-          var v = values[i];
-          if (typeof v === 'string' && v.length > 0) return v;
-        }
-        return '';
-      }
-      function findInObject(root, names, depth) {
-        if (!root || depth > 7) return '';
-        if (typeof root !== 'object') return '';
-        for (var k in root) {
-          if (!Object.prototype.hasOwnProperty.call(root, k)) continue;
-          var v = root[k];
-          for (var i = 0; i < names.length; i++) {
-            if (k === names[i] && typeof v === 'string' && v.length > 0) return v;
-          }
-          var nested = findInObject(v, names, depth + 1);
-          if (nested) return nested;
-        }
-        return '';
-      }
-      function findScriptValue(patterns) {
-        var scripts = Array.prototype.slice.call(document.scripts || []);
-        for (var p = 0; p < patterns.length; p++) {
-          var pattern = patterns[p];
-          for (var i = 0; i < scripts.length; i++) {
-            var text = scripts[i].textContent || '';
-            var match = text.match(pattern);
-            if (match && match[1]) return match[1];
-          }
-        }
-        return '';
-      }
-      function parseCipher(cipher) {
-        if (!cipher) return null;
-        try {
-          var params = new URLSearchParams(cipher);
-          var url = params.get('url');
-          var sig = params.get('sig') || params.get('signature');
-          var s = params.get('s');
-          var sp = params.get('sp') || 'signature';
-          if (url && sig && !s) return url + (url.indexOf('?') >= 0 ? '&' : '?') + sp + '=' + encodeURIComponent(sig);
-        } catch(e) {}
-        return null;
-      }
-      function scriptPlayerResponse() {
-        var scripts = Array.prototype.slice.call(document.scripts || []);
-        for (var i = 0; i < scripts.length; i++) {
-          var text = scripts[i].textContent || '';
-          var key = 'ytInitialPlayerResponse';
-          var pos = text.indexOf(key);
-          if (pos < 0) continue;
-          var start = text.indexOf('{', pos);
-          if (start < 0) continue;
-          var depth = 0, inString = false, quote = '', escape = false;
-          for (var j = start; j < text.length; j++) {
-            var ch = text[j];
-            if (inString) {
-              if (escape) { escape = false; continue; }
-              if (ch === '\\\\') { escape = true; continue; }
-              if (ch === quote) { inString = false; quote = ''; }
-              continue;
-            }
-            if (ch === '"' || ch === "'") { inString = true; quote = ch; continue; }
-            if (ch === '{') depth++;
-            if (ch === '}') {
-              depth--;
-              if (depth === 0) return parseMaybe(text.slice(start, j + 1));
-            }
-          }
-        }
-        return null;
-      }
-      function candidatesFromResponse(r) {
-        r = parseMaybe(r);
-        if (!r || !r.streamingData) return null;
-        var sd = r.streamingData, vd = r.videoDetails || {};
-        var out = {
-          isLive: !!(vd.isLive || vd.isLiveContent),
-          hls: sd.hlsManifestUrl || null,
-          formats: [],
-          poToken: findInObject(r, ['poToken'], 0),
-          visitorData: findInObject(r, ['visitorData'], 0),
-          signatureTimestamp: ytcfgValue('STS') || null,
-          sabr: !!sd.serverAbrStreamingUrl
-        };
-        function add(f, adaptive) {
-          if (!f) return;
-          var streamURL = f.url || parseCipher(f.signatureCipher || f.cipher);
-          if (!streamURL) return;
-          out.formats.push({
-            url: streamURL,
-            height: f.height || 0,
-            bitrate: f.bitrate || 0,
-            mimeType: f.mimeType || '',
-            hasAudio: !adaptive || !!f.audioQuality || !!f.audioSampleRate
-          });
-        }
-        (sd.formats || []).forEach(function(f){ add(f, false); });
-        (sd.adaptiveFormats || []).forEach(function(f){ add(f, true); });
-        return out;
-      }
-      var responses = [
-        window.ytInitialPlayerResponse,
-        ytcfgValue('PLAYER_RESPONSE'),
-        window.ytplayer && ytplayer.config && ytplayer.config.args && ytplayer.config.args.player_response,
-        scriptPlayerResponse()
-      ];
-      for (var i = 0; i < responses.length; i++) {
-        var out = candidatesFromResponse(responses[i]);
-        if (out && (out.hls || out.formats.length)) return JSON.stringify(out);
-      }
-      var apiKey = ytcfgValue('INNERTUBE_API_KEY') || '';
-      var currentContext = ytcfgValue('INNERTUBE_CONTEXT') || {};
-      var visitorData = firstString([
-        ytcfgValue('VISITOR_DATA'),
-        currentContext.client && currentContext.client.visitorData,
-        findInObject(window.ytInitialPlayerResponse, ['visitorData'], 0),
-        findScriptValue([/"visitorData"\\s*:\\s*"([^"]+)"/])
-      ]);
-      var poToken = firstString([
-        ytcfgValue('PO_TOKEN'),
-        ytcfgValue('PLAYER_PO_TOKEN'),
-        ytcfgValue('INNERTUBE_CONTEXT') && findInObject(ytcfgValue('INNERTUBE_CONTEXT'), ['poToken'], 0),
-        findInObject(window.ytInitialPlayerResponse, ['poToken'], 0),
-        findScriptValue([/"poToken"\\s*:\\s*"([^"]+)"/, /"PO_TOKEN"\\s*:\\s*"([^"]+)"/])
-      ]);
-      var signatureTimestamp = ytcfgValue('STS') || findScriptValue([/"signatureTimestamp"\\s*:\\s*(\\d+)/]);
-      var context = ytcfgValue('INNERTUBE_CONTEXT') || {
-        client: {
-          clientName: 'MWEB',
-          clientVersion: ytcfgValue('INNERTUBE_CLIENT_VERSION') || '2.20240501.01.00',
-          hl: 'ja',
-          gl: 'JP'
-        }
-      };
-      if (visitorData && context.client && !context.client.visitorData) context.client.visitorData = visitorData;
-      return JSON.stringify({
-        apiKey: apiKey,
-        context: context,
-        visitorData: visitorData,
-        poToken: poToken,
-        signatureTimestamp: signatureTimestamp,
-        formats: []
-      });
-    } catch (e) { return null; }
-  })();
-  """
 
   private func startPlayback(url: URL, videoId: String, isLive: Bool) {
     guard !isStopped else { return }
@@ -4985,61 +4244,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     installAlternativeWebFallback(videoId: videoId)
   }
 
-  private func installWatchPagePlayer(videoId: String) {
-    guard !isStopped, fallbackWebView == nil else { return }
-    teardownExtractor()
-    if let timeObserver {
-      player.removeTimeObserver(timeObserver)
-      self.timeObserver = nil
-    }
-    itemStatusObservation = nil
-    player.pause()
-    player.replaceCurrentItem(with: nil)
-    iframeAudioEnabled = true
-    watchLastMediaTime = -1
-    watchLastProgressAt = Date()
-    showStatus("YouTube watchページで再生準備中\nvideoId=\(videoId)")
-
-    let session = AVAudioSession.sharedInstance()
-    try? session.setCategory(.playback, mode: .default, options: [])
-    try? session.setActive(true)
-
-    let config = WKWebViewConfiguration()
-    config.allowsInlineMediaPlayback = true
-    config.mediaTypesRequiringUserActionForPlayback = []
-    config.websiteDataStore = .default()
-    config.userContentController.add(self, name: "youtubeStatus")
-    config.userContentController.addUserScript(WKUserScript(source: Self.watchPageScript(volume: iframeEffectiveVolume()), injectionTime: .atDocumentEnd, forMainFrameOnly: false))
-    WebAdBlocker.install(on: config)
-
-    let web = WKWebView(frame: bounds, configuration: config)
-    web.isOpaque = false
-    web.backgroundColor = .black
-    web.scrollView.backgroundColor = .black
-    web.scrollView.isScrollEnabled = false
-    web.scrollView.contentInsetAdjustmentBehavior = .never
-    web.customUserAgent = Self.userAgent
-    web.navigationDelegate = self
-    web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-    insertSubview(web, at: 0)
-    fallbackWebView = web
-
-    guard let url = URL(string: "https://m.youtube.com/watch?v=\(videoId)&app=m&persist_app=1") else {
-      showStatus("YouTube watch URL作成失敗\nvideoId=\(videoId)")
-      return
-    }
-    var request = URLRequest(url: url)
-    request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-    request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
-    web.load(request)
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-      self?.resumePlayback()
-    }
-  }
-
-  // Legacy iframe fallback kept for comparison. The active path uses the mobile
-  // watch page because many live streams explicitly forbid iframe embedding.
-  //
   // YouTube official iframe player: YouTube 公式 iframe API (embedHTML) を
   // WKWebView に loadHTMLString する。watch ページ遷移や CSS chrome 隠しは
   // 廃止 (player 初期化を壊して thumbnail すら出ない問題があったため)。
@@ -5055,9 +4259,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   //    起動経路から外して二重出力を防ぐ。
   //  - iframe が onError 102/150/152 (埋め込み禁止) を返した場合は、無理に
   //    watch ページに遷移せず error メッセージを overlay 表示する。
-  private func installAlternativeWebFallback(videoId: String, attempt: Int = 0) {
+  private func installAlternativeWebFallback(videoId: String) {
     guard !isStopped, fallbackWebView == nil else { return }
-    teardownExtractor()
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
@@ -5182,26 +4385,13 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
-  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-    guard webView === extractorWebView, !isStopped, let videoId = pendingVideoId else { return }
-    WebLoginCookies.sync { [weak self] in
-      self?.runExtraction(videoId: videoId, attempt: 0)
-    }
-  }
-
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-    if webView === extractorWebView, let videoId = pendingVideoId {
-      installEmbedFallback(videoId: videoId)
-      return
-    }
+    guard !isStopped else { return }
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
   func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-    if webView === extractorWebView, let videoId = pendingVideoId {
-      installEmbedFallback(videoId: videoId)
-      return
-    }
+    guard !isStopped else { return }
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
@@ -5213,130 +4403,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(iframeEffectiveVolume()));")
       return
     }
-    guard message.name == "youtubeStatus",
-          let body = message.body as? [String: Any] else { return }
-    handleYouTubeStatus(body)
-  }
-
-  private func handleYouTubeStatus(_ body: [String: Any]) {
-    let kind = body["kind"] as? String ?? "status"
-    let href = (body["href"] as? String) ?? ""
-    if kind == "error" {
-      let detail = (body["message"] as? String) ?? "unknown"
-      showStatus("YouTubeページエラー\n\(detail)\n\(href)")
-      return
-    }
-    if let text = body["errorText"] as? String, !text.isEmpty {
-      showStatus("YouTubeページ警告\n\(text.prefix(180))")
-      return
-    }
-    let videoCount = (body["videoCount"] as? NSNumber)?.intValue ?? 0
-    let mediaTime = (body["currentTime"] as? NSNumber)?.doubleValue ?? -1
-    let paused = (body["paused"] as? Bool) ?? true
-    let muted = (body["muted"] as? Bool) ?? true
-    let readyState = (body["readyState"] as? NSNumber)?.intValue ?? 0
-    if mediaTime >= 0, mediaTime > watchLastMediaTime + 0.25 {
-      watchLastMediaTime = mediaTime
-      watchLastProgressAt = Date()
-      statusLabel.isHidden = true
-      return
-    }
-    let stalledFor = Date().timeIntervalSince(watchLastProgressAt)
-    if videoCount == 0 {
-      showStatus("YouTube動画要素が見つかりません\n\(href)")
-    } else if stalledFor > 8 {
-      let state = paused ? "paused" : "not paused"
-      let audio = muted ? "muted" : "unmuted"
-      showStatus("YouTube再生が進んでいません\n\(state), \(audio), readyState=\(readyState), t=\(String(format: "%.1f", mediaTime))")
-    }
-  }
-
-  private static func watchPageScript(volume: Float) -> String {
-    let initialVolume = min(1, max(0.01, Double(volume)))
-    return """
-    (function(){
-      if (window.__mvWatchPageInstalled) return;
-      window.__mvWatchPageInstalled = true;
-      var VOL = \(initialVolume);
-      function post(payload) {
-        try { window.webkit.messageHandlers.youtubeStatus.postMessage(payload); } catch (e) {}
-      }
-      function largestVideo() {
-        var videos = Array.prototype.slice.call(document.querySelectorAll('video'));
-        videos.sort(function(a,b){
-          return ((b.clientWidth||0)*(b.clientHeight||0))-((a.clientWidth||0)*(a.clientHeight||0));
-        });
-        return videos[0] || null;
-      }
-      function findErrorText() {
-        var text = '';
-        try { text = (document.body && document.body.innerText) || ''; } catch(e) {}
-        var needles = [
-          'この動画は再生できません',
-          '動画を再生できません',
-          '再生できません',
-          'Video unavailable',
-          'This video is unavailable',
-          '年齢制限',
-          'ログインして年齢を確認',
-          '地域ではご利用いただけません',
-          '配信者が埋め込み再生を禁止'
-        ];
-        for (var i=0; i<needles.length; i++) {
-          var idx = text.indexOf(needles[i]);
-          if (idx >= 0) return text.slice(Math.max(0, idx - 40), idx + 160);
-        }
-        return '';
-      }
-      function forcePlayback() {
-        try {
-          var v = largestVideo();
-          if (v) {
-            v.playsInline = true;
-            v.autoplay = true;
-            v.muted = false;
-            v.volume = VOL;
-            var p = v.play && v.play();
-            if (p && p.catch) p.catch(function(err){
-              post({kind:'error', message:'video.play rejected: '+(err && err.message ? err.message : String(err)), href:location.href});
-            });
-          }
-          var play = document.querySelector('.ytp-large-play-button,button[aria-label*="再生"],button[aria-label*="Play"]');
-          if (play && v && v.paused) play.click();
-        } catch(e) {
-          post({kind:'error', message:String(e), href:location.href});
-        }
-      }
-      function report() {
-        var v = largestVideo();
-        post({
-          kind: 'status',
-          href: location.href,
-          title: document.title || '',
-          videoCount: document.querySelectorAll('video').length,
-          currentTime: v ? v.currentTime : -1,
-          paused: v ? !!v.paused : true,
-          muted: v ? !!v.muted : true,
-          volume: v ? v.volume : 0,
-          readyState: v ? v.readyState : 0,
-          networkState: v ? v.networkState : 0,
-          errorText: findErrorText()
-        });
-      }
-      window.mvPlay = forcePlayback;
-      window.mvPause = function(){};
-      window.mvSetVolume = function(value) {
-        VOL = Math.max(0.01, Math.min(1, Number(value) || 1));
-        forcePlayback();
-      };
-      document.addEventListener('touchstart', forcePlayback, {capture:true, passive:true});
-      document.addEventListener('click', forcePlayback, {capture:true});
-      setInterval(forcePlayback, 800);
-      setInterval(report, 1000);
-      setTimeout(forcePlayback, 250);
-      setTimeout(report, 1200);
-    })();
-    """
   }
 
   // YouTube official embed: YouTube 公式 iframe API。当時 (8321d49) 動いてた構造を踏襲。
