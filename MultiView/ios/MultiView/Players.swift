@@ -613,8 +613,11 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
-      // LL-HLS 配信時のみライブエッジから4秒位置を狙う(通常HLSはno-op、stallにはならない)。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 4, preferredTimescale: 1)
+      // LL-HLS 配信時のみライブエッジから一定位置を狙う(通常HLSはno-op)。設定「ニコ生 低遅延」
+      // ON で 4→1.5 秒に詰める(LL-HLS配信なら遅延が縮む。通常HLSなら効かないのでローダーが別途必要)。
+      item.configuredTimeOffsetFromLive = self.settings.niconicoLowLatency
+        ? CMTime(seconds: 1.5, preferredTimescale: 600)
+        : CMTime(seconds: 4, preferredTimescale: 1)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
@@ -1749,7 +1752,14 @@ final class KickLowLatencyLoader: NSObject, AVAssetResourceLoaderDelegate {
   private static func rewritePlaylist(_ text: String) -> String {
     if text.contains("#EXT-X-STREAM-INF") {
       // マスター: 子(メディア)プレイリストの https:// を自スキームへ向けて横取り対象にする。
-      return text.replacingOccurrences(of: "https://", with: "\(scheme)://")
+      // 加えて EXT-X-START でライブ端から3秒手前を開始位置に明示し、既定(3×TARGETDURATION≒6秒)
+      // よりさらに端へ寄せる。マスターは一度だけ取得されるので再シークの心配がない。AVPlayer
+      // 未対応なら無視されるだけ(無害・規格準拠タグ)。
+      var out = text.replacingOccurrences(of: "https://", with: "\(scheme)://")
+      if !out.contains("#EXT-X-START") {
+        out = out.replacingOccurrences(of: "#EXTM3U", with: "#EXTM3U\n#EXT-X-START:TIME-OFFSET=-3.0,PRECISE=YES")
+      }
+      return out
     }
     // メディア: TARGETDURATION を 2 に下げてライブ端へ寄せる。セグメントURL(https)は触らない。
     return text.replacingOccurrences(
