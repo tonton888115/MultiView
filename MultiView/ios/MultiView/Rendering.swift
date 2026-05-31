@@ -914,6 +914,24 @@ enum NativeEventOverlay {
     tint: UIColor
   ) {
     let center = CGPoint(x: panel.frame.midX, y: panel.frame.maxY + min(58, root.bounds.height * 0.18))
+
+    // 中央から広がる発光リング(派手さアップ・自前演出)。2枚を時差で出して二重リングに。
+    for ringDelay in [0.0, 0.12] {
+      let ring = UIView(frame: CGRect(x: center.x - 22, y: center.y - 22, width: 44, height: 44))
+      ring.backgroundColor = .clear
+      ring.layer.borderColor = tint.withAlphaComponent(0.9).cgColor
+      ring.layer.borderWidth = 4
+      ring.layer.cornerRadius = 22
+      ring.alpha = 0.0
+      root.insertSubview(ring, at: 0)
+      UIView.animate(withDuration: 0.72, delay: ringDelay, options: [.curveEaseOut]) {
+        ring.transform = CGAffineTransform(scaleX: 3.4, y: 3.4)
+        ring.alpha = 0.0
+      }
+      UIView.animate(withDuration: 0.16, delay: ringDelay) { ring.alpha = 0.85 }
+      UIView.animate(withDuration: 0.5, delay: ringDelay + 0.16) { ring.alpha = 0 } completion: { _ in ring.removeFromSuperview() }
+    }
+
     let hero = UIImageView(image: assetImage ?? UIImage(systemName: style.heroSymbol) ?? UIImage(systemName: "sparkles"))
     hero.tintColor = assetImage == nil ? tint : nil
     hero.contentMode = .scaleAspectFit
@@ -942,7 +960,8 @@ enum NativeEventOverlay {
     }
 
     let symbols = style.particleSymbols
-    for index in 0..<12 {
+    let particleCount = 18
+    for index in 0..<particleCount {
       let symbol = symbols[index % symbols.count]
       let particle = UIImageView(image: UIImage(systemName: symbol) ?? UIImage(systemName: "sparkle"))
       particle.tintColor = index % 4 == 0 ? UIColor.white : tint
@@ -952,8 +971,8 @@ enum NativeEventOverlay {
       particle.frame = CGRect(x: center.x - side / 2, y: center.y - side / 2, width: side, height: side)
       root.addSubview(particle)
 
-      let angle = CGFloat(index) / 12.0 * .pi * 2.0 - .pi / 2.0
-      let radius = CGFloat(42 + (index % 5) * 12)
+      let angle = CGFloat(index) / CGFloat(particleCount) * .pi * 2.0 - .pi / 2.0
+      let radius = CGFloat(48 + (index % 5) * 14)
       let dx = cos(angle) * radius
       let dy = sin(angle) * radius * 0.72
       UIView.animate(

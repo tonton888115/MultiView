@@ -673,9 +673,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
       // LL-HLS 配信時のみライブエッジから一定位置を狙う(通常HLSはno-op)。設定「ニコ生 低遅延」
       // ON で 4→1.5 秒に詰める(LL-HLS配信なら遅延が縮む。通常HLSなら効かないのでローダーが別途必要)。
-      // 低遅延ONでも 1.0s は薄すぎてカクつくため 2.5s に緩和(OFFは従来4s)。
+      // 低遅延ONで1.5秒(再詰め)。OFFは従来4s。
       item.configuredTimeOffsetFromLive = self.settings.niconicoLowLatency
-        ? CMTime(seconds: 2.5, preferredTimescale: 600)
+        ? CMTime(seconds: 1.5, preferredTimescale: 600)
         : CMTime(seconds: 4, preferredTimescale: 1)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -2789,9 +2789,8 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
-      // Twitch(fast_bread LL-HLS)。詰めすぎ(2s)はバッファ薄でカクつく割に体感が変わらないため
-      // 安定側の4秒へ戻す。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 4, preferredTimescale: 1)
+      // Twitch(fast_bread LL-HLS)。低遅延優先で2秒(再詰め・ユーザー要望/カクつき改善後)。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
@@ -3270,8 +3269,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
-      // 詰めすぎ(2s)はカクつくため安定側の4秒へ戻す。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 4, preferredTimescale: 1)
+      // 低遅延優先で2秒(再詰め)。LL-HLS配信なら効く・通常HLSはno-op。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
@@ -4837,6 +4836,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     ])
     let item = AVPlayerItem(asset: asset)
     item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+    if isLive {
+      // LL-HLS配信なら効く(通常HLSはno-op)。ライブエッジ2秒を狙う(再詰め)。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
+      item.automaticallyPreservesTimeOffsetFromLive = true
+    }
     itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
       guard let self else { return }
       if item.status == .failed {
