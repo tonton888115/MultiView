@@ -814,6 +814,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private func installFallback(_ reason: String) {
     DispatchQueue.main.async {
       guard !self.isStopped, self.fallbackWebView == nil else { return }
+      self.stallWatchdog.stop()
       self.showStatus(reason)
       self.player.pause()
       self.player.replaceCurrentItem(with: nil)
@@ -2033,16 +2034,21 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     }.resume()
   }
 
-  private func play(hlsURL: URL) {
+  // lowLatency=true は TARGETDURATION 書換ローダー経由。これで AVPlayer が稀に開けない
+  // (cannot open 等)ことがあるため、失敗時は lowLatency=false の素HLSでネイティブ再試行し、
+  // それでもダメな時だけ web UI フォールバックへ。これで「cannot open→Kick独自UI」を防ぐ。
+  private func play(hlsURL: URL, lowLatency: Bool = true) {
     DispatchQueue.main.async {
       guard !self.isStopped else { return }
       self.statusLabel.isHidden = true
-      // プレイリストを横取りして TARGETDURATION を下げる低遅延ローダーを噛ませる(下記クラス参照)。
-      // URLのスキームを mvkickll:// に変えると AVAssetResourceLoaderDelegate が発火する。
       let headers = self.kickPlaybackHeaders()
-      var llComponents = URLComponents(url: hlsURL, resolvingAgainstBaseURL: false)
-      llComponents?.scheme = KickLowLatencyLoader.scheme
-      let assetURL = llComponents?.url ?? hlsURL
+      let assetURL: URL
+      if lowLatency, var llComponents = URLComponents(url: hlsURL, resolvingAgainstBaseURL: false) {
+        llComponents.scheme = KickLowLatencyLoader.scheme
+        assetURL = llComponents.url ?? hlsURL
+      } else {
+        assetURL = hlsURL
+      }
       let asset = AVURLAsset(url: assetURL, options: [
         "AVURLAssetHTTPHeaderFieldsKey": headers,
         // Live HLS never needs a precise duration; skip that analysis to trim startup.
@@ -2052,6 +2058,8 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         let loader = KickLowLatencyLoader(headers: headers)
         asset.resourceLoader.setDelegate(loader, queue: DispatchQueue(label: "app.multiview.kick.ll"))
         self.lowLatencyLoader = loader
+      } else {
+        self.lowLatencyLoader = nil
       }
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
@@ -2064,7 +2072,13 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
           DispatchQueue.main.async {
-            self?.installFallback(item.error?.localizedDescription ?? "Kickネイティブ再生に失敗しました")
+            guard let self else { return }
+            if lowLatency {
+              // 低遅延ローダーで開けなかった→素のHLSでネイティブ再試行(web UIに落とす前に)。
+              self.play(hlsURL: hlsURL, lowLatency: false)
+            } else {
+              self.installFallback(item.error?.localizedDescription ?? "Kickネイティブ再生に失敗しました")
+            }
           }
         } else if item.status == .readyToPlay {
           DispatchQueue.main.async {
@@ -2136,8 +2150,18 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private func installFallback(_ reason: String) {
     DispatchQueue.main.async {
       guard !self.isStopped, self.fallbackWebView == nil else { return }
+      // ネイティブ再生を完全停止してから web UI へ(失敗item/timer/watchdog/loaderの残留を防ぐ・Codex指摘)。
       self.liveCatchUpTimer?.invalidate()
       self.liveCatchUpTimer = nil
+      self.stallWatchdog.stop()
+      self.lowLatencyLoader = nil
+      self.player.pause()
+      self.player.replaceCurrentItem(with: nil)
+      self.itemStatusObservation = nil
+      if let obs = self.itemFailedObserver {
+        NotificationCenter.default.removeObserver(obs)
+        self.itemFailedObserver = nil
+      }
       self.showStatus(reason)
       let web = PlayerWebView(stream: self.stream, settings: self.settings)
       web.setPlaybackVolume(self.playbackVolume)
@@ -2580,6 +2604,9 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   private var tokenTask: URLSessionDataTask?
   private var chatSocket: URLSessionWebSocketTask?
   private var chatChannel: String?
+  private lazy var stallWatchdog = StallWatchdog(player: player) { [weak self] in
+    self?.recoverFromStall()
+  }
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
   private var fallbackWebView: PlayerWebView?
@@ -2663,8 +2690,18 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     fallbackWebView?.pausePlayback()
   }
 
+  private func recoverFromStall() {
+    guard !isStopped, fallbackWebView == nil else { return }
+    player.replaceCurrentItem(with: nil)
+    tokenTask?.cancel()
+    tokenTask = nil
+    isLoading = false
+    loadNativeStream()
+  }
+
   func stopPlayback() {
     isStopped = true
+    stallWatchdog.stop()
     tokenTask?.cancel()
     tokenTask = nil
     player.pause()
@@ -2800,6 +2837,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
         } else if item.status == .readyToPlay {
           DispatchQueue.main.async {
             self?.resumePlayback()
+            self?.stallWatchdog.start()
           }
         }
       }
@@ -2825,6 +2863,15 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     DispatchQueue.main.async {
       guard !self.isStopped, self.fallbackWebView == nil else { return }
       self.isLoading = false
+      // 失敗item/watchdogを残さない(Codex指摘の停止漏れ修正)。
+      self.stallWatchdog.stop()
+      self.player.pause()
+      self.player.replaceCurrentItem(with: nil)
+      self.itemStatusObservation = nil
+      if let obs = self.itemFailedObserver {
+        NotificationCenter.default.removeObserver(obs)
+        self.itemFailedObserver = nil
+      }
       self.showStatus(reason)
       let web = PlayerWebView(stream: self.stream, settings: self.settings)
       web.setPlaybackVolume(self.playbackVolume)
@@ -3089,6 +3136,9 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private let danmakuView = UIView()
   private let statusLabel = UILabel()
   private var chatClient: TwitcastingChatClient?
+  private lazy var stallWatchdog = StallWatchdog(player: player) { [weak self] in
+    self?.recoverFromStall()
+  }
   private var streamTask: URLSessionDataTask?
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
@@ -3173,8 +3223,18 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     fallbackWebView?.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(function(m){try{m.pause()}catch(e){}});")
   }
 
+  private func recoverFromStall() {
+    guard !isStopped, fallbackWebView == nil else { return }
+    player.replaceCurrentItem(with: nil)
+    streamTask?.cancel()
+    streamTask = nil
+    isLoading = false
+    loadNativeStream()
+  }
+
   func stopPlayback() {
     isStopped = true
+    stallWatchdog.stop()
     chatClient?.stop()
     chatClient = nil
     streamTask?.cancel()
@@ -3280,6 +3340,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
         } else if item.status == .readyToPlay {
           DispatchQueue.main.async {
             self?.resumePlayback()
+            self?.stallWatchdog.start()
           }
         }
       }
@@ -3307,6 +3368,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     DispatchQueue.main.async {
       self.isLoading = false
       guard !self.isStopped, self.fallbackWebView == nil else { return }
+      self.stallWatchdog.stop()
       self.showStatus(reason)
       self.player.pause()
       self.player.replaceCurrentItem(with: nil)

@@ -801,7 +801,19 @@ final class AppState {
   var settings = Store.loadSettings() {
     didSet {
       Store.saveSettings(settings)
-      delegate?.appStateDidChange()
+      // 再生/並び順/チャット接続に影響する設定が変わった時だけプレイヤー等を作り直す。
+      // 弾幕表示・ギフト通知の種別・ギフト音などの表示系トグルはイベント時に live で読むので
+      // reload 不要＝トグルのたびに再生が無駄に作り直されない(Codex指摘 #5)。
+      let needsReload = settings.wifiQuality != oldValue.wifiQuality
+        || settings.mobileQuality != oldValue.mobileQuality
+        || settings.niconicoLowLatency != oldValue.niconicoLowLatency
+        || settings.playAudio != oldValue.playAudio
+        || settings.showChat != oldValue.showChat
+        || settings.layoutMode != oldValue.layoutMode
+        || settings.platformOrder != oldValue.platformOrder
+      if needsReload {
+        delegate?.appStateDidChange()
+      }
     }
   }
 
