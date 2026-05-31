@@ -194,6 +194,9 @@ final class ViewingController: UIViewController {
     let spacer = UIView()
     spacer.translatesAutoresizingMaskIntoConstraints = false
 
+    let handoffButton = iconButton(systemName: "qrcode", accessibilityLabel: "引き継ぎ") { [weak self] in
+      self?.present(UINavigationController(rootViewController: HandoffController()), animated: true)
+    }
     let addButton = iconButton(systemName: "plus", accessibilityLabel: "追加") { [weak self] in
       self?.present(AddStreamController(), animated: true)
     }
@@ -203,6 +206,7 @@ final class ViewingController: UIViewController {
     }
     row.addArrangedSubview(layoutControl)
     row.addArrangedSubview(spacer)
+    row.addArrangedSubview(handoffButton)
     row.addArrangedSubview(addButton)
     row.addArrangedSubview(reloadButton)
 
@@ -214,6 +218,8 @@ final class ViewingController: UIViewController {
       row.trailingAnchor.constraint(equalTo: host.trailingAnchor),
       layoutControl.widthAnchor.constraint(equalToConstant: 96),
       layoutControl.heightAnchor.constraint(equalToConstant: 34),
+      handoffButton.widthAnchor.constraint(equalToConstant: 40),
+      handoffButton.heightAnchor.constraint(equalToConstant: 36),
       addButton.widthAnchor.constraint(equalToConstant: 38),
       addButton.heightAnchor.constraint(equalToConstant: 36),
       reloadButton.widthAnchor.constraint(equalToConstant: 46),
