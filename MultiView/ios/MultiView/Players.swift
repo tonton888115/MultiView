@@ -670,12 +670,12 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       let asset = AVURLAsset(url: hlsURL, options: assetOptions)
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
-      item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
+      item.preferredPeakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: self.settings)
       // LL-HLS 配信時のみライブエッジから一定位置を狙う(通常HLSはno-op)。設定「ニコ生 低遅延」
       // ON で 4→1.5 秒に詰める(LL-HLS配信なら遅延が縮む。通常HLSなら効かないのでローダーが別途必要)。
       // 低遅延ONで1.5秒(再詰め)。OFFは従来4s。
       item.configuredTimeOffsetFromLive = self.settings.niconicoLowLatency
-        ? CMTime(seconds: 1.5, preferredTimescale: 600)
+        ? CMTime(seconds: 1.0, preferredTimescale: 600)
         : CMTime(seconds: 4, preferredTimescale: 1)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -1615,42 +1615,20 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
   }
 
+  // 共通の lane-occupancy レンダラへ統一(Codex#3)。旧独自実装は round-robin(laneCursor%maxLines)で
+  // 重なりやすく、CALayer shadow で off-screen render も重かった。NativeDanmakuRenderer.emit は
+  // 空きレーン選択＋属性文字列影でそれらを解決済み(maxLength/フォント/不透明度も内部で処理)。
   private func emitDanmaku(_ text: String) {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return }
-    if settings.danmakuMaxLength > 0, trimmed.count > settings.danmakuMaxLength {
-      return
-    }
     DispatchQueue.main.async {
-      guard self.danmakuView.bounds.height > 0, self.danmakuView.bounds.width > 0 else { return }
-      let fontSize = NativeDanmakuRenderer.scaledFontSize(base: self.settings.danmakuFontSize, in: self.danmakuView)
-      let lineHeight = fontSize + 8
-      let maxLines = self.settings.danmakuMaxLines > 0
-        ? self.settings.danmakuMaxLines
-        : max(1, Int(self.danmakuView.bounds.height / lineHeight))
-      let label = UILabel()
-      label.text = trimmed
-      label.font = .systemFont(ofSize: fontSize, weight: .bold)
-      label.textColor = UIColor.white.withAlphaComponent(self.settings.danmakuOpacity)
-      label.layer.shadowColor = UIColor.black.cgColor
-      label.layer.shadowRadius = 2
-      label.layer.shadowOpacity = 1
-      label.layer.shadowOffset = CGSize(width: 1, height: 1)
-      label.sizeToFit()
-      let lane = self.laneCursor % maxLines
-      self.laneCursor += 1
-      let y = CGFloat(lane) * lineHeight + 6
-      let startX = self.danmakuView.bounds.width + 12
-      label.frame.origin = CGPoint(x: startX, y: y)
-      self.danmakuView.addSubview(label)
-      let travel = startX + label.bounds.width + 24
-      let pixelsPerSecond = max(35, self.danmakuView.bounds.width * CGFloat(self.settings.danmakuSpeed))
-      let duration = TimeInterval(travel / pixelsPerSecond)
-      UIView.animate(withDuration: duration, delay: 0, options: [.curveLinear]) {
-        label.frame.origin.x = -label.bounds.width - 12
-      } completion: { _ in
-        label.removeFromSuperview()
-      }
+      self.laneCursor = NativeDanmakuRenderer.emit(
+        tokens: NativeDanmakuRenderer.textTokens(trimmed),
+        filterText: trimmed,
+        in: self.danmakuView,
+        laneCursor: self.laneCursor,
+        settings: self.settings
+      )
     }
   }
 
@@ -2063,11 +2041,11 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       }
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
-      item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
+      item.preferredPeakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: self.settings)
       // Kick は低遅延HLS(LL-HLS)。ライブ端からのオフセットを 4→2 秒へ詰めて公式アプリとの
       // 遅延差を縮める(automaticallyWaitsToMinimizeStalling=false と整合)。回線が細いと
       // リバッファ寄りになるトレードオフ。通常HLSではこのプロパティは no-op。要実機A/B。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 1.5, preferredTimescale: 600)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
@@ -2825,9 +2803,9 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       ])
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
-      item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
+      item.preferredPeakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: self.settings)
       // Twitch(fast_bread LL-HLS)。低遅延優先で2秒(再詰め・ユーザー要望/カクつき改善後)。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 1.5, preferredTimescale: 600)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
@@ -3328,9 +3306,9 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       let asset = AVURLAsset(url: hlsURL, options: options)
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
-      item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
+      item.preferredPeakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: self.settings)
       // 低遅延優先で2秒(再詰め)。LL-HLS配信なら効く・通常HLSはno-op。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 1.5, preferredTimescale: 600)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
@@ -3741,12 +3719,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private func pollLiveChat() {
     guard settings.showChat,
           !isStopped,
-          let liveChatID,
-          let liveChatAccessToken else { return }
-    YouTubeAuthManager.shared.fetchLiveChatMessages(
+          let liveChatID else { return }
+    // token は毎回自動更新(Codex#2)。固定 token のままだと長時間視聴で 401→停止していた。
+    YouTubeAuthManager.shared.fetchLiveChatMessagesRefreshing(
       liveChatID: liveChatID,
-      pageToken: liveChatPageToken,
-      accessToken: liveChatAccessToken
+      pageToken: liveChatPageToken
     ) { [weak self] result in
       guard let self, !self.isStopped else { return }
       switch result {
@@ -4900,7 +4877,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
     if isLive {
       // LL-HLS配信なら効く(通常HLSはno-op)。ライブエッジ2秒を狙う(再詰め)。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 1.5, preferredTimescale: 600)
       item.automaticallyPreservesTimeOffsetFromLive = true
     }
     itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in

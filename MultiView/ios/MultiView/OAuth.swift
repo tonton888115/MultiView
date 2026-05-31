@@ -719,6 +719,23 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
     }.resume()
   }
 
+  // 固定 token を使い続けると ~1時間で 401 になり弾幕/Super Chat が止まる(Codex#2)。毎回
+  // withValidAccessToken で有効 token を取得(期限切れは自動リフレッシュ)してから取得する版。
+  func fetchLiveChatMessagesRefreshing(
+    liveChatID: String,
+    pageToken: String?,
+    completion: @escaping (Result<YouTubeLiveChatPage, Error>) -> Void
+  ) {
+    withValidAccessToken { [weak self] result in
+      switch result {
+      case .failure(let error):
+        Self.finish(completion, .failure(error))
+      case .success(let accessToken):
+        self?.fetchLiveChatMessages(liveChatID: liveChatID, pageToken: pageToken, accessToken: accessToken, completion: completion)
+      }
+    }
+  }
+
   func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
     authAnchor ?? ASPresentationAnchor()
   }

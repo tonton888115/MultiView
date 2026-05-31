@@ -299,6 +299,15 @@ final class NetworkQuality {
     }
     return settings.wifiQuality
   }
+
+  // 自動適応(Codex案): 同時視聴が3本以上だと帯域不足でカクつくため、ビットレート上限を
+  // 自動でエコノミー(約900kbps)へ落とす。2本以下は設定どおりの画質。
+  func effectivePeakBitRate(settings: AppSettings) -> Double {
+    let base = activeQuality(settings: settings).preferredPeakBitRate
+    guard AppState.shared.streams.count >= 3 else { return base }
+    let economy = PlaybackQuality.economy.preferredPeakBitRate
+    return base == 0 ? economy : min(base, economy)
+  }
 }
 
 // Copies the logins made in the in-app web views (WKWebsiteDataStore) into the
