@@ -72,14 +72,27 @@ if ($LASTEXITCODE -ne 0) { throw "IPA download failed (curl exit $LASTEXITCODE)"
 $sizeMB = [math]::Round((Get-Item $Output).Length / 1MB, 2)
 Write-Host "Saved: $Output ($sizeMB MB)"
 
-$icloudDir = Join-Path $env:USERPROFILE 'iCloudDrive\Downloads'
-if (Test-Path $icloudDir) {
-    $icloudPath = Join-Path $icloudDir (Split-Path -Path $Output -Leaf)
+# iCloud の Downloads は再起動等で日本語ローカライズ名 'ダウンロード' に化けることがあり、
+# しかも NFD(分解形)で保存されるため 'ダウンロード'(NFC)直書きでは一致しない。実体を列挙し
+# Unicode 正規化して照合する。
+$icloudRoot = Join-Path $env:USERPROFILE 'iCloudDrive'
+$icloudDir = $null
+if (Test-Path $icloudRoot) {
+    $dlName = [string]'ダウンロード'
+    $dl = Get-ChildItem $icloudRoot -Directory -Force -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -eq 'Downloads' -or $_.Name.Normalize([Text.NormalizationForm]::FormC) -eq $dlName.Normalize([Text.NormalizationForm]::FormC)
+    } | Select-Object -First 1
+    if ($dl) { $icloudDir = $dl.FullName }
+}
+if ($icloudDir) {
+    $leaf = Split-Path -Path $Output -Leaf
+    $icloudPath = Join-Path $icloudDir $leaf
     Copy-Item -Path $Output -Destination $icloudPath -Force
     Write-Host "Mirrored to iCloud: $icloudPath"
-    # 紛らわしいバージョン無しの旧ファイルは消す（同名キャッシュの元）。
-    $staleGeneric = Join-Path $icloudDir 'MultiView.ipa'
-    if (Test-Path $staleGeneric) { Remove-Item $staleGeneric -Force; Write-Host "Removed stale: $staleGeneric" }
+    # 古い MultiView*.ipa は全部消し、最新の1つだけ残す（同名/旧版キャッシュ事故の根絶）。
+    Get-ChildItem $icloudDir -Filter 'MultiView*.ipa' -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne $leaf } |
+        ForEach-Object { Remove-Item $_.FullName -Force; Write-Host "Removed old: $($_.Name)" }
 } else {
-    Write-Warning "iCloud Drive Downloads not found at $icloudDir; skipped mirror."
+    Write-Warning "iCloud Drive Downloads/ダウンロード folder not found under $icloudRoot; skipped mirror."
 }
