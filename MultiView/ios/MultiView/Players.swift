@@ -10,6 +10,60 @@ import CryptoKit
 // Per-platform native player views (Niconico / Kick / Twitch / TwitCasting / YouTube).
 // Each plays its stream via a dedicated AVPlayer/WebView. Extracted from AppDelegate.swift.
 
+// 再生位置が一定時間進まない「フリーズ(ストール)」を監視し、自動で復旧コールバックを呼ぶ。
+// AVPlayer は本物のエラーを出さず固まることがある(回線揺れ/ライブ端枯渇)ので、currentTime の
+// 前進を見て検知する。誤検知で無駄に再読み込みしないよう、無前進12秒+復旧クールダウン20秒と保守的。
+final class StallWatchdog {
+  private weak var player: AVPlayer?
+  private let onStall: () -> Void
+  private let stallThreshold: TimeInterval
+  private let cooldown: TimeInterval
+  private var timer: Timer?
+  private var lastTime: Double = -1
+  private var lastProgressAt = Date()
+  private var lastRecoveryAt = Date.distantPast
+
+  init(player: AVPlayer, threshold: TimeInterval = 12, cooldown: TimeInterval = 20, onStall: @escaping () -> Void) {
+    self.player = player
+    self.stallThreshold = threshold
+    self.cooldown = cooldown
+    self.onStall = onStall
+  }
+
+  func start() {
+    stop()
+    lastTime = -1
+    lastProgressAt = Date()
+    timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+      self?.tick()
+    }
+  }
+
+  func stop() {
+    timer?.invalidate()
+    timer = nil
+  }
+
+  private func tick() {
+    guard let player, let item = player.currentItem else { return }
+    if player.timeControlStatus == .paused {
+      lastProgressAt = Date()
+      return
+    }
+    let now = CMTimeGetSeconds(item.currentTime())
+    if now.isFinite, now > lastTime + 0.25 {
+      lastTime = now
+      lastProgressAt = Date()
+      return
+    }
+    guard Date().timeIntervalSince(lastProgressAt) > stallThreshold,
+          Date().timeIntervalSince(lastRecoveryAt) > cooldown else { return }
+    lastRecoveryAt = Date()
+    lastProgressAt = Date()
+    onStall()
+  }
+}
+
 final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
   private let stream: StreamItem
   private let player = AVPlayer()
@@ -43,6 +97,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   // NDGR コメントが最後に成功した時刻。VIEW/SEGMENT 両方のループから更新され、
   // 60 秒成功なしでフル再読み込みへ escalation する閾値判定に使う。
   private var ndgrLastSuccessAt = Date()
+  private lazy var stallWatchdog = StallWatchdog(player: player) { [weak self] in
+    self?.recoverPlaybackError("再生が止まったため再接続中")
+  }
 
   private struct NiconicoGiftBarUpdate {
     let currentLevel: Int?
@@ -144,6 +201,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
 
   func stopPlayback() {
     isStopped = true
+    stallWatchdog.stop()
     player.pause()
     player.replaceCurrentItem(with: nil)
     keepSeatTimer?.invalidate()
@@ -615,8 +673,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
       // LL-HLS 配信時のみライブエッジから一定位置を狙う(通常HLSはno-op)。設定「ニコ生 低遅延」
       // ON で 4→1.5 秒に詰める(LL-HLS配信なら遅延が縮む。通常HLSなら効かないのでローダーが別途必要)。
+      // 低遅延ONでも 1.0s は薄すぎてカクつくため 2.5s に緩和(OFFは従来4s)。
       item.configuredTimeOffsetFromLive = self.settings.niconicoLowLatency
-        ? CMTime(seconds: 1.0, preferredTimescale: 600)
+        ? CMTime(seconds: 2.5, preferredTimescale: 600)
         : CMTime(seconds: 4, preferredTimescale: 1)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -641,6 +700,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       self.player.isMuted = !self.settings.playAudio
       self.player.volume = self.settings.playAudio ? self.playbackVolume : 0
       self.player.play()
+      self.stallWatchdog.start()
     }
   }
 
@@ -1758,14 +1818,8 @@ final class KickLowLatencyLoader: NSObject, AVAssetResourceLoaderDelegate {
   private static func rewritePlaylist(_ text: String) -> String {
     if text.contains("#EXT-X-STREAM-INF") {
       // マスター: 子(メディア)プレイリストの https:// を自スキームへ向けて横取り対象にする。
-      // 加えて EXT-X-START でライブ端から3秒手前を開始位置に明示し、既定(3×TARGETDURATION≒6秒)
-      // よりさらに端へ寄せる。マスターは一度だけ取得されるので再シークの心配がない。AVPlayer
-      // 未対応なら無視されるだけ(無害・規格準拠タグ)。
-      var out = text.replacingOccurrences(of: "https://", with: "\(scheme)://")
-      if !out.contains("#EXT-X-START") {
-        out = out.replacingOccurrences(of: "#EXTM3U", with: "#EXTM3U\n#EXT-X-START:TIME-OFFSET=-3.0,PRECISE=YES")
-      }
-      return out
+      // (EXT-X-START 注入は AVPlayer が尊重せず無効だったため撤去。TARGETDURATION 書換のみ有効。)
+      return text.replacingOccurrences(of: "https://", with: "\(scheme)://")
     }
     // メディア: TARGETDURATION を 2 に下げてライブ端へ寄せる。セグメントURL(https)は触らない。
     return text.replacingOccurrences(
@@ -1792,6 +1846,9 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private var kickChannelID: String?
   private var liveCatchUpTimer: Timer?
   private var lowLatencyLoader: KickLowLatencyLoader?
+  private lazy var stallWatchdog = StallWatchdog(player: player) { [weak self] in
+    self?.recoverFromStall()
+  }
   private var isLoading = false
   private var isStopped = false
   private var laneCursor = 0
@@ -1878,6 +1935,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
 
   func stopPlayback() {
     isStopped = true
+    stallWatchdog.stop()
     liveCatchUpTimer?.invalidate()
     liveCatchUpTimer = nil
     lowLatencyLoader = nil
@@ -2012,6 +2070,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
           DispatchQueue.main.async {
             self?.resumePlayback()
             self?.startLiveCatchUp()
+            self?.stallWatchdog.start()
           }
         }
       }
@@ -2061,6 +2120,17 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     item.seek(to: target,
               toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
               toleranceAfter: .zero) { _ in }
+  }
+
+  // ストール検知時のネイティブ再接続(webviewフォールバックではなく Kick HLS を取り直す)。
+  private func recoverFromStall() {
+    guard !isStopped, fallbackWebView == nil else { return }
+    showStatus("再生が止まったため再接続中")
+    player.replaceCurrentItem(with: nil)
+    channelTask?.cancel()
+    channelTask = nil
+    isLoading = false
+    loadNativeStream()
   }
 
   private func installFallback(_ reason: String) {
@@ -2719,9 +2789,9 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
-      // Twitchはfast_bread=trueでLL-HLSが出るので configuredTimeOffsetFromLive が効く。
-      // ライブエッジから2秒(従来4秒)に詰めて低遅延化。LL-HLSが出ない配信ではno-op。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
+      // Twitch(fast_bread LL-HLS)。詰めすぎ(2s)はバッファ薄でカクつく割に体感が変わらないため
+      // 安定側の4秒へ戻す。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 4, preferredTimescale: 1)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
@@ -3189,8 +3259,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate
-      // LL-HLS配信なら効く。4→2秒に詰めて低遅延化(通常HLSはno-op)。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
+      // 詰めすぎ(2s)はカクつくため安定側の4秒へ戻す。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 4, preferredTimescale: 1)
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
@@ -4740,11 +4810,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     ])
     let item = AVPlayerItem(asset: asset)
     item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
-    if isLive {
-      // YouTube ライブが LL-HLS なら効く(通常HLSはno-op・無害)。ライブエッジ2秒を狙う。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 2, preferredTimescale: 1)
-      item.automaticallyPreservesTimeOffsetFromLive = true
-    }
     itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
       guard let self else { return }
       if item.status == .failed {
