@@ -2230,7 +2230,18 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       return
     }
     if let alert = Self.kickSupportAlert(event: event, payload: payload) {
-      NativeEventOverlay.show(alert, in: danmakuView, tint: StreamPlatform.kick.tint)
+      // サブ/ギフトはニコ生と同じリッチ表示(アイコン+バースト+音)に格上げ。テキストバナーから変更。
+      NativeGiftSoundMixer.shared.play(style: .gift, enabled: settings.giftSoundEnabled, volume: playbackVolume)
+      NativeEventOverlay.showSupport(
+        title: alert,
+        subtitle: nil,
+        symbolName: NativeGiftEffectStyle.gift.heroSymbol,
+        progress: nil,
+        effectStyle: .gift,
+        assetImage: nil,
+        in: danmakuView,
+        tint: StreamPlatform.kick.tint
+      )
       return
     }
     guard event.contains("ChatMessage"),
