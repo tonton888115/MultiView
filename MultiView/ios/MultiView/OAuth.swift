@@ -451,6 +451,8 @@ struct YouTubeLiveChatMessage {
   let id: String
   let author: String
   let text: String
+  // Super Chat / Super Sticker / メンバー加入 のとき金額や種別の表示文字列。通常チャットは nil。
+  let superInfo: String?
 }
 
 struct YouTubeLiveChatPage {
@@ -690,12 +692,23 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
       let messages = parsedItems.compactMap { item -> YouTubeLiveChatMessage? in
         guard let id = item["id"] as? String,
               let snippet = item["snippet"] as? [String: Any] else { return nil }
+        let type = (snippet["type"] as? String) ?? ""
+        let author = ((item["authorDetails"] as? [String: Any])?["displayName"] as? String) ?? ""
         let text = (snippet["displayMessage"] as? String)
           ?? ((snippet["textMessageDetails"] as? [String: Any])?["messageText"] as? String)
           ?? ""
+        // Super Chat / Super Sticker / メンバー加入 は投げ銭系イベントとして拾う(同じ liveChat 応答に含まれる)。
+        if type == "superChatEvent" || type == "superStickerEvent" {
+          let details = (snippet["superChatDetails"] ?? snippet["superStickerDetails"]) as? [String: Any]
+          let amount = (details?["amountDisplayString"] as? String) ?? "Super Chat"
+          let comment = (details?["userComment"] as? String) ?? text
+          return YouTubeLiveChatMessage(id: id, author: author, text: comment, superInfo: amount)
+        }
+        if type == "newSponsorEvent" || type == "memberMilestoneChatEvent" {
+          return YouTubeLiveChatMessage(id: id, author: author, text: text, superInfo: "メンバー加入")
+        }
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        let author = ((item["authorDetails"] as? [String: Any])?["displayName"] as? String) ?? ""
-        return YouTubeLiveChatMessage(id: id, author: author, text: text)
+        return YouTubeLiveChatMessage(id: id, author: author, text: text, superInfo: nil)
       }
       let page = YouTubeLiveChatPage(
         messages: messages,

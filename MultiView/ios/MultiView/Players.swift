@@ -2915,7 +2915,18 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
         RaidAutoFollow.follow(platform: target.0, channel: target.1, currentChannel: stream.channel)
       }
       if let alert = Self.twitchSupportAlert(from: line, tags: tags) {
-        NativeEventOverlay.show(alert, in: danmakuView, tint: StreamPlatform.twitch.tint)
+        // サブ/ギフトはニコ生・Kickと同じリッチ表示(アイコン+バースト+音)に格上げ。
+        NativeGiftSoundMixer.shared.play(style: .gift, enabled: settings.giftSoundEnabled, volume: playbackVolume)
+        NativeEventOverlay.showSupport(
+          title: alert,
+          subtitle: nil,
+          symbolName: NativeGiftEffectStyle.gift.heroSymbol,
+          progress: nil,
+          effectStyle: .gift,
+          assetImage: nil,
+          in: danmakuView,
+          tint: StreamPlatform.twitch.tint
+        )
       }
       guard let privmsg = line.range(of: " PRIVMSG "),
             let bodyRange = line.range(of: " :", range: privmsg.lowerBound..<line.endIndex) else { continue }
@@ -3709,7 +3720,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     if seenLiveChatMessageIDs.count > 2000 {
       seenLiveChatMessageIDs = Set(fresh.map { $0.id })
     }
-    pendingChatMessages.append(contentsOf: fresh)
+    // Super Chat / メンバー加入 は投げ銭系としてニコ生風のリッチ表示で即時に出す。通常チャットは弾幕へ。
+    fresh.filter { $0.superInfo != nil }.forEach { emitYouTubeSuperChat($0) }
+    pendingChatMessages.append(contentsOf: fresh.filter { $0.superInfo == nil })
     // A long stall can return a big backlog; cap it so we don't drip hundreds slowly.
     if pendingChatMessages.count > 80 {
       pendingChatMessages.removeFirst(pendingChatMessages.count - 80)
@@ -3717,6 +3730,20 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     if chatDripWorkItem == nil {
       dripNextChatMessage()
     }
+  }
+
+  private func emitYouTubeSuperChat(_ message: YouTubeLiveChatMessage) {
+    NativeGiftSoundMixer.shared.play(style: .premiumGift, enabled: settings.giftSoundEnabled, volume: playbackVolume)
+    NativeEventOverlay.showSupport(
+      title: "\(message.author): \(message.superInfo ?? "Super Chat")",
+      subtitle: message.text.isEmpty ? nil : message.text,
+      symbolName: NativeGiftEffectStyle.premiumGift.heroSymbol,
+      progress: nil,
+      effectStyle: .premiumGift,
+      assetImage: nil,
+      in: danmakuView,
+      tint: StreamPlatform.youtube.tint
+    )
   }
 
   // Emit one queued message, then schedule the next so a polled batch is spread over
