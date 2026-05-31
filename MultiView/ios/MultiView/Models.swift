@@ -58,6 +58,7 @@ struct AppSettings: Codable {
   var niconicoShowGift = true
   var niconicoShowNicoad = true
   var niconicoShowNotification = true
+  var autoEconomyOnManyStreams = true
   var platformOrder = StreamPlatform.allCases
 
   init() {}
@@ -81,6 +82,7 @@ struct AppSettings: Codable {
     niconicoShowGift = try container.decodeIfPresent(Bool.self, forKey: .niconicoShowGift) ?? true
     niconicoShowNicoad = try container.decodeIfPresent(Bool.self, forKey: .niconicoShowNicoad) ?? true
     niconicoShowNotification = try container.decodeIfPresent(Bool.self, forKey: .niconicoShowNotification) ?? true
+    autoEconomyOnManyStreams = try container.decodeIfPresent(Bool.self, forKey: .autoEconomyOnManyStreams) ?? true
     platformOrder = try container.decodeIfPresent([StreamPlatform].self, forKey: .platformOrder) ?? StreamPlatform.allCases
   }
 }

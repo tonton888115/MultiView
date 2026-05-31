@@ -304,7 +304,7 @@ final class NetworkQuality {
   // 自動でエコノミー(約900kbps)へ落とす。2本以下は設定どおりの画質。
   func effectivePeakBitRate(settings: AppSettings) -> Double {
     let base = activeQuality(settings: settings).preferredPeakBitRate
-    guard AppState.shared.streams.count >= 3 else { return base }
+    guard settings.autoEconomyOnManyStreams, AppState.shared.streams.count >= 3 else { return base }
     let economy = PlaybackQuality.economy.preferredPeakBitRate
     return base == 0 ? economy : min(base, economy)
   }
@@ -820,6 +820,7 @@ final class AppState {
         || settings.showChat != oldValue.showChat
         || settings.layoutMode != oldValue.layoutMode
         || settings.platformOrder != oldValue.platformOrder
+        || settings.autoEconomyOnManyStreams != oldValue.autoEconomyOnManyStreams
       if needsReload {
         delegate?.appStateDidChange()
       }
