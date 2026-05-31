@@ -106,7 +106,8 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     // 揺れで頻繁にストールし、フレームレートがガクガク＋「見られるまで遅い」になっていた
     // (ce716c1 の低遅延化で発生)。低遅延よりも滑らかさを優先し、AVPlayer にバッファ管理を
     // 任せる (true)。他プラットフォームは挙動が安定しているため false のまま据え置く。
-    player.automaticallyWaitsToMinimizeStalling = true
+    // 既定は true(滑らか優先)。設定「ニコ生 低遅延」を ON にするとユーザー責任で false(低遅延)。
+    player.automaticallyWaitsToMinimizeStalling = !settings.niconicoLowLatency
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
@@ -1695,6 +1696,69 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
 }
 
+// Kick=Amazon IVS の標準HLSは実セグメント2秒なのに TARGETDURATION=6 で、AVPlayer は
+// 3×TARGETDURATION≒18秒ライブ端から後ろに居座る(=体感10秒超の遅延)。コンテンツ自体は実時間に
+// 来ている(実測: 端の遅延 ≒0秒)。そこでプレイリストを横取りし、メディアプレイリストの
+// TARGETDURATION を 2 へ書き換えて AVPlayer を端の約6秒手前まで寄らせる(IVS低遅延モード相当)。
+// マスターは子(メディア)プレイリストURLを自スキームへ向けて横取り対象にするだけ。セグメント(.ts)は
+// httpsのまま直接取得させる(無駄な横取りを避ける)。取得失敗時は item が .failed → installFallback。
+final class KickLowLatencyLoader: NSObject, AVAssetResourceLoaderDelegate {
+  static let scheme = "mvkickll"
+  private let headers: [String: String]
+  private let session = URLSession(configuration: .ephemeral)
+
+  init(headers: [String: String]) {
+    self.headers = headers
+    super.init()
+  }
+
+  private func realURL(from url: URL) -> URL? {
+    var comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    comps?.scheme = "https"
+    return comps?.url
+  }
+
+  func resourceLoader(_ resourceLoader: AVAssetResourceLoader,
+                      shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest) -> Bool {
+    guard let requestURL = loadingRequest.request.url,
+          requestURL.scheme == Self.scheme,
+          let real = realURL(from: requestURL) else { return false }
+    var req = URLRequest(url: real)
+    headers.forEach { req.setValue($0.value, forHTTPHeaderField: $0.key) }
+    session.dataTask(with: req) { data, response, error in
+      guard let data, error == nil else {
+        loadingRequest.finishLoading(with: error ?? NSError(domain: "KickLL", code: -1))
+        return
+      }
+      var outData = data
+      let text = String(data: data, encoding: .utf8)
+      if let text, text.hasPrefix("#EXTM3U") {
+        outData = Data(Self.rewritePlaylist(text).utf8)
+        loadingRequest.contentInformationRequest?.contentType = "application/vnd.apple.mpegurl"
+      } else if let mime = (response as? HTTPURLResponse)?.mimeType {
+        loadingRequest.contentInformationRequest?.contentType = mime
+      }
+      loadingRequest.contentInformationRequest?.contentLength = Int64(outData.count)
+      loadingRequest.contentInformationRequest?.isByteRangeAccessSupported = false
+      loadingRequest.dataRequest?.respond(with: outData)
+      loadingRequest.finishLoading()
+    }.resume()
+    return true
+  }
+
+  private static func rewritePlaylist(_ text: String) -> String {
+    if text.contains("#EXT-X-STREAM-INF") {
+      // マスター: 子(メディア)プレイリストの https:// を自スキームへ向けて横取り対象にする。
+      return text.replacingOccurrences(of: "https://", with: "\(scheme)://")
+    }
+    // メディア: TARGETDURATION を 2 に下げてライブ端へ寄せる。セグメントURL(https)は触らない。
+    return text.replacingOccurrences(
+      of: "#EXT-X-TARGETDURATION:[0-9]+",
+      with: "#EXT-X-TARGETDURATION:2",
+      options: .regularExpression)
+  }
+}
+
 final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
   private let stream: StreamItem
   private let settings: AppSettings
@@ -1711,6 +1775,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private var chatroomID: String?
   private var kickChannelID: String?
   private var liveCatchUpTimer: Timer?
+  private var lowLatencyLoader: KickLowLatencyLoader?
   private var isLoading = false
   private var isStopped = false
   private var laneCursor = 0
@@ -1799,6 +1864,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     isStopped = true
     liveCatchUpTimer?.invalidate()
     liveCatchUpTimer = nil
+    lowLatencyLoader = nil
     channelTask?.cancel()
     channelTask = nil
     player.pause()
@@ -1897,11 +1963,22 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     DispatchQueue.main.async {
       guard !self.isStopped else { return }
       self.statusLabel.isHidden = true
-      let asset = AVURLAsset(url: hlsURL, options: [
-        "AVURLAssetHTTPHeaderFieldsKey": self.kickPlaybackHeaders(),
+      // プレイリストを横取りして TARGETDURATION を下げる低遅延ローダーを噛ませる(下記クラス参照)。
+      // URLのスキームを mvkickll:// に変えると AVAssetResourceLoaderDelegate が発火する。
+      let headers = self.kickPlaybackHeaders()
+      var llComponents = URLComponents(url: hlsURL, resolvingAgainstBaseURL: false)
+      llComponents?.scheme = KickLowLatencyLoader.scheme
+      let assetURL = llComponents?.url ?? hlsURL
+      let asset = AVURLAsset(url: assetURL, options: [
+        "AVURLAssetHTTPHeaderFieldsKey": headers,
         // Live HLS never needs a precise duration; skip that analysis to trim startup.
         AVURLAssetPreferPreciseDurationAndTimingKey: false
       ])
+      if assetURL.scheme == KickLowLatencyLoader.scheme {
+        let loader = KickLowLatencyLoader(headers: headers)
+        asset.resourceLoader.setDelegate(loader, queue: DispatchQueue(label: "app.multiview.kick.ll"))
+        self.lowLatencyLoader = loader
+      }
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.activeQuality(settings: self.settings).preferredPeakBitRate

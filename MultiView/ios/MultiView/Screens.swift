@@ -423,7 +423,7 @@ final class SettingsController: UITableViewController {
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     guard let sec = Sec(rawValue: section) else { return 0 }
     switch sec {
-    case .playback: return 5
+    case .playback: return 6
     case .danmaku: return 6
     case .order: return platforms.count
     case .kick: return 5
@@ -547,10 +547,15 @@ final class SettingsController: UITableViewController {
         cell.accessoryView = qualityControl(selected: AppState.shared.settings.wifiQuality) { quality in
           var s = AppState.shared.settings; s.wifiQuality = quality; AppState.shared.settings = s
         }
-      default:
+      case 4:
         cell.textLabel?.text = "モバイル通信時の画質"
         cell.accessoryView = qualityControl(selected: AppState.shared.settings.mobileQuality) { quality in
           var s = AppState.shared.settings; s.mobileQuality = quality; AppState.shared.settings = s
+        }
+      default:
+        cell.textLabel?.text = "ニコ生 低遅延 (カクつくことがあります)"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoLowLatency) { v in
+          var s = AppState.shared.settings; s.niconicoLowLatency = v; AppState.shared.settings = s
         }
       }
     case .danmaku:

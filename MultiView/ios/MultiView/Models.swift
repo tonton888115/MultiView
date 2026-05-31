@@ -53,6 +53,7 @@ struct AppSettings: Codable {
   var danmakuOpacity = 0.9
   var danmakuMaxLines = 0
   var danmakuMaxLength = 0
+  var niconicoLowLatency = false
   var platformOrder = StreamPlatform.allCases
 
   init() {}
@@ -71,6 +72,7 @@ struct AppSettings: Codable {
     danmakuOpacity = try container.decodeIfPresent(Double.self, forKey: .danmakuOpacity) ?? 0.9
     danmakuMaxLines = try container.decodeIfPresent(Int.self, forKey: .danmakuMaxLines) ?? 0
     danmakuMaxLength = try container.decodeIfPresent(Int.self, forKey: .danmakuMaxLength) ?? 0
+    niconicoLowLatency = try container.decodeIfPresent(Bool.self, forKey: .niconicoLowLatency) ?? false
     platformOrder = try container.decodeIfPresent([StreamPlatform].self, forKey: .platformOrder) ?? StreamPlatform.allCases
   }
 }
