@@ -1,11 +1,23 @@
 import UIKit
 import WebKit
 
+struct StreamReorderEvent {
+  enum Phase: Equatable {
+    case began
+    case changed
+    case ended
+    case cancelled
+  }
+
+  let phase: Phase
+  let windowLocation: CGPoint
+}
+
 final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDelegate {
   let stream: StreamItem
-  private let onReorder: (StreamCellView, UIGestureRecognizer) -> Void
+  private let onReorder: (StreamCellView, StreamReorderEvent) -> Void
   private var autoHider: AutoHidingControls?
-  private let reorderHandle = UIView()
+  private let reorderHandle = ReorderHandleView()
   private let commentBar = UIView()
   private let commentField = UITextField()
   private let commentStatus = UILabel()
@@ -14,7 +26,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
   private weak var commentPoster: CommentPostable?
   private weak var commentEchoer: CommentEchoDisplay?
 
-  init(stream: StreamItem, onFocus: @escaping () -> Void, onReorder: @escaping (StreamCellView, UIGestureRecognizer) -> Void) {
+  init(stream: StreamItem, onFocus: @escaping () -> Void, onReorder: @escaping (StreamCellView, StreamReorderEvent) -> Void) {
     self.stream = stream
     self.onReorder = onReorder
     super.init(frame: .zero)
@@ -118,7 +130,11 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
         viewerCountOverlay.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10)
       ])
     }
-    autoHider = AutoHidingControls(host: self, controls: [focus, remove, comment, volume, reorderHandle])
+    var autoHideControls: [UIView] = [focus, remove, comment, volume, reorderHandle]
+    if let viewerCountOverlay {
+      autoHideControls.append(viewerCountOverlay)
+    }
+    autoHider = AutoHidingControls(host: self, controls: autoHideControls)
     let reorder = UILongPressGestureRecognizer(target: self, action: #selector(handleReorderGesture(_:)))
     reorder.minimumPressDuration = 0.28
     reorder.allowableMovement = 18
@@ -137,6 +153,13 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     reorderHandle.accessibilityLabel = "並び替え"
     reorderHandle.accessibilityHint = "ドラッグして表示順を変更"
     reorderHandle.isAccessibilityElement = true
+    reorderHandle.onDrag = { [weak self] event in
+      guard let self else { return }
+      if event.phase == .began {
+        self.autoHider?.showTemporarily()
+      }
+      self.onReorder(self, event)
+    }
     addSubview(reorderHandle)
 
     let icon = UIImageView(image: UIImage(systemName: "line.3.horizontal"))
@@ -150,12 +173,6 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
       icon.widthAnchor.constraint(equalToConstant: 22),
       icon.heightAnchor.constraint(equalToConstant: 16)
     ])
-
-    let pan = UIPanGestureRecognizer(target: self, action: #selector(handleReorderGesture(_:)))
-    pan.maximumNumberOfTouches = 1
-    pan.cancelsTouchesInView = false
-    pan.delegate = self
-    reorderHandle.addGestureRecognizer(pan)
   }
 
   private func buildCommentBar() {
@@ -286,7 +303,8 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
   }
 
   @objc private func handleReorderGesture(_ gesture: UIGestureRecognizer) {
-    onReorder(self, gesture)
+    guard let event = StreamReorderEvent(gesture: gesture, window: window) else { return }
+    onReorder(self, event)
   }
 
   func setReorderSourceActive(_ active: Bool) {
@@ -302,9 +320,9 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
   }
 
   func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-    if gestureRecognizer.view === reorderHandle { return true }
     var current: UIView? = touch.view
     while let view = current {
+      if view === reorderHandle { return false }
       if view is UIControl { return false }
       current = view.superview
     }
@@ -317,6 +335,72 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
 
   private var dragVisualCanChange: Bool {
     alpha > 0.8
+  }
+}
+
+private extension StreamReorderEvent {
+  init?(gesture: UIGestureRecognizer, window: UIWindow?) {
+    let phase: Phase
+    switch gesture.state {
+    case .began:
+      phase = .began
+    case .changed:
+      phase = .changed
+    case .ended:
+      phase = .ended
+    case .cancelled, .failed:
+      phase = .cancelled
+    default:
+      return nil
+    }
+    let location = window.map { gesture.location(in: $0) } ?? gesture.location(in: nil)
+    self.init(phase: phase, windowLocation: location)
+  }
+}
+
+private final class ReorderHandleView: UIView {
+  var onDrag: ((StreamReorderEvent) -> Void)?
+  private var activeTouch: UITouch?
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    isMultipleTouchEnabled = false
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+    bounds.insetBy(dx: -8, dy: -8).contains(point)
+  }
+
+  override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+    guard activeTouch == nil, let touch = touches.first else { return }
+    activeTouch = touch
+    emit(.began, touch: touch)
+  }
+
+  override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+    guard let touch = activeTouch, touches.contains(where: { $0 === touch }) else { return }
+    emit(.changed, touch: touch)
+  }
+
+  override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+    guard let touch = activeTouch, touches.contains(where: { $0 === touch }) else { return }
+    emit(.ended, touch: touch)
+    activeTouch = nil
+  }
+
+  override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+    guard let touch = activeTouch, touches.contains(where: { $0 === touch }) else { return }
+    emit(.cancelled, touch: touch)
+    activeTouch = nil
+  }
+
+  private func emit(_ phase: StreamReorderEvent.Phase, touch: UITouch) {
+    let location = window.map { touch.location(in: $0) } ?? touch.location(in: nil)
+    onDrag?(StreamReorderEvent(phase: phase, windowLocation: location))
   }
 }
 

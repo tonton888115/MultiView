@@ -113,6 +113,7 @@ final class ViewingController: UIViewController {
 
   private func configureScroll() {
     scrollView.translatesAutoresizingMaskIntoConstraints = false
+    scrollView.delaysContentTouches = false
     stack.axis = .vertical
     stack.spacing = 10
     stack.translatesAutoresizingMaskIntoConstraints = false
@@ -134,8 +135,8 @@ final class ViewingController: UIViewController {
     StreamCellView(stream: stream, onFocus: { [weak self] in
       self?.focused = stream
       self?.reload()
-    }, onReorder: { [weak self] cell, gesture in
-      self?.handleReorder(cell: cell, gesture: gesture)
+    }, onReorder: { [weak self] cell, event in
+      self?.handleReorder(cell: cell, event: event)
     })
   }
 
@@ -324,20 +325,18 @@ final class ViewingController: UIViewController {
     }
   }
 
-  private func handleReorder(cell: StreamCellView, gesture: UIGestureRecognizer) {
+  private func handleReorder(cell: StreamCellView, event: StreamReorderEvent) {
     guard focused == nil, AppState.shared.streams.count > 1 else { return }
-    let location = gesture.location(in: view)
-    switch gesture.state {
+    let location = view.convert(event.windowLocation, from: nil)
+    switch event.phase {
     case .began:
       beginReorder(cell: cell, at: location)
     case .changed:
       updateReorder(at: location)
     case .ended:
       finishReorder(commit: true)
-    case .cancelled, .failed:
+    case .cancelled:
       finishReorder(commit: false)
-    default:
-      break
     }
   }
 

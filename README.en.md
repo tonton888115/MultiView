@@ -19,7 +19,8 @@ Repository: **https://github.com/tonton888115/MultiView** (public)
 ## Features
 
 - **4 bottom tabs**: Following / Ranking / Watch / Settings
-- **Watch tab**: grid multi-view. Tap **⤢** on a cell to focus one stream, long-press to reorder, **×** to remove
+- **Watch tab**: grid multi-view. Tap **⤢** on a cell to focus one stream, long-press or drag the bottom-right handle to reorder, **×** to remove
+- **Viewer count overlay**: when enabled in Settings, exact viewer counts appear at bottom-left together with the volume controls after tapping
 - **Native playback**: a dedicated player per service (Kick/Twitch prefer Amazon IVS Player with AVPlayer fallback; YouTube uses InnerTube HLS extraction with AVPlayer/iframe fallback; TwitCasting uses native HLS; Niconico uses the program-page HLS + comment WebSocket)
 - **Danmaku**: Niconico-style right→left comments (toggle/speed/opacity/font size/max lines/max length). Niconico also renders gift effects
 - **Posting comments**: from an in-app field where supported; otherwise log in via the official chat shown in the focused view

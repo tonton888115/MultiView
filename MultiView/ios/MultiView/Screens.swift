@@ -578,7 +578,7 @@ final class SettingsController: UITableViewController {
           var s = AppState.shared.settings; s.niconicoShowNotification = v; AppState.shared.settings = s
         }
       case 10:
-        cell.textLabel?.text = "同接数を左下に表示"
+        cell.textLabel?.text = "タップ時に同接数を左下に表示"
         cell.accessoryView = switchControl(isOn: AppState.shared.settings.showViewerCount) { v in
           var s = AppState.shared.settings; s.showViewerCount = v; AppState.shared.settings = s
         }

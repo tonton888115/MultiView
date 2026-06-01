@@ -192,7 +192,11 @@ final class FocusedStreamView: UIView {
     bringSubviewToFront(volume)
     bringSubviewToFront(remove)
     if let closeButton { bringSubviewToFront(closeButton) }
+    if let viewerCountOverlay { bringSubviewToFront(viewerCountOverlay) }
     var autoHideControls: [UIView] = [remove, volume]
+    if let viewerCountOverlay {
+      autoHideControls.append(viewerCountOverlay)
+    }
     if let closeButton {
       autoHideControls.append(closeButton)
     }

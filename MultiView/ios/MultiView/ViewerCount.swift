@@ -79,24 +79,19 @@ final class ViewerCountOverlay: UIVisualEffectView {
       }
       return
     }
-    label.text = "\(Self.format(count))人"
+    let controlsAreVisible = alpha > 0.01
+    label.text = "\(count)人"
+    accessibilityLabel = "同接 \(count)人"
     if isHidden {
       isHidden = false
+    }
+    guard controlsAreVisible else {
       alpha = 0
+      return
     }
     UIView.animate(withDuration: 0.16) {
       self.alpha = 1
     }
-  }
-
-  private static func format(_ count: Int) -> String {
-    if count >= 10_000 {
-      return String(format: "%.1f万", Double(count) / 10_000.0)
-    }
-    if count >= 1_000 {
-      return String(format: "%.1fK", Double(count) / 1_000.0)
-    }
-    return String(count)
   }
 }
 
@@ -161,13 +156,21 @@ enum ViewerCountProvider {
 
   private static func fetchTwitcasting(channel rawChannel: String, completion: @escaping (Int?) -> Void) -> URLSessionDataTask? {
     let channel = normalizedChannel(rawChannel)
-    guard let target = channel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-          let url = URL(string: "https://twitcasting.tv/streamserver.php?target=\(target)&mode=client&player=pc_web") else {
+    guard let escaped = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+          let url = URL(string: "https://twitcasting.tv/\(escaped)") else {
       completion(nil)
       return nil
     }
-    return jsonTask(url: url, headers: browserHeaders(referer: "https://twitcasting.tv/\(channel)")) { object in
-      completion(count(in: object, keys: twitcastingKeys))
+    var headers = browserHeaders(referer: "https://twitcasting.tv/")
+    headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    return htmlTask(url: url, headers: headers) { html in
+      guard let viewerURL = twitcastingViewerURL(from: html) else {
+        completion(nil)
+        return
+      }
+      _ = jsonTask(url: viewerURL, headers: browserHeaders(referer: "https://twitcasting.tv/\(channel)")) { object in
+        completion(twitcastingViewerCount(from: object))
+      }
     }
   }
 
@@ -359,6 +362,44 @@ enum ViewerCountProvider {
     }
     let decoded = decodeHTMLEntities(encoded)
     return parseJSON(decoded.data(using: .utf8))
+  }
+
+  private static func twitcastingViewerURL(from html: String?) -> URL? {
+    guard let html else { return nil }
+    let decoded = decodeHTMLEntities(html)
+    let patterns = [
+      #"fetch\(["']([^"']*userajax\.php\?c=viewers[^"']+)["']\)"#,
+      #"["']([^"']*userajax\.php\?c=viewers[^"']+)["']"#
+    ]
+    for pattern in patterns {
+      guard let raw = firstMatch(in: decoded, pattern: pattern) else { continue }
+      if let absolute = URL(string: raw), absolute.scheme != nil {
+        return absolute
+      }
+      let path = raw.hasPrefix("/") ? raw : "/\(raw)"
+      if let url = URL(string: "https://twitcasting.tv\(path)") {
+        return url
+      }
+      if let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+        return URL(string: "https://twitcasting.tv\(encodedPath)")
+      }
+    }
+    return nil
+  }
+
+  private static func twitcastingViewerCount(from object: Any?) -> Int? {
+    if let array = object as? [Any], let first = array.first {
+      return intValue(first)
+    }
+    if let dict = object as? [String: Any] {
+      if let data = dict["data"] as? [Any], let first = data.first {
+        return intValue(first)
+      }
+      if let viewers = dict["viewers"] as? [Any], let first = viewers.first {
+        return intValue(first)
+      }
+    }
+    return count(in: object, keys: twitcastingKeys)
   }
 
   private static func firstMatch(in text: String, pattern: String) -> String? {
