@@ -650,7 +650,10 @@ enum StreamVolumeStore {
 }
 
 protocol AppStateDelegate: AnyObject {
-  func appStateDidChange()
+  // 並び替え・追加・削除。生き残る配信のプレイヤーは再利用してよい(作り直さない)。
+  func appStateStreamsDidChange()
+  // 画質/弾幕/音声など、既存プレイヤーへ反映するには作り直しが要る設定変更。
+  func appStateSettingsDidChange()
 }
 
 extension Notification.Name {
@@ -804,7 +807,7 @@ final class AppState {
   var streams = Store.loadStreams() {
     didSet {
       Store.saveStreams(streams)
-      delegate?.appStateDidChange()
+      delegate?.appStateStreamsDidChange()
     }
   }
   var settings = Store.loadSettings() {
@@ -823,7 +826,7 @@ final class AppState {
         || settings.platformOrder != oldValue.platformOrder
         || settings.autoEconomyOnManyStreams != oldValue.autoEconomyOnManyStreams
       if needsReload {
-        delegate?.appStateDidChange()
+        delegate?.appStateSettingsDidChange()
       }
     }
   }
@@ -889,16 +892,24 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
     NotificationCenter.default.addObserver(self, selector: #selector(raidFollowed), name: .multiViewRaidFollowed, object: nil)
   }
 
-  func appStateDidChange() {
-    viewVC.reload()
+  func appStateStreamsDidChange() {
+    // 並び順・本数だけの変化。視聴タブはプレイヤーを再利用して更新(並び替えはアニメ)。
+    // ランキング/フォロー/設定は platformOrder(=settings)依存なので、ここでは更新しない。
+    viewVC.reloadForStreamsChange()
+  }
+
+  func appStateSettingsDidChange() {
+    // 画質・弾幕・レイアウト等。プレイヤーへ確実に反映するため作り直す。
+    viewVC.reload(rebuildPlayers: true)
     rankingVC.reloadOrder()
     followingVC.reloadOrder()
     settingsVC.reload()
   }
 
   @objc private func raidFollowed() {
+    // streams への追加は appStateStreamsDidChange 経由で視聴タブへ既に反映される。
+    // ここではレイドで増えた配信を見せるため視聴タブへ切り替えるだけ。
     selectedIndex = 2
-    viewVC.reload()
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
       PlaybackCoordinator.shared.resumeAll()
     }

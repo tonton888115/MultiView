@@ -15,6 +15,10 @@ final class ViewingController: UIViewController {
   private var dragSourceStream: StreamItem?
   private var dragInsertIndex: Int?
   private var lastAutoReloadAt = Date.distantPast
+  // 並び替え・追加・削除でプレイヤーを作り直さず使い回すためのセル再利用プール(stream.id -> cell)。
+  private var cellPool: [String: StreamCellView] = [:]
+  // 再利用セル/行に付けた高さ制約。reload のたびに貼り直すので、冒頭で必ず外す。
+  private var cellLayoutConstraints: [NSLayoutConstraint] = []
 
   override func viewDidLoad() {
     super.viewDidLoad()
@@ -70,19 +74,31 @@ final class ViewingController: UIViewController {
     }
   }
 
-  func reload() {
+  // 既定では作り直す(rebuildPlayers:true)。並び替え/追加/削除/レイアウト切替のときだけ false を渡し、
+  // 生き残る配信のプレイヤーを破棄せず使い回す(黒画面/コールドスタートを避け、並び替えはアニメ可能)。
+  func reload(rebuildPlayers: Bool = true) {
     guard isViewLoaded else { return }
-    clearStack()
+    NSLayoutConstraint.deactivate(cellLayoutConstraints)
+    cellLayoutConstraints.removeAll()
+    detachArrangedSubviews()
+    if rebuildPlayers {
+      discardAllPooledCells()
+    }
+
     let streams = AppState.shared.streams
     if streams.isEmpty {
+      pruneCellPool(keeping: [])
       stack.addArrangedSubview(emptyView())
       return
     }
-    addPlaybackBar()
     if let focused, streams.contains(focused) {
+      // 展開中はグリッドのセルを残しても二重再生・帯域消費になるだけなので破棄する。
+      // 展開ビューは自前のプレイヤーを持つ(プール対象外)。
+      pruneCellPool(keeping: [])
+      addPlaybackBar()
       let focusedView = FocusedStreamView(stream: focused, onClose: { [weak self] in
         self?.focused = nil
-        self?.reload()
+        self?.reload(rebuildPlayers: true)
       })
       stack.addArrangedSubview(focusedView)
       // 展開（1配信フル表示）は可視領域いっぱいに広げる（再生バー＋余白分を引いた高さ）。
@@ -92,23 +108,66 @@ final class ViewingController: UIViewController {
       PlaybackCoordinator.shared.resumeAll()
       return
     }
-    // Every platform now has a dedicated per-cell native player, so all streams go
-    // through addCells (grid / stacked). The old single-WebView fallback is gone.
+    // 消えた配信のセルだけ停止・破棄し、残る配信はプールのプレイヤーを使い回す。
+    pruneCellPool(keeping: streams.map { $0.id })
+    addPlaybackBar()
     addCells(streams)
     PlaybackCoordinator.shared.resumeAll()
   }
 
-  private func clearStack() {
-    stack.arrangedSubviews.forEach { view in
-      stopPlayback(in: view)
-      stack.removeArrangedSubview(view)
-      view.removeFromSuperview()
+  // 並び替え・追加・削除を、再利用セルを旧位置→新位置へ補間移動させてアニメ反映する
+  // (iOSのホーム画面アイコン並べ替えのように、残るセルがスッと退いて新しい配置に収まる)。
+  func reloadForStreamsChange() {
+    reload(rebuildPlayers: false)
+    view.setNeedsLayout()
+    UIView.animate(
+      withDuration: 0.32, delay: 0,
+      usingSpringWithDamping: 0.85, initialSpringVelocity: 0.2,
+      options: [.allowUserInteraction, .beginFromCurrentState]
+    ) {
+      self.view.layoutIfNeeded()
     }
   }
 
-  private func stopPlayback(in view: UIView) {
-    (view as? PlaybackStoppable)?.stopPlayback()
-    view.subviews.forEach { stopPlayback(in: $0) }
+  // stack の現在の中身を外す。再利用セル(StreamCellView)は cellPool が強参照で保持しているため
+  // ここでは解放されず、次の addCells で新しい行へ付け替わる(プレイヤー継続)。展開ビューなど
+  // プール外の PlaybackStoppable は確実に停止してから捨てる。
+  private func detachArrangedSubviews() {
+    for sub in stack.arrangedSubviews {
+      stack.removeArrangedSubview(sub)
+      if !(sub is StreamCellView) {
+        stopNonPooledPlayback(in: sub)
+      }
+      sub.removeFromSuperview()
+    }
+  }
+
+  // 再利用プール内のセルは停止しない(継続)。それ以外の PlaybackStoppable(展開ビュー等)だけ停止する。
+  private func stopNonPooledPlayback(in view: UIView) {
+    for sub in view.subviews {
+      if sub is StreamCellView { continue }
+      stopNonPooledPlayback(in: sub)
+    }
+    if !(view is StreamCellView) {
+      (view as? PlaybackStoppable)?.stopPlayback()
+    }
+  }
+
+  private func pruneCellPool(keeping ids: [String]) {
+    let keep = Set(ids)
+    for (id, cell) in cellPool where !keep.contains(id) {
+      cell.stopPlayback()
+      cell.removeFromSuperview()
+      cellPool.removeValue(forKey: id)
+    }
+  }
+
+  private func discardAllPooledCells() {
+    cellPool.values.forEach { cell in
+      cell.stopPlayback()
+      cell.removeFromSuperview()
+    }
+    cellPool.removeAll()
   }
 
   private func configureScroll() {
@@ -132,19 +191,26 @@ final class ViewingController: UIViewController {
   }
 
   private func makeCell(_ stream: StreamItem) -> StreamCellView {
-    StreamCellView(stream: stream, onFocus: { [weak self] in
+    if let existing = cellPool[stream.id] {
+      return existing
+    }
+    let cell = StreamCellView(stream: stream, onFocus: { [weak self] in
       self?.focused = stream
-      self?.reload()
+      self?.reload(rebuildPlayers: true)
     }, onReorder: { [weak self] cell, event in
       self?.handleReorder(cell: cell, event: event)
     })
+    cellPool[stream.id] = cell
+    return cell
   }
 
   private func addStackedCell(_ stream: StreamItem) {
     let cell = makeCell(stream)
     stack.addArrangedSubview(cell)
-    cell.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: 9 / 16).isActive = true
-    cell.heightAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
+    let ratio = cell.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: 9 / 16)
+    let floor = cell.heightAnchor.constraint(greaterThanOrEqualToConstant: 220)
+    cellLayoutConstraints.append(contentsOf: [ratio, floor])
+    NSLayoutConstraint.activate([ratio, floor])
   }
 
   private func addCells(_ streams: [StreamItem]) {
@@ -178,12 +244,12 @@ final class ViewingController: UIViewController {
     layoutControl.setImage(UIImage(systemName: "square.grid.2x2"), forSegmentAt: 1)
     layoutControl.setTitleTextAttributes([.foregroundColor: UIColor.white], for: .selected)
     layoutControl.translatesAutoresizingMaskIntoConstraints = false
-    layoutControl.addAction(UIAction { [weak self] actionEvent in
+    layoutControl.addAction(UIAction { actionEvent in
       guard let control = actionEvent.sender as? UISegmentedControl else { return }
       var settings = AppState.shared.settings
       settings.layoutMode = control.selectedSegmentIndex == 0 ? .stacked : .grid
       AppState.shared.settings = settings
-      self?.reload()
+      // settings 変更は appStateSettingsDidChange 経由で reload されるため、ここでは呼ばない。
     }, for: .valueChanged)
 
     let spacer = UIView()
@@ -315,8 +381,10 @@ final class ViewingController: UIViewController {
       row.addArrangedSubview(makeCell(streams[index]))
       row.addArrangedSubview(makeCell(streams[index + 1]))
       stack.addArrangedSubview(row)
-      row.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: 9 / 32).isActive = true
-      row.heightAnchor.constraint(greaterThanOrEqualToConstant: 150).isActive = true
+      let ratio = row.heightAnchor.constraint(equalTo: view.widthAnchor, multiplier: 9 / 32)
+      let floor = row.heightAnchor.constraint(greaterThanOrEqualToConstant: 150)
+      cellLayoutConstraints.append(contentsOf: [ratio, floor])
+      NSLayoutConstraint.activate([ratio, floor])
       index += 2
     }
     while index < streams.count {
@@ -327,16 +395,19 @@ final class ViewingController: UIViewController {
 
   private func handleReorder(cell: StreamCellView, event: StreamReorderEvent) {
     guard focused == nil, AppState.shared.streams.count > 1 else { return }
+    // スタック(縦1列)はドラッグ中に他セルがリアルタイムに退くライブ並べ替え。グリッドは行構造が
+    // 複雑なので従来のスナップショット＋挿入インジケータ方式を維持する。
+    let isStacked = AppState.shared.settings.layoutMode == .stacked
     let location = view.convert(event.windowLocation, from: nil)
     switch event.phase {
     case .began:
-      beginReorder(cell: cell, at: location)
+      if isStacked { beginLiveReorder(cell: cell, at: location) } else { beginReorder(cell: cell, at: location) }
     case .changed:
-      updateReorder(at: location)
+      if isStacked { updateLiveReorder(at: location) } else { updateReorder(at: location) }
     case .ended:
-      finishReorder(commit: true)
+      if isStacked { finishLiveReorder(commit: true) } else { finishReorder(commit: true) }
     case .cancelled:
-      finishReorder(commit: false)
+      if isStacked { finishLiveReorder(commit: false) } else { finishReorder(commit: false) }
     }
   }
 
@@ -493,6 +564,87 @@ final class ViewingController: UIViewController {
       }
     }
     return result
+  }
+
+  // MARK: - スタックモードのライブ並べ替え(iOSホーム画面のように他セルがリアルタイムに退く)
+
+  private func beginLiveReorder(cell: StreamCellView, at location: CGPoint) {
+    guard dragSnapshot == nil else { return }
+    dragSourceCell = cell
+    dragSourceStream = cell.stream
+    scrollView.isScrollEnabled = false
+
+    let sourceFrame = cell.convert(cell.bounds, to: view)
+    let snapshot = cell.snapshotView(afterScreenUpdates: false) ?? UIView(frame: cell.bounds)
+    snapshot.frame = sourceFrame
+    dragSnapshotCenterOffset = CGPoint(x: sourceFrame.midX - location.x, y: sourceFrame.midY - location.y)
+    snapshot.layer.shadowColor = UIColor.black.cgColor
+    snapshot.layer.shadowOpacity = 0.35
+    snapshot.layer.shadowRadius = 14
+    snapshot.layer.shadowOffset = CGSize(width: 0, height: 8)
+    snapshot.transform = CGAffineTransform(scaleX: 1.03, y: 1.03)
+    view.addSubview(snapshot)
+    view.bringSubviewToFront(snapshot)
+    dragSnapshot = snapshot
+
+    // ソースセルは透明にして「隙間」として残す(場所は保持＝他セルが退くと隙間が空いて見える)。
+    // 重要: stack からは外さない。外すと進行中のドラッグ入力(セルのジェスチャ/ハンドル)が
+    // 切れてしまう。一度 began した touch は alpha を 0 にしても届き続ける。指の下はスナップショットが代役。
+    cell.alpha = 0
+  }
+
+  private func updateLiveReorder(at location: CGPoint) {
+    guard let cell = dragSourceCell, let snapshot = dragSnapshot else { return }
+    snapshot.center = CGPoint(x: location.x + dragSnapshotCenterOffset.x, y: location.y + dragSnapshotCenterOffset.y)
+
+    // ソース以外のセルを基準に指のyが入るべき位置を求め、ソースセル(隙間)をそこへ移して他セルを退かせる。
+    let others = stack.arrangedSubviews.compactMap { $0 as? StreamCellView }.filter { $0 !== cell }
+    var insertBefore = others.count
+    for (index, other) in others.enumerated() {
+      let frame = other.convert(other.bounds, to: view)
+      if location.y < frame.midY {
+        insertBefore = index
+        break
+      }
+    }
+    let barOffset = (stack.arrangedSubviews.first is StreamCellView) ? 0 : 1
+    let desiredStackIndex = min(insertBefore + barOffset, stack.arrangedSubviews.count - 1)
+    guard stack.arrangedSubviews.firstIndex(of: cell) != desiredStackIndex else { return }
+    UIView.animate(withDuration: 0.22, delay: 0, options: [.allowUserInteraction, .beginFromCurrentState]) {
+      self.stack.insertArrangedSubview(cell, at: desiredStackIndex)
+      self.stack.layoutIfNeeded()
+    }
+  }
+
+  private func finishLiveReorder(commit: Bool) {
+    scrollView.isScrollEnabled = true
+    let snapshot = dragSnapshot
+    let cell = dragSourceCell
+    let newStreams = (commit && cell != nil) ? streamsFromLiveLayout() : nil
+    dragSnapshot = nil
+    dragSourceCell = nil
+    dragSourceStream = nil
+    dragSnapshotCenterOffset = .zero
+
+    cell?.alpha = 1
+    UIView.animate(withDuration: 0.16, animations: {
+      snapshot?.alpha = 0
+    }, completion: { _ in
+      snapshot?.removeFromSuperview()
+    })
+
+    if let newStreams, newStreams.count == AppState.shared.streams.count, newStreams != AppState.shared.streams {
+      // 確定: 並びを保存 → appStateStreamsDidChange 経由で再利用＋整列アニメ(プレイヤー継続)。
+      AppState.shared.streams = newStreams
+    } else {
+      // キャンセル / 変化なし: ドラッグ中に動かした並びを streams 順(元の並び)へ戻す。
+      reload(rebuildPlayers: false)
+    }
+  }
+
+  // ドラッグ中の stack の並び(ソースセルも含む)から、確定後の streams 配列を作る。
+  private func streamsFromLiveLayout() -> [StreamItem] {
+    stack.arrangedSubviews.compactMap { ($0 as? StreamCellView)?.stream }
   }
 
   private func emptyView() -> UIView {

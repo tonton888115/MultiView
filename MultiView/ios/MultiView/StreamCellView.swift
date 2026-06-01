@@ -13,7 +13,7 @@ struct StreamReorderEvent {
   let windowLocation: CGPoint
 }
 
-final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDelegate {
+final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDelegate, PlaybackStoppable {
   let stream: StreamItem
   private let onReorder: (StreamCellView, StreamReorderEvent) -> Void
   private var autoHider: AutoHidingControls?
@@ -25,6 +25,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
   private var commentBottom: NSLayoutConstraint?
   private weak var commentPoster: CommentPostable?
   private weak var commentEchoer: CommentEchoDisplay?
+  private weak var playbackView: PlaybackStoppable?
 
   init(stream: StreamItem, onFocus: @escaping () -> Void, onReorder: @escaping (StreamCellView, StreamReorderEvent) -> Void) {
     self.stream = stream
@@ -53,6 +54,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     let audio = video as? AudioControllable
     commentPoster = video as? CommentPostable
     commentEchoer = video as? CommentEchoDisplay
+    playbackView = video as? PlaybackStoppable
     video.translatesAutoresizingMaskIntoConstraints = false
     addSubview(video)
 
@@ -300,6 +302,11 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
 
   deinit {
     NotificationCenter.default.removeObserver(self)
+  }
+
+  // 再利用プールから外れる(配信が消える/全体を作り直す)ときに内部プレイヤーを停止する。
+  func stopPlayback() {
+    playbackView?.stopPlayback()
   }
 
   @objc private func handleReorderGesture(_ gesture: UIGestureRecognizer) {
