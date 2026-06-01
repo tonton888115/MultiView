@@ -6,6 +6,7 @@ import ImageIO
 import AuthenticationServices
 import Security
 import CryptoKit
+import AmazonIVSPlayer
 
 // Per-platform native player views (Niconico / Kick / Twitch / TwitCasting / YouTube).
 // Each plays its stream via a dedicated AVPlayer/WebView. Extracted from AppDelegate.swift.
@@ -1887,11 +1888,13 @@ final class KickLowLatencyLoader: NSObject, AVAssetResourceLoaderDelegate {
   }
 }
 
-final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
+final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, IVSPlayer.Delegate {
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
+  private var ivsPlayer: IVSPlayer?
+  private var ivsPlayerLayer: IVSPlayerLayer?
   private let danmakuView = UIView()
   private let statusLabel = UILabel()
   private var playbackVolume: Float
@@ -1904,6 +1907,10 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private var kickChannelID: String?
   private var liveCatchUpTimer: Timer?
   private var lowLatencyLoader: KickLowLatencyLoader?
+  private var ivsBufferingRecoveryWork: DispatchWorkItem?
+  private var usingIvsPlayback = false
+  private var forceLegacyPlayback = false
+  private let ivsRetry = NativeRetryLimiter(maxAttempts: 2)
   // 直近のplayback_url(素HLS再試行用)、再生世代(古いitemのKVO/通知を無視)、
   // ネイティブ再取得リトライ(トークン失効時に新URL取得。上限超過でのみweb UIへ)。Codex指摘②③④。
   private var currentHLSURL: URL?
@@ -1968,6 +1975,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   override func layoutSubviews() {
     super.layoutSubviews()
     playerLayer.frame = bounds
+    ivsPlayerLayer?.frame = bounds
     danmakuView.frame = bounds
   }
 
@@ -1980,6 +1988,11 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       fallbackWebView.resumePlayback()
       return
     }
+    if let ivsPlayer, usingIvsPlayback {
+      applyIvsAudio()
+      ivsPlayer.play()
+      return
+    }
     if player.currentItem == nil {
       loadNativeStream()
       return
@@ -1990,6 +2003,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   }
 
   func pausePlayback() {
+    ivsPlayer?.pause()
     player.pause()
     fallbackWebView?.pausePlayback()
   }
@@ -2009,6 +2023,10 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     stallCountResetWork = nil
     stableModeResetWork?.cancel()
     stableModeResetWork = nil
+    ivsRetry.reset()
+    ivsBufferingRecoveryWork?.cancel()
+    ivsBufferingRecoveryWork = nil
+    teardownIvsPlayback(removeLayer: true)
     liveCatchUpTimer?.invalidate()
     liveCatchUpTimer = nil
     lowLatencyLoader = nil
@@ -2032,6 +2050,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
 
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
+    applyIvsAudio()
     player.volume = settings.playAudio ? playbackVolume : 0
     fallbackWebView?.setPlaybackVolume(playbackVolume)
   }
@@ -2060,15 +2079,19 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       self.channelTask = nil
       self.isLoading = false
       if let error {
-        self.installFallback("Kick HLS取得失敗: \(error.localizedDescription)")
+        self.retryKickLoadOrFallback("Kick HLS取得失敗: \(error.localizedDescription)")
         return
       }
       if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-        self.installFallback("Kick HLS取得失敗: HTTP \(http.statusCode)")
+        if http.statusCode == 401 || http.statusCode == 403 {
+          self.installFallback("Kick HLS取得失敗: HTTP \(http.statusCode)")
+        } else {
+          self.retryKickLoadOrFallback("Kick HLS取得失敗: HTTP \(http.statusCode)")
+        }
         return
       }
       guard let data else {
-        self.installFallback("Kick HLS URLを取得できません")
+        self.retryKickLoadOrFallback("Kick HLS URLを取得できません")
         return
       }
       let channelInfo = Self.extractChannelInfo(from: data)
@@ -2079,7 +2102,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         self.fetchKickChatroom(channel: channel)
       }
       guard let hlsURL = channelInfo.hlsURL else {
-        self.installFallback("Kick HLS URLを取得できません")
+        self.retryKickLoadOrFallback("Kick HLS URLを取得できません")
         return
       }
       self.play(hlsURL: hlsURL)
@@ -2110,8 +2133,61 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   // (cannot open 等)ことがあるため、失敗時は lowLatency=false の素HLSでネイティブ再試行し、
   // それでもダメな時だけ web UI フォールバックへ。これで「cannot open→Kick独自UI」を防ぐ。
   private func play(hlsURL: URL, lowLatency: Bool = true) {
+    if Self.useIvsPlayer, !forceLegacyPlayback {
+      playWithIvs(hlsURL: hlsURL)
+    } else {
+      playWithAVPlayer(hlsURL: hlsURL, lowLatency: lowLatency)
+    }
+  }
+
+  private func playWithIvs(hlsURL: URL) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil else { return }
+      self.statusLabel.isHidden = true
+      self.currentHLSURL = hlsURL
+      self.playbackGeneration += 1
+      let generation = self.playbackGeneration
+      self.teardownAVPlayerPlayback()
+
+      let ivs = IVSPlayer()
+      ivs.delegate = self
+      ivs.autoQualityMode = true
+      ivs.setOrigin(URL(string: "https://kick.com"))
+      ivs.setLiveLowLatencyEnabled(!self.stableMode)
+      ivs.setRebufferToLive(!self.stableMode)
+      ivs.setNetworkRecoveryMode(.resume)
+      ivs.setInitialBufferDuration(CMTime(seconds: self.stableMode ? 3.0 : 1.2, preferredTimescale: 600))
+      let peakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: self.settings)
+      if peakBitRate > 0 {
+        ivs.setAutoMaxBitrate(Int(peakBitRate))
+      }
+
+      self.teardownIvsPlayback(removeLayer: false)
+      self.ivsPlayer = ivs
+      self.usingIvsPlayback = true
+      self.applyIvsAudio()
+
+      let ivsLayer = self.ivsPlayerLayer ?? IVSPlayerLayer(player: nil)
+      ivsLayer.player = ivs
+      ivsLayer.videoGravity = .resizeAspect
+      ivsLayer.frame = self.bounds
+      ivsLayer.isHidden = false
+      if ivsLayer.superlayer == nil {
+        self.layer.insertSublayer(ivsLayer, above: self.playerLayer)
+      }
+      self.ivsPlayerLayer = ivsLayer
+      self.playerLayer.isHidden = true
+
+      ivs.load(hlsURL)
+      ivs.play()
+      self.scheduleIvsBufferingRecovery(generation: generation)
+    }
+  }
+
+  private func playWithAVPlayer(hlsURL: URL, lowLatency: Bool = true) {
     DispatchQueue.main.async {
       guard !self.isStopped else { return }
+      self.teardownIvsPlayback(removeLayer: false)
       self.statusLabel.isHidden = true
       self.currentHLSURL = hlsURL
       self.playbackGeneration += 1
@@ -2204,6 +2280,11 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   // 失敗item/通知/タイマー/ウォッチドッグ/ローダーを一掃(再接続・再試行前の後始末)。Codex指摘④。
   private func teardownPlayback() {
     playbackGeneration += 1
+    teardownIvsPlayback(removeLayer: false)
+    teardownAVPlayerPlayback()
+  }
+
+  private func teardownAVPlayerPlayback() {
     liveCatchUpTimer?.invalidate()
     liveCatchUpTimer = nil
     stallWatchdog.stop()
@@ -2213,7 +2294,35 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       NotificationCenter.default.removeObserver(obs)
       itemFailedObserver = nil
     }
+    player.pause()
     player.replaceCurrentItem(with: nil)
+    playerLayer.isHidden = false
+  }
+
+  private func teardownIvsPlayback(removeLayer: Bool) {
+    ivsBufferingRecoveryWork?.cancel()
+    ivsBufferingRecoveryWork = nil
+    usingIvsPlayback = false
+    if let ivsPlayer {
+      ivsPlayer.delegate = nil
+      ivsPlayer.pause()
+      ivsPlayer.load(nil as URL?)
+    }
+    ivsPlayer = nil
+    ivsPlayerLayer?.player = nil
+    ivsPlayerLayer?.isHidden = true
+    if removeLayer {
+      ivsPlayerLayer?.removeFromSuperlayer()
+      ivsPlayerLayer = nil
+    }
+    playerLayer.isHidden = false
+  }
+
+  private func applyIvsAudio() {
+    guard let ivsPlayer else { return }
+    let effectiveVolume = settings.playAudio ? playbackVolume : 0
+    ivsPlayer.volume = effectiveVolume
+    ivsPlayer.muted = effectiveVolume <= 0
   }
 
   // ネイティブ再生失敗の共通処理。web UIへ落とす前に: ①低遅延ローダー失敗→素HLS再試行
@@ -2238,6 +2347,58 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       }
       self.installFallback(reason)
     }
+  }
+
+  private func retryKickLoadOrFallback(_ reason: String) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil else { return }
+      if let attempt = self.nativeRetry.nextAttempt() {
+        self.teardownPlayback()
+        self.channelTask?.cancel()
+        self.channelTask = nil
+        self.isLoading = false
+        self.showStatus("Kick再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
+        self.loadNativeStream()
+        return
+      }
+      self.installFallback(reason)
+    }
+  }
+
+  private func handleIvsFailure(_ reason: String, generation: Int) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil,
+            self.usingIvsPlayback, generation == self.playbackGeneration else { return }
+      if let attempt = self.ivsRetry.nextAttempt() {
+        self.teardownIvsPlayback(removeLayer: false)
+        self.channelTask?.cancel()
+        self.channelTask = nil
+        self.isLoading = false
+        self.showStatus("Kick SDK再接続中(\(attempt)/\(self.ivsRetry.maxAttempts))")
+        self.loadNativeStream()
+        return
+      }
+      if let hlsURL = self.currentHLSURL {
+        self.forceLegacyPlayback = true
+        self.teardownIvsPlayback(removeLayer: false)
+        self.showStatus("Kick SDKが不安定なため旧ネイティブ再生へ切替中")
+        self.playWithAVPlayer(hlsURL: hlsURL, lowLatency: false)
+        return
+      }
+      self.installFallback(reason)
+    }
+  }
+
+  private func scheduleIvsBufferingRecovery(generation: Int) {
+    ivsBufferingRecoveryWork?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, !self.isStopped, self.usingIvsPlayback,
+            generation == self.playbackGeneration,
+            self.ivsPlayer?.state == .buffering else { return }
+      self.handleIvsFailure("Kick SDKのバッファリングが続いています", generation: generation)
+    }
+    ivsBufferingRecoveryWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 18, execute: work)
   }
 
   // 安定モードで一定時間ストール無しなら低遅延へ自動復帰(ネットワーク回復時)。次回再接続からLL有効。
@@ -2290,17 +2451,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     DispatchQueue.main.async {
       guard !self.isStopped, self.fallbackWebView == nil else { return }
       // ネイティブ再生を完全停止してから web UI へ(失敗item/timer/watchdog/loaderの残留を防ぐ・Codex指摘)。
-      self.liveCatchUpTimer?.invalidate()
-      self.liveCatchUpTimer = nil
-      self.stallWatchdog.stop()
-      self.lowLatencyLoader = nil
-      self.player.pause()
-      self.player.replaceCurrentItem(with: nil)
-      self.itemStatusObservation = nil
-      if let obs = self.itemFailedObserver {
-        NotificationCenter.default.removeObserver(obs)
-        self.itemFailedObserver = nil
-      }
+      self.teardownPlayback()
       self.showStatus(reason)
       let web = PlayerWebView(stream: self.stream, settings: self.settings)
       web.setPlaybackVolume(self.playbackVolume)
@@ -2319,6 +2470,48 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         web.resumePlayback()
       }
     }
+  }
+
+  func player(_ player: IVSPlayer, didChangeState state: IVSPlayer.State) {
+    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    let generation = playbackGeneration
+    switch state {
+    case .ready:
+      nativeRetry.reset()
+      ivsRetry.reset()
+      scheduleStableModeReset()
+      applyIvsAudio()
+      statusLabel.isHidden = true
+      player.play()
+    case .buffering:
+      scheduleIvsBufferingRecovery(generation: generation)
+    case .playing:
+      ivsBufferingRecoveryWork?.cancel()
+      ivsBufferingRecoveryWork = nil
+      statusLabel.isHidden = true
+    case .ended:
+      handleIvsFailure("Kick SDK再生が終了しました", generation: generation)
+    case .idle:
+      break
+    @unknown default:
+      break
+    }
+  }
+
+  func player(_ player: IVSPlayer, didFailWithError error: Error) {
+    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback else { return }
+    handleIvsFailure(error.localizedDescription, generation: playbackGeneration)
+  }
+
+  func playerWillRebuffer(_ player: IVSPlayer) {
+    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    scheduleIvsBufferingRecovery(generation: playbackGeneration)
+  }
+
+  func playerNetworkDidBecomeUnavailable(_ player: IVSPlayer) {
+    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    showStatus("Kick SDKネットワーク復旧待ち")
+    scheduleIvsBufferingRecovery(generation: playbackGeneration)
   }
 
   private func showStatus(_ text: String) {
@@ -2727,6 +2920,9 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   }
 
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+  private static var useIvsPlayer: Bool {
+    !UserDefaults.standard.bool(forKey: "experimental.kick.ivs.disabled")
+  }
 }
 
 // Native Twitch playback, emulating the official app: fetch a PlaybackAccessToken

@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		0C80B921A6F3F58F76C31292 /* libPods-MultiView.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 5DCACB8F33CDC322A6C60F78 /* libPods-MultiView.a */; };
+		A4D901010000000000000001 /* AmazonIVSPlayer in Frameworks */ = {isa = PBXBuildFile; productRef = A4D901030000000000000001 /* AmazonIVSPlayer */; };
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
 		761780ED2CA45674006654EE /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EC2CA45674006654EE /* AppDelegate.swift */; };
 		A1B2C3D4E5F60718293A4B5D /* KickAuthManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4B5C /* KickAuthManager.swift */; };
@@ -52,6 +53,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				0C80B921A6F3F58F76C31292 /* libPods-MultiView.a in Frameworks */,
+				A4D901010000000000000001 /* AmazonIVSPlayer in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -146,6 +148,9 @@
 			dependencies = (
 			);
 			name = MultiView;
+			packageProductDependencies = (
+				A4D901030000000000000001 /* AmazonIVSPlayer */,
+			);
 			productName = MultiView;
 			productReference = 13B07F961A680F5B00A75B9A /* MultiView.app */;
 			productType = "com.apple.product-type.application";
@@ -172,6 +177,9 @@
 				Base,
 			);
 			mainGroup = 83CBB9F61A601CBA00E9B192;
+			packageReferences = (
+				A4D901020000000000000001 /* XCLocalSwiftPackageReference "AmazonIVSPlayer" */,
+			);
 			productRefGroup = 83CBBA001A601CBA00E9B192 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -273,6 +281,21 @@
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		A4D901020000000000000001 /* XCLocalSwiftPackageReference "AmazonIVSPlayer" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = AmazonIVSPlayer;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A4D901030000000000000001 /* AmazonIVSPlayer */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A4D901020000000000000001 /* XCLocalSwiftPackageReference "AmazonIVSPlayer" */;
+			productName = AmazonIVSPlayer;
+		};
+/* End XCSwiftPackageProductDependency section */
+
 /* Begin XCBuildConfiguration section */
 		13B07F941A680F5B00A75B9A /* Debug */ = {
 			isa = XCBuildConfiguration;
@@ -280,7 +303,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
-				CURRENT_PROJECT_VERSION = 33;
+				CURRENT_PROJECT_VERSION = 34;
 				ENABLE_BITCODE = NO;
 				INFOPLIST_FILE = MultiView/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
@@ -288,7 +311,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.1.24;
+				MARKETING_VERSION = 1.1.25;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
@@ -310,14 +333,14 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
-				CURRENT_PROJECT_VERSION = 33;
+				CURRENT_PROJECT_VERSION = 34;
 				INFOPLIST_FILE = MultiView/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.1.24;
+				MARKETING_VERSION = 1.1.25;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
