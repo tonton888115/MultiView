@@ -382,7 +382,7 @@ final class TwitcastingAuthManager: NSObject, ASWebAuthenticationPresentationCon
     }
     var request = URLRequest(url: url)
     request.setValue("application/json", forHTTPHeaderField: "Accept")
-    request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+    request.setValue(BrowserUserAgent.mobileWebKit, forHTTPHeaderField: "User-Agent")
     URLSession.shared.dataTask(with: request) { data, _, error in
       if let error {
         Self.finish(completion, .failure(error))

@@ -55,7 +55,7 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
   // id.kick.com / api.kick.com sit behind Cloudflare, which returns a 400 "challenge"
   // page to requests that don't look like a browser (the default URLSession UA gets
   // blocked). Sending a full browser-like header set lets the API calls through.
-  private static let browserUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+  private static let browserUserAgent = BrowserUserAgent.mobileSafari
 
   private static func applyBrowserHeaders(_ request: inout URLRequest) {
     request.setValue(browserUserAgent, forHTTPHeaderField: "User-Agent")

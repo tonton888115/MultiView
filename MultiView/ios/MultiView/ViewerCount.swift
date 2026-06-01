@@ -232,14 +232,14 @@ enum ViewerCountProvider {
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue("com.google.ios.youtube/21.17.3 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X; ja_JP)", forHTTPHeaderField: "User-Agent")
+    request.setValue(BrowserUserAgent.youtubeIOS(version: BrowserUserAgent.youtubeIOSVersion), forHTTPHeaderField: "User-Agent")
     request.setValue("5", forHTTPHeaderField: "X-YouTube-Client-Name")
-    request.setValue("21.17.3", forHTTPHeaderField: "X-YouTube-Client-Version")
+    request.setValue(BrowserUserAgent.youtubeIOSVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
     request.httpBody = try? JSONSerialization.data(withJSONObject: [
       "context": [
         "client": [
           "clientName": "IOS",
-          "clientVersion": "21.17.3",
+              "clientVersion": BrowserUserAgent.youtubeIOSVersion,
           "deviceMake": "Apple",
           "deviceModel": "iPhone16,2",
           "osName": "iOS",
@@ -594,7 +594,7 @@ enum ViewerCountProvider {
     ]
   }
 
-  private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+  private static let userAgent = BrowserUserAgent.mobileSafari
   private static let kickKeys: Set<String> = ["viewer_count", "viewerCount", "viewers", "viewersCount", "currentViewers"]
   private static let twitcastingKeys: Set<String> = ["current_view_count", "currentViewerCount", "current_viewer_count", "viewer_count", "viewerCount", "viewers"]
   private static let youtubeKeys: Set<String> = ["concurrentViewers", "concurrent_viewers"]

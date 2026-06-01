@@ -23,7 +23,7 @@ final class FocusedStreamView: UIView {
       // 「チャットをご利用いただけません。ブラウザのバージョンが古いようです」と出て表示されない。
       // デスクトップ Safari の UA を名乗るとデスクトップ版 live_chat が返り、正しく表示される。
       if stream.platform == .youtube {
-        chatWeb?.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
+        chatWeb?.customUserAgent = BrowserUserAgent.desktopSafari
       }
       // 読み込みは super.init 後に少し遅らせて開始する（下記）。展開直後はネイティブ
       // プレイヤーの起動を優先し、重いチャット watch ページと帯域を奪い合わせない。

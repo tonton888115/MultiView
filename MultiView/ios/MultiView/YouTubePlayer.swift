@@ -398,10 +398,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private static func nativePlayerClients() -> [(label: String, headerClientName: String, version: String, userAgent: String, context: [String: Any])] {
-    let iosVersion = "21.17.3"
-    let iosUA = "com.google.ios.youtube/\(iosVersion) (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X; ja_JP)"
-    let androidVersion = "20.19.35"
-    let androidUA = "com.google.android.youtube/\(androidVersion) (Linux; U; Android 15) gzip"
+    let iosVersion = BrowserUserAgent.youtubeIOSVersion
+    let iosUA = BrowserUserAgent.youtubeIOS(version: iosVersion)
+    let androidVersion = BrowserUserAgent.youtubeAndroidVersion
+    let androidUA = BrowserUserAgent.youtubeAndroid(version: androidVersion)
     return [
       (
         label: "IOS",
@@ -961,5 +961,5 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     return nil
   }
 
-  static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+  static let userAgent = BrowserUserAgent.mobileSafari
 }

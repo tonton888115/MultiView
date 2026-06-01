@@ -40,7 +40,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
 
   private static let clientID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
   private static let accessTokenHash = "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712"
-  private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+  private static let userAgent = BrowserUserAgent.mobileSafari
   private static var useIvsPlayer: Bool {
     !UserDefaults.standard.bool(forKey: "playback.twitch.ivs.disabled")
   }

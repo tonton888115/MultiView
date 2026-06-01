@@ -60,7 +60,7 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     return WKWebView(frame: .zero, configuration: config)
   }()
   private var activeSources = [(StreamPlatform, Source)]()
-  fileprivate static let browserUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+  fileprivate static let browserUserAgent = BrowserUserAgent.mobileSafari
 
   override func viewDidLoad() {
     super.viewDidLoad()
