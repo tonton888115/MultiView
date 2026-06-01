@@ -64,6 +64,51 @@ final class StallWatchdog {
   }
 }
 
+final class NativeRetryLimiter {
+  let maxAttempts: Int
+  private(set) var attempts = 0
+
+  init(maxAttempts: Int = 2) {
+    self.maxAttempts = maxAttempts
+  }
+
+  func reset() {
+    attempts = 0
+  }
+
+  func nextAttempt() -> Int? {
+    guard attempts < maxAttempts else { return nil }
+    attempts += 1
+    return attempts
+  }
+}
+
+enum LiveEdgeCatchUp {
+  static func seekIfNeeded(
+    player: AVPlayer,
+    isStopped: Bool,
+    fallbackActive: Bool,
+    behindThreshold: TimeInterval = 6,
+    targetOffset: TimeInterval = 3,
+    toleranceBefore: TimeInterval = 1
+  ) {
+    guard !isStopped, !fallbackActive,
+          player.timeControlStatus == .playing,
+          let item = player.currentItem,
+          let liveRange = item.seekableTimeRanges.last?.timeRangeValue,
+          liveRange.duration.isNumeric else { return }
+    let liveEdge = CMTimeAdd(liveRange.start, liveRange.duration)
+    let current = item.currentTime()
+    let behind = CMTimeGetSeconds(CMTimeSubtract(liveEdge, current))
+    guard behind > behindThreshold else { return }
+    let target = CMTimeSubtract(liveEdge, CMTime(seconds: targetOffset, preferredTimescale: 600))
+    guard CMTimeCompare(target, current) > 0 else { return }
+    item.seek(to: target,
+              toleranceBefore: CMTime(seconds: toleranceBefore, preferredTimescale: 600),
+              toleranceAfter: .zero) { _ in }
+  }
+}
+
 final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
   private let stream: StreamItem
   private let player = AVPlayer()
@@ -1860,11 +1905,10 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private var liveCatchUpTimer: Timer?
   private var lowLatencyLoader: KickLowLatencyLoader?
   // 直近のplayback_url(素HLS再試行用)、再生世代(古いitemのKVO/通知を無視)、
-  // ネイティブ再取得リトライ回数(トークン失効時に新URL取得。上限超過でのみweb UIへ)。Codex指摘②③④。
+  // ネイティブ再取得リトライ(トークン失効時に新URL取得。上限超過でのみweb UIへ)。Codex指摘②③④。
   private var currentHLSURL: URL?
   private var playbackGeneration = 0
-  private var nativeRetryCount = 0
-  private let maxNativeRetries = 2
+  private let nativeRetry = NativeRetryLimiter(maxAttempts: 2)
   // 連続ストールでアグレッシブな低遅延(LLローダー+ライブ端追従)を一時停止し安定優先へ切替。
   // 一定時間ストール無しで自動復帰(次回再接続からLL有効)。Codex#1 part2。
   private var stallCount = 0
@@ -2110,7 +2154,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         } else if item.status == .readyToPlay {
           DispatchQueue.main.async {
             guard let self, generation == self.playbackGeneration else { return }
-            self.nativeRetryCount = 0   // 再生成功で再取得カウンタをリセット(長時間再生でも枯渇しない)
+            self.nativeRetry.reset()   // 再生成功で再取得カウンタをリセット(長時間再生でも枯渇しない)
             self.scheduleStableModeReset()
             self.resumePlayback()
             self.startLiveCatchUp()
@@ -2154,20 +2198,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   }
 
   private func catchUpToLiveEdge() {
-    guard !isStopped, fallbackWebView == nil,
-          player.timeControlStatus == .playing,
-          let item = player.currentItem,
-          let liveRange = item.seekableTimeRanges.last?.timeRangeValue,
-          liveRange.duration.isNumeric else { return }
-    let liveEdge = CMTimeAdd(liveRange.start, liveRange.duration)
-    let current = item.currentTime()
-    let behind = CMTimeGetSeconds(CMTimeSubtract(liveEdge, current))
-    guard behind > 6 else { return }
-    let target = CMTimeSubtract(liveEdge, CMTime(seconds: 3, preferredTimescale: 1))
-    guard CMTimeCompare(target, current) > 0 else { return }
-    item.seek(to: target,
-              toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
-              toleranceAfter: .zero) { _ in }
+    LiveEdgeCatchUp.seekIfNeeded(player: player, isStopped: isStopped, fallbackActive: fallbackWebView != nil)
   }
 
   // 失敗item/通知/タイマー/ウォッチドッグ/ローダーを一掃(再接続・再試行前の後始末)。Codex指摘④。
@@ -2187,7 +2218,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
 
   // ネイティブ再生失敗の共通処理。web UIへ落とす前に: ①低遅延ローダー失敗→素HLS再試行
   // ②素HLSも失敗(=playback_url/トークン失効の可能性)→チャンネル再取得で新URLを取り直し再生。
-  // 上限(maxNativeRetries)超過時のみ web UI フォールバック。古い世代の失敗通知は無視。Codex指摘②③。
+  // 上限超過時のみ web UI フォールバック。古い世代の失敗通知は無視。Codex指摘②③。
   private func handleNativeFailure(_ reason: String, wasLowLatency: Bool, generation: Int) {
     DispatchQueue.main.async {
       guard !self.isStopped, self.fallbackWebView == nil,
@@ -2196,13 +2227,12 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         self.play(hlsURL: url, lowLatency: false)
         return
       }
-      if self.nativeRetryCount < self.maxNativeRetries {
-        self.nativeRetryCount += 1
+      if let attempt = self.nativeRetry.nextAttempt() {
         self.teardownPlayback()
         self.channelTask?.cancel()
         self.channelTask = nil
         self.isLoading = false
-        self.showStatus("Kick再接続中(\(self.nativeRetryCount)/\(self.maxNativeRetries))")
+        self.showStatus("Kick再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
         self.loadNativeStream()
         return
       }
@@ -2718,7 +2748,10 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
+  private var liveCatchUpTimer: Timer?
   private var fallbackWebView: PlayerWebView?
+  private var playbackGeneration = 0
+  private let nativeRetry = NativeRetryLimiter(maxAttempts: 2)
   private var isLoading = false
   private var isStopped = false
   private var laneCursor = 0
@@ -2801,7 +2834,8 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
 
   private func recoverFromStall() {
     guard !isStopped, fallbackWebView == nil else { return }
-    player.replaceCurrentItem(with: nil)
+    showStatus("Twitch再接続中")
+    teardownPlayback()
     tokenTask?.cancel()
     tokenTask = nil
     isLoading = false
@@ -2811,6 +2845,8 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   func stopPlayback() {
     isStopped = true
     stallWatchdog.stop()
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = nil
     tokenTask?.cancel()
     tokenTask = nil
     player.pause()
@@ -2847,10 +2883,10 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     }
     isLoading = true
     showStatus("Twitchをネイティブ再生で読み込み中")
-    requestAccessToken(channel: channel)
+    requestAccessToken(channel: channel, generation: playbackGeneration)
   }
 
-  private func requestAccessToken(channel: String) {
+  private func requestAccessToken(channel: String, generation: Int) {
     guard let url = URL(string: "https://gql.twitch.tv/gql") else {
       installFallback("Twitch APIに接続できません")
       return
@@ -2880,8 +2916,9 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     tokenTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
       guard let self else { return }
       self.tokenTask = nil
+      guard !self.isStopped, generation == self.playbackGeneration else { return }
       if let error {
-        self.installFallback("Twitchトークン取得失敗: \(error.localizedDescription)")
+        self.retryNativeLoadOrFallback("Twitchトークン取得失敗: \(error.localizedDescription)", generation: generation)
         return
       }
       guard let data,
@@ -2890,16 +2927,19 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
             let token = payload["streamPlaybackAccessToken"] as? [String: Any],
             let value = token["value"] as? String,
             let signature = token["signature"] as? String else {
-        self.installFallback("Twitchの配信情報を取得できません")
+        self.retryNativeLoadOrFallback("Twitchの配信情報を取得できません", generation: generation)
         return
       }
       guard let usherURL = Self.buildUsherURL(channel: channel, token: value, signature: signature) else {
-        self.installFallback("Twitch再生URLを構築できません")
+        self.retryNativeLoadOrFallback("Twitch再生URLを構築できません", generation: generation)
         return
       }
-      self.isLoading = false
-      self.connectTwitchChat(channel: channel)
-      self.play(hlsURL: usherURL)
+      DispatchQueue.main.async {
+        guard !self.isStopped, generation == self.playbackGeneration, self.fallbackWebView == nil else { return }
+        self.isLoading = false
+        self.connectTwitchChat(channel: channel)
+        self.play(hlsURL: usherURL, requestGeneration: generation)
+      }
     }
     tokenTask?.resume()
   }
@@ -2923,10 +2963,13 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     return components.url
   }
 
-  private func play(hlsURL: URL) {
+  private func play(hlsURL: URL, requestGeneration: Int) {
     DispatchQueue.main.async {
-      guard !self.isStopped else { return }
+      guard !self.isStopped, requestGeneration == self.playbackGeneration,
+            self.fallbackWebView == nil else { return }
       self.statusLabel.isHidden = true
+      self.playbackGeneration += 1
+      let generation = self.playbackGeneration
       let asset = AVURLAsset(url: hlsURL, options: [
         "AVURLAssetHTTPHeaderFieldsKey": self.twitchPlaybackHeaders(),
         // Live HLS never needs a precise duration; skip that analysis to trim startup.
@@ -2940,13 +2983,17 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
-          DispatchQueue.main.async {
-            self?.installFallback(item.error?.localizedDescription ?? "Twitchネイティブ再生に失敗しました")
-          }
+          self?.handleNativeFailure(
+            item.error?.localizedDescription ?? "Twitchネイティブ再生に失敗しました",
+            generation: generation)
         } else if item.status == .readyToPlay {
           DispatchQueue.main.async {
-            self?.resumePlayback()
-            self?.stallWatchdog.start()
+            guard let self, generation == self.playbackGeneration,
+                  !self.isStopped, self.fallbackWebView == nil else { return }
+            self.nativeRetry.reset()
+            self.resumePlayback()
+            self.startLiveCatchUp()
+            self.stallWatchdog.start()
           }
         }
       }
@@ -2959,7 +3006,9 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
         queue: .main
       ) { [weak self] notification in
         let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
-        self?.installFallback(error?.localizedDescription ?? "Twitchネイティブ再生が停止しました")
+        self?.handleNativeFailure(
+          error?.localizedDescription ?? "Twitchネイティブ再生が停止しました",
+          generation: generation)
       }
       self.player.replaceCurrentItem(with: item)
       self.player.isMuted = !self.settings.playAudio
@@ -2968,19 +3017,65 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     }
   }
 
+  private func startLiveCatchUp() {
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+      self?.catchUpToLiveEdge()
+    }
+    catchUpToLiveEdge()
+  }
+
+  private func catchUpToLiveEdge() {
+    LiveEdgeCatchUp.seekIfNeeded(player: player, isStopped: isStopped, fallbackActive: fallbackWebView != nil)
+  }
+
+  private func teardownPlayback() {
+    playbackGeneration += 1
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = nil
+    stallWatchdog.stop()
+    itemStatusObservation = nil
+    if let obs = itemFailedObserver {
+      NotificationCenter.default.removeObserver(obs)
+      itemFailedObserver = nil
+    }
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+  }
+
+  private func handleNativeFailure(_ reason: String, generation: Int) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil,
+            generation == self.playbackGeneration else { return }
+      self.retryNativeLoadOrFallback(reason, generation: generation)
+    }
+  }
+
+  private func retryNativeLoadOrFallback(_ reason: String, generation: Int? = nil) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil else { return }
+      if let generation, generation != self.playbackGeneration { return }
+      if let attempt = self.nativeRetry.nextAttempt() {
+        self.teardownPlayback()
+        self.tokenTask?.cancel()
+        self.tokenTask = nil
+        self.isLoading = false
+        self.showStatus("Twitch再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
+        self.loadNativeStream()
+        return
+      }
+      self.installFallback(reason)
+    }
+  }
+
   private func installFallback(_ reason: String) {
     DispatchQueue.main.async {
       guard !self.isStopped, self.fallbackWebView == nil else { return }
       self.isLoading = false
-      // 失敗item/watchdogを残さない(Codex指摘の停止漏れ修正)。
-      self.stallWatchdog.stop()
-      self.player.pause()
-      self.player.replaceCurrentItem(with: nil)
-      self.itemStatusObservation = nil
-      if let obs = self.itemFailedObserver {
-        NotificationCenter.default.removeObserver(obs)
-        self.itemFailedObserver = nil
-      }
+      // 失敗item/watchdog/timerを残さない(Codex指摘の停止漏れ修正)。
+      self.teardownPlayback()
+      self.tokenTask?.cancel()
+      self.tokenTask = nil
       self.showStatus(reason)
       let web = PlayerWebView(stream: self.stream, settings: self.settings)
       web.setPlaybackVolume(self.playbackVolume)
@@ -3251,7 +3346,10 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private var streamTask: URLSessionDataTask?
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
+  private var liveCatchUpTimer: Timer?
   private var fallbackWebView: WKWebView?
+  private var playbackGeneration = 0
+  private let nativeRetry = NativeRetryLimiter(maxAttempts: 2)
   private var playbackVolume: Float
   private var laneCursor = 0
   private var isLoading = false
@@ -3334,7 +3432,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
 
   private func recoverFromStall() {
     guard !isStopped, fallbackWebView == nil else { return }
-    player.replaceCurrentItem(with: nil)
+    showStatus("ツイキャス再接続中")
+    teardownPlayback()
     streamTask?.cancel()
     streamTask = nil
     isLoading = false
@@ -3344,6 +3443,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   func stopPlayback() {
     isStopped = true
     stallWatchdog.stop()
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = nil
     chatClient?.stop()
     chatClient = nil
     streamTask?.cancel()
@@ -3364,6 +3465,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
     player.volume = settings.playAudio ? playbackVolume : 0
+    applyFallbackVolume()
   }
 
   func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -3374,13 +3476,14 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     guard !isStopped, !isLoading, fallbackWebView == nil else { return }
     isLoading = true
     showStatus("ツイキャスをネイティブ再生で読み込み中")
+    let generation = playbackGeneration
     syncTwitcastingWebCookies { [weak self] in
-      self?.fetchStreamServer()
+      self?.fetchStreamServer(generation: generation)
     }
   }
 
-  private func fetchStreamServer() {
-    guard !isStopped else { return }
+  private func fetchStreamServer(generation: Int) {
+    guard !isStopped, generation == playbackGeneration else { return }
     let channel = stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
     guard let target = channel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
           let url = URL(string: "https://twitcasting.tv/streamserver.php?target=\(target)&mode=client&player=pc_web") else {
@@ -3393,36 +3496,44 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     streamTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       guard let self else { return }
       self.streamTask = nil
+      guard !self.isStopped, generation == self.playbackGeneration else { return }
       // Keep isLoading true until play()/installEmbedFallback runs on the main
       // queue, so a concurrent resumePlayback() can't kick off a second fetch.
       if let error {
-        self.installEmbedFallback("ツイキャス取得失敗: \(error.localizedDescription)")
+        self.retryNativeLoadOrFallback("ツイキャス取得失敗: \(error.localizedDescription)", generation: generation)
         return
       }
       if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-        self.installEmbedFallback("ツイキャス取得失敗: HTTP \(http.statusCode)")
+        self.retryNativeLoadOrFallback("ツイキャス取得失敗: HTTP \(http.statusCode)", generation: generation)
         return
       }
       guard let data, let info = Self.extractStreamInfo(from: data) else {
-        self.installEmbedFallback("ツイキャスの配信情報を取得できません")
+        self.retryNativeLoadOrFallback("ツイキャスの配信情報を取得できません", generation: generation)
         return
       }
       guard let hlsURL = info.hlsURL else {
-        self.installEmbedFallback(info.isLive ? "ツイキャスのHLSを取得できません" : "ツイキャスはオフラインです")
+        if info.isLive {
+          self.retryNativeLoadOrFallback("ツイキャスのHLSを取得できません", generation: generation)
+        } else {
+          self.installEmbedFallback("ツイキャスはオフラインです")
+        }
         return
       }
-      // Play the HLS whenever one is advertised. If it is stale (truly offline)
-      // AVPlayer fails and we drop to the official embed.
-      self.play(hlsURL: hlsURL)
+      // Play the HLS whenever one is advertised. If it is stale, AVPlayer
+      // failure first retries native acquisition, then drops to the official embed.
+      self.play(hlsURL: hlsURL, requestGeneration: generation)
     }
     streamTask?.resume()
   }
 
-  private func play(hlsURL: URL) {
+  private func play(hlsURL: URL, requestGeneration: Int) {
     DispatchQueue.main.async {
       self.isLoading = false
-      guard !self.isStopped else { return }
+      guard !self.isStopped, requestGeneration == self.playbackGeneration,
+            self.fallbackWebView == nil else { return }
       self.statusLabel.isHidden = true
+      self.playbackGeneration += 1
+      let generation = self.playbackGeneration
       var options: [String: Any] = [
         "AVURLAssetHTTPHeaderFieldsKey": self.twitcastingPlaybackHeaders(),
         // Live HLS never needs a precise duration; skip that analysis to trim startup.
@@ -3443,13 +3554,17 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       item.automaticallyPreservesTimeOffsetFromLive = true
       self.itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
         if item.status == .failed {
-          DispatchQueue.main.async {
-            self?.installEmbedFallback(item.error?.localizedDescription ?? "ツイキャスのネイティブ再生に失敗しました")
-          }
+          self?.handleNativeFailure(
+            item.error?.localizedDescription ?? "ツイキャスのネイティブ再生に失敗しました",
+            generation: generation)
         } else if item.status == .readyToPlay {
           DispatchQueue.main.async {
-            self?.resumePlayback()
-            self?.stallWatchdog.start()
+            guard let self, generation == self.playbackGeneration,
+                  !self.isStopped, self.fallbackWebView == nil else { return }
+            self.nativeRetry.reset()
+            self.resumePlayback()
+            self.startLiveCatchUp()
+            self.stallWatchdog.start()
           }
         }
       }
@@ -3462,7 +3577,9 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
         queue: .main
       ) { [weak self] notification in
         let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
-        self?.installEmbedFallback(error?.localizedDescription ?? "ツイキャスのネイティブ再生が停止しました")
+        self?.handleNativeFailure(
+          error?.localizedDescription ?? "ツイキャスのネイティブ再生が停止しました",
+          generation: generation)
       }
       self.player.replaceCurrentItem(with: item)
       self.player.isMuted = !self.settings.playAudio
@@ -3471,16 +3588,77 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     }
   }
 
+  private func startLiveCatchUp() {
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+      self?.catchUpToLiveEdge()
+    }
+    catchUpToLiveEdge()
+  }
+
+  private func catchUpToLiveEdge() {
+    LiveEdgeCatchUp.seekIfNeeded(player: player, isStopped: isStopped, fallbackActive: fallbackWebView != nil)
+  }
+
+  private func teardownPlayback() {
+    playbackGeneration += 1
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = nil
+    stallWatchdog.stop()
+    itemStatusObservation = nil
+    if let obs = itemFailedObserver {
+      NotificationCenter.default.removeObserver(obs)
+      itemFailedObserver = nil
+    }
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+  }
+
+  private func handleNativeFailure(_ reason: String, generation: Int) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil,
+            generation == self.playbackGeneration else { return }
+      self.retryNativeLoadOrFallback(reason, generation: generation)
+    }
+  }
+
+  private func retryNativeLoadOrFallback(_ reason: String, generation: Int? = nil) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil else { return }
+      if let generation, generation != self.playbackGeneration { return }
+      if let attempt = self.nativeRetry.nextAttempt() {
+        self.teardownPlayback()
+        self.streamTask?.cancel()
+        self.streamTask = nil
+        self.isLoading = false
+        self.showStatus("ツイキャス再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
+        self.loadNativeStream()
+        return
+      }
+      self.installEmbedFallback(reason)
+    }
+  }
+
+  private func applyFallbackVolume() {
+    guard let fallbackWebView else { return }
+    let effectiveVolume = settings.playAudio ? playbackVolume : 0
+    let volumeLiteral = String(Double(effectiveVolume))
+    let mutedLiteral = effectiveVolume > 0 ? "false" : "true"
+    fallbackWebView.evaluateJavaScript(
+      "document.querySelectorAll('video,audio').forEach(function(m){try{m.volume=\(volumeLiteral);m.muted=\(mutedLiteral);}catch(e){}});"
+    )
+  }
+
   // Last resort: the official embedded player (handles offline/standby and
   // member-only lives that the native HLS path cannot reach).
   private func installEmbedFallback(_ reason: String) {
     DispatchQueue.main.async {
       self.isLoading = false
       guard !self.isStopped, self.fallbackWebView == nil else { return }
-      self.stallWatchdog.stop()
+      self.teardownPlayback()
+      self.streamTask?.cancel()
+      self.streamTask = nil
       self.showStatus(reason)
-      self.player.pause()
-      self.player.replaceCurrentItem(with: nil)
       let channel = self.stream.channel.trimmingCharacters(in: .whitespacesAndNewlines)
       guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
             var components = URLComponents(string: "https://twitcasting.tv/\(encoded)/embeddedplayer/live") else { return }
