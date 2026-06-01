@@ -2921,7 +2921,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
 
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
   private static var useIvsPlayer: Bool {
-    !UserDefaults.standard.bool(forKey: "experimental.kick.ivs.disabled")
+    !UserDefaults.standard.bool(forKey: "playback.kick.ivs.disabled")
   }
 }
 
@@ -2964,7 +2964,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   private static let accessTokenHash = "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712"
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
   private static var useIvsPlayer: Bool {
-    !UserDefaults.standard.bool(forKey: "experimental.twitch.ivs.disabled")
+    !UserDefaults.standard.bool(forKey: "playback.twitch.ivs.disabled")
   }
 
   init(stream: StreamItem, settings: AppSettings) {

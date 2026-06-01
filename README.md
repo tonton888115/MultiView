@@ -19,11 +19,11 @@ Windows だけで開発でき、**クラウドの Mac (Codemagic) で未署名 I
 
 - **下タブ 4 つ**: フォロー / ランキング / 視聴 / 設定
 - **視聴タブ**: グリッド同時視聴。セルの **⤢** で 1 配信を拡大、長押しで並べ替え、**×** で削除
-- **ネイティブ再生**: 5 サービスそれぞれ専用プレイヤー（Kick は Amazon IVS Player、Twitch は IVS Player 実験→AVPlayer、YouTube は HLS 抽出、ツイキャスは HLS、ニコ生は番組ページの HLS + コメント WebSocket）
+- **ネイティブ再生**: 5 サービスそれぞれ専用プレイヤー（Kick/Twitch は Amazon IVS Player 優先 + AVPlayer 退避、YouTube はアプリ内 HLS 抽出、ツイキャスは HLS、ニコ生は番組ページの HLS + コメント WebSocket）
 - **弾幕**: ニコ生風に右→左へ流れるコメント（表示/速度/不透明度/文字サイズ/最大行数/最大文字数を設定可）。ニコ生はギフト演出も表示
 - **コメント送信**: 可能なサービスはアプリ内入力欄から、未対応は拡大時の公式チャットからログインして送信
 - **端末間引き継ぎ**: 視聴タブの QR ボタンで、開いているタブ一式を iPad↔iPhone に引き継ぎ（QR スキャン or クリップボード、サーバ不要）
-- **低遅延チューニング**: Kick は Amazon IVS Player で低遅延化、Twitch は IVS Player 実験経路から旧 AVPlayer へ自動退避、ニコ生は設定で低遅延トグル
+- **低遅延チューニング**: Kick/Twitch は Amazon IVS Player を標準採用。失敗時のみ旧 AVPlayer 経路へ自動退避、ニコ生は設定で低遅延トグル
 - **画質**: Wi-Fi / モバイルで別々に高画質/エコノミーを設定
 
 ---
@@ -32,7 +32,7 @@ Windows だけで開発でき、**クラウドの Mac (Codemagic) で未署名 I
 
 | サービス | 映像 | 弾幕(右→左) | コメント送信 |
 |---|---|---|---|
-| Twitch | ✅ IVS Player 実験 + 旧ネイティブ HLS fallback | ✅ 匿名受信 | ✅ 拡大時に公式チャット(ログイン) |
+| Twitch | ✅ Amazon IVS Player + 旧ネイティブ HLS fallback | ✅ 匿名受信 | ✅ 拡大時に公式チャット(ログイン) |
 | Kick | ✅ Amazon IVS Player (低遅延) | ✅ Pusher 受信 | ✅ ネイティブ(OAuth ログイン) |
 | YouTube | ✅ HLS 抽出 | △ Data API + OAuth が必要 | ✅ 拡大時に公式ライブチャット(ログイン) |
 | ツイキャス | ✅ ネイティブ HLS | ⚠️ best-effort | ✅ ネイティブ(OAuth ログイン) |
@@ -91,25 +91,18 @@ tools\codemagic-build.ps1
 
 ---
 
-## YouTube 抽出用 Cloudflare Worker（任意）
+## YouTube 抽出
 
-YouTube のライブ/DVR は **`cloudflare-worker/youtube-extractor`** の Worker が HLS manifest を返します。既定では作者の Worker（`multiview.rinngo0626.workers.dev`）を使いますが、**他人が大量に使うと作者の無料枠(10万req/日)を消費**します。自分で運用するなら:
-
-```sh
-cd cloudflare-worker/youtube-extractor
-npm i && npx wrangler deploy   # 自分の *.workers.dev にデプロイ
-```
-
-デプロイ後、`Players.swift` の `extractionWorkerURL` を自分の Worker URL に変更してください。Worker に秘密情報はありません（InnerTube 利用・API キー不要）。
+YouTube のライブ/DVR は Cloudflare Worker を使わず、アプリ内から InnerTube (`youtubei.googleapis.com/youtubei/v1/player`) を直接呼び、`hlsManifestUrl` が取れた場合だけ AVPlayer でネイティブ再生します。取得できない動画や再生開始しない動画は、公式 iframe プレイヤーへ自動退避します。
 
 ---
 
 ## セキュリティ / 公開について
 
-- ✅ **ハードコードされた秘密情報なし**: API キー・パスワード・トークンはコードに含まれません。OAuth の Client ID/Secret は**ユーザーが入力**（既定は空）、アクセストークンは Keychain 保存。Worker にも秘密情報なし。
-- ⚠️ **公開で露出する個人識別子（秘密ではない）**: Worker URL（`*.rinngo0626.workers.dev`）、リダイレクト中継ページ（`tonton888115.github.io`）、Bundle ID（`com.rinng.multiview`）。public リポジトリなので元々公開情報です。
-- ⚠️ **他人が使う場合の論点**: ①YouTube 再生は作者の Worker を叩く（枠消費）→ 各自デプロイ推奨 ②OAuth は各自の Client ID が必要 ③リダイレクト中継ページを共用すると OAuth code が一瞬その静的ページを通る（独立運用なら自前ホスト推奨）。
-- 結論: **ソース公開自体は安全**（秘密の流出なし）。共有インフラ(Worker/中継ページ)を他人に使われたくなければ、各自デプロイ＆自分の Client ID を案内してください。
+- ✅ **ハードコードされた秘密情報なし**: API キー・パスワード・トークンはコードに含まれません。OAuth の Client ID/Secret は**ユーザーが入力**（既定は空）、アクセストークンは Keychain 保存。
+- ⚠️ **公開で露出する個人識別子（秘密ではない）**: リダイレクト中継ページ（`tonton888115.github.io`）と Bundle ID（`com.rinng.multiview`）。public リポジトリなので元々公開情報です。
+- ⚠️ **他人が使う場合の論点**: ①OAuth は各自の Client ID が必要 ②リダイレクト中継ページを共用すると OAuth code が一瞬その静的ページを通る（独立運用なら自前ホスト推奨）。
+- 結論: **ソース公開自体は安全**（秘密の流出なし）。共有インフラ(中継ページ)を他人に使われたくなければ、各自デプロイ＆自分の Client ID を案内してください。
 
 ---
 
@@ -119,6 +112,6 @@ npm i && npx wrangler deploy   # 自分の *.workers.dev にデプロイ
 - **無料 Apple ID**: 署名は 7 日失効。LiveContainer 運用だと再インストール負担が小さい。
 - **YouTube 弾幕**は Data API + OAuth が必要（視聴・チャット入力は可能）。
 - **Kick の遅延**: 1.1.25 以降は Amazon IVS Player を優先。失敗時だけ旧 AVPlayer 経路へ戻します。
-- **Twitch の遅延**: 1.1.26 以降は IVS Player 実験経路を先に試し、未対応・不安定なら自動で旧 AVPlayer 経路へ戻します。
+- **Twitch の遅延**: 1.1.26 以降は Amazon IVS Player を標準採用。未対応・不安定なら自動で旧 AVPlayer 経路へ戻します。
 - 同時視聴は端末性能次第で **3〜4 画面**が実用上限。
 - 配信/チャットは各サイトの仕様変更で壊れることがあります。
