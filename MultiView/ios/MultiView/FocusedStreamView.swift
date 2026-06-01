@@ -8,6 +8,7 @@ final class FocusedStreamView: UIView {
   private var autoHider: AutoHidingControls?
   private weak var commentPoster: CommentPostable?
   private weak var commentEchoer: CommentEchoDisplay?
+  private var viewerCountOverlay: ViewerCountOverlay?
 
   init(stream: StreamItem, onClose: (() -> Void)?) {
     self.stream = stream
@@ -93,6 +94,12 @@ final class FocusedStreamView: UIView {
     }
     volume.translatesAutoresizingMaskIntoConstraints = false
     addSubview(volume)
+    if AppState.shared.settings.showViewerCount {
+      let viewerCount = ViewerCountOverlay(stream: stream)
+      viewerCount.translatesAutoresizingMaskIntoConstraints = false
+      addSubview(viewerCount)
+      viewerCountOverlay = viewerCount
+    }
 
     let chatPanel = LiquidGlass.makePanel(cornerRadius: 18)
     chatPanel.translatesAutoresizingMaskIntoConstraints = false
@@ -157,6 +164,12 @@ final class FocusedStreamView: UIView {
       volume.widthAnchor.constraint(equalToConstant: 42),
       volume.heightAnchor.constraint(equalTo: video.heightAnchor, multiplier: 0.7)
     ]
+    if let viewerCountOverlay {
+      constraints += [
+        viewerCountOverlay.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+        viewerCountOverlay.bottomAnchor.constraint(equalTo: video.bottomAnchor, constant: -10)
+      ]
+    }
     if let closeButton {
       constraints += [
         closeButton.topAnchor.constraint(equalTo: topAnchor, constant: 10),

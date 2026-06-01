@@ -25,6 +25,7 @@
 		A1B2C3D4E5F60718293A4D62 /* YouTubePlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4D61 /* YouTubePlayer.swift */; };
 		A1B2C3D4E5F60718293A4D72 /* StreamCellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4D71 /* StreamCellView.swift */; };
 		A1B2C3D4E5F60718293A4D82 /* FocusedStreamView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4D81 /* FocusedStreamView.swift */; };
+		A1B2C3D4E5F60718293A4D92 /* ViewerCount.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4D91 /* ViewerCount.swift */; };
 		A1B2C3D4E5F60718293A4C52 /* Rendering.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4C51 /* Rendering.swift */; };
 		A1B2C3D4E5F60718293A4C62 /* ViewingUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4C61 /* ViewingUI.swift */; };
 		A1B2C3D4E5F60718293A4D02 /* Handoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4D01 /* Handoff.swift */; };
@@ -55,6 +56,7 @@
 		A1B2C3D4E5F60718293A4D61 /* YouTubePlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = YouTubePlayer.swift; path = MultiView/YouTubePlayer.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4D71 /* StreamCellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StreamCellView.swift; path = MultiView/StreamCellView.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4D81 /* FocusedStreamView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = FocusedStreamView.swift; path = MultiView/FocusedStreamView.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4D91 /* ViewerCount.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ViewerCount.swift; path = MultiView/ViewerCount.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4C51 /* Rendering.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Rendering.swift; path = MultiView/Rendering.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4C61 /* ViewingUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ViewingUI.swift; path = MultiView/ViewingUI.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4D01 /* Handoff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Handoff.swift; path = MultiView/Handoff.swift; sourceTree = "<group>"; };
@@ -95,6 +97,7 @@
 				A1B2C3D4E5F60718293A4D61 /* YouTubePlayer.swift */,
 				A1B2C3D4E5F60718293A4D71 /* StreamCellView.swift */,
 				A1B2C3D4E5F60718293A4D81 /* FocusedStreamView.swift */,
+				A1B2C3D4E5F60718293A4D91 /* ViewerCount.swift */,
 				A1B2C3D4E5F60718293A4C51 /* Rendering.swift */,
 				A1B2C3D4E5F60718293A4C61 /* ViewingUI.swift */,
 				A1B2C3D4E5F60718293A4D01 /* Handoff.swift */,
@@ -304,6 +307,7 @@
 				A1B2C3D4E5F60718293A4D62 /* YouTubePlayer.swift in Sources */,
 				A1B2C3D4E5F60718293A4D72 /* StreamCellView.swift in Sources */,
 				A1B2C3D4E5F60718293A4D82 /* FocusedStreamView.swift in Sources */,
+				A1B2C3D4E5F60718293A4D92 /* ViewerCount.swift in Sources */,
 				A1B2C3D4E5F60718293A4C52 /* Rendering.swift in Sources */,
 				A1B2C3D4E5F60718293A4C62 /* ViewingUI.swift in Sources */,
 				A1B2C3D4E5F60718293A4D02 /* Handoff.swift in Sources */,
@@ -335,7 +339,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 43;
 				ENABLE_BITCODE = NO;
 				INFOPLIST_FILE = MultiView/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
@@ -343,7 +347,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.1.33;
+				MARKETING_VERSION = 1.1.34;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
@@ -365,14 +369,14 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 43;
 				INFOPLIST_FILE = MultiView/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.1.33;
+				MARKETING_VERSION = 1.1.34;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",

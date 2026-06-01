@@ -42,6 +42,7 @@ enum PlaybackQuality: String, Codable {
 
 struct AppSettings: Codable {
   var showChat = true
+  var showViewerCount = false
   var playAudio = true
   var autoFollowRaids = false
   var blockWebAds = true
@@ -66,6 +67,7 @@ struct AppSettings: Codable {
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     showChat = try container.decodeIfPresent(Bool.self, forKey: .showChat) ?? true
+    showViewerCount = try container.decodeIfPresent(Bool.self, forKey: .showViewerCount) ?? false
     playAudio = try container.decodeIfPresent(Bool.self, forKey: .playAudio) ?? true
     autoFollowRaids = try container.decodeIfPresent(Bool.self, forKey: .autoFollowRaids) ?? false
     blockWebAds = try container.decodeIfPresent(Bool.self, forKey: .blockWebAds) ?? true

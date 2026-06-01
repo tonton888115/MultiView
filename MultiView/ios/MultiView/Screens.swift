@@ -423,7 +423,7 @@ final class SettingsController: UITableViewController {
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     guard let sec = Sec(rawValue: section) else { return 0 }
     switch sec {
-    case .playback: return 11
+    case .playback: return 12
     case .danmaku: return 6
     case .order: return platforms.count
     case .kick: return 5
@@ -576,6 +576,11 @@ final class SettingsController: UITableViewController {
         cell.textLabel?.text = "ニコ生 お知らせ通知を表示"
         cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoShowNotification) { v in
           var s = AppState.shared.settings; s.niconicoShowNotification = v; AppState.shared.settings = s
+        }
+      case 10:
+        cell.textLabel?.text = "同接数を左下に表示"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.showViewerCount) { v in
+          var s = AppState.shared.settings; s.showViewerCount = v; AppState.shared.settings = s
         }
       default:
         cell.textLabel?.text = "3本以上で自動エコノミー画質"

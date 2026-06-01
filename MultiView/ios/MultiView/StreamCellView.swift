@@ -9,6 +9,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
   private let commentBar = UIView()
   private let commentField = UITextField()
   private let commentStatus = UILabel()
+  private var viewerCountOverlay: ViewerCountOverlay?
   private var commentBottom: NSLayoutConstraint?
   private weak var commentPoster: CommentPostable?
   private weak var commentEchoer: CommentEchoDisplay?
@@ -66,6 +67,12 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     }
     volume.translatesAutoresizingMaskIntoConstraints = false
     addSubview(volume)
+    if AppState.shared.settings.showViewerCount {
+      let viewerCount = ViewerCountOverlay(stream: stream)
+      viewerCount.translatesAutoresizingMaskIntoConstraints = false
+      addSubview(viewerCount)
+      viewerCountOverlay = viewerCount
+    }
 
     let comment = UIButton(type: .system)
     comment.setImage(UIImage(systemName: "text.bubble"), for: .normal)
@@ -105,7 +112,13 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
       reorderHandle.widthAnchor.constraint(equalToConstant: 44),
       reorderHandle.heightAnchor.constraint(equalToConstant: 32)
     ])
-    autoHider = AutoHidingControls(host: self, controls: [focus, remove, comment, volume])
+    if let viewerCountOverlay {
+      NSLayoutConstraint.activate([
+        viewerCountOverlay.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+        viewerCountOverlay.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10)
+      ])
+    }
+    autoHider = AutoHidingControls(host: self, controls: [focus, remove, comment, volume, reorderHandle])
     let reorder = UILongPressGestureRecognizer(target: self, action: #selector(handleReorderGesture(_:)))
     reorder.minimumPressDuration = 0.28
     reorder.allowableMovement = 18

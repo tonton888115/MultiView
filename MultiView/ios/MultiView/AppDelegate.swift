@@ -818,6 +818,7 @@ final class AppState {
         || settings.niconicoLowLatency != oldValue.niconicoLowLatency
         || settings.playAudio != oldValue.playAudio
         || settings.showChat != oldValue.showChat
+        || settings.showViewerCount != oldValue.showViewerCount
         || settings.layoutMode != oldValue.layoutMode
         || settings.platformOrder != oldValue.platformOrder
         || settings.autoEconomyOnManyStreams != oldValue.autoEconomyOnManyStreams
