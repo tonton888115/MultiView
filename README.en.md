@@ -20,11 +20,11 @@ Repository: **https://github.com/tonton888115/MultiView** (public)
 
 - **4 bottom tabs**: Following / Ranking / Watch / Settings
 - **Watch tab**: grid multi-view. Tap **⤢** on a cell to focus one stream, long-press to reorder, **×** to remove
-- **Native playback**: a dedicated player per service (Kick/Twitch prefer Amazon IVS Player with AVPlayer fallback; YouTube via in-app HLS extraction; TwitCasting via HLS; Niconico via the program-page HLS + comment WebSocket)
+- **Native playback**: a dedicated player per service (Kick/Twitch prefer Amazon IVS Player with AVPlayer fallback; YouTube uses InnerTube HLS extraction and tries IVS for live HLS; TwitCasting tries IVS with HLS fallback; Niconico uses the program-page HLS + comment WebSocket)
 - **Danmaku**: Niconico-style right→left comments (toggle/speed/opacity/font size/max lines/max length). Niconico also renders gift effects
 - **Posting comments**: from an in-app field where supported; otherwise log in via the official chat shown in the focused view
 - **Device handoff**: the QR button in the Watch tab carries your open tabs between iPad ↔ iPhone (QR scan or clipboard; no server)
-- **Low-latency tuning**: Kick/Twitch use Amazon IVS Player by default and automatically fall back to the old AVPlayer path when needed; Niconico has a low-latency toggle
+- **Low-latency tuning**: Kick/Twitch use Amazon IVS Player by default. TwitCasting/YouTube also try IVS first when HLS is available, then automatically fall back to the existing path; Niconico has a low-latency toggle
 - **Quality**: separate high/economy for Wi-Fi vs cellular
 
 ---
@@ -35,8 +35,8 @@ Repository: **https://github.com/tonton888115/MultiView** (public)
 |---|---|---|---|
 | Twitch | ✅ Amazon IVS Player + native HLS fallback | ✅ anonymous | ✅ official chat in focus (login) |
 | Kick | ✅ Amazon IVS Player (low-latency) | ✅ Pusher | ✅ native (OAuth login) |
-| YouTube | ✅ HLS extraction | △ needs Data API + OAuth | ✅ official live chat in focus (login) |
-| TwitCasting | ✅ native HLS | ⚠️ best-effort | ✅ native (OAuth login) |
+| YouTube | ✅ InnerTube HLS + IVS trial + AVPlayer/iframe fallback | △ needs Data API + OAuth | ✅ official live chat in focus (login) |
+| TwitCasting | ✅ IVS trial + native HLS fallback | ⚠️ best-effort | ✅ native (OAuth login) |
 | Niconico | ✅ HLS + native comments | native comments + gifts | ✅ native (needs user_session login) |
 
 ---
@@ -87,10 +87,10 @@ console and **enter your own Client ID in Settings**.
 
 ## YouTube Extraction
 
-YouTube live/DVR playback no longer uses a Cloudflare Worker. The app calls InnerTube
-(`youtubei.googleapis.com/youtubei/v1/player`) directly and uses `hlsManifestUrl` with AVPlayer when
-available. If extraction fails or playback does not start, it automatically falls back to the official
-iframe player.
+YouTube live/DVR playback calls InnerTube (`youtubei.googleapis.com/youtubei/v1/player`) directly.
+When a live HLS URL is available, the app tries Amazon IVS Player first and automatically falls back
+to AVPlayer if unsupported or unstable. If extraction fails or playback does not start, it falls back
+to the official iframe player.
 
 ---
 
@@ -110,5 +110,6 @@ iframe player.
 - **YouTube danmaku** needs the Data API + OAuth (viewing and chat input work without it).
 - **Kick latency**: since 1.1.25, the app tries Amazon IVS Player first and falls back to the old AVPlayer path only if needed.
 - **Twitch latency**: since 1.1.26, the app uses Amazon IVS Player by default and automatically returns to the old AVPlayer path if unsupported or unstable.
+- **TwitCasting/YouTube latency**: since 1.1.27, the app tries IVS first when HLS is available and falls back to the existing AVPlayer/iframe path if unsupported.
 - Comfortable multi-view is **3–4 streams**, depending on device performance.
 - Streams/chat can break when a site changes its internals.

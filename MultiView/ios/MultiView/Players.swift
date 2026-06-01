@@ -3717,11 +3717,13 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 }
 
-final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
+final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, IVSPlayer.Delegate {
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
+  private var ivsPlayer: IVSPlayer?
+  private var ivsPlayerLayer: IVSPlayerLayer?
   private let danmakuView = UIView()
   private let statusLabel = UILabel()
   private var chatClient: TwitcastingChatClient?
@@ -3732,11 +3734,16 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
   private var liveCatchUpTimer: Timer?
+  private var ivsBufferingRecoveryWork: DispatchWorkItem?
   private var fallbackWebView: WKWebView?
+  private var currentHLSURL: URL?
   private var playbackGeneration = 0
   private let nativeRetry = NativeRetryLimiter(maxAttempts: 2)
+  private let ivsRetry = NativeRetryLimiter(maxAttempts: 1)
   private var playbackVolume: Float
   private var laneCursor = 0
+  private var usingIvsPlayback = false
+  private var forceLegacyPlayback = false
   private var isLoading = false
   private var isStopped = false
 
@@ -3790,6 +3797,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   override func layoutSubviews() {
     super.layoutSubviews()
     playerLayer.frame = bounds
+    ivsPlayerLayer?.frame = bounds
     danmakuView.frame = bounds
   }
 
@@ -3800,6 +3808,11 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     try? session.setActive(true)
     if let fallbackWebView {
       fallbackWebView.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(function(m){try{m.play()}catch(e){}});")
+      return
+    }
+    if let ivsPlayer, usingIvsPlayback {
+      applyIvsAudio()
+      ivsPlayer.play()
       return
     }
     if player.currentItem == nil {
@@ -3815,6 +3828,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
 
   func pausePlayback() {
     player.pause()
+    ivsPlayer?.pause()
     fallbackWebView?.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(function(m){try{m.pause()}catch(e){}});")
   }
 
@@ -3839,6 +3853,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     streamTask = nil
     player.pause()
     player.replaceCurrentItem(with: nil)
+    teardownIvsPlayback(removeLayer: true)
     itemStatusObservation = nil
     if let itemFailedObserver {
       NotificationCenter.default.removeObserver(itemFailedObserver)
@@ -3853,6 +3868,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
     player.volume = settings.playAudio ? playbackVolume : 0
+    applyIvsAudio()
     applyFallbackVolume()
   }
 
@@ -3919,9 +3935,69 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       self.isLoading = false
       guard !self.isStopped, requestGeneration == self.playbackGeneration,
             self.fallbackWebView == nil else { return }
+      self.currentHLSURL = hlsURL
+      if Self.useIvsPlayer, !self.forceLegacyPlayback {
+        self.playWithIvs(hlsURL: hlsURL, requestGeneration: requestGeneration)
+      } else {
+        self.playWithAVPlayer(hlsURL: hlsURL, requestGeneration: requestGeneration)
+      }
+    }
+  }
+
+  private func playWithIvs(hlsURL: URL, requestGeneration: Int) {
+    DispatchQueue.main.async {
+      self.isLoading = false
+      guard !self.isStopped, requestGeneration == self.playbackGeneration,
+            self.fallbackWebView == nil else { return }
       self.statusLabel.isHidden = true
       self.playbackGeneration += 1
       let generation = self.playbackGeneration
+      self.teardownAVPlayerPlayback()
+
+      let ivs = IVSPlayer()
+      ivs.delegate = self
+      ivs.autoQualityMode = true
+      ivs.setOrigin(URL(string: "https://twitcasting.tv"))
+      ivs.setLiveLowLatencyEnabled(true)
+      ivs.setRebufferToLive(true)
+      ivs.setNetworkRecoveryMode(.resume)
+      ivs.setInitialBufferDuration(CMTime(seconds: 1.6, preferredTimescale: 600))
+      let peakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: self.settings)
+      if peakBitRate > 0 {
+        ivs.setAutoMaxBitrate(Int(peakBitRate))
+      }
+
+      self.teardownIvsPlayback(removeLayer: false)
+      self.ivsPlayer = ivs
+      self.usingIvsPlayback = true
+      self.applyIvsAudio()
+
+      let ivsLayer = self.ivsPlayerLayer ?? IVSPlayerLayer(player: nil)
+      ivsLayer.player = ivs
+      ivsLayer.videoGravity = .resizeAspect
+      ivsLayer.frame = self.bounds
+      ivsLayer.isHidden = false
+      if ivsLayer.superlayer == nil {
+        self.layer.insertSublayer(ivsLayer, above: self.playerLayer)
+      }
+      self.ivsPlayerLayer = ivsLayer
+      self.playerLayer.isHidden = true
+
+      ivs.load(hlsURL)
+      ivs.play()
+      self.scheduleIvsBufferingRecovery(generation: generation)
+    }
+  }
+
+  private func playWithAVPlayer(hlsURL: URL, requestGeneration: Int) {
+    DispatchQueue.main.async {
+      self.isLoading = false
+      guard !self.isStopped, requestGeneration == self.playbackGeneration,
+            self.fallbackWebView == nil else { return }
+      self.statusLabel.isHidden = true
+      self.playbackGeneration += 1
+      let generation = self.playbackGeneration
+      self.teardownIvsPlayback(removeLayer: false)
       var options: [String: Any] = [
         "AVURLAssetHTTPHeaderFieldsKey": self.twitcastingPlaybackHeaders(),
         // Live HLS never needs a precise duration; skip that analysis to trim startup.
@@ -3998,6 +4074,11 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
 
   private func teardownPlayback() {
     playbackGeneration += 1
+    teardownIvsPlayback(removeLayer: false)
+    teardownAVPlayerPlayback()
+  }
+
+  private func teardownAVPlayerPlayback() {
     liveCatchUpTimer?.invalidate()
     liveCatchUpTimer = nil
     stallWatchdog.stop()
@@ -4008,6 +4089,33 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     }
     player.pause()
     player.replaceCurrentItem(with: nil)
+    playerLayer.isHidden = false
+  }
+
+  private func teardownIvsPlayback(removeLayer: Bool) {
+    ivsBufferingRecoveryWork?.cancel()
+    ivsBufferingRecoveryWork = nil
+    usingIvsPlayback = false
+    if let ivsPlayer {
+      ivsPlayer.delegate = nil
+      ivsPlayer.pause()
+      ivsPlayer.load(nil as URL?)
+    }
+    ivsPlayer = nil
+    ivsPlayerLayer?.player = nil
+    ivsPlayerLayer?.isHidden = true
+    if removeLayer {
+      ivsPlayerLayer?.removeFromSuperlayer()
+      ivsPlayerLayer = nil
+    }
+    playerLayer.isHidden = false
+  }
+
+  private func applyIvsAudio() {
+    guard let ivsPlayer else { return }
+    let effectiveVolume = settings.playAudio ? playbackVolume : 0
+    ivsPlayer.volume = effectiveVolume
+    ivsPlayer.muted = effectiveVolume <= 0
   }
 
   private func handleNativeFailure(_ reason: String, generation: Int) {
@@ -4033,6 +4141,43 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       }
       self.installEmbedFallback(reason)
     }
+  }
+
+  private func handleIvsFailure(_ reason: String, generation: Int) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil,
+            self.usingIvsPlayback, generation == self.playbackGeneration else { return }
+      if let attempt = self.ivsRetry.nextAttempt() {
+        self.teardownIvsPlayback(removeLayer: false)
+        self.showStatus("ツイキャス SDK再接続中(\(attempt)/\(self.ivsRetry.maxAttempts))")
+        if let hlsURL = self.currentHLSURL {
+          self.playWithIvs(hlsURL: hlsURL, requestGeneration: generation)
+        } else {
+          self.retryNativeLoadOrFallback(reason, generation: generation)
+        }
+        return
+      }
+      if let hlsURL = self.currentHLSURL {
+        self.forceLegacyPlayback = true
+        self.teardownIvsPlayback(removeLayer: false)
+        self.showStatus("ツイキャス SDKが未対応のため旧ネイティブ再生へ切替中")
+        self.playWithAVPlayer(hlsURL: hlsURL, requestGeneration: generation)
+        return
+      }
+      self.retryNativeLoadOrFallback(reason, generation: generation)
+    }
+  }
+
+  private func scheduleIvsBufferingRecovery(generation: Int) {
+    ivsBufferingRecoveryWork?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, !self.isStopped, self.usingIvsPlayback,
+            generation == self.playbackGeneration,
+            self.ivsPlayer?.state == .buffering else { return }
+      self.handleIvsFailure("ツイキャス SDKのバッファリングが続いています", generation: generation)
+    }
+    ivsBufferingRecoveryWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 14, execute: work)
   }
 
   private func applyFallbackVolume() {
@@ -4153,6 +4298,47 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     }
   }
 
+  func player(_ player: IVSPlayer, didChangeState state: IVSPlayer.State) {
+    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    let generation = playbackGeneration
+    switch state {
+    case .ready:
+      nativeRetry.reset()
+      ivsRetry.reset()
+      applyIvsAudio()
+      statusLabel.isHidden = true
+      player.play()
+    case .buffering:
+      scheduleIvsBufferingRecovery(generation: generation)
+    case .playing:
+      ivsBufferingRecoveryWork?.cancel()
+      ivsBufferingRecoveryWork = nil
+      statusLabel.isHidden = true
+    case .ended:
+      handleIvsFailure("ツイキャス SDK再生が終了しました", generation: generation)
+    case .idle:
+      break
+    @unknown default:
+      break
+    }
+  }
+
+  func player(_ player: IVSPlayer, didFailWithError error: Error) {
+    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback else { return }
+    handleIvsFailure(error.localizedDescription, generation: playbackGeneration)
+  }
+
+  func playerWillRebuffer(_ player: IVSPlayer) {
+    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    scheduleIvsBufferingRecovery(generation: playbackGeneration)
+  }
+
+  func playerNetworkDidBecomeUnavailable(_ player: IVSPlayer) {
+    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    showStatus("ツイキャス SDKネットワーク復旧待ち")
+    scheduleIvsBufferingRecovery(generation: playbackGeneration)
+  }
+
   func emitOwnComment(_ text: String) {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return }
@@ -4229,17 +4415,21 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   }
 
   private static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+  private static var useIvsPlayer: Bool {
+    !UserDefaults.standard.bool(forKey: "playback.twitcasting.ivs.disabled")
+  }
 }
 
-// Per-cell YouTube playback first tries native HLS via InnerTube, then falls back
-// to the official iframe. Older Worker/WebView/Piped extraction paths were removed
-// because they were no longer called and only added startup/network noise.
-final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, WKScriptMessageHandler {
+// Per-cell YouTube playback resolves HLS via InnerTube, tries IVS for live HLS,
+// then falls back to AVPlayer and finally to the official iframe.
+final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, WKScriptMessageHandler, IVSPlayer.Delegate {
   private static let instances = NSHashTable<YouTubeNativePlayerView>.weakObjects()
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
+  private var ivsPlayer: IVSPlayer?
+  private var ivsPlayerLayer: IVSPlayerLayer?
   private let danmakuView = UIView()
   private let statusLabel = UILabel()
   private var playbackVolume: Float
@@ -4248,8 +4438,14 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var chatPollWorkItem: DispatchWorkItem?
   private var itemStatusObservation: NSKeyValueObservation?
   private var timeObserver: Any?
+  private var ivsBufferingRecoveryWork: DispatchWorkItem?
   private var sponsorSegments: [(start: Double, end: Double)] = []
   private var fallbackWebView: WKWebView?
+  private var currentNativeURL: URL?
+  private var currentNativeVideoID: String?
+  private var currentNativeIsLive = false
+  private var usingIvsPlayback = false
+  private var forceLegacyPlayback = false
   private var isStopped = false
   private var iframeAudioEnabled = false
   private var liveChatID: String?
@@ -4318,6 +4514,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   override func layoutSubviews() {
     super.layoutSubviews()
     playerLayer.frame = bounds
+    ivsPlayerLayer?.frame = bounds
     fallbackWebView?.frame = bounds
   }
 
@@ -4331,6 +4528,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     let session = AVAudioSession.sharedInstance()
     try? session.setCategory(.playback, mode: .default, options: [])
     try? session.setActive(true)
+    if let ivsPlayer, usingIvsPlayback {
+      applyIvsAudio()
+      ivsPlayer.play()
+      return
+    }
     applyVolume()
     player.play()
   }
@@ -4338,6 +4540,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   func pausePlayback() {
     guard !isStopped else { return }
     player.pause()
+    ivsPlayer?.pause()
     fallbackWebView?.evaluateJavaScript("window.mvPause && window.mvPause();")
   }
 
@@ -4348,12 +4551,19 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       Self.focusAudio(on: self)
     }
     applyVolume()
+    applyIvsAudio()
     fallbackWebView?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(iframeEffectiveVolume()));")
   }
 
   private func applyVolume() {
     player.isMuted = false
     player.volume = max(0.01, playbackVolume)
+  }
+
+  private func applyIvsAudio() {
+    guard let ivsPlayer else { return }
+    ivsPlayer.volume = max(0.01, playbackVolume)
+    ivsPlayer.muted = false
   }
 
   private func iframeEffectiveVolume() -> Float {
@@ -4527,6 +4737,16 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     chatPollWorkItem?.cancel(); chatPollWorkItem = nil
     chatDripWorkItem?.cancel(); chatDripWorkItem = nil
     pendingChatMessages.removeAll()
+    teardownIvsPlayback(removeLayer: true)
+    teardownAVPlayerPlayback()
+    fallbackWebView?.stopLoading()
+    fallbackWebView?.configuration.userContentController.removeScriptMessageHandler(forName: "youtubeAudio")
+    fallbackWebView?.loadHTMLString("", baseURL: nil)
+    fallbackWebView?.removeFromSuperview()
+    fallbackWebView = nil
+  }
+
+  private func teardownAVPlayerPlayback() {
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
@@ -4534,11 +4754,26 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     itemStatusObservation = nil
     player.pause()
     player.replaceCurrentItem(with: nil)
-    fallbackWebView?.stopLoading()
-    fallbackWebView?.configuration.userContentController.removeScriptMessageHandler(forName: "youtubeAudio")
-    fallbackWebView?.loadHTMLString("", baseURL: nil)
-    fallbackWebView?.removeFromSuperview()
-    fallbackWebView = nil
+    playerLayer.isHidden = false
+  }
+
+  private func teardownIvsPlayback(removeLayer: Bool) {
+    ivsBufferingRecoveryWork?.cancel()
+    ivsBufferingRecoveryWork = nil
+    usingIvsPlayback = false
+    if let ivsPlayer {
+      ivsPlayer.delegate = nil
+      ivsPlayer.pause()
+      ivsPlayer.load(nil as URL?)
+    }
+    ivsPlayer = nil
+    ivsPlayerLayer?.player = nil
+    ivsPlayerLayer?.isHidden = true
+    if removeLayer {
+      ivsPlayerLayer?.removeFromSuperlayer()
+      ivsPlayerLayer = nil
+    }
+    playerLayer.isHidden = false
   }
 
   private func loadPlayer() {
@@ -4556,7 +4791,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private func requestNativePlayer(videoId: String, attempt: Int = 0) {
-    guard !isStopped, player.currentItem == nil else { return }
+    guard !isStopped, player.currentItem == nil, ivsPlayer == nil, fallbackWebView == nil else { return }
     let clients = Self.nativePlayerClients()
     guard clients.indices.contains(attempt) else {
       noteExtractionFailure("Native player: manifest取得失敗")
@@ -4602,7 +4837,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       let parsed = Self.parseJSONObject(data)
       if let parsed, let stream = Self.extractPlayableStream(from: parsed) {
         DispatchQueue.main.async {
-          guard !self.isStopped, self.player.currentItem == nil else { return }
+          guard !self.isStopped, self.player.currentItem == nil,
+                self.ivsPlayer == nil, self.fallbackWebView == nil else { return }
           self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive)
         }
         return
@@ -4619,6 +4855,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       guard let self,
             !self.isStopped,
             self.player.currentItem == nil,
+            self.ivsPlayer == nil,
+            self.fallbackWebView == nil,
             let task,
             self.resolveTask === task else { return }
       task.cancel()
@@ -4753,7 +4991,66 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   private func startPlayback(url: URL, videoId: String, isLive: Bool) {
     guard !isStopped else { return }
+    currentNativeURL = url
+    currentNativeVideoID = videoId
+    currentNativeIsLive = isLive
+    if isLive, Self.useIvsPlayer, !forceLegacyPlayback, Self.looksLikeHLS(url) {
+      startIvsPlayback(url: url)
+    } else {
+      startAVPlayerPlayback(url: url, videoId: videoId, isLive: isLive)
+    }
+  }
+
+  private func startIvsPlayback(url: URL) {
+    guard !isStopped, fallbackWebView == nil else { return }
     statusLabel.isHidden = true
+    teardownAVPlayerPlayback()
+
+    let ivs = IVSPlayer()
+    ivs.delegate = self
+    ivs.autoQualityMode = true
+    ivs.setOrigin(URL(string: "https://www.youtube.com"))
+    ivs.setLiveLowLatencyEnabled(true)
+    ivs.setRebufferToLive(true)
+    ivs.setNetworkRecoveryMode(.resume)
+    ivs.setInitialBufferDuration(CMTime(seconds: 1.2, preferredTimescale: 600))
+    let peakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: settings)
+    if peakBitRate > 0 {
+      ivs.setAutoMaxBitrate(Int(peakBitRate))
+    }
+
+    teardownIvsPlayback(removeLayer: false)
+    ivsPlayer = ivs
+    usingIvsPlayback = true
+    applyIvsAudio()
+
+    let ivsLayer = ivsPlayerLayer ?? IVSPlayerLayer(player: nil)
+    ivsLayer.player = ivs
+    ivsLayer.videoGravity = .resizeAspect
+    ivsLayer.frame = bounds
+    ivsLayer.isHidden = false
+    if ivsLayer.superlayer == nil {
+      layer.insertSublayer(ivsLayer, above: playerLayer)
+    }
+    ivsPlayerLayer = ivsLayer
+    playerLayer.isHidden = true
+
+    ivs.load(url)
+    ivs.play()
+    scheduleIvsBufferingRecovery()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self, weak ivs] in
+      guard let self, !self.isStopped, self.fallbackWebView == nil,
+            let ivs, let current = self.ivsPlayer, current === ivs,
+            self.usingIvsPlayback else { return }
+      ivs.play()
+    }
+  }
+
+  private func startAVPlayerPlayback(url: URL, videoId: String, isLive: Bool) {
+    guard !isStopped else { return }
+    statusLabel.isHidden = true
+    teardownIvsPlayback(removeLayer: false)
+    teardownAVPlayerPlayback()
     let asset = AVURLAsset(url: url, options: [
       "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": Self.userAgent],
       // Live HLS never needs a precise duration; skip that analysis to trim startup.
@@ -4803,17 +5100,12 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
-  // 2026年現在、YouTube は formats[*].url を出さず (signatureCipher のみ)、
-  // hlsManifestUrl も SABR 強制で空のことが多い。Piped/Invidious 含む第三者
-  // API も全滅していることを PC 検証済み。proxy 経路を回しても 10-15秒の
-  // 黒画面を増やすだけなので、抽出失敗 = 直ちに iframe 描画に進む。
+  // YouTube often returns SABR-only/no direct URL. Extra extractor chains were
+  // removed because they only added black-screen delay; fail fast to iframe.
   private func installEmbedFallback(videoId: String) {
     guard !isStopped else { return }
-    if player.currentItem != nil {
-      itemStatusObservation = nil
-      player.pause()
-      player.replaceCurrentItem(with: nil)
-    }
+    teardownIvsPlayback(removeLayer: false)
+    teardownAVPlayerPlayback()
     noteExtractionFailure("抽出失敗: YouTube iframe fallback")
     installAlternativeWebFallback(videoId: videoId)
   }
@@ -4826,22 +5118,15 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   //  - 自動再生は iOS WebKit ルールに合わせて muted 起動する。
   //  - ネイティブ音量操作で「音声をオン」ボタンを iframe 内に出し、WebView 内の
   //    user gesture で unmute する。ネイティブ側だけでは iOS が解除を拒否し得る。
-  //  - YouTube セルの音声は focusAudio(on:) で 1 つに絞り、同時出力を避ける。
+  //  - iframe fallback の音声は focusAudio(on:) で 1 つに絞り、同時出力を避ける。
   //  - 広告は WebAdBlocker のコンテンツルール + embedHTML 内の iv_load_policy=3
   //    アノテーション無効化で抑制 (YouTube は完全には防げない)。
-  //  - 他配信との衝突: YouTube は iframe だけを鳴らし、AVPlayer 抽出音声を
-  //    起動経路から外して二重出力を防ぐ。
   //  - iframe が onError 102/150/152 (埋め込み禁止) を返した場合は、無理に
   //    watch ページに遷移せず error メッセージを overlay 表示する。
   private func installAlternativeWebFallback(videoId: String) {
     guard !isStopped, fallbackWebView == nil else { return }
-    if let timeObserver {
-      player.removeTimeObserver(timeObserver)
-      self.timeObserver = nil
-    }
-    itemStatusObservation = nil
-    player.pause()
-    player.replaceCurrentItem(with: nil)
+    teardownIvsPlayback(removeLayer: false)
+    teardownAVPlayerPlayback()
     showStatus("YouTube公式iframeで再生")
     let config = WKWebViewConfiguration()
     config.allowsInlineMediaPlayback = true
@@ -4950,6 +5235,74 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       }
     }
     resolveTask?.resume()
+  }
+
+  private func handleIvsFailure(_ reason: String) {
+    DispatchQueue.main.async {
+      guard !self.isStopped, self.fallbackWebView == nil, self.usingIvsPlayback else { return }
+      self.noteExtractionFailure("YouTube IVS: \(reason)")
+      self.forceLegacyPlayback = true
+      self.teardownIvsPlayback(removeLayer: false)
+      if let url = self.currentNativeURL, let videoId = self.currentNativeVideoID {
+        self.showStatus("YouTube IVSが未対応のため旧ネイティブ再生へ切替中")
+        self.startAVPlayerPlayback(url: url, videoId: videoId, isLive: self.currentNativeIsLive)
+        return
+      }
+      if let videoId = Self.videoID(from: self.stream.channel) {
+        self.installEmbedFallback(videoId: videoId)
+      }
+    }
+  }
+
+  private func scheduleIvsBufferingRecovery() {
+    ivsBufferingRecoveryWork?.cancel()
+    let target = ivsPlayer
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, !self.isStopped, self.usingIvsPlayback,
+            let target, let current = self.ivsPlayer, current === target,
+            target.state == .buffering else { return }
+      self.handleIvsFailure("バッファリングが続いています")
+    }
+    ivsBufferingRecoveryWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: work)
+  }
+
+  func player(_ player: IVSPlayer, didChangeState state: IVSPlayer.State) {
+    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    switch state {
+    case .ready:
+      applyIvsAudio()
+      statusLabel.isHidden = true
+      player.play()
+    case .buffering:
+      scheduleIvsBufferingRecovery()
+    case .playing:
+      ivsBufferingRecoveryWork?.cancel()
+      ivsBufferingRecoveryWork = nil
+      statusLabel.isHidden = true
+    case .ended:
+      handleIvsFailure("再生が終了しました")
+    case .idle:
+      break
+    @unknown default:
+      break
+    }
+  }
+
+  func player(_ player: IVSPlayer, didFailWithError error: Error) {
+    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback else { return }
+    handleIvsFailure(error.localizedDescription)
+  }
+
+  func playerWillRebuffer(_ player: IVSPlayer) {
+    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    scheduleIvsBufferingRecovery()
+  }
+
+  func playerNetworkDidBecomeUnavailable(_ player: IVSPlayer) {
+    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    showStatus("YouTube IVSネットワーク復旧待ち")
+    scheduleIvsBufferingRecovery()
   }
 
   private func showStatus(_ text: String) {
@@ -5191,5 +5544,13 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     return nil
   }
 
+  private static func looksLikeHLS(_ url: URL) -> Bool {
+    let raw = url.absoluteString.lowercased()
+    return raw.contains(".m3u8") || raw.contains("/manifest/hls") || raw.contains("hls_playlist")
+  }
+
   static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"
+  private static var useIvsPlayer: Bool {
+    !UserDefaults.standard.bool(forKey: "playback.youtube.ivs.disabled")
+  }
 }
