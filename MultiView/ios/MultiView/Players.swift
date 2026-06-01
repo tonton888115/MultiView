@@ -2017,14 +2017,14 @@ final class KickLowLatencyLoader: NSObject, AVAssetResourceLoaderDelegate {
 
 final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, IVSPlayer.Delegate, IVSPlaybackHost {
   private let stream: StreamItem
-  private let settings: AppSettings
+  fileprivate let settings: AppSettings
   private let player = AVPlayer()
-  private let playerLayer = AVPlayerLayer()
-  private var ivsPlayer: IVSPlayer?
-  private var ivsPlayerLayer: IVSPlayerLayer?
+  fileprivate let playerLayer = AVPlayerLayer()
+  fileprivate var ivsPlayer: IVSPlayer?
+  fileprivate var ivsPlayerLayer: IVSPlayerLayer?
   private let danmakuView = UIView()
   private let statusLabel = UILabel()
-  private var playbackVolume: Float
+  fileprivate var playbackVolume: Float
   private var channelTask: URLSessionDataTask?
   private var socketTask: URLSessionWebSocketTask?
   private var itemStatusObservation: NSKeyValueObservation?
@@ -2034,8 +2034,8 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private var kickChannelID: String?
   private var liveCatchUpTimer: Timer?
   private var lowLatencyLoader: KickLowLatencyLoader?
-  private var ivsBufferingRecoveryWork: DispatchWorkItem?
-  private var usingIvsPlayback = false
+  fileprivate var ivsBufferingRecoveryWork: DispatchWorkItem?
+  fileprivate var usingIvsPlayback = false
   private var forceLegacyPlayback = false
   private let ivsRetry = NativeRetryLimiter(maxAttempts: 2)
   // 直近のplayback_url(素HLS再試行用)、再生世代(古いitemのKVO/通知を無視)、
@@ -3025,14 +3025,14 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
 // Anonymous IRC supplies danmaku comments.
 final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, IVSPlayer.Delegate, IVSPlaybackHost {
   private let stream: StreamItem
-  private let settings: AppSettings
+  fileprivate let settings: AppSettings
   private let player = AVPlayer()
-  private let playerLayer = AVPlayerLayer()
-  private var ivsPlayer: IVSPlayer?
-  private var ivsPlayerLayer: IVSPlayerLayer?
+  fileprivate let playerLayer = AVPlayerLayer()
+  fileprivate var ivsPlayer: IVSPlayer?
+  fileprivate var ivsPlayerLayer: IVSPlayerLayer?
   private let danmakuView = UIView()
   private let statusLabel = UILabel()
-  private var playbackVolume: Float
+  fileprivate var playbackVolume: Float
   private var tokenTask: URLSessionDataTask?
   private var chatSocket: URLSessionWebSocketTask?
   private var chatChannel: String?
@@ -3042,13 +3042,13 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
   private var liveCatchUpTimer: Timer?
-  private var ivsBufferingRecoveryWork: DispatchWorkItem?
+  fileprivate var ivsBufferingRecoveryWork: DispatchWorkItem?
   private var fallbackWebView: PlayerWebView?
   private var currentHLSURL: URL?
   private var playbackGeneration = 0
   private let nativeRetry = NativeRetryLimiter(maxAttempts: 2)
   private let ivsRetry = NativeRetryLimiter(maxAttempts: 1)
-  private var usingIvsPlayback = false
+  fileprivate var usingIvsPlayback = false
   private var forceLegacyPlayback = false
   private var isLoading = false
   private var isStopped = false
