@@ -408,22 +408,11 @@ final class ViewingController: UIViewController {
     }
   }
 
-  // MARK: - グリッドモードのライブ並べ替え
+  // MARK: - 並び替えドラッグ共通処理
 
-  private func beginGridLiveReorder(cell: StreamCellView, at location: CGPoint) {
-    guard dragSnapshot == nil else { return }
-    let streams = AppState.shared.streams
-    guard streams.contains(where: { $0.id == cell.stream.id }) else { return }
-
-    view.layoutIfNeeded()
-    let slotFrames = currentGridSlotFrames(for: streams)
-    guard slotFrames.count == streams.count else { return }
-
+  private func beginDragSnapshot(for cell: StreamCellView, at location: CGPoint) {
     dragSourceCell = cell
     dragSourceStream = cell.stream
-    gridDragSlotFrames = slotFrames
-    gridDragOriginalFrames = Dictionary(uniqueKeysWithValues: zip(streams.map { $0.id }, slotFrames))
-    gridDragCurrentStreams = streams
     scrollView.isScrollEnabled = false
 
     let sourceFrame = cell.convert(cell.bounds, to: view)
@@ -439,14 +428,58 @@ final class ViewingController: UIViewController {
     view.bringSubviewToFront(snapshot)
     dragSnapshot = snapshot
 
-    // ソースセルは元の階層に残して touch を維持し、見た目だけスナップショットへ移す。
+    // ソースセルは階層に残して touch を維持し、見た目だけスナップショットへ移す。
     cell.alpha = 0
+  }
+
+  @discardableResult
+  private func updateDragSnapshot(at location: CGPoint) -> Bool {
+    guard let snapshot = dragSnapshot else { return false }
+    snapshot.center = CGPoint(x: location.x + dragSnapshotCenterOffset.x, y: location.y + dragSnapshotCenterOffset.y)
+    return true
+  }
+
+  private func clearDragState() -> UIView? {
+    scrollView.isScrollEnabled = true
+    let snapshot = dragSnapshot
+    dragSnapshot = nil
+    dragSourceCell = nil
+    dragSourceStream = nil
+    dragSnapshotCenterOffset = .zero
+    return snapshot
+  }
+
+  private func fadeOutDragSnapshot(_ snapshot: UIView?, finalFrame: CGRect? = nil) {
+    UIView.animate(withDuration: 0.16, animations: {
+      if let finalFrame {
+        snapshot?.frame = finalFrame
+      }
+      snapshot?.alpha = 0
+    }, completion: { _ in
+      snapshot?.removeFromSuperview()
+    })
+  }
+
+  // MARK: - グリッドモードのライブ並べ替え
+
+  private func beginGridLiveReorder(cell: StreamCellView, at location: CGPoint) {
+    guard dragSnapshot == nil else { return }
+    let streams = AppState.shared.streams
+    guard streams.contains(where: { $0.id == cell.stream.id }) else { return }
+
+    view.layoutIfNeeded()
+    let slotFrames = currentGridSlotFrames(for: streams)
+    guard slotFrames.count == streams.count else { return }
+
+    gridDragSlotFrames = slotFrames
+    gridDragOriginalFrames = Dictionary(uniqueKeysWithValues: zip(streams.map { $0.id }, slotFrames))
+    gridDragCurrentStreams = streams
+    beginDragSnapshot(for: cell, at: location)
     updateGridLiveReorder(at: location)
   }
 
   private func updateGridLiveReorder(at location: CGPoint) {
-    guard let sourceStream = dragSourceStream, let snapshot = dragSnapshot else { return }
-    snapshot.center = CGPoint(x: location.x + dragSnapshotCenterOffset.x, y: location.y + dragSnapshotCenterOffset.y)
+    guard let sourceStream = dragSourceStream, updateDragSnapshot(at: location) else { return }
 
     let insertIndex = gridLiveInsertIndex(at: location)
     let orderedStreams = streams(moving: sourceStream, to: insertIndex)
@@ -463,18 +496,13 @@ final class ViewingController: UIViewController {
   }
 
   private func finishGridLiveReorder(commit: Bool) {
-    scrollView.isScrollEnabled = true
-    let snapshot = dragSnapshot
     let sourceCell = dragSourceCell
     let sourceStream = dragSourceStream
     let newStreams = (commit && !gridDragCurrentStreams.isEmpty) ? gridDragCurrentStreams : nil
     let finalSnapshotFrame = gridFinalSnapshotFrame(for: sourceStream, in: newStreams) ??
       sourceCell.map { $0.convert($0.bounds, to: view) }
 
-    dragSnapshot = nil
-    dragSourceCell = nil
-    dragSourceStream = nil
-    dragSnapshotCenterOffset = .zero
+    let snapshot = clearDragState()
     gridDragSlotFrames.removeAll()
     gridDragOriginalFrames.removeAll()
     gridDragCurrentStreams.removeAll()
@@ -491,14 +519,7 @@ final class ViewingController: UIViewController {
       }
     }
 
-    UIView.animate(withDuration: 0.16, animations: {
-      if let finalSnapshotFrame {
-        snapshot?.frame = finalSnapshotFrame
-      }
-      snapshot?.alpha = 0
-    }, completion: { _ in
-      snapshot?.removeFromSuperview()
-    })
+    fadeOutDragSnapshot(snapshot, finalFrame: finalSnapshotFrame)
   }
 
   private func currentGridSlotFrames(for streams: [StreamItem]) -> [CGRect] {
@@ -573,32 +594,11 @@ final class ViewingController: UIViewController {
 
   private func beginLiveReorder(cell: StreamCellView, at location: CGPoint) {
     guard dragSnapshot == nil else { return }
-    dragSourceCell = cell
-    dragSourceStream = cell.stream
-    scrollView.isScrollEnabled = false
-
-    let sourceFrame = cell.convert(cell.bounds, to: view)
-    let snapshot = cell.snapshotView(afterScreenUpdates: false) ?? UIView(frame: cell.bounds)
-    snapshot.frame = sourceFrame
-    dragSnapshotCenterOffset = CGPoint(x: sourceFrame.midX - location.x, y: sourceFrame.midY - location.y)
-    snapshot.layer.shadowColor = UIColor.black.cgColor
-    snapshot.layer.shadowOpacity = 0.35
-    snapshot.layer.shadowRadius = 14
-    snapshot.layer.shadowOffset = CGSize(width: 0, height: 8)
-    snapshot.transform = CGAffineTransform(scaleX: 1.03, y: 1.03)
-    view.addSubview(snapshot)
-    view.bringSubviewToFront(snapshot)
-    dragSnapshot = snapshot
-
-    // ソースセルは透明にして「隙間」として残す(場所は保持＝他セルが退くと隙間が空いて見える)。
-    // 重要: stack からは外さない。外すと進行中のドラッグ入力(セルのジェスチャ/ハンドル)が
-    // 切れてしまう。一度 began した touch は alpha を 0 にしても届き続ける。指の下はスナップショットが代役。
-    cell.alpha = 0
+    beginDragSnapshot(for: cell, at: location)
   }
 
   private func updateLiveReorder(at location: CGPoint) {
-    guard let cell = dragSourceCell, let snapshot = dragSnapshot else { return }
-    snapshot.center = CGPoint(x: location.x + dragSnapshotCenterOffset.x, y: location.y + dragSnapshotCenterOffset.y)
+    guard let cell = dragSourceCell, updateDragSnapshot(at: location) else { return }
 
     // ソース以外のセルを基準に指のyが入るべき位置を求め、ソースセル(隙間)をそこへ移して他セルを退かせる。
     let others = stack.arrangedSubviews.compactMap { $0 as? StreamCellView }.filter { $0 !== cell }
@@ -620,21 +620,12 @@ final class ViewingController: UIViewController {
   }
 
   private func finishLiveReorder(commit: Bool) {
-    scrollView.isScrollEnabled = true
-    let snapshot = dragSnapshot
     let cell = dragSourceCell
     let newStreams = (commit && cell != nil) ? streamsFromLiveLayout() : nil
-    dragSnapshot = nil
-    dragSourceCell = nil
-    dragSourceStream = nil
-    dragSnapshotCenterOffset = .zero
+    let snapshot = clearDragState()
 
     cell?.alpha = 1
-    UIView.animate(withDuration: 0.16, animations: {
-      snapshot?.alpha = 0
-    }, completion: { _ in
-      snapshot?.removeFromSuperview()
-    })
+    fadeOutDragSnapshot(snapshot)
 
     if let newStreams, newStreams.count == AppState.shared.streams.count, newStreams != AppState.shared.streams {
       // 確定: 並びを保存 → appStateStreamsDidChange 経由で再利用＋整列アニメ(プレイヤー継続)。
