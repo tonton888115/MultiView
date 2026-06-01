@@ -8,12 +8,12 @@ final class ViewingController: UIViewController {
   private let stack = UIStackView()
   private var focused: StreamItem?
   private weak var dragSourceCell: StreamCellView?
-  private weak var dragTargetCell: StreamCellView?
-  private let reorderIndicator = UIView()
   private var dragSnapshot: UIView?
   private var dragSnapshotCenterOffset = CGPoint.zero
   private var dragSourceStream: StreamItem?
-  private var dragInsertIndex: Int?
+  private var gridDragSlotFrames: [CGRect] = []
+  private var gridDragOriginalFrames: [String: CGRect] = [:]
+  private var gridDragCurrentStreams: [StreamItem] = []
   private var lastAutoReloadAt = Date.distantPast
   // 並び替え・追加・削除でプレイヤーを作り直さず使い回すためのセル再利用プール(stream.id -> cell)。
   private var cellPool: [String: StreamCellView] = [:]
@@ -24,7 +24,6 @@ final class ViewingController: UIViewController {
     super.viewDidLoad()
     view.backgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.04, alpha: 1)
     configureScroll()
-    configureReorderIndicator()
     reload()
     NotificationCenter.default.addObserver(self, selector: #selector(reloadAndResume), name: .multiViewReloadAndResume, object: nil)
     NotificationCenter.default.addObserver(self, selector: #selector(networkQualityChanged), name: .multiViewNetworkQualityChanged, object: nil)
@@ -395,43 +394,40 @@ final class ViewingController: UIViewController {
 
   private func handleReorder(cell: StreamCellView, event: StreamReorderEvent) {
     guard focused == nil, AppState.shared.streams.count > 1 else { return }
-    // スタック(縦1列)はドラッグ中に他セルがリアルタイムに退くライブ並べ替え。グリッドは行構造が
-    // 複雑なので従来のスナップショット＋挿入インジケータ方式を維持する。
     let isStacked = AppState.shared.settings.layoutMode == .stacked
     let location = view.convert(event.windowLocation, from: nil)
     switch event.phase {
     case .began:
-      if isStacked { beginLiveReorder(cell: cell, at: location) } else { beginReorder(cell: cell, at: location) }
+      if isStacked { beginLiveReorder(cell: cell, at: location) } else { beginGridLiveReorder(cell: cell, at: location) }
     case .changed:
-      if isStacked { updateLiveReorder(at: location) } else { updateReorder(at: location) }
+      if isStacked { updateLiveReorder(at: location) } else { updateGridLiveReorder(at: location) }
     case .ended:
-      if isStacked { finishLiveReorder(commit: true) } else { finishReorder(commit: true) }
+      if isStacked { finishLiveReorder(commit: true) } else { finishGridLiveReorder(commit: true) }
     case .cancelled:
-      if isStacked { finishLiveReorder(commit: false) } else { finishReorder(commit: false) }
+      if isStacked { finishLiveReorder(commit: false) } else { finishGridLiveReorder(commit: false) }
     }
   }
 
-  private func configureReorderIndicator() {
-    reorderIndicator.backgroundColor = .systemGreen
-    reorderIndicator.layer.cornerRadius = 2
-    reorderIndicator.layer.shadowColor = UIColor.black.cgColor
-    reorderIndicator.layer.shadowOpacity = 0.24
-    reorderIndicator.layer.shadowRadius = 8
-    reorderIndicator.layer.shadowOffset = CGSize(width: 0, height: 3)
-    reorderIndicator.isHidden = true
-    reorderIndicator.alpha = 0
-    view.addSubview(reorderIndicator)
-  }
+  // MARK: - グリッドモードのライブ並べ替え
 
-  private func beginReorder(cell: StreamCellView, at location: CGPoint) {
+  private func beginGridLiveReorder(cell: StreamCellView, at location: CGPoint) {
     guard dragSnapshot == nil else { return }
+    let streams = AppState.shared.streams
+    guard streams.contains(where: { $0.id == cell.stream.id }) else { return }
+
+    view.layoutIfNeeded()
+    let slotFrames = currentGridSlotFrames(for: streams)
+    guard slotFrames.count == streams.count else { return }
+
     dragSourceCell = cell
-    dragTargetCell = cell
     dragSourceStream = cell.stream
+    gridDragSlotFrames = slotFrames
+    gridDragOriginalFrames = Dictionary(uniqueKeysWithValues: zip(streams.map { $0.id }, slotFrames))
+    gridDragCurrentStreams = streams
     scrollView.isScrollEnabled = false
-    cell.setReorderSourceActive(true)
-    let snapshot = cell.snapshotView(afterScreenUpdates: false) ?? UIView(frame: cell.bounds)
+
     let sourceFrame = cell.convert(cell.bounds, to: view)
+    let snapshot = cell.snapshotView(afterScreenUpdates: false) ?? UIView(frame: cell.bounds)
     snapshot.frame = sourceFrame
     dragSnapshotCenterOffset = CGPoint(x: sourceFrame.midX - location.x, y: sourceFrame.midY - location.y)
     snapshot.layer.shadowColor = UIColor.black.cgColor
@@ -440,130 +436,137 @@ final class ViewingController: UIViewController {
     snapshot.layer.shadowOffset = CGSize(width: 0, height: 8)
     snapshot.transform = CGAffineTransform(scaleX: 1.03, y: 1.03)
     view.addSubview(snapshot)
-    view.bringSubviewToFront(reorderIndicator)
     view.bringSubviewToFront(snapshot)
     dragSnapshot = snapshot
-    updateReorder(at: location)
+
+    // ソースセルは元の階層に残して touch を維持し、見た目だけスナップショットへ移す。
+    cell.alpha = 0
+    updateGridLiveReorder(at: location)
   }
 
-  private func updateReorder(at location: CGPoint) {
-    dragSnapshot?.center = CGPoint(
-      x: location.x + dragSnapshotCenterOffset.x,
-      y: location.y + dragSnapshotCenterOffset.y
-    )
-    guard let target = reorderCell(at: location),
-          let targetIndex = AppState.shared.streams.firstIndex(where: { $0.id == target.stream.id }) else {
-      dragInsertIndex = nil
-      hideReorderIndicator()
-      return
+  private func updateGridLiveReorder(at location: CGPoint) {
+    guard let sourceStream = dragSourceStream, let snapshot = dragSnapshot else { return }
+    snapshot.center = CGPoint(x: location.x + dragSnapshotCenterOffset.x, y: location.y + dragSnapshotCenterOffset.y)
+
+    let insertIndex = gridLiveInsertIndex(at: location)
+    let orderedStreams = streams(moving: sourceStream, to: insertIndex)
+    guard orderedStreams != gridDragCurrentStreams else { return }
+    gridDragCurrentStreams = orderedStreams
+
+    UIView.animate(
+      withDuration: 0.22, delay: 0,
+      usingSpringWithDamping: 0.86, initialSpringVelocity: 0.25,
+      options: [.allowUserInteraction, .beginFromCurrentState]
+    ) {
+      self.applyGridLiveTransforms(for: orderedStreams)
     }
-    if target !== dragTargetCell {
-      dragTargetCell?.setDropTargetActive(false)
-      dragTargetCell = target
-      if target !== dragSourceCell {
-        target.setDropTargetActive(true)
+  }
+
+  private func finishGridLiveReorder(commit: Bool) {
+    scrollView.isScrollEnabled = true
+    let snapshot = dragSnapshot
+    let sourceCell = dragSourceCell
+    let sourceStream = dragSourceStream
+    let newStreams = (commit && !gridDragCurrentStreams.isEmpty) ? gridDragCurrentStreams : nil
+    let finalSnapshotFrame = gridFinalSnapshotFrame(for: sourceStream, in: newStreams) ??
+      sourceCell.map { $0.convert($0.bounds, to: view) }
+
+    dragSnapshot = nil
+    dragSourceCell = nil
+    dragSourceStream = nil
+    dragSnapshotCenterOffset = .zero
+    gridDragSlotFrames.removeAll()
+    gridDragOriginalFrames.removeAll()
+    gridDragCurrentStreams.removeAll()
+
+    if let newStreams, newStreams.count == AppState.shared.streams.count, newStreams != AppState.shared.streams {
+      resetGridLiveCellVisuals()
+      AppState.shared.streams = newStreams
+    } else {
+      UIView.animate(
+        withDuration: 0.2, delay: 0,
+        options: [.allowUserInteraction, .beginFromCurrentState]
+      ) {
+        self.resetGridLiveCellVisuals()
       }
     }
-    let frame = target.convert(target.bounds, to: view)
-    let insertAfterTarget = location.y > frame.midY
-    dragInsertIndex = targetIndex + (insertAfterTarget ? 1 : 0)
-    showReorderIndicator(near: frame, after: insertAfterTarget)
-  }
 
-  private func finishReorder(commit: Bool) {
-    scrollView.isScrollEnabled = true
-    let sourceCell = dragSourceCell
-    let targetCell = dragTargetCell
-    let sourceStream = dragSourceStream
-    let insertIndex = dragInsertIndex
-    dragSourceCell = nil
-    dragTargetCell = nil
-    dragSourceStream = nil
-    dragInsertIndex = nil
-    dragSnapshotCenterOffset = .zero
-
-    sourceCell?.setReorderSourceActive(false)
-    targetCell?.setDropTargetActive(false)
-    hideReorderIndicator()
-
-    let snapshot = dragSnapshot
-    dragSnapshot = nil
     UIView.animate(withDuration: 0.16, animations: {
-      if let sourceCell, let snapshot {
-        snapshot.frame = sourceCell.convert(sourceCell.bounds, to: self.view)
+      if let finalSnapshotFrame {
+        snapshot?.frame = finalSnapshotFrame
       }
       snapshot?.alpha = 0
     }, completion: { _ in
       snapshot?.removeFromSuperview()
     })
-
-    guard commit,
-          let sourceStream,
-          let from = AppState.shared.streams.firstIndex(where: { $0.id == sourceStream.id }),
-          let insertIndex,
-          insertIndex != from,
-          insertIndex != from + 1 else { return }
-    moveStream(from: from, to: insertIndex)
   }
 
-  private func moveStream(from sourceIndex: Int, to rawInsertIndex: Int) {
+  private func currentGridSlotFrames(for streams: [StreamItem]) -> [CGRect] {
+    streams.compactMap { stream in
+      guard let cell = cellPool[stream.id] else { return nil }
+      return cell.convert(cell.bounds, to: view)
+    }
+  }
+
+  private func gridLiveInsertIndex(at location: CGPoint) -> Int {
+    guard !gridDragSlotFrames.isEmpty else { return 0 }
+    for (index, frame) in gridDragSlotFrames.enumerated() {
+      if location.y < frame.minY { return index }
+      if location.y <= frame.maxY {
+        let isFullWidthSlot = frame.width >= view.bounds.width * 0.72
+        if isFullWidthSlot {
+          if location.y < frame.midY { return index }
+        } else if location.x < frame.midX {
+          return index
+        }
+      }
+    }
+    return gridDragSlotFrames.count
+  }
+
+  private func streams(moving sourceStream: StreamItem, to rawInsertIndex: Int) -> [StreamItem] {
     var next = AppState.shared.streams
+    guard let sourceIndex = next.firstIndex(where: { $0.id == sourceStream.id }) else { return next }
     let moved = next.remove(at: sourceIndex)
     let adjustedInsertIndex = sourceIndex < rawInsertIndex ? rawInsertIndex - 1 : rawInsertIndex
     next.insert(moved, at: max(0, min(adjustedInsertIndex, next.count)))
-    AppState.shared.streams = next
+    return next
   }
 
-  private func showReorderIndicator(near targetFrame: CGRect, after: Bool) {
-    let y = after ? targetFrame.maxY : targetFrame.minY
-    let frame = CGRect(x: targetFrame.minX + 10, y: y - 2, width: max(24, targetFrame.width - 20), height: 4)
-    if reorderIndicator.isHidden {
-      reorderIndicator.frame = frame
-      reorderIndicator.transform = CGAffineTransform(scaleX: 0.86, y: 1)
-      reorderIndicator.isHidden = false
-      UIView.animate(withDuration: 0.18, delay: 0, usingSpringWithDamping: 0.78, initialSpringVelocity: 0.3, options: [.allowUserInteraction, .beginFromCurrentState]) {
-        self.reorderIndicator.alpha = 1
-        self.reorderIndicator.transform = .identity
-      }
-      return
-    }
-    UIView.animate(withDuration: 0.16, delay: 0, options: [.allowUserInteraction, .beginFromCurrentState]) {
-      self.reorderIndicator.frame = frame
+  private func applyGridLiveTransforms(for streams: [StreamItem]) {
+    for stream in AppState.shared.streams {
+      guard let cell = cellPool[stream.id], cell !== dragSourceCell,
+            let originalFrame = gridDragOriginalFrames[stream.id],
+            let targetIndex = streams.firstIndex(where: { $0.id == stream.id }),
+            gridDragSlotFrames.indices.contains(targetIndex) else { continue }
+      cell.transform = gridTransform(from: originalFrame, to: gridDragSlotFrames[targetIndex])
     }
   }
 
-  private func hideReorderIndicator() {
-    guard !reorderIndicator.isHidden else { return }
-    UIView.animate(withDuration: 0.12, delay: 0, options: [.allowUserInteraction, .beginFromCurrentState]) {
-      self.reorderIndicator.alpha = 0
-    } completion: { _ in
-      self.reorderIndicator.isHidden = true
-      self.reorderIndicator.transform = .identity
-    }
+  private func gridTransform(from originalFrame: CGRect, to targetFrame: CGRect) -> CGAffineTransform {
+    guard originalFrame.width > 0, originalFrame.height > 0 else { return .identity }
+    return CGAffineTransform(
+      a: targetFrame.width / originalFrame.width,
+      b: 0,
+      c: 0,
+      d: targetFrame.height / originalFrame.height,
+      tx: targetFrame.midX - originalFrame.midX,
+      ty: targetFrame.midY - originalFrame.midY
+    )
   }
 
-  private func reorderCell(at location: CGPoint) -> StreamCellView? {
-    let cells = reorderCells(in: stack)
-    if let containing = cells.first(where: { $0.convert($0.bounds, to: view).contains(location) }) {
-      return containing
-    }
-    return cells.min { lhs, rhs in
-      let left = lhs.convert(lhs.bounds, to: view).centerDistance(to: location)
-      let right = rhs.convert(rhs.bounds, to: view).centerDistance(to: location)
-      return left < right
-    }
+  private func gridFinalSnapshotFrame(for sourceStream: StreamItem?, in streams: [StreamItem]?) -> CGRect? {
+    guard let sourceStream, let streams,
+          let targetIndex = streams.firstIndex(where: { $0.id == sourceStream.id }),
+          gridDragSlotFrames.indices.contains(targetIndex) else { return nil }
+    return gridDragSlotFrames[targetIndex]
   }
 
-  private func reorderCells(in root: UIView) -> [StreamCellView] {
-    var result: [StreamCellView] = []
-    for subview in root.subviews {
-      if let cell = subview as? StreamCellView {
-        result.append(cell)
-      } else {
-        result.append(contentsOf: reorderCells(in: subview))
-      }
+  private func resetGridLiveCellVisuals() {
+    cellPool.values.forEach { cell in
+      cell.alpha = 1
+      cell.transform = .identity
     }
-    return result
   }
 
   // MARK: - スタックモードのライブ並べ替え(iOSホーム画面のように他セルがリアルタイムに退く)
@@ -655,11 +658,5 @@ final class ViewingController: UIViewController {
     label.numberOfLines = 0
     label.heightAnchor.constraint(equalToConstant: 420).isActive = true
     return label
-  }
-}
-
-private extension CGRect {
-  func centerDistance(to point: CGPoint) -> CGFloat {
-    hypot(midX - point.x, midY - point.y)
   }
 }
