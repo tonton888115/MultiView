@@ -87,7 +87,10 @@ if (Test-Path $icloudRoot) {
 if ($icloudDir) {
     $leaf = Split-Path -Path $Output -Leaf
     $icloudPath = Join-Path $icloudDir $leaf
-    Copy-Item -Path $Output -Destination $icloudPath -Force
+    $tmpPath = Join-Path $icloudDir "$leaf.uploading"
+    Copy-Item -Path $Output -Destination $tmpPath -Force
+    Move-Item -Path $tmpPath -Destination $icloudPath -Force
+    (Get-Item -LiteralPath $icloudPath).LastWriteTime = Get-Date
     Write-Host "Mirrored to iCloud: $icloudPath"
     # 古い MultiView*.ipa は全部消し、最新の1つだけ残す（同名/旧版キャッシュ事故の根絶）。
     Get-ChildItem $icloudDir -Filter 'MultiView*.ipa' -Force -ErrorAction SilentlyContinue |
