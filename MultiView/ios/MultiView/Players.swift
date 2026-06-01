@@ -110,6 +110,133 @@ enum LiveEdgeCatchUp {
   }
 }
 
+private protocol IVSPlaybackHost: AnyObject {
+  var ivsPlayer: IVSPlayer? { get set }
+  var ivsPlayerLayer: IVSPlayerLayer? { get set }
+  var ivsBufferingRecoveryWork: DispatchWorkItem? { get set }
+  var usingIvsPlayback: Bool { get set }
+  var playerLayer: AVPlayerLayer { get }
+  var settings: AppSettings { get }
+  var playbackVolume: Float { get }
+}
+
+extension IVSPlaybackHost where Self: UIView {
+  func layoutIvsLayer() {
+    ivsPlayerLayer?.frame = bounds
+  }
+
+  func resumeIvsPlaybackIfActive() -> Bool {
+    guard let ivsPlayer, usingIvsPlayback else { return false }
+    applyIvsAudio()
+    ivsPlayer.play()
+    return true
+  }
+
+  func pauseIvsPlayback() {
+    ivsPlayer?.pause()
+  }
+
+  func attachIvsPlayer(_ ivs: IVSPlayer) {
+    teardownIvsPlayback(removeLayer: false)
+    ivsPlayer = ivs
+    usingIvsPlayback = true
+    applyIvsAudio()
+
+    let layer = ivsPlayerLayer ?? IVSPlayerLayer(player: nil)
+    layer.player = ivs
+    layer.videoGravity = .resizeAspect
+    layer.frame = bounds
+    layer.isHidden = false
+    if layer.superlayer == nil {
+      self.layer.insertSublayer(layer, above: playerLayer)
+    }
+    ivsPlayerLayer = layer
+    playerLayer.isHidden = true
+  }
+
+  func teardownIvsPlayback(removeLayer: Bool) {
+    ivsBufferingRecoveryWork?.cancel()
+    ivsBufferingRecoveryWork = nil
+    usingIvsPlayback = false
+    if let ivsPlayer {
+      ivsPlayer.delegate = nil
+      ivsPlayer.pause()
+      ivsPlayer.load(nil as URL?)
+    }
+    ivsPlayer = nil
+    ivsPlayerLayer?.player = nil
+    ivsPlayerLayer?.isHidden = true
+    if removeLayer {
+      ivsPlayerLayer?.removeFromSuperlayer()
+      ivsPlayerLayer = nil
+    }
+    playerLayer.isHidden = false
+  }
+
+  func applyIvsAudio() {
+    guard let ivsPlayer else { return }
+    let effectiveVolume = settings.playAudio ? playbackVolume : 0
+    ivsPlayer.volume = effectiveVolume
+    ivsPlayer.muted = effectiveVolume <= 0
+  }
+
+  func ownsIvsPlayer(_ player: IVSPlayer) -> Bool {
+    guard let ivsPlayer else { return false }
+    return player === ivsPlayer && usingIvsPlayback
+  }
+}
+
+private enum NativeAVPlaybackCleanup {
+  static func run(
+    player: AVPlayer,
+    playerLayer: AVPlayerLayer,
+    liveCatchUpTimer: inout Timer?,
+    stallWatchdog: StallWatchdog,
+    itemStatusObservation: inout NSKeyValueObservation?,
+    itemFailedObserver: inout NSObjectProtocol?
+  ) {
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = nil
+    stallWatchdog.stop()
+    itemStatusObservation = nil
+    if let observer = itemFailedObserver {
+      NotificationCenter.default.removeObserver(observer)
+      itemFailedObserver = nil
+    }
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    playerLayer.isHidden = false
+  }
+}
+
+private enum NativeFallbackRetry {
+  static func retryOrFallback(
+    isStopped: Bool,
+    fallbackActive: Bool,
+    generation: Int? = nil,
+    currentGeneration: Int,
+    limiter: NativeRetryLimiter,
+    teardown: () -> Void,
+    cancelRequest: () -> Void,
+    resetLoading: () -> Void,
+    showRetry: (Int) -> Void,
+    reload: () -> Void,
+    fallback: () -> Void
+  ) {
+    guard !isStopped, !fallbackActive else { return }
+    if let generation, generation != currentGeneration { return }
+    if let attempt = limiter.nextAttempt() {
+      teardown()
+      cancelRequest()
+      resetLoading()
+      showRetry(attempt)
+      reload()
+      return
+    }
+    fallback()
+  }
+}
+
 final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
   private let stream: StreamItem
   private let player = AVPlayer()
@@ -1888,7 +2015,7 @@ final class KickLowLatencyLoader: NSObject, AVAssetResourceLoaderDelegate {
   }
 }
 
-final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, IVSPlayer.Delegate {
+final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, IVSPlayer.Delegate, IVSPlaybackHost {
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
@@ -1975,7 +2102,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   override func layoutSubviews() {
     super.layoutSubviews()
     playerLayer.frame = bounds
-    ivsPlayerLayer?.frame = bounds
+    layoutIvsLayer()
     danmakuView.frame = bounds
   }
 
@@ -1988,11 +2115,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       fallbackWebView.resumePlayback()
       return
     }
-    if let ivsPlayer, usingIvsPlayback {
-      applyIvsAudio()
-      ivsPlayer.play()
-      return
-    }
+    if resumeIvsPlaybackIfActive() { return }
     if player.currentItem == nil {
       loadNativeStream()
       return
@@ -2003,7 +2126,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   }
 
   func pausePlayback() {
-    ivsPlayer?.pause()
+    pauseIvsPlayback()
     player.pause()
     fallbackWebView?.pausePlayback()
   }
@@ -2162,21 +2285,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         ivs.setAutoMaxBitrate(Int(peakBitRate))
       }
 
-      self.teardownIvsPlayback(removeLayer: false)
-      self.ivsPlayer = ivs
-      self.usingIvsPlayback = true
-      self.applyIvsAudio()
-
-      let ivsLayer = self.ivsPlayerLayer ?? IVSPlayerLayer(player: nil)
-      ivsLayer.player = ivs
-      ivsLayer.videoGravity = .resizeAspect
-      ivsLayer.frame = self.bounds
-      ivsLayer.isHidden = false
-      if ivsLayer.superlayer == nil {
-        self.layer.insertSublayer(ivsLayer, above: self.playerLayer)
-      }
-      self.ivsPlayerLayer = ivsLayer
-      self.playerLayer.isHidden = true
+      self.attachIvsPlayer(ivs)
 
       ivs.load(hlsURL)
       ivs.play()
@@ -2285,44 +2394,15 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   }
 
   private func teardownAVPlayerPlayback() {
-    liveCatchUpTimer?.invalidate()
-    liveCatchUpTimer = nil
-    stallWatchdog.stop()
     lowLatencyLoader = nil
-    itemStatusObservation = nil
-    if let obs = itemFailedObserver {
-      NotificationCenter.default.removeObserver(obs)
-      itemFailedObserver = nil
-    }
-    player.pause()
-    player.replaceCurrentItem(with: nil)
-    playerLayer.isHidden = false
-  }
-
-  private func teardownIvsPlayback(removeLayer: Bool) {
-    ivsBufferingRecoveryWork?.cancel()
-    ivsBufferingRecoveryWork = nil
-    usingIvsPlayback = false
-    if let ivsPlayer {
-      ivsPlayer.delegate = nil
-      ivsPlayer.pause()
-      ivsPlayer.load(nil as URL?)
-    }
-    ivsPlayer = nil
-    ivsPlayerLayer?.player = nil
-    ivsPlayerLayer?.isHidden = true
-    if removeLayer {
-      ivsPlayerLayer?.removeFromSuperlayer()
-      ivsPlayerLayer = nil
-    }
-    playerLayer.isHidden = false
-  }
-
-  private func applyIvsAudio() {
-    guard let ivsPlayer else { return }
-    let effectiveVolume = settings.playAudio ? playbackVolume : 0
-    ivsPlayer.volume = effectiveVolume
-    ivsPlayer.muted = effectiveVolume <= 0
+    NativeAVPlaybackCleanup.run(
+      player: player,
+      playerLayer: playerLayer,
+      liveCatchUpTimer: &liveCatchUpTimer,
+      stallWatchdog: stallWatchdog,
+      itemStatusObservation: &itemStatusObservation,
+      itemFailedObserver: &itemFailedObserver
+    )
   }
 
   // ネイティブ再生失敗の共通処理。web UIへ落とす前に: ①低遅延ローダー失敗→素HLS再試行
@@ -2336,32 +2416,46 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         self.play(hlsURL: url, lowLatency: false)
         return
       }
-      if let attempt = self.nativeRetry.nextAttempt() {
-        self.teardownPlayback()
-        self.channelTask?.cancel()
-        self.channelTask = nil
-        self.isLoading = false
-        self.showStatus("Kick再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
-        self.loadNativeStream()
-        return
-      }
-      self.installFallback(reason)
+      NativeFallbackRetry.retryOrFallback(
+        isStopped: self.isStopped,
+        fallbackActive: self.fallbackWebView != nil,
+        generation: generation,
+        currentGeneration: self.playbackGeneration,
+        limiter: self.nativeRetry,
+        teardown: { self.teardownPlayback() },
+        cancelRequest: {
+          self.channelTask?.cancel()
+          self.channelTask = nil
+        },
+        resetLoading: { self.isLoading = false },
+        showRetry: { attempt in
+          self.showStatus("Kick再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
+        },
+        reload: { self.loadNativeStream() },
+        fallback: { self.installFallback(reason) }
+      )
     }
   }
 
   private func retryKickLoadOrFallback(_ reason: String) {
     DispatchQueue.main.async {
-      guard !self.isStopped, self.fallbackWebView == nil else { return }
-      if let attempt = self.nativeRetry.nextAttempt() {
-        self.teardownPlayback()
-        self.channelTask?.cancel()
-        self.channelTask = nil
-        self.isLoading = false
-        self.showStatus("Kick再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
-        self.loadNativeStream()
-        return
-      }
-      self.installFallback(reason)
+      NativeFallbackRetry.retryOrFallback(
+        isStopped: self.isStopped,
+        fallbackActive: self.fallbackWebView != nil,
+        currentGeneration: self.playbackGeneration,
+        limiter: self.nativeRetry,
+        teardown: { self.teardownPlayback() },
+        cancelRequest: {
+          self.channelTask?.cancel()
+          self.channelTask = nil
+        },
+        resetLoading: { self.isLoading = false },
+        showRetry: { attempt in
+          self.showStatus("Kick再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
+        },
+        reload: { self.loadNativeStream() },
+        fallback: { self.installFallback(reason) }
+      )
     }
   }
 
@@ -2473,7 +2567,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   }
 
   func player(_ player: IVSPlayer, didChangeState state: IVSPlayer.State) {
-    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    guard ownsIvsPlayer(player), !isStopped else { return }
     let generation = playbackGeneration
     switch state {
     case .ready:
@@ -2499,17 +2593,17 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   }
 
   func player(_ player: IVSPlayer, didFailWithError error: Error) {
-    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback else { return }
+    guard ownsIvsPlayer(player) else { return }
     handleIvsFailure(error.localizedDescription, generation: playbackGeneration)
   }
 
   func playerWillRebuffer(_ player: IVSPlayer) {
-    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    guard ownsIvsPlayer(player), !isStopped else { return }
     scheduleIvsBufferingRecovery(generation: playbackGeneration)
   }
 
   func playerNetworkDidBecomeUnavailable(_ player: IVSPlayer) {
-    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    guard ownsIvsPlayer(player), !isStopped else { return }
     showStatus("Kick SDKネットワーク復旧待ち")
     scheduleIvsBufferingRecovery(generation: playbackGeneration)
   }
@@ -2929,7 +3023,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
 // usher.ttvnw.net HLS master playlist, and try IVSPlayer first. If IVS cannot
 // handle Twitch's HLS shape, fall back to the proven AVPlayer path, then web.
 // Anonymous IRC supplies danmaku comments.
-final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, IVSPlayer.Delegate {
+final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, IVSPlayer.Delegate, IVSPlaybackHost {
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
@@ -3013,7 +3107,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   override func layoutSubviews() {
     super.layoutSubviews()
     playerLayer.frame = bounds
-    ivsPlayerLayer?.frame = bounds
+    layoutIvsLayer()
     danmakuView.frame = bounds
   }
 
@@ -3026,11 +3120,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       fallbackWebView.resumePlayback()
       return
     }
-    if let ivsPlayer, usingIvsPlayback {
-      applyIvsAudio()
-      ivsPlayer.play()
-      return
-    }
+    if resumeIvsPlaybackIfActive() { return }
     if player.currentItem == nil {
       loadNativeStream()
       return
@@ -3042,7 +3132,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
 
   func pausePlayback() {
     player.pause()
-    ivsPlayer?.pause()
+    pauseIvsPlayback()
     fallbackWebView?.pausePlayback()
   }
 
@@ -3215,21 +3305,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
         ivs.setAutoMaxBitrate(Int(peakBitRate))
       }
 
-      self.teardownIvsPlayback(removeLayer: false)
-      self.ivsPlayer = ivs
-      self.usingIvsPlayback = true
-      self.applyIvsAudio()
-
-      let ivsLayer = self.ivsPlayerLayer ?? IVSPlayerLayer(player: nil)
-      ivsLayer.player = ivs
-      ivsLayer.videoGravity = .resizeAspect
-      ivsLayer.frame = self.bounds
-      ivsLayer.isHidden = false
-      if ivsLayer.superlayer == nil {
-        self.layer.insertSublayer(ivsLayer, above: self.playerLayer)
-      }
-      self.ivsPlayerLayer = ivsLayer
-      self.playerLayer.isHidden = true
+      self.attachIvsPlayer(ivs)
 
       ivs.load(hlsURL)
       ivs.play()
@@ -3311,43 +3387,14 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 
   private func teardownAVPlayerPlayback() {
-    liveCatchUpTimer?.invalidate()
-    liveCatchUpTimer = nil
-    stallWatchdog.stop()
-    itemStatusObservation = nil
-    if let obs = itemFailedObserver {
-      NotificationCenter.default.removeObserver(obs)
-      itemFailedObserver = nil
-    }
-    player.pause()
-    player.replaceCurrentItem(with: nil)
-    playerLayer.isHidden = false
-  }
-
-  private func teardownIvsPlayback(removeLayer: Bool) {
-    ivsBufferingRecoveryWork?.cancel()
-    ivsBufferingRecoveryWork = nil
-    usingIvsPlayback = false
-    if let ivsPlayer {
-      ivsPlayer.delegate = nil
-      ivsPlayer.pause()
-      ivsPlayer.load(nil as URL?)
-    }
-    ivsPlayer = nil
-    ivsPlayerLayer?.player = nil
-    ivsPlayerLayer?.isHidden = true
-    if removeLayer {
-      ivsPlayerLayer?.removeFromSuperlayer()
-      ivsPlayerLayer = nil
-    }
-    playerLayer.isHidden = false
-  }
-
-  private func applyIvsAudio() {
-    guard let ivsPlayer else { return }
-    let effectiveVolume = settings.playAudio ? playbackVolume : 0
-    ivsPlayer.volume = effectiveVolume
-    ivsPlayer.muted = effectiveVolume <= 0
+    NativeAVPlaybackCleanup.run(
+      player: player,
+      playerLayer: playerLayer,
+      liveCatchUpTimer: &liveCatchUpTimer,
+      stallWatchdog: stallWatchdog,
+      itemStatusObservation: &itemStatusObservation,
+      itemFailedObserver: &itemFailedObserver
+    )
   }
 
   private func handleNativeFailure(_ reason: String, generation: Int) {
@@ -3360,18 +3407,24 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
 
   private func retryNativeLoadOrFallback(_ reason: String, generation: Int? = nil) {
     DispatchQueue.main.async {
-      guard !self.isStopped, self.fallbackWebView == nil else { return }
-      if let generation, generation != self.playbackGeneration { return }
-      if let attempt = self.nativeRetry.nextAttempt() {
-        self.teardownPlayback()
-        self.tokenTask?.cancel()
-        self.tokenTask = nil
-        self.isLoading = false
-        self.showStatus("Twitch再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
-        self.loadNativeStream()
-        return
-      }
-      self.installFallback(reason)
+      NativeFallbackRetry.retryOrFallback(
+        isStopped: self.isStopped,
+        fallbackActive: self.fallbackWebView != nil,
+        generation: generation,
+        currentGeneration: self.playbackGeneration,
+        limiter: self.nativeRetry,
+        teardown: { self.teardownPlayback() },
+        cancelRequest: {
+          self.tokenTask?.cancel()
+          self.tokenTask = nil
+        },
+        resetLoading: { self.isLoading = false },
+        showRetry: { attempt in
+          self.showStatus("Twitch再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
+        },
+        reload: { self.loadNativeStream() },
+        fallback: { self.installFallback(reason) }
+      )
     }
   }
 
@@ -3441,7 +3494,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 
   func player(_ player: IVSPlayer, didChangeState state: IVSPlayer.State) {
-    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    guard ownsIvsPlayer(player), !isStopped else { return }
     let generation = playbackGeneration
     switch state {
     case .ready:
@@ -3466,17 +3519,17 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 
   func player(_ player: IVSPlayer, didFailWithError error: Error) {
-    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback else { return }
+    guard ownsIvsPlayer(player) else { return }
     handleIvsFailure(error.localizedDescription, generation: playbackGeneration)
   }
 
   func playerWillRebuffer(_ player: IVSPlayer) {
-    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    guard ownsIvsPlayer(player), !isStopped else { return }
     scheduleIvsBufferingRecovery(generation: playbackGeneration)
   }
 
   func playerNetworkDidBecomeUnavailable(_ player: IVSPlayer) {
-    guard let ivsPlayer, player === ivsPlayer, usingIvsPlayback, !isStopped else { return }
+    guard ownsIvsPlayer(player), !isStopped else { return }
     showStatus("Twitch SDKネットワーク復旧待ち")
     scheduleIvsBufferingRecovery(generation: playbackGeneration)
   }
@@ -3998,16 +4051,14 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
 
   private func teardownPlayback() {
     playbackGeneration += 1
-    liveCatchUpTimer?.invalidate()
-    liveCatchUpTimer = nil
-    stallWatchdog.stop()
-    itemStatusObservation = nil
-    if let obs = itemFailedObserver {
-      NotificationCenter.default.removeObserver(obs)
-      itemFailedObserver = nil
-    }
-    player.pause()
-    player.replaceCurrentItem(with: nil)
+    NativeAVPlaybackCleanup.run(
+      player: player,
+      playerLayer: playerLayer,
+      liveCatchUpTimer: &liveCatchUpTimer,
+      stallWatchdog: stallWatchdog,
+      itemStatusObservation: &itemStatusObservation,
+      itemFailedObserver: &itemFailedObserver
+    )
   }
 
   private func handleNativeFailure(_ reason: String, generation: Int) {
@@ -4020,18 +4071,24 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
 
   private func retryNativeLoadOrFallback(_ reason: String, generation: Int? = nil) {
     DispatchQueue.main.async {
-      guard !self.isStopped, self.fallbackWebView == nil else { return }
-      if let generation, generation != self.playbackGeneration { return }
-      if let attempt = self.nativeRetry.nextAttempt() {
-        self.teardownPlayback()
-        self.streamTask?.cancel()
-        self.streamTask = nil
-        self.isLoading = false
-        self.showStatus("ツイキャス再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
-        self.loadNativeStream()
-        return
-      }
-      self.installEmbedFallback(reason)
+      NativeFallbackRetry.retryOrFallback(
+        isStopped: self.isStopped,
+        fallbackActive: self.fallbackWebView != nil,
+        generation: generation,
+        currentGeneration: self.playbackGeneration,
+        limiter: self.nativeRetry,
+        teardown: { self.teardownPlayback() },
+        cancelRequest: {
+          self.streamTask?.cancel()
+          self.streamTask = nil
+        },
+        resetLoading: { self.isLoading = false },
+        showRetry: { attempt in
+          self.showStatus("ツイキャス再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
+        },
+        reload: { self.loadNativeStream() },
+        fallback: { self.installEmbedFallback(reason) }
+      )
     }
   }
 
