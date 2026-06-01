@@ -177,7 +177,7 @@ enum ViewerCountProvider {
   private static func fetchYouTube(channel rawChannel: String, completion: @escaping (Int?) -> Void) -> URLSessionDataTask? {
     let channel = rawChannel.trimmingCharacters(in: .whitespacesAndNewlines)
     if let videoId = extractYouTubeVideoID(from: channel) {
-      return fetchYouTubePlayer(videoId: videoId, completion: completion)
+      return fetchYouTubePlayer(videoId: videoId, fallbackHTML: nil, fallbackURL: youtubeWatchURL(videoId: videoId), completion: completion)
     }
     guard let liveURL = youtubeLiveURL(from: channel) else {
       completion(nil)
@@ -191,28 +191,40 @@ enum ViewerCountProvider {
         completion(nil)
         return
       }
-      _ = fetchYouTubePlayer(videoId: videoId, completion: completion)
+      if let count = youtubeCount(inHTML: html) {
+        completion(count)
+        return
+      }
+      _ = fetchYouTubePlayer(videoId: videoId, fallbackHTML: html, fallbackURL: youtubeWatchURL(videoId: videoId), completion: completion)
     }
     task.resume()
     return task
   }
 
   private static func fetchNiconico(programId rawProgramId: String, completion: @escaping (Int?) -> Void) -> URLSessionDataTask? {
-    let programId = normalizedChannel(rawProgramId)
+    guard let programId = extractNiconicoProgramID(from: rawProgramId) else {
+      completion(nil)
+      return nil
+    }
     guard let url = URL(string: "https://live.nicovideo.jp/watch/\(programId)") else {
       completion(nil)
       return nil
     }
     return htmlTask(url: url, headers: browserHeaders(referer: "https://live.nicovideo.jp/")) { html in
       guard let props = niconicoProps(from: html) else {
-        completion(nil)
+        completion(niconicoViewerCount(fromHTML: html))
         return
       }
-      completion(count(in: props, keys: niconicoKeys))
+      completion(niconicoViewerCount(from: props) ?? niconicoViewerCount(fromHTML: html))
     }
   }
 
-  private static func fetchYouTubePlayer(videoId: String, completion: @escaping (Int?) -> Void) -> URLSessionDataTask? {
+  private static func fetchYouTubePlayer(
+    videoId: String,
+    fallbackHTML: String?,
+    fallbackURL: URL?,
+    completion: @escaping (Int?) -> Void
+  ) -> URLSessionDataTask? {
     guard let url = URL(string: "https://youtubei.googleapis.com/youtubei/v1/player") else {
       completion(nil)
       return nil
@@ -242,7 +254,21 @@ enum ViewerCountProvider {
     ])
     let task = URLSession.shared.dataTask(with: request) { data, _, _ in
       let object = parseJSON(data)
-      completion(count(in: object, keys: youtubeKeys))
+      if let count = youtubeCount(in: object) {
+        completion(count)
+        return
+      }
+      if let count = youtubeCount(inHTML: fallbackHTML) {
+        completion(count)
+        return
+      }
+      guard let fallbackURL else {
+        completion(nil)
+        return
+      }
+      _ = htmlTask(url: fallbackURL, headers: browserHeaders(referer: "https://www.youtube.com/")) { html in
+        completion(youtubeCount(inHTML: html))
+      }
     }
     task.resume()
     return task
@@ -352,6 +378,23 @@ enum ViewerCountProvider {
     return URL(string: "https://www.youtube.com/@\(handle)/live")
   }
 
+  private static func youtubeWatchURL(videoId: String) -> URL? {
+    URL(string: "https://www.youtube.com/watch?v=\(videoId)")
+  }
+
+  private static func extractNiconicoProgramID(from raw: String) -> String? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    let patterns = [
+      #"live\.nicovideo\.jp/watch/(lv[0-9]+)"#,
+      #"(lv[0-9]{6,})"#
+    ]
+    for pattern in patterns {
+      if let value = firstMatch(in: trimmed, pattern: pattern) { return value }
+    }
+    let channel = normalizedChannel(trimmed)
+    return channel.range(of: #"^lv[0-9]{6,}$"#, options: .regularExpression) != nil ? channel : nil
+  }
+
   private static func niconicoProps(from html: String?) -> Any? {
     guard let html,
           let encoded = firstMatch(in: html, pattern: #"<script[^>]+id=["']initial-state["'][^>]+data-props=["']([^"']+)["']"#)
@@ -362,6 +405,115 @@ enum ViewerCountProvider {
     }
     let decoded = decodeHTMLEntities(encoded)
     return parseJSON(decoded.data(using: .utf8))
+  }
+
+  private static func niconicoViewerCount(from value: Any?) -> Int? {
+    count(in: value, keys: niconicoKeys)
+  }
+
+  private static func niconicoViewerCount(fromHTML html: String?) -> Int? {
+    guard let html else { return nil }
+    let decoded = decodeHTMLEntities(html)
+    let patterns = [
+      #"watch-count[^>]*>[\s\S]*?data-value=["']([0-9,]+)["']"#,
+      #""watchCount"\s*:\s*"?([0-9,]+)"?"#
+    ]
+    for pattern in patterns {
+      if let value = firstMatch(in: decoded, pattern: pattern) {
+        return intValue(value)
+      }
+    }
+    return nil
+  }
+
+  private static func youtubeCount(in value: Any?) -> Int? {
+    count(in: value, keys: youtubeKeys) ?? liveViewerCount(in: value)
+  }
+
+  private static func youtubeCount(inHTML html: String?) -> Int? {
+    guard let html else { return nil }
+    let decoded = decodeHTMLEntities(html)
+    let patterns = [
+      #""concurrentViewers"\s*:\s*"?([0-9,]+)"?"#,
+      #"([0-9][0-9,]*)\s*(?:watching now|watching|人が視聴中|人が視聴しています)"#
+    ]
+    for pattern in patterns {
+      if let value = firstMatch(in: decoded, pattern: pattern) {
+        return intValue(value)
+      }
+    }
+    for token in ["ytInitialPlayerResponse", "ytInitialData"] {
+      guard let json = jsonObjectString(afterToken: token, in: decoded),
+            let object = parseJSON(json.data(using: .utf8)),
+            let count = youtubeCount(in: object) else { continue }
+      return count
+    }
+    return nil
+  }
+
+  private static func liveViewerCount(in value: Any?) -> Int? {
+    guard let value else { return nil }
+    if let text = value as? String {
+      return liveViewerCount(inText: text)
+    }
+    if let dict = value as? [String: Any] {
+      for nested in dict.values {
+        if let count = liveViewerCount(in: nested) { return count }
+      }
+    } else if let array = value as? [Any] {
+      for nested in array {
+        if let count = liveViewerCount(in: nested) { return count }
+      }
+    }
+    return nil
+  }
+
+  private static func liveViewerCount(inText text: String) -> Int? {
+    let patterns = [
+      #"([0-9][0-9,]*)\s*(?:watching now|watching)"#,
+      #"([0-9][0-9,]*)\s*人が視聴(?:中|しています)"#
+    ]
+    for pattern in patterns {
+      if let value = firstMatch(in: text, pattern: pattern) {
+        return intValue(value)
+      }
+    }
+    return nil
+  }
+
+  private static func jsonObjectString(afterToken token: String, in text: String) -> String? {
+    var searchRange = text.startIndex..<text.endIndex
+    while let tokenRange = text.range(of: token, range: searchRange),
+          let start = text[tokenRange.upperBound...].firstIndex(of: "{") {
+      var index = start
+      var depth = 0
+      var inString = false
+      var escaping = false
+      while index < text.endIndex {
+        let character = text[index]
+        if inString {
+          if escaping {
+            escaping = false
+          } else if character == "\\" {
+            escaping = true
+          } else if character == "\"" {
+            inString = false
+          }
+        } else if character == "\"" {
+          inString = true
+        } else if character == "{" {
+          depth += 1
+        } else if character == "}" {
+          depth -= 1
+          if depth == 0 {
+            return String(text[start...index])
+          }
+        }
+        index = text.index(after: index)
+      }
+      searchRange = tokenRange.upperBound..<text.endIndex
+    }
+    return nil
   }
 
   private static func twitcastingViewerURL(from html: String?) -> URL? {
@@ -446,5 +598,5 @@ enum ViewerCountProvider {
   private static let kickKeys: Set<String> = ["viewer_count", "viewerCount", "viewers", "viewersCount", "currentViewers"]
   private static let twitcastingKeys: Set<String> = ["current_view_count", "currentViewerCount", "current_viewer_count", "viewer_count", "viewerCount", "viewers"]
   private static let youtubeKeys: Set<String> = ["concurrentViewers", "concurrent_viewers"]
-  private static let niconicoKeys: Set<String> = ["viewers", "viewersCount", "viewerCount", "currentViewers", "audienceCount", "visitorCount"]
+  private static let niconicoKeys: Set<String> = ["watchCount", "viewers", "viewersCount", "viewerCount", "currentViewers", "audienceCount", "visitorCount"]
 }
