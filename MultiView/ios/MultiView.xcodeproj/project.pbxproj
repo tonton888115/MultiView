@@ -16,7 +16,7 @@
 		A1B2C3D4E5F60718293A4C12 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4C11 /* Models.swift */; };
 		A1B2C3D4E5F60718293A4C22 /* StreamPlatform.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4C21 /* StreamPlatform.swift */; };
 		A1B2C3D4E5F60718293A4C32 /* OAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4C31 /* OAuth.swift */; };
-		A1B2C3D4E5F60718293A4C42 /* Players.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4C41 /* Players.swift */; };
+		A1B2C3D4E5F60718293A4C42 /* IvsPlaybackSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4C41 /* IvsPlaybackSupport.swift */; };
 		A1B2C3D4E5F60718293A4D12 /* PlaybackSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4D11 /* PlaybackSupport.swift */; };
 		A1B2C3D4E5F60718293A4D22 /* NiconicoPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4D21 /* NiconicoPlayer.swift */; };
 		A1B2C3D4E5F60718293A4D32 /* KickPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60718293A4D31 /* KickPlayer.swift */; };
@@ -44,7 +44,7 @@
 		A1B2C3D4E5F60718293A4C11 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Models.swift; path = MultiView/Models.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4C21 /* StreamPlatform.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = StreamPlatform.swift; path = MultiView/StreamPlatform.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4C31 /* OAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = OAuth.swift; path = MultiView/OAuth.swift; sourceTree = "<group>"; };
-		A1B2C3D4E5F60718293A4C41 /* Players.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Players.swift; path = MultiView/Players.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60718293A4C41 /* IvsPlaybackSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = IvsPlaybackSupport.swift; path = MultiView/IvsPlaybackSupport.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4D11 /* PlaybackSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PlaybackSupport.swift; path = MultiView/PlaybackSupport.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4D21 /* NiconicoPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = NiconicoPlayer.swift; path = MultiView/NiconicoPlayer.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F60718293A4D31 /* KickPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = KickPlayer.swift; path = MultiView/KickPlayer.swift; sourceTree = "<group>"; };
@@ -82,7 +82,7 @@
 				A1B2C3D4E5F60718293A4C11 /* Models.swift */,
 				A1B2C3D4E5F60718293A4C21 /* StreamPlatform.swift */,
 				A1B2C3D4E5F60718293A4C31 /* OAuth.swift */,
-				A1B2C3D4E5F60718293A4C41 /* Players.swift */,
+				A1B2C3D4E5F60718293A4C41 /* IvsPlaybackSupport.swift */,
 				A1B2C3D4E5F60718293A4D11 /* PlaybackSupport.swift */,
 				A1B2C3D4E5F60718293A4D21 /* NiconicoPlayer.swift */,
 				A1B2C3D4E5F60718293A4D31 /* KickPlayer.swift */,
@@ -289,7 +289,7 @@
 				A1B2C3D4E5F60718293A4C12 /* Models.swift in Sources */,
 				A1B2C3D4E5F60718293A4C22 /* StreamPlatform.swift in Sources */,
 				A1B2C3D4E5F60718293A4C32 /* OAuth.swift in Sources */,
-				A1B2C3D4E5F60718293A4C42 /* Players.swift in Sources */,
+				A1B2C3D4E5F60718293A4C42 /* IvsPlaybackSupport.swift in Sources */,
 				A1B2C3D4E5F60718293A4D12 /* PlaybackSupport.swift in Sources */,
 				A1B2C3D4E5F60718293A4D22 /* NiconicoPlayer.swift in Sources */,
 				A1B2C3D4E5F60718293A4D32 /* KickPlayer.swift in Sources */,
@@ -327,7 +327,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
-				CURRENT_PROJECT_VERSION = 40;
+				CURRENT_PROJECT_VERSION = 41;
 				ENABLE_BITCODE = NO;
 				INFOPLIST_FILE = MultiView/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
@@ -335,7 +335,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.1.31;
+				MARKETING_VERSION = 1.1.32;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
@@ -357,14 +357,14 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
-				CURRENT_PROJECT_VERSION = 40;
+				CURRENT_PROJECT_VERSION = 41;
 				INFOPLIST_FILE = MultiView/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.1.31;
+				MARKETING_VERSION = 1.1.32;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
