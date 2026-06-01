@@ -19,11 +19,11 @@ Windows だけで開発でき、**クラウドの Mac (Codemagic) で未署名 I
 
 - **下タブ 4 つ**: フォロー / ランキング / 視聴 / 設定
 - **視聴タブ**: グリッド同時視聴。セルの **⤢** で 1 配信を拡大、長押しで並べ替え、**×** で削除
-- **ネイティブ再生**: 5 サービスそれぞれ専用プレイヤー（YouTube は HLS 抽出、Kick/Twitch/ツイキャスは HLS、ニコ生は番組ページの HLS + コメント WebSocket）
+- **ネイティブ再生**: 5 サービスそれぞれ専用プレイヤー（Kick は Amazon IVS Player、Twitch は IVS Player 実験→AVPlayer、YouTube は HLS 抽出、ツイキャスは HLS、ニコ生は番組ページの HLS + コメント WebSocket）
 - **弾幕**: ニコ生風に右→左へ流れるコメント（表示/速度/不透明度/文字サイズ/最大行数/最大文字数を設定可）。ニコ生はギフト演出も表示
 - **コメント送信**: 可能なサービスはアプリ内入力欄から、未対応は拡大時の公式チャットからログインして送信
 - **端末間引き継ぎ**: 視聴タブの QR ボタンで、開いているタブ一式を iPad↔iPhone に引き継ぎ（QR スキャン or クリップボード、サーバ不要）
-- **低遅延チューニング**: Kick は IVS プレイリストを横取りして低遅延化、ニコ生は設定で低遅延トグル
+- **低遅延チューニング**: Kick は Amazon IVS Player で低遅延化、Twitch は IVS Player 実験経路から旧 AVPlayer へ自動退避、ニコ生は設定で低遅延トグル
 - **画質**: Wi-Fi / モバイルで別々に高画質/エコノミーを設定
 
 ---
@@ -32,8 +32,8 @@ Windows だけで開発でき、**クラウドの Mac (Codemagic) で未署名 I
 
 | サービス | 映像 | 弾幕(右→左) | コメント送信 |
 |---|---|---|---|
-| Twitch | ✅ ネイティブ HLS | ✅ 匿名受信 | ✅ 拡大時に公式チャット(ログイン) |
-| Kick | ✅ ネイティブ HLS (低遅延化) | ✅ Pusher 受信 | ✅ ネイティブ(OAuth ログイン) |
+| Twitch | ✅ IVS Player 実験 + 旧ネイティブ HLS fallback | ✅ 匿名受信 | ✅ 拡大時に公式チャット(ログイン) |
+| Kick | ✅ Amazon IVS Player (低遅延) | ✅ Pusher 受信 | ✅ ネイティブ(OAuth ログイン) |
 | YouTube | ✅ HLS 抽出 | △ Data API + OAuth が必要 | ✅ 拡大時に公式ライブチャット(ログイン) |
 | ツイキャス | ✅ ネイティブ HLS | ⚠️ best-effort | ✅ ネイティブ(OAuth ログイン) |
 | ニコ生 | ✅ HLS + 純正コメント | 純正コメント + ギフト | ✅ ネイティブ(要 user_session ログイン) |
@@ -118,6 +118,7 @@ npm i && npx wrangler deploy   # 自分の *.workers.dev にデプロイ
 - **iOS ビルドは Windows 単体不可** — クラウド Mac (Codemagic) が必要。
 - **無料 Apple ID**: 署名は 7 日失効。LiveContainer 運用だと再インストール負担が小さい。
 - **YouTube 弾幕**は Data API + OAuth が必要（視聴・チャット入力は可能）。
-- **Kick の遅延**: 公式アプリは Amazon IVS 専用プレイヤーで ~2秒。本アプリは AVPlayer + 標準 HLS のため ~5秒前後が下限（プレイリスト書き換えで短縮済み）。
+- **Kick の遅延**: 1.1.25 以降は Amazon IVS Player を優先。失敗時だけ旧 AVPlayer 経路へ戻します。
+- **Twitch の遅延**: 1.1.26 以降は IVS Player 実験経路を先に試し、未対応・不安定なら自動で旧 AVPlayer 経路へ戻します。
 - 同時視聴は端末性能次第で **3〜4 画面**が実用上限。
 - 配信/チャットは各サイトの仕様変更で壊れることがあります。
