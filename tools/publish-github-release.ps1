@@ -36,8 +36,11 @@ if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -Er
     $oldNativePreference = $global:PSNativeCommandUseErrorActionPreference
     $global:PSNativeCommandUseErrorActionPreference = $false
 }
+$oldErrorPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 $existing = & gh release view $Tag --repo $Repo --json tagName 2>$null
 $viewExitCode = $LASTEXITCODE
+$ErrorActionPreference = $oldErrorPreference
 if ($null -ne $oldNativePreference) {
     $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
 }
