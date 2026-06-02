@@ -40,7 +40,7 @@ final class KickLowLatencyLoader: NSObject, AVAssetResourceLoaderDelegate {
       // このローダーへの要求は必ずプレイリスト(マスター/メディア)。セグメント(.ts)はhttps直取得。
       // 非2xx(トークン失効の403等)やプレイリスト以外(HTMLエラー本文)を有効データとして
       // AVPlayerへ渡すと不正データで詰まる(=「開けません」)ため、ここで明示的に失敗させ、
-      // 上位の再取得リトライ(handleNativeFailure)へ繋ぐ。Codex指摘①。
+      // 上位の再取得リトライ(handleNativeFailure)へ繋ぐ。
       let status = (response as? HTTPURLResponse)?.statusCode ?? 0
       guard (200..<300).contains(status), let data,
             let text = String(data: data, encoding: .utf8), text.hasPrefix("#EXTM3U") else {
@@ -97,12 +97,12 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private var forceLegacyPlayback = false
   private let ivsRetry = NativeRetryLimiter(maxAttempts: 2)
   // 直近のplayback_url(素HLS再試行用)、再生世代(古いitemのKVO/通知を無視)、
-  // ネイティブ再取得リトライ(トークン失効時に新URL取得。上限超過でのみweb UIへ)。Codex指摘②③④。
+  // ネイティブ再取得リトライ(トークン失効時に新URL取得。上限超過でのみweb UIへ)。
   private var currentHLSURL: URL?
   private var playbackGeneration = 0
   private let nativeRetry = NativeRetryLimiter(maxAttempts: 2)
   // 連続ストールでアグレッシブな低遅延(LLローダー+ライブ端追従)を一時停止し安定優先へ切替。
-  // 一定時間ストール無しで自動復帰(次回再接続からLL有効)。Codex#1 part2。
+  // 一定時間ストール無しで自動復帰(次回再接続からLL有効)。
   private var stallCount = 0
   private var stableMode = false
   private var stallCountResetWork: DispatchWorkItem?
@@ -359,7 +359,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       self.currentHLSURL = hlsURL
       self.playbackGeneration += 1
       let generation = self.playbackGeneration
-      // 安定モード中は低遅延ローダーを使わず素HLS(ライブ端から自然に離れ=ストール抑制)。Codex#1 part2。
+      // 安定モード中は低遅延ローダーを使わず素HLS(ライブ端から自然に離れ=ストール抑制)。
       let useLowLatency = lowLatency && !self.stableMode
       let headers = self.kickPlaybackHeaders()
       let assetURL: URL
@@ -413,7 +413,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         object: item,
         queue: .main
       ) { [weak self] notification in
-        // しばらく再生後に停止 → web UIへ即落とさず、素HLS再試行→playback_url再取得を試す。Codex指摘②。
+        // しばらく再生後に停止 → web UIへ即落とさず、素HLS再試行→playback_url再取得を試す。
         let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
         self?.handleNativeFailure(
           error?.localizedDescription ?? "Kickネイティブ再生が停止しました",
@@ -444,7 +444,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     LiveEdgeCatchUp.seekIfNeeded(player: player, isStopped: isStopped, fallbackActive: fallbackWebView != nil)
   }
 
-  // 失敗item/通知/タイマー/ウォッチドッグ/ローダーを一掃(再接続・再試行前の後始末)。Codex指摘④。
+  // 失敗item/通知/タイマー/ウォッチドッグ/ローダーを一掃(再接続・再試行前の後始末)。
   private func teardownPlayback() {
     playbackGeneration += 1
     teardownIvsPlayback(removeLayer: false)
@@ -465,7 +465,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
 
   // ネイティブ再生失敗の共通処理。web UIへ落とす前に: ①低遅延ローダー失敗→素HLS再試行
   // ②素HLSも失敗(=playback_url/トークン失効の可能性)→チャンネル再取得で新URLを取り直し再生。
-  // 上限超過時のみ web UI フォールバック。古い世代の失敗通知は無視。Codex指摘②③。
+  // 上限超過時のみ web UI フォールバック。古い世代の失敗通知は無視。
   private func handleNativeFailure(_ reason: String, wasLowLatency: Bool, generation: Int) {
     DispatchQueue.main.async {
       guard !self.isStopped, self.fallbackWebView == nil,
@@ -602,7 +602,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private func installFallback(_ reason: String) {
     DispatchQueue.main.async {
       guard !self.isStopped, self.fallbackWebView == nil else { return }
-      // ネイティブ再生を完全停止してから web UI へ(失敗item/timer/watchdog/loaderの残留を防ぐ・Codex指摘)。
+      // ネイティブ再生を完全停止してから web UI へ(失敗item/timer/watchdog/loaderの残留を防ぐ)。
       self.teardownPlayback()
       self.showStatus(reason)
       let web = PlayerWebView(stream: self.stream, settings: self.settings)

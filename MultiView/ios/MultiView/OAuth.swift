@@ -719,7 +719,7 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
     }.resume()
   }
 
-  // 固定 token を使い続けると ~1時間で 401 になり弾幕/Super Chat が止まる(Codex#2)。毎回
+  // 固定 token を使い続けると ~1時間で 401 になり弾幕/Super Chat が止まる。毎回
   // withValidAccessToken で有効 token を取得(期限切れは自動リフレッシュ)してから取得する版。
   func fetchLiveChatMessagesRefreshing(
     liveChatID: String,

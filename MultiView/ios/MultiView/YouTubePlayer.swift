@@ -187,7 +187,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     guard settings.showChat,
           !isStopped,
           let liveChatID else { return }
-    // token は毎回自動更新(Codex#2)。固定 token のままだと長時間視聴で 401→停止していた。
+    // token は毎回自動更新。固定 token のままだと長時間視聴で 401→停止していた。
     YouTubeAuthManager.shared.fetchLiveChatMessagesRefreshing(
       liveChatID: liveChatID,
       pageToken: liveChatPageToken

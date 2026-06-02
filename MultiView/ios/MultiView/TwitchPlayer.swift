@@ -453,7 +453,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     DispatchQueue.main.async {
       guard !self.isStopped, self.fallbackWebView == nil else { return }
       self.isLoading = false
-      // 失敗item/watchdog/timerを残さない(Codex指摘の停止漏れ修正)。
+      // 失敗item/watchdog/timerを残さない。
       self.teardownPlayback()
       self.tokenTask?.cancel()
       self.tokenTask = nil

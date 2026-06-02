@@ -1581,7 +1581,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
   }
 
-  // 共通の lane-occupancy レンダラへ統一(Codex#3)。旧独自実装は round-robin(laneCursor%maxLines)で
+  // 共通の lane-occupancy レンダラへ統一。旧独自実装は round-robin(laneCursor%maxLines)で
   // 重なりやすく、CALayer shadow で off-screen render も重かった。NativeDanmakuRenderer.emit は
   // 空きレーン選択＋属性文字列影でそれらを解決済み(maxLength/フォント/不透明度も内部で処理)。
   private func emitDanmaku(_ text: String) {

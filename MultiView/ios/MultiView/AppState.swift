@@ -99,7 +99,7 @@ final class AppState {
       Store.saveSettings(settings)
       // 再生/並び順/チャット接続に影響する設定が変わった時だけプレイヤー等を作り直す。
       // 弾幕表示・ギフト通知の種別・ギフト音などの表示系トグルはイベント時に live で読むので
-      // reload 不要＝トグルのたびに再生が無駄に作り直されない(Codex指摘 #5)。
+      // reload 不要＝トグルのたびに再生が無駄に作り直されない。
       let needsReload = settings.wifiQuality != oldValue.wifiQuality
         || settings.mobileQuality != oldValue.mobileQuality
         || settings.niconicoLowLatency != oldValue.niconicoLowLatency

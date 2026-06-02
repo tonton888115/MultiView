@@ -96,10 +96,20 @@ playback does not start, it falls back to the official iframe player.
 
 ## Security / publishing
 
-- ✅ **No hardcoded secrets**: no API keys, passwords, or tokens in the code. OAuth Client ID/Secret are **user-entered** (empty by default); access tokens live in the Keychain.
-- ⚠️ **Personal identifiers exposed (not secrets)**: the redirect bounce pages (`tonton888115.github.io`) and the Bundle ID (`com.rinng.multiview`). These are already public via the public repo.
-- ⚠️ **If other people use it**: (1) OAuth needs each user's own Client ID; (2) sharing the redirect bounce pages means the OAuth code transits the author's static page briefly (self-host for independence).
-- Bottom line: **publishing the source is safe** (no secret leakage). If you don't want others using the shared bounce pages, tell them to deploy their own and use their own Client IDs.
+- **No bundled secrets**: passwords, Client Secrets, and access tokens are not committed by design. OAuth Client ID/Secret are user-entered (empty by default); access tokens live in the Keychain.
+- **Public identifiers**: the redirect bounce pages (`tonton888115.github.io`), Bundle ID (`com.rinng.multiview`), and some public service client identifiers are public information. For independent distribution, replace them with your own Bundle ID, OAuth Client IDs, and redirect pages.
+- **Service relationship**: this app is an unofficial client for Kick / Twitch / YouTube / Niconico Live / TwitCasting. Check each service's trademark, content, API, and OAuth terms before distributing it.
+- **License**: no explicit open-source license is selected yet. Add a LICENSE before granting third parties reuse rights.
+
+## App Store distribution
+
+This repository is currently designed for **personal sideloading**. Before App Store submission, at minimum:
+
+- Confirm that you have the rights and permissions needed to distribute an app that displays each service's video, comments, OAuth/API flows, and marks.
+- Prepare App Review notes, demo access, login credentials, and sample QR payloads where needed.
+- Prepare a privacy policy, App Store Connect privacy answers, and third-party SDK privacy manifest/signature compliance.
+- Build with iOS 26 SDK / Xcode 26 or later for App Store Connect submission.
+- If the app is monetized, use Apple's In-App Purchase rules where required.
 
 ---
 
