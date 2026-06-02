@@ -1,128 +1,72 @@
-# MultiView — 複数配信の同時視聴アプリ (iOS / sideload)
+# MultiView
 
-[English](README.en.md) ｜ 日本語
+[English](README.en.md) | 日本語
 
-**Kick / Twitch / YouTube / ニコ生 / ツイキャス** の配信をグリッドで**同時視聴**し、コメントを
-**ニコ生風に右→左へ流す弾幕**で表示する iOS アプリです。各サービスは**ネイティブプレイヤー**で再生し、
-拡大表示・ドラッグ並べ替え・端末間引き継ぎ(QR)などに対応します。
+MultiView は、Kick / Twitch / YouTube / ニコ生 / ツイキャスの配信を iPhone / iPad で同時視聴するための iOS アプリです。グリッド表示、1配信の拡大表示、ドラッグ並び替え、弾幕コメント、端末間引き継ぎに対応しています。
 
-Windows だけで開発でき、**クラウドの Mac (Codemagic) で未署名 IPA をビルド**し、**LiveContainer**
-（推奨）または Sideloadly で iPhone にインストールします。
+このアプリは個人利用のサイドロード前提です。各サービスの利用規約、API/OAuth条件、コンテンツ利用条件は各自で確認してください。
 
-リポジトリ: **https://github.com/tonton888115/MultiView** (public)
+## ダウンロード
 
-> ⚠️ 個人利用・自分のアカウントでのサイドロード前提のツールです。各サービスの利用規約は各自で確認してください。
+最新版の IPA は GitHub Releases から取得できます。
 
----
+- [MultiView Releases](https://github.com/tonton888115/MultiView/releases)
+
+## 推奨インストール
+
+SideStore で LiveContainer を導入し、LiveContainer に MultiView の IPA を追加する運用を推奨します。
+
+- [SideStore](https://sidestore.io)
+- [SideStore GitHub](https://github.com/SideStore/SideStore)
+- [LiveContainer GitHub](https://github.com/LiveContainer/LiveContainer)
+- Windows で SideStore 導入を補助する場合: [iloader](https://github.com/nab138/iloader)
+
+手順:
+
+1. SideStore を入れる。
+2. SideStore から LiveContainer を入れる。
+3. Releases から `MultiView-...ipa` をダウンロードする。
+4. LiveContainer の Apps から IPA を追加する。
 
 ## 主な機能
 
-- **下タブ 4 つ**: フォロー / ランキング / 視聴 / 設定
-- **視聴タブ**: グリッド同時視聴。セルの **⤢** で 1 配信を拡大、長押し/右下ハンドルで並べ替え、**×** で削除
-- **同接表示**: 設定で有効化すると、画面タップ時に音量バーと一緒に左下へ正確な人数を表示
-- **ネイティブ再生**: 5 サービスそれぞれ専用プレイヤー（Kick/Twitch は Amazon IVS Player 優先 + AVPlayer 退避、YouTube は InnerTube HLS 抽出 + AVPlayer/iframe 退避、ツイキャスはネイティブ HLS、ニコ生は番組ページの HLS + コメント WebSocket）
-- **弾幕**: ニコ生風に右→左へ流れるコメント（表示/速度/不透明度/文字サイズ/最大行数/最大文字数を設定可）。ニコ生はギフト演出も表示
-- **コメント送信**: 可能なサービスはアプリ内入力欄から、未対応は拡大時の公式チャットからログインして送信
-- **端末間引き継ぎ**: 視聴タブの QR ボタンで、開いているタブ一式を iPad↔iPhone に引き継ぎ（QR スキャン or クリップボード、サーバ不要）
-- **低遅延チューニング**: Kick/Twitch は Amazon IVS Player を標準採用。失敗時のみ旧 AVPlayer 経路へ自動退避、ニコ生は設定で低遅延トグル
-- **画質**: Wi-Fi / モバイルで別々に高画質/エコノミーを設定
-
----
+- フォロー / ランキング / 視聴 / 設定の4タブ
+- グリッド同時視聴、縦1列表示、1配信の拡大表示
+- iOSホーム画面風のドラッグ並び替え
+- ニコ生風の右から左へ流れる弾幕
+- Kick / Twitch / YouTube / ニコ生 / ツイキャスのコメント取得
+- 対応サービスでのコメント投稿
+- QR / クリップボードによる端末間引き継ぎ
+- Wi-Fi / モバイル別の画質設定
+- ギフト/通知演出の表示切替と通知音切替
 
 ## 対応サービス
 
-| サービス | 映像 | 弾幕(右→左) | コメント送信 |
+| サービス | 映像 | 弾幕 | コメント投稿 |
 |---|---|---|---|
-| Twitch | ✅ Amazon IVS Player + 旧ネイティブ HLS fallback | ✅ 匿名受信 | ✅ 拡大時に公式チャット(ログイン) |
-| Kick | ✅ Amazon IVS Player (低遅延) | ✅ Pusher 受信 | ✅ ネイティブ(OAuth ログイン) |
-| YouTube | ✅ InnerTube HLS + AVPlayer/iframe fallback | △ Data API + OAuth が必要 | ✅ 拡大時に公式ライブチャット(ログイン) |
-| ツイキャス | ✅ ネイティブ HLS | ⚠️ best-effort | ✅ ネイティブ(OAuth ログイン) |
-| ニコ生 | ✅ HLS + 純正コメント | 純正コメント + ギフト | ✅ ネイティブ(要 user_session ログイン) |
+| Twitch | Amazon IVS Player + fallback | 匿名受信 | 拡大時の公式チャット |
+| Kick | Amazon IVS Player | Pusher受信 | OAuthログイン |
+| YouTube | InnerTube HLS + iframe fallback | Data API + OAuth | 拡大時の公式チャット |
+| ツイキャス | ネイティブHLS | best-effort | OAuthログイン |
+| ニコ生 | HLS + 純正コメント | 純正コメント + ギフト | Webログイン |
 
----
+## OAuth / ログイン
 
-## 開発 & ビルド（Windows）
+コメント投稿や YouTube 弾幕には、サービスごとのログインや OAuth 設定が必要です。現状、OAuth の Client ID / Client Secret はアプリに同梱していません。設定画面から各自の Client ID を入力する構成です。
 
-- アプリ本体は **`MultiView/ios/MultiView/*.swift`**（UIKit ネイティブ）。RN プロジェクトの足回りを流用しつつ、UI は完全ネイティブです。
-- iOS のビルドには Mac が必要なので **Codemagic**（クラウド Mac）で未署名 IPA を作ります。GitHub Actions は使いません。
-
-```powershell
-# 1. 変更を main にコミット & プッシュ
-git add -A; git commit -m "変更内容"; git push origin main
-
-# 2. Codemagic でビルド → IPA を artifacts と iCloud にDL
-#    (バージョン付きファイル名 MultiView-<version>-b<build>.ipa で出力されます)
-tools\codemagic-build.ps1
-```
-
-> Codemagic の API トークンは `~/.codemagic/token` に保存しておきます（`codemagic.yaml` の `ios-unsigned-ipa` ワークフローをビルド）。
-
----
-
-## インストール（iloader + LiveContainer 推奨）
-
-無料 Apple ID の「7日失効・同時3アプリ」を避けやすく、再インストールも楽なので **LiveContainer** を推奨します。
-
-1. **LiveContainer を導入**: [SideStore](https://sidestore.io) もしくは [AltStore](https://altstore.io) で LiveContainer をインストール。Windows からは [**iloader**](https://github.com/nab138/iloader) を使うと導入が簡単です。
-2. **IPA を入れる**: ビルドした `MultiView-<version>-b<build>.ipa` を iPhone に渡し（iCloud Drive など）、LiveContainer の **Apps → +** から取り込む。既にある場合は**置換(replace)**、データ(ログイン Cookie)は消さない。
-3. 起動 → 設定フッターの **`MultiView x.y.z (build N)`** で版数を確認。
-
-> 💡 **更新時はファイル名にバージョンを付ける**（`MultiView-1.1.12-b21.ipa` など）。同名 `MultiView.ipa` だと iPhone 側のキャッシュで「入れたのに更新されない」事故が起きます。`tools\codemagic-build.ps1` は自動でバージョン名を付け、古い IPA を消します。
->
-> **代替**: [Sideloadly](https://sideloadly.io) で直接インストールも可。無料 Apple ID は 7 日で署名失効・同時 3 アプリまで。
-
----
-
-## 使い方
-
-- **ランキング / フォロー** タブで配信をタップ → 視聴タブに追加（**＋**で手動追加も可: サービス選択 + チャンネル名 / 動画ID / ユーザーID / 番組ID）。
-- グリッドは画面数で自動調整、**横向きで列が増えます**。セルの **⤢** で拡大、長押しで並べ替え、**×** で削除。
-- 拡大すると動画の下にチャット(入力欄付き)。投稿には各サービスへのログインが必要。
-- **設定**タブ: 音声/レイド自動追加/Web広告ブロック/画質/弾幕/ニコ生低遅延/各サービスの OAuth 連携。
-
----
-
-## OAuth ログイン（各自の Client ID が必要）
-
-アプリ内からのコメント送信や YouTube 弾幕などは各サービスの **OAuth アプリ登録**が要ります。**アプリには Client ID/Secret は同梱されていません**（既定は空）。各自で developer console に登録し、**設定タブから自分の Client ID を入力**してください。
-
-- リダイレクト URI の既定は作者の GitHub Pages の中継ページ（`https://tonton888115.github.io/MultiView/*.html`、コードを `multiview://` に戻すだけの静的ページ）を指します。**独立して使うなら自分でホストした中継ページ**に差し替え推奨。
-- YouTube は iOS クライアント ID（リバースドメイン redirect）方式。Kick は OAuth2.1 PKCE、ツイキャスは OAuth2.0。
-- トークンは iOS の **Keychain** に保存されます。
-
----
-
-## YouTube 抽出
-
-YouTube のライブ/DVR は、アプリ内から InnerTube (`youtubei.googleapis.com/youtubei/v1/player`) を直接呼びます。HLS が取れた場合は AVPlayer でネイティブ再生し、取得できない動画や再生開始しない動画は公式 iframe プレイヤーへ退避します。
-
----
+トークンは iOS Keychain に保存されます。Webログインが必要なサービスは、アプリ内 WebView の Cookie を使います。
 
 ## セキュリティ / 公開について
 
-- **秘密情報は同梱していません**: パスワード・Client Secret・アクセストークンはコードに含めない設計です。OAuth の Client ID/Secret はユーザー入力（既定は空）、アクセストークンは Keychain 保存です。
-- **公開される識別子**: リダイレクト中継ページ（`tonton888115.github.io`）、Bundle ID（`com.rinng.multiview`）、一部サービスの公開クライアント識別子は公開情報です。独立運用する場合は、自分の Bundle ID / OAuth Client ID / リダイレクト中継ページに差し替えてください。
-- **サービスとの関係**: このアプリは Kick / Twitch / YouTube / ニコ生 / ツイキャスの非公式クライアントです。各サービスの商標・コンテンツ・API・OAuth 利用条件を確認してください。
-- **ライセンス**: 現時点では明示的なオープンソースライセンスを設定していません。第三者に再利用を許可する場合は、公開前に LICENSE を追加してください。
+- パスワード、Client Secret、アクセストークンはリポジトリに含めない設計です。
+- リダイレクト中継ページ、Bundle ID、一部サービスの公開クライアント識別子は公開情報です。
+- このアプリは各配信サービスの非公式クライアントです。第三者へ配布する場合は、商標、コンテンツ、API、OAuthの利用条件を確認してください。
+- 現時点では明示的なオープンソースライセンスを設定していません。第三者の再利用を許可する場合は LICENSE を追加してください。
 
 ## App Store 公開について
 
-このリポジトリは現在、**個人利用のサイドロード前提**です。App Store に出すには、少なくとも以下を別途確認・整備してください。
+現在の状態はサイドロード配布向けです。App Store に出すには、各サービスの映像・コメント・OAuth/API利用に関する権利確認、App Review 用の説明、プライバシーポリシー、App Store Connect のプライバシー回答、第三者SDKの privacy manifest / signature 確認が必要です。
 
-- 各配信サービスの映像・コメント・OAuth/API 利用について、App Store 配布に必要な権利や許諾があること。
-- App Review 用の動作説明、必要なログイン情報、サンプルQRなどを用意すること。
-- プライバシーポリシー、App Store Connect のプライバシー回答、第三者SDKの privacy manifest / signature 要件を確認すること。
-- iOS 26 SDK / Xcode 26 以降で提出できるビルド環境にすること。
-- 収益化する場合は、Apple の In-App Purchase ルールに沿うこと。
+## 開発者向け
 
----
-
-## 既知の制限
-
-- **iOS ビルドは Windows 単体不可** — クラウド Mac (Codemagic) が必要。
-- **無料 Apple ID**: 署名は 7 日失効。LiveContainer 運用だと再インストール負担が小さい。
-- **YouTube 弾幕**は Data API + OAuth が必要（視聴・チャット入力は可能）。
-- **Kick の遅延**: 1.1.25 以降は Amazon IVS Player を優先。失敗時だけ旧 AVPlayer 経路へ戻します。
-- **Twitch の遅延**: 1.1.26 以降は Amazon IVS Player を標準採用。未対応・不安定なら自動で旧 AVPlayer 経路へ戻します。
-- 同時視聴は端末性能次第で **3〜4 画面**が実用上限。
-- 配信/チャットは各サイトの仕様変更で壊れることがあります。
+アプリ本体は `MultiView/ios/MultiView/*.swift` の UIKit ネイティブ実装です。ビルド設定は `codemagic.yaml` と `tools/` にあります。

@@ -6,6 +6,26 @@ import UIKit
 final class ViewingController: UIViewController {
   private let scrollView = UIScrollView()
   private let stack = UIStackView()
+  private let bottomControlsHost = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+  private let bottomControlsRow = UIStackView()
+  private lazy var layoutControl: UISegmentedControl = {
+    let control = UISegmentedControl(items: [
+      UIImage(systemName: "rectangle.grid.1x2") ?? UIImage(),
+      UIImage(systemName: "square.grid.2x2") ?? UIImage()
+    ])
+    control.selectedSegmentTintColor = .systemBlue
+    control.setImage(UIImage(systemName: "rectangle.grid.1x2"), forSegmentAt: 0)
+    control.setImage(UIImage(systemName: "square.grid.2x2"), forSegmentAt: 1)
+    control.setTitleTextAttributes([.foregroundColor: UIColor.white], for: .selected)
+    control.translatesAutoresizingMaskIntoConstraints = false
+    control.addAction(UIAction { actionEvent in
+      guard let control = actionEvent.sender as? UISegmentedControl else { return }
+      var settings = AppState.shared.settings
+      settings.layoutMode = control.selectedSegmentIndex == 0 ? .stacked : .grid
+      AppState.shared.settings = settings
+    }, for: .valueChanged)
+    return control
+  }()
   private var focused: StreamItem?
   private weak var dragSourceCell: StreamCellView?
   private var dragSnapshot: UIView?
@@ -77,6 +97,7 @@ final class ViewingController: UIViewController {
   // 生き残る配信のプレイヤーを破棄せず使い回す(黒画面/コールドスタートを避け、並び替えはアニメ可能)。
   func reload(rebuildPlayers: Bool = true) {
     guard isViewLoaded else { return }
+    updateBottomControls()
     NSLayoutConstraint.deactivate(cellLayoutConstraints)
     cellLayoutConstraints.removeAll()
     detachArrangedSubviews()
@@ -94,22 +115,20 @@ final class ViewingController: UIViewController {
       // 展開中はグリッドのセルを残しても二重再生・帯域消費になるだけなので破棄する。
       // 展開ビューは自前のプレイヤーを持つ(プール対象外)。
       pruneCellPool(keeping: [])
-      addPlaybackBar()
       let focusedView = FocusedStreamView(stream: focused, onClose: { [weak self] in
         self?.focused = nil
         self?.reload(rebuildPlayers: true)
       })
       stack.addArrangedSubview(focusedView)
-      // 展開（1配信フル表示）は可視領域いっぱいに広げる（再生バー＋余白分を引いた高さ）。
+      // 展開（1配信フル表示）は操作バーを除いたスクロール領域いっぱいに広げる。
       focusedView.heightAnchor.constraint(
-        equalTo: scrollView.frameLayoutGuide.heightAnchor, constant: -80
+        equalTo: scrollView.frameLayoutGuide.heightAnchor, constant: -18
       ).isActive = true
       PlaybackCoordinator.shared.resumeAll()
       return
     }
     // 消えた配信のセルだけ停止・破棄し、残る配信はプールのプレイヤーを使い回す。
     pruneCellPool(keeping: streams.map { $0.id })
-    addPlaybackBar()
     addCells(streams)
     PlaybackCoordinator.shared.resumeAll()
   }
@@ -176,12 +195,18 @@ final class ViewingController: UIViewController {
     stack.spacing = 10
     stack.translatesAutoresizingMaskIntoConstraints = false
     view.addSubview(scrollView)
+    view.addSubview(bottomControlsHost)
     scrollView.addSubview(stack)
+    configureBottomControls()
     NSLayoutConstraint.activate([
       scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
       scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      scrollView.bottomAnchor.constraint(equalTo: bottomControlsHost.topAnchor),
+      bottomControlsHost.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      bottomControlsHost.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      bottomControlsHost.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+      bottomControlsHost.heightAnchor.constraint(equalToConstant: 56),
       stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 10),
       stack.leadingAnchor.constraint(equalTo: scrollView.frameLayoutGuide.leadingAnchor, constant: 10),
       stack.trailingAnchor.constraint(equalTo: scrollView.frameLayoutGuide.trailingAnchor, constant: -10),
@@ -220,36 +245,18 @@ final class ViewingController: UIViewController {
     streams.forEach { addStackedCell($0) }
   }
 
-  private func addPlaybackBar() {
-    let host = UIView()
-    host.translatesAutoresizingMaskIntoConstraints = false
+  private func configureBottomControls() {
+    bottomControlsHost.translatesAutoresizingMaskIntoConstraints = false
+    bottomControlsHost.backgroundColor = UIColor.black.withAlphaComponent(0.28)
+    bottomControlsHost.layer.borderColor = UIColor.white.withAlphaComponent(0.12).cgColor
+    bottomControlsHost.layer.borderWidth = 0.5
 
-    let row = UIStackView()
-    row.axis = .horizontal
-    row.spacing = 8
-    row.alignment = .center
-    row.distribution = .fill
-    row.translatesAutoresizingMaskIntoConstraints = false
-    host.addSubview(row)
-
-    // Clear segmented toggle: the selected side (縦 / グリッド) is highlighted.
-    let layoutControl = UISegmentedControl(items: [
-      UIImage(systemName: "rectangle.grid.1x2") ?? UIImage(),
-      UIImage(systemName: "square.grid.2x2") ?? UIImage()
-    ])
-    layoutControl.selectedSegmentIndex = AppState.shared.settings.layoutMode == .stacked ? 0 : 1
-    layoutControl.selectedSegmentTintColor = .systemBlue
-    layoutControl.setImage(UIImage(systemName: "rectangle.grid.1x2"), forSegmentAt: 0)
-    layoutControl.setImage(UIImage(systemName: "square.grid.2x2"), forSegmentAt: 1)
-    layoutControl.setTitleTextAttributes([.foregroundColor: UIColor.white], for: .selected)
-    layoutControl.translatesAutoresizingMaskIntoConstraints = false
-    layoutControl.addAction(UIAction { actionEvent in
-      guard let control = actionEvent.sender as? UISegmentedControl else { return }
-      var settings = AppState.shared.settings
-      settings.layoutMode = control.selectedSegmentIndex == 0 ? .stacked : .grid
-      AppState.shared.settings = settings
-      // settings 変更は appStateSettingsDidChange 経由で reload されるため、ここでは呼ばない。
-    }, for: .valueChanged)
+    bottomControlsRow.axis = .horizontal
+    bottomControlsRow.spacing = 8
+    bottomControlsRow.alignment = .center
+    bottomControlsRow.distribution = .fill
+    bottomControlsRow.translatesAutoresizingMaskIntoConstraints = false
+    bottomControlsHost.contentView.addSubview(bottomControlsRow)
 
     let spacer = UIView()
     spacer.translatesAutoresizingMaskIntoConstraints = false
@@ -264,18 +271,17 @@ final class ViewingController: UIViewController {
       self?.reload()
       self?.resumePlaybackAfterReload()
     }
-    row.addArrangedSubview(layoutControl)
-    row.addArrangedSubview(spacer)
-    row.addArrangedSubview(handoffButton)
-    row.addArrangedSubview(addButton)
-    row.addArrangedSubview(reloadButton)
+    bottomControlsRow.addArrangedSubview(layoutControl)
+    bottomControlsRow.addArrangedSubview(spacer)
+    bottomControlsRow.addArrangedSubview(handoffButton)
+    bottomControlsRow.addArrangedSubview(addButton)
+    bottomControlsRow.addArrangedSubview(reloadButton)
 
-    stack.addArrangedSubview(host)
     NSLayoutConstraint.activate([
-      host.heightAnchor.constraint(equalToConstant: 40),
-      row.centerYAnchor.constraint(equalTo: host.centerYAnchor),
-      row.leadingAnchor.constraint(equalTo: host.leadingAnchor),
-      row.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+      bottomControlsRow.topAnchor.constraint(equalTo: bottomControlsHost.contentView.topAnchor, constant: 8),
+      bottomControlsRow.leadingAnchor.constraint(equalTo: bottomControlsHost.contentView.leadingAnchor, constant: 10),
+      bottomControlsRow.trailingAnchor.constraint(equalTo: bottomControlsHost.contentView.trailingAnchor, constant: -10),
+      bottomControlsRow.bottomAnchor.constraint(equalTo: bottomControlsHost.contentView.bottomAnchor, constant: -8),
       layoutControl.widthAnchor.constraint(equalToConstant: 96),
       layoutControl.heightAnchor.constraint(equalToConstant: 34),
       handoffButton.widthAnchor.constraint(equalToConstant: 40),
@@ -287,81 +293,15 @@ final class ViewingController: UIViewController {
     ])
   }
 
+  private func updateBottomControls() {
+    layoutControl.selectedSegmentIndex = AppState.shared.settings.layoutMode == .stacked ? 0 : 1
+  }
+
   private func iconButton(systemName: String, accessibilityLabel: String, action: @escaping () -> Void) -> UIButton {
     let button = LiquidGlass.makeButton(title: nil, systemImage: systemName, tint: nil)
     button.addAction(UIAction { _ in action() }, for: .touchUpInside)
     button.accessibilityLabel = accessibilityLabel
     return button
-  }
-
-  private func playbackButton(title: String, icon: String, color: UIColor?, action: @escaping () -> Void) -> UIButton {
-    let button = LiquidGlass.makeButton(title: title, systemImage: icon, tint: color)
-    button.addAction(UIAction { actionEvent in
-      guard let sender = actionEvent.sender as? UIButton else {
-        action()
-        return
-      }
-      let originalTitle = sender.configuration?.title
-      sender.alpha = 0.62
-      sender.configuration?.title = "実行中"
-      action()
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-        sender.alpha = 1
-        sender.configuration?.title = originalTitle
-      }
-    }, for: .touchUpInside)
-    return button
-  }
-
-  private func addCloseBar(_ streams: [StreamItem]) {
-    let scroller = UIScrollView()
-    scroller.showsHorizontalScrollIndicator = false
-    scroller.translatesAutoresizingMaskIntoConstraints = false
-    let row = UIStackView()
-    row.axis = .horizontal
-    row.spacing = 8
-    row.translatesAutoresizingMaskIntoConstraints = false
-    scroller.addSubview(row)
-
-    streams.forEach { stream in
-      let group = UIStackView()
-      group.axis = .horizontal
-      group.spacing = 2
-      group.alignment = .fill
-      group.backgroundColor = UIColor.white.withAlphaComponent(0.12)
-      group.layer.cornerRadius = 15
-      group.clipsToBounds = true
-
-      let open = UIButton(type: .system)
-      open.setTitle("\(stream.platform.label) / \(stream.channel)", for: .normal)
-      open.setTitleColor(.white, for: .normal)
-      open.titleLabel?.font = .systemFont(ofSize: 12, weight: .bold)
-      open.contentEdgeInsets = UIEdgeInsets(top: 7, left: 11, bottom: 7, right: 9)
-      open.addAction(UIAction { [weak self] _ in
-        self?.focused = stream
-        self?.reload()
-      }, for: .touchUpInside)
-
-      let close = UIButton(type: .system)
-      close.setImage(UIImage(systemName: "xmark"), for: .normal)
-      close.tintColor = .white
-      close.contentEdgeInsets = UIEdgeInsets(top: 7, left: 8, bottom: 7, right: 11)
-      close.addAction(UIAction { _ in AppState.shared.remove(stream) }, for: .touchUpInside)
-
-      group.addArrangedSubview(open)
-      group.addArrangedSubview(close)
-      row.addArrangedSubview(group)
-    }
-
-    stack.addArrangedSubview(scroller)
-    NSLayoutConstraint.activate([
-      scroller.heightAnchor.constraint(equalToConstant: 38),
-      row.topAnchor.constraint(equalTo: scroller.contentLayoutGuide.topAnchor),
-      row.leadingAnchor.constraint(equalTo: scroller.contentLayoutGuide.leadingAnchor),
-      row.trailingAnchor.constraint(equalTo: scroller.contentLayoutGuide.trailingAnchor),
-      row.bottomAnchor.constraint(equalTo: scroller.contentLayoutGuide.bottomAnchor),
-      row.heightAnchor.constraint(equalTo: scroller.frameLayoutGuide.heightAnchor)
-    ])
   }
 
   private func addGrid(_ streams: [StreamItem]) {

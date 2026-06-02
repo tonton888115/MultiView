@@ -1617,7 +1617,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     DispatchQueue.main.async {
       // 種別ごとの表示オン/オフ(設定)。OFFの種別はここで弾く。
       switch event.kind {
-      case .gift: guard self.settings.niconicoShowGift else { return }
+      case .gift: guard self.settings.showGiftEffects else { return }
       case .nicoad: guard self.settings.niconicoShowNicoad else { return }
       case .notification, .akashic: guard self.settings.niconicoShowNotification else { return }
       }
@@ -1682,6 +1682,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   }
 
   private func emitSupportAlert(_ text: String) {
+    guard settings.showGiftEffects else { return }
     let now = Date()
     if let lastSupportAlert, lastSupportAlert.text == text, now.timeIntervalSince(lastSupportAlert.at) < 10 {
       return

@@ -77,16 +77,17 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     segmented.addTarget(self, action: #selector(sourceChanged), for: .valueChanged)
     segmented.translatesAutoresizingMaskIntoConstraints = false
     web.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(segmented)
     view.addSubview(web)
+    view.addSubview(segmented)
     NSLayoutConstraint.activate([
-      segmented.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
-      segmented.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
-      segmented.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
-      web.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 8),
+      web.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
       web.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       web.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      web.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+      web.bottomAnchor.constraint(equalTo: segmented.topAnchor, constant: -8),
+      segmented.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
+      segmented.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
+      segmented.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8),
+      segmented.heightAnchor.constraint(equalToConstant: 34)
     ])
     reloadOrder()
   }
@@ -386,8 +387,6 @@ final class SettingsController: UITableViewController {
     tableView.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
     tableView.isEditing = true
     tableView.allowsSelectionDuringEditing = true
-    tableView.estimatedSectionFooterHeight = 72
-    tableView.sectionFooterHeight = UITableView.automaticDimension
   }
 
   func reload() {
@@ -399,7 +398,7 @@ final class SettingsController: UITableViewController {
   // setup is its own clearly-labelled section (the old layout mixed playback with
   // danmaku and scattered OAuth across confusing rows).
   private enum Sec: Int, CaseIterable {
-    case playback, danmaku, order, kick, twitch, twitcasting, youtube, niconico, webData, add
+    case playback, quality, danmaku, gifts, order, kick, twitch, twitcasting, youtube, niconico, webData, add
   }
 
   private func switchControl(isOn: Bool, onChange: @escaping (Bool) -> Void) -> UISwitch {
@@ -423,15 +422,17 @@ final class SettingsController: UITableViewController {
   override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
     guard let sec = Sec(rawValue: section) else { return 0 }
     switch sec {
-    case .playback: return 12
+    case .playback: return 3
+    case .quality: return 4
     case .danmaku: return 6
+    case .gifts: return 4
     case .order: return platforms.count
     case .kick: return 5
     case .twitch: return 4
     case .twitcasting: return 4
     case .youtube: return 5
     case .niconico: return 2
-    case .webData: return 1
+    case .webData: return 2
     case .add: return 1
     }
   }
@@ -439,72 +440,23 @@ final class SettingsController: UITableViewController {
   override func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
     guard let sec = Sec(rawValue: section) else { return nil }
     switch sec {
-    case .playback: return "再生・画質"
+    case .playback: return "再生"
+    case .quality: return "画質"
     case .danmaku: return "弾幕"
+    case .gifts: return "ギフト・通知"
     case .order: return "サービス順"
     case .kick: return "Kick 連携"
     case .twitch: return "Twitch 連携"
     case .twitcasting: return "ツイキャス 連携"
     case .youtube: return "YouTube 連携"
     case .niconico: return "ニコ生 連携"
-    case .webData: return "ログイン情報"
+    case .webData: return "Web"
     case .add: return "追加"
     }
   }
 
   override func tableView(_ tableView: UITableView, titleForFooterInSection section: Int) -> String? {
     nil
-  }
-
-  private func footerText(for section: Int) -> String? {
-    guard let sec = Sec(rawValue: section) else { return nil }
-    switch sec {
-    case .order:
-      return "右端の並べ替えハンドルをドラッグして、表示順を自由に変更できます。"
-    case .kick:
-      return "Kick Developer でOAuthアプリを作成します。Redirect URI「\(KickAuthManager.shared.config.redirectURI)」を登録してください。"
-    case .twitch:
-      return "Twitch Developer Console でアプリを作成します。Redirect URI はHTTPS必須なので「\(TwitchAuthManager.shared.config.redirectURI)」を登録してください。"
-    case .twitcasting:
-      return "ツイキャスのAPIアプリ(Write権限)の Client ID を設定し、Redirect URI を登録してください(行をタップでコピー)。"
-    case .youtube:
-      return "YouTubeコメント弾幕・投稿には Google Cloud の iOS OAuth Client ID と YouTube Data API v3 が必要です。手順は「設定手順を表示」を開いて確認できます。"
-    case .niconico:
-      return "ニコ生はログイン必須です。公式の外部連携(OAuth)が無いため、Webでログインします。ログイン状態はアプリ内のCookieに保持され、視聴・コメント投稿・コメント受信に使われます。"
-    case .webData:
-      return "フォロー・ランキング・視聴タブで使うWebログインCookieと閲覧データを削除します。OAuthトークンとClient ID設定は残ります。"
-    case .add:
-      let info = Bundle.main.infoDictionary
-      let version = (info?["CFBundleShortVersionString"] as? String) ?? "?"
-      let build = (info?["CFBundleVersion"] as? String) ?? "?"
-      return "MultiView \(version) (build \(build))"
-    default:
-      return nil
-    }
-  }
-
-  override func tableView(_ tableView: UITableView, viewForFooterInSection section: Int) -> UIView? {
-    guard let text = footerText(for: section) else { return nil }
-    let container = UIView()
-    let label = UILabel()
-    label.text = text
-    label.textColor = UIColor.white.withAlphaComponent(0.56)
-    label.font = .systemFont(ofSize: 12)
-    label.numberOfLines = 0
-    label.lineBreakMode = .byWordWrapping
-    label.translatesAutoresizingMaskIntoConstraints = false
-    container.addSubview(label)
-    NSLayoutConstraint.activate([
-      label.topAnchor.constraint(equalTo: container.topAnchor, constant: 6),
-      label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
-      label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -20),
-      label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12)
-    ])
-    return container
-  }
-
-  override func tableView(_ tableView: UITableView, heightForFooterInSection section: Int) -> CGFloat {
-    footerText(for: section) == nil ? CGFloat.leastNormalMagnitude : UITableView.automaticDimension
   }
 
   override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
@@ -535,57 +487,60 @@ final class SettingsController: UITableViewController {
           var s = AppState.shared.settings; s.autoFollowRaids = v; AppState.shared.settings = s
         }
       case 2:
-        cell.textLabel?.text = "Web広告ブロック"
-        cell.accessoryView = switchControl(isOn: AppState.shared.settings.blockWebAds) { v in
-          var s = AppState.shared.settings
-          s.blockWebAds = v
-          AppState.shared.settings = s
-          if v { WebAdBlocker.prepare() }
-        }
-      case 3:
-        cell.textLabel?.text = "Wi-Fi時の画質"
-        cell.accessoryView = qualityControl(selected: AppState.shared.settings.wifiQuality) { quality in
-          var s = AppState.shared.settings; s.wifiQuality = quality; AppState.shared.settings = s
-        }
-      case 4:
-        cell.textLabel?.text = "モバイル通信時の画質"
-        cell.accessoryView = qualityControl(selected: AppState.shared.settings.mobileQuality) { quality in
-          var s = AppState.shared.settings; s.mobileQuality = quality; AppState.shared.settings = s
-        }
-      case 5:
-        cell.textLabel?.text = "ニコ生 低遅延 (カクつくことがあります)"
-        cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoLowLatency) { v in
-          var s = AppState.shared.settings; s.niconicoLowLatency = v; AppState.shared.settings = s
-        }
-      case 6:
-        cell.textLabel?.text = "ギフト通知音"
-        cell.accessoryView = switchControl(isOn: AppState.shared.settings.giftSoundEnabled) { v in
-          var s = AppState.shared.settings; s.giftSoundEnabled = v; AppState.shared.settings = s
-        }
-      case 7:
-        cell.textLabel?.text = "ニコ生 ギフト通知を表示"
-        cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoShowGift) { v in
-          var s = AppState.shared.settings; s.niconicoShowGift = v; AppState.shared.settings = s
-        }
-      case 8:
-        cell.textLabel?.text = "ニコ生 ニコニ広告を表示"
-        cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoShowNicoad) { v in
-          var s = AppState.shared.settings; s.niconicoShowNicoad = v; AppState.shared.settings = s
-        }
-      case 9:
-        cell.textLabel?.text = "ニコ生 お知らせ通知を表示"
-        cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoShowNotification) { v in
-          var s = AppState.shared.settings; s.niconicoShowNotification = v; AppState.shared.settings = s
-        }
-      case 10:
         cell.textLabel?.text = "タップ時に同接数を左下に表示"
         cell.accessoryView = switchControl(isOn: AppState.shared.settings.showViewerCount) { v in
           var s = AppState.shared.settings; s.showViewerCount = v; AppState.shared.settings = s
         }
       default:
+        break
+      }
+    case .quality:
+      switch indexPath.row {
+      case 0:
+        cell.textLabel?.text = "Wi-Fi時の画質"
+        cell.accessoryView = qualityControl(selected: AppState.shared.settings.wifiQuality) { quality in
+          var s = AppState.shared.settings; s.wifiQuality = quality; AppState.shared.settings = s
+        }
+      case 1:
+        cell.textLabel?.text = "モバイル通信時の画質"
+        cell.accessoryView = qualityControl(selected: AppState.shared.settings.mobileQuality) { quality in
+          var s = AppState.shared.settings; s.mobileQuality = quality; AppState.shared.settings = s
+        }
+      case 2:
         cell.textLabel?.text = "3本以上で自動エコノミー画質"
         cell.accessoryView = switchControl(isOn: AppState.shared.settings.autoEconomyOnManyStreams) { v in
           var s = AppState.shared.settings; s.autoEconomyOnManyStreams = v; AppState.shared.settings = s
+        }
+      default:
+        cell.textLabel?.text = "ニコ生 低遅延 (カクつくことがあります)"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoLowLatency) { v in
+          var s = AppState.shared.settings; s.niconicoLowLatency = v; AppState.shared.settings = s
+        }
+      }
+    case .gifts:
+      switch indexPath.row {
+      case 0:
+        cell.textLabel?.text = "ギフト演出を表示"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.showGiftEffects) { v in
+          var s = AppState.shared.settings
+          s.showGiftEffects = v
+          s.niconicoShowGift = v
+          AppState.shared.settings = s
+        }
+      case 1:
+        cell.textLabel?.text = "ギフト通知音"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.giftSoundEnabled) { v in
+          var s = AppState.shared.settings; s.giftSoundEnabled = v; AppState.shared.settings = s
+        }
+      case 2:
+        cell.textLabel?.text = "ニコ生 ニコニ広告を表示"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoShowNicoad) { v in
+          var s = AppState.shared.settings; s.niconicoShowNicoad = v; AppState.shared.settings = s
+        }
+      default:
+        cell.textLabel?.text = "ニコ生 お知らせ通知を表示"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.niconicoShowNotification) { v in
+          var s = AppState.shared.settings; s.niconicoShowNotification = v; AppState.shared.settings = s
         }
       }
     case .danmaku:
@@ -651,10 +606,20 @@ final class SettingsController: UITableViewController {
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
     case .webData:
-      cell.textLabel?.text = "Webログイン情報と履歴を削除"
-      cell.textLabel?.textColor = .systemRed
-      cell.accessoryType = .disclosureIndicator
-      cell.selectionStyle = .default
+      if indexPath.row == 0 {
+        cell.textLabel?.text = "Web広告ブロック"
+        cell.accessoryView = switchControl(isOn: AppState.shared.settings.blockWebAds) { v in
+          var s = AppState.shared.settings
+          s.blockWebAds = v
+          AppState.shared.settings = s
+          if v { WebAdBlocker.prepare() }
+        }
+      } else {
+        cell.textLabel?.text = "Webログイン情報と履歴を削除"
+        cell.textLabel?.textColor = .systemRed
+        cell.accessoryType = .disclosureIndicator
+        cell.selectionStyle = .default
+      }
     case .add:
       cell.textLabel?.text = "配信を手動追加"
       cell.accessoryType = .disclosureIndicator
@@ -711,7 +676,7 @@ final class SettingsController: UITableViewController {
     case .niconico:
       handleNiconicoRow(indexPath.row)
     case .webData:
-      confirmClearWebData()
+      if indexPath.row == 1 { confirmClearWebData() }
     case .add:
       present(AddStreamController(), animated: true)
     default:
@@ -1120,6 +1085,7 @@ final class SettingsController: UITableViewController {
 final class AddStreamController: UIViewController {
   private let segmented = UISegmentedControl()
   private let field = UITextField()
+  private let bottomHost = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
   private var selectedPlatform: StreamPlatform {
     let order = AppState.shared.settings.platformOrder
     guard order.indices.contains(segmented.selectedSegmentIndex) else { return .kick }
@@ -1141,8 +1107,10 @@ final class AddStreamController: UIViewController {
       segmented.insertSegment(withTitle: platform.label, at: index, animated: false)
     }
     segmented.selectedSegmentIndex = 0
+    segmented.addAction(UIAction { [weak self] _ in
+      self?.field.placeholder = self?.selectedPlatform.hint
+    }, for: .valueChanged)
     segmented.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(segmented)
 
     field.placeholder = selectedPlatform.hint
     field.textColor = .white
@@ -1158,20 +1126,32 @@ final class AddStreamController: UIViewController {
     add.titleLabel?.font = .systemFont(ofSize: 17, weight: .bold)
     add.addAction(UIAction { [weak self] _ in self?.submit() }, for: .touchUpInside)
     add.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(add)
+
+    bottomHost.translatesAutoresizingMaskIntoConstraints = false
+    bottomHost.backgroundColor = UIColor.black.withAlphaComponent(0.25)
+    bottomHost.contentView.addSubview(segmented)
+    bottomHost.contentView.addSubview(add)
+    view.addSubview(bottomHost)
 
     NSLayoutConstraint.activate([
       close.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
       close.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
-      segmented.topAnchor.constraint(equalTo: close.bottomAnchor, constant: 20),
-      segmented.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
-      segmented.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
-      field.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 18),
+      field.topAnchor.constraint(equalTo: close.bottomAnchor, constant: 28),
       field.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 18),
       field.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -18),
       field.heightAnchor.constraint(equalToConstant: 44),
-      add.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 18),
-      add.centerXAnchor.constraint(equalTo: view.centerXAnchor)
+      field.bottomAnchor.constraint(lessThanOrEqualTo: bottomHost.topAnchor, constant: -18),
+      bottomHost.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      bottomHost.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      bottomHost.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+      bottomHost.heightAnchor.constraint(equalToConstant: 104),
+      segmented.topAnchor.constraint(equalTo: bottomHost.contentView.topAnchor, constant: 12),
+      segmented.leadingAnchor.constraint(equalTo: bottomHost.contentView.leadingAnchor, constant: 18),
+      segmented.trailingAnchor.constraint(equalTo: bottomHost.contentView.trailingAnchor, constant: -18),
+      segmented.heightAnchor.constraint(equalToConstant: 34),
+      add.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 10),
+      add.centerXAnchor.constraint(equalTo: bottomHost.contentView.centerXAnchor),
+      add.bottomAnchor.constraint(lessThanOrEqualTo: bottomHost.contentView.bottomAnchor, constant: -10)
     ])
   }
 

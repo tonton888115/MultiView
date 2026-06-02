@@ -55,6 +55,7 @@ struct AppSettings: Codable {
   var danmakuMaxLines = 0
   var danmakuMaxLength = 0
   var niconicoLowLatency = false
+  var showGiftEffects = true
   var giftSoundEnabled = true
   var niconicoShowGift = true
   var niconicoShowNicoad = true
@@ -80,8 +81,10 @@ struct AppSettings: Codable {
     danmakuMaxLines = try container.decodeIfPresent(Int.self, forKey: .danmakuMaxLines) ?? 0
     danmakuMaxLength = try container.decodeIfPresent(Int.self, forKey: .danmakuMaxLength) ?? 0
     niconicoLowLatency = try container.decodeIfPresent(Bool.self, forKey: .niconicoLowLatency) ?? false
+    let legacyGiftVisible = try container.decodeIfPresent(Bool.self, forKey: .niconicoShowGift)
+    showGiftEffects = try container.decodeIfPresent(Bool.self, forKey: .showGiftEffects) ?? legacyGiftVisible ?? true
     giftSoundEnabled = try container.decodeIfPresent(Bool.self, forKey: .giftSoundEnabled) ?? true
-    niconicoShowGift = try container.decodeIfPresent(Bool.self, forKey: .niconicoShowGift) ?? true
+    niconicoShowGift = legacyGiftVisible ?? true
     niconicoShowNicoad = try container.decodeIfPresent(Bool.self, forKey: .niconicoShowNicoad) ?? true
     niconicoShowNotification = try container.decodeIfPresent(Bool.self, forKey: .niconicoShowNotification) ?? true
     autoEconomyOnManyStreams = try container.decodeIfPresent(Bool.self, forKey: .autoEconomyOnManyStreams) ?? true

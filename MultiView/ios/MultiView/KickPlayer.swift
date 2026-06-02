@@ -807,7 +807,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       }
       return
     }
-    if let alert = Self.kickSupportAlert(event: event, payload: payload) {
+    if settings.showGiftEffects, let alert = Self.kickSupportAlert(event: event, payload: payload) {
       // サブ/ギフトはニコ生と同じリッチ表示(アイコン+バースト+音)に格上げ。テキストバナーから変更。
       NativeGiftSoundMixer.shared.play(style: .gift, enabled: settings.giftSoundEnabled, volume: playbackVolume)
       NativeEventOverlay.showSupport(

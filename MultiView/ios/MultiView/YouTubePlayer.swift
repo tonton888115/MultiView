@@ -238,6 +238,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private func emitYouTubeSuperChat(_ message: YouTubeLiveChatMessage) {
+    guard settings.showGiftEffects else { return }
     NativeGiftSoundMixer.shared.play(style: .premiumGift, enabled: settings.giftSoundEnabled, volume: playbackVolume)
     NativeEventOverlay.showSupport(
       title: "\(message.author): \(message.superInfo ?? "Super Chat")",

@@ -586,7 +586,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
          let target = Self.twitchRaidTarget(from: line, tags: tags) {
         RaidAutoFollow.follow(platform: target.0, channel: target.1, currentChannel: stream.channel)
       }
-      if let alert = Self.twitchSupportAlert(from: line, tags: tags) {
+      if settings.showGiftEffects, let alert = Self.twitchSupportAlert(from: line, tags: tags) {
         // サブ/ギフトはニコ生・Kickと同じリッチ表示(アイコン+バースト+音)に格上げ。
         NativeGiftSoundMixer.shared.play(style: .gift, enabled: settings.giftSoundEnabled, volume: playbackVolume)
         NativeEventOverlay.showSupport(
