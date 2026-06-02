@@ -31,8 +31,18 @@ if (-not (Test-Path -LiteralPath $IpaPath)) {
 $title = "MultiView $marketing (build $buildNum)"
 $notes = "Unsigned IPA for sideload use with SideStore + LiveContainer."
 
+$oldNativePreference = $null
+if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
+    $oldNativePreference = $global:PSNativeCommandUseErrorActionPreference
+    $global:PSNativeCommandUseErrorActionPreference = $false
+}
 $existing = & gh release view $Tag --repo $Repo --json tagName 2>$null
-if ($LASTEXITCODE -eq 0 -and $existing) {
+$viewExitCode = $LASTEXITCODE
+if ($null -ne $oldNativePreference) {
+    $global:PSNativeCommandUseErrorActionPreference = $oldNativePreference
+}
+
+if ($viewExitCode -eq 0 -and $existing) {
     Write-Host "Updating existing release: $Tag"
     & gh release upload $Tag $IpaPath --repo $Repo --clobber
     if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
