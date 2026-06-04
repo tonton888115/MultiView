@@ -235,6 +235,8 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
         config.defaultWebpagePreferences.preferredContentMode = .mobile
       }
       config.userContentController.addUserScript(WKUserScript(source: PlayerWebView.niconicoPopupBlockerScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+    } else if stream.platform == .kick || stream.platform == .twitch {
+      config.userContentController.addUserScript(WKUserScript(source: PlayerWebView.embeddedPlayerTouchShieldScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
     }
     super.init(frame: .zero, configuration: config)
     isOpaque = false
@@ -347,6 +349,15 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
     startTwitcastingChatIfNeeded()
   }
 
+  func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    if (stream.platform == .kick || stream.platform == .twitch),
+       navigationAction.navigationType == .linkActivated {
+      decisionHandler(.cancel)
+      return
+    }
+    decisionHandler(.allow)
+  }
+
   private func startTwitcastingChatIfNeeded() {
     guard stream.platform == .twitcasting, showChat, !twitcastingStarted else { return }
     twitcastingStarted = true
@@ -388,6 +399,22 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
     }
     hideComfortPopup();
     new MutationObserver(hideComfortPopup).observe(document.documentElement, { childList:true, subtree:true });
+  })();
+  """
+
+  private static let embeddedPlayerTouchShieldScript = """
+  (function(){
+    var styleId = 'mv-embedded-player-touch-shield';
+    function install(){
+      if (!document.getElementById(styleId)) {
+        var style = document.createElement('style');
+        style.id = styleId;
+        style.textContent = '#player iframe,#player video{pointer-events:none!important}';
+        (document.head || document.documentElement).appendChild(style);
+      }
+    }
+    install();
+    new MutationObserver(install).observe(document.documentElement, { childList:true, subtree:true });
   })();
   """
 

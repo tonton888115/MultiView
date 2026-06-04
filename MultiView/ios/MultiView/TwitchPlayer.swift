@@ -16,6 +16,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   var ivsPlayerLayer: IVSPlayerLayer?
   private let danmakuView = UIView()
   private let statusLabel = UILabel()
+  private let playbackBlocker = PlaybackBlockingOverlay()
   var playbackVolume: Float
   private var tokenTask: URLSessionDataTask?
   private var chatSocket: URLSessionWebSocketTask?
@@ -25,6 +26,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
+  private var itemEndedObserver: NSObjectProtocol?
   private var liveCatchUpTimer: Timer?
   var ivsBufferingRecoveryWork: DispatchWorkItem?
   private var fallbackWebView: PlayerWebView?
@@ -36,6 +38,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   private var forceLegacyPlayback = false
   private var isLoading = false
   private var isStopped = false
+  private var streamBlocked = false
   private var laneCursor = 0
 
   private static let clientID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
@@ -76,6 +79,15 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16)
     ])
 
+    playbackBlocker.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(playbackBlocker)
+    NSLayoutConstraint.activate([
+      playbackBlocker.topAnchor.constraint(equalTo: topAnchor),
+      playbackBlocker.leadingAnchor.constraint(equalTo: leadingAnchor),
+      playbackBlocker.trailingAnchor.constraint(equalTo: trailingAnchor),
+      playbackBlocker.bottomAnchor.constraint(equalTo: bottomAnchor)
+    ])
+
     PlaybackCoordinator.shared.register(self)
     loadNativeStream()
   }
@@ -96,7 +108,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 
   func resumePlayback() {
-    guard !isStopped else { return }
+    guard !isStopped, !streamBlocked else { return }
     let session = AVAudioSession.sharedInstance()
     try? session.setCategory(.playback, mode: .default, options: [])
     try? session.setActive(true)
@@ -132,6 +144,8 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
 
   func stopPlayback() {
     isStopped = true
+    streamBlocked = true
+    playbackBlocker.hide()
     stallWatchdog.stop()
     liveCatchUpTimer?.invalidate()
     liveCatchUpTimer = nil
@@ -151,6 +165,10 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       NotificationCenter.default.removeObserver(itemFailedObserver)
       self.itemFailedObserver = nil
     }
+    if let itemEndedObserver {
+      NotificationCenter.default.removeObserver(itemEndedObserver)
+      self.itemEndedObserver = nil
+    }
   }
 
   func setPlaybackVolume(_ volume: Float) {
@@ -165,7 +183,8 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 
   private func loadNativeStream() {
-    guard !isStopped, !isLoading, fallbackWebView == nil else { return }
+    guard !isStopped, !streamBlocked, !isLoading, fallbackWebView == nil else { return }
+    playbackBlocker.hide()
     let channel = Self.normalizeChannel(stream.channel)
     guard !channel.isEmpty else {
       installFallback("Twitchチャンネル名が不正です")
@@ -335,6 +354,9 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       if let itemFailedObserver = self.itemFailedObserver {
         NotificationCenter.default.removeObserver(itemFailedObserver)
       }
+      if let itemEndedObserver = self.itemEndedObserver {
+        NotificationCenter.default.removeObserver(itemEndedObserver)
+      }
       self.itemFailedObserver = NotificationCenter.default.addObserver(
         forName: .AVPlayerItemFailedToPlayToEndTime,
         object: item,
@@ -344,6 +366,13 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
         self?.handleNativeFailure(
           error?.localizedDescription ?? "Twitchネイティブ再生が停止しました",
           generation: generation)
+      }
+      self.itemEndedObserver = NotificationCenter.default.addObserver(
+        forName: .AVPlayerItemDidPlayToEndTime,
+        object: item,
+        queue: .main
+      ) { [weak self] _ in
+        self?.blockPlayback("Twitch配信が終了しました", generation: generation)
       }
       self.player.replaceCurrentItem(with: item)
       self.player.isMuted = !self.settings.playAudio
@@ -379,6 +408,10 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       itemStatusObservation: &itemStatusObservation,
       itemFailedObserver: &itemFailedObserver
     )
+    if let itemEndedObserver {
+      NotificationCenter.default.removeObserver(itemEndedObserver)
+      self.itemEndedObserver = nil
+    }
   }
 
   private func handleNativeFailure(_ reason: String, generation: Int) {
@@ -407,7 +440,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
           self.showStatus("Twitch再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
         },
         reload: { self.loadNativeStream() },
-        fallback: { self.installFallback(reason) }
+        fallback: { self.blockOrInstallFallback(reason) }
       )
     }
   }
@@ -433,8 +466,50 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
         self.playWithAVPlayer(hlsURL: hlsURL, requestGeneration: generation)
         return
       }
-      self.retryNativeLoadOrFallback(reason, generation: generation)
+      self.blockOrRetryNative(reason, generation: generation)
     }
+  }
+
+  private func blockOrRetryNative(_ reason: String, generation: Int) {
+    if Self.shouldBlockPlayback(for: reason) {
+      blockPlayback(reason, generation: generation)
+    } else {
+      retryNativeLoadOrFallback(reason, generation: generation)
+    }
+  }
+
+  private func blockOrInstallFallback(_ reason: String) {
+    if Self.shouldBlockPlayback(for: reason) {
+      blockPlayback(reason)
+    } else {
+      installFallback(reason)
+    }
+  }
+
+  private func blockPlayback(_ reason: String, generation: Int? = nil) {
+    DispatchQueue.main.async {
+      guard !self.isStopped else { return }
+      if let generation, generation != self.playbackGeneration { return }
+      self.streamBlocked = true
+      self.isLoading = false
+      self.tokenTask?.cancel()
+      self.tokenTask = nil
+      self.teardownPlayback()
+      self.fallbackWebView?.pausePlayback()
+      self.fallbackWebView?.isUserInteractionEnabled = false
+      self.chatSocket?.cancel(with: .goingAway, reason: nil)
+      self.chatSocket = nil
+      self.statusLabel.isHidden = true
+      self.playbackBlocker.show(
+        title: "Twitch配信は終了したか、再生できません",
+        detail: "プレイヤー内操作を無効化しています"
+      )
+    }
+  }
+
+  private static func shouldBlockPlayback(for reason: String) -> Bool {
+    let markers = ["終了", "停止", "配信情報を取得できません", "not live", "offline", "404"]
+    return markers.contains { reason.localizedCaseInsensitiveContains($0) }
   }
 
   private func scheduleIvsBufferingRecovery(generation: Int) {
@@ -494,7 +569,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       ivsBufferingRecoveryWork = nil
       statusLabel.isHidden = true
     case .ended:
-      handleIvsFailure("Twitch SDK再生が終了しました", generation: generation)
+      blockPlayback("Twitch SDK再生が終了しました", generation: generation)
     case .idle:
       break
     @unknown default:
@@ -520,6 +595,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
 
   private func showStatus(_ text: String) {
     DispatchQueue.main.async {
+      guard !self.streamBlocked else { return }
       self.statusLabel.text = text
       self.statusLabel.isHidden = false
     }

@@ -2,6 +2,68 @@ import AVFoundation
 import UIKit
 import WebKit
 
+final class PlaybackBlockingOverlay: UIView {
+  private let panel = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+  private let titleLabel = UILabel()
+  private let detailLabel = UILabel()
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    isHidden = true
+    isUserInteractionEnabled = true
+    backgroundColor = UIColor.black.withAlphaComponent(0.2)
+
+    panel.translatesAutoresizingMaskIntoConstraints = false
+    panel.layer.cornerRadius = 14
+    panel.clipsToBounds = true
+    addSubview(panel)
+
+    let stack = UIStackView(arrangedSubviews: [titleLabel, detailLabel])
+    stack.axis = .vertical
+    stack.alignment = .center
+    stack.spacing = 3
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    panel.contentView.addSubview(stack)
+
+    titleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+    titleLabel.textColor = .white
+    titleLabel.textAlignment = .center
+    titleLabel.numberOfLines = 2
+
+    detailLabel.font = .systemFont(ofSize: 11, weight: .medium)
+    detailLabel.textColor = UIColor.white.withAlphaComponent(0.72)
+    detailLabel.textAlignment = .center
+    detailLabel.numberOfLines = 2
+
+    NSLayoutConstraint.activate([
+      panel.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+      panel.centerXAnchor.constraint(equalTo: centerXAnchor),
+      panel.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 12),
+      panel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
+      stack.topAnchor.constraint(equalTo: panel.contentView.topAnchor, constant: 10),
+      stack.leadingAnchor.constraint(equalTo: panel.contentView.leadingAnchor, constant: 14),
+      stack.trailingAnchor.constraint(equalTo: panel.contentView.trailingAnchor, constant: -14),
+      stack.bottomAnchor.constraint(equalTo: panel.contentView.bottomAnchor, constant: -10)
+    ])
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  func show(title: String, detail: String?) {
+    titleLabel.text = title
+    detailLabel.text = detail
+    detailLabel.isHidden = detail?.isEmpty ?? true
+    isHidden = false
+    superview?.bringSubviewToFront(self)
+  }
+
+  func hide() {
+    isHidden = true
+  }
+}
+
 // 再生位置が一定時間進まない「フリーズ(ストール)」を監視し、自動で復旧コールバックを呼ぶ。
 // AVPlayer は本物のエラーを出さず固まることがある(回線揺れ/ライブ端枯渇)ので、currentTime の
 // 前進を見て検知する。誤検知で無駄に再読み込みしないよう、無前進12秒+復旧クールダウン20秒と保守的。
