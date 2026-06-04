@@ -126,6 +126,7 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
     super.viewDidLoad()
     AppState.shared.delegate = self
     delegate = self
+    configureIPadTabPlacement()
     tabBar.tintColor = .systemBlue
     // On iOS 26 the tab bar is Liquid Glass automatically; overriding its
     // background would fight that, so only style it on older systems.
@@ -178,6 +179,27 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
       PlaybackCoordinator.shared.resumeAll()
     }
+  }
+
+  func tabBarController(_ tabBarController: UITabBarController, shouldSelect viewController: UIViewController) -> Bool {
+    if tabBarController.selectedViewController !== viewController {
+      (tabBarController.selectedViewController as? BrowserSourceController)?.resetForTabExit()
+    }
+    return true
+  }
+
+  private func configureIPadTabPlacement() {
+    guard UIDevice.current.userInterfaceIdiom == .pad else { return }
+    #if compiler(>=6.0)
+    if #available(iOS 18.0, *) {
+      mode = .tabBar
+    }
+    #endif
+    #if compiler(>=5.9)
+    if #available(iOS 17.0, *) {
+      traitOverrides.horizontalSizeClass = .compact
+    }
+    #endif
   }
 
   private func glassTabAppearance() -> UITabBarAppearance {

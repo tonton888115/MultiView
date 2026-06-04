@@ -50,7 +50,14 @@ struct Source {
 
 class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
   private let segmented = UISegmentedControl()
-  private let web: WKWebView = {
+  private var web = BrowserSourceController.makeWebView()
+  private var activeSources = [(StreamPlatform, Source)]()
+  private var needsInitialPageLoad = false
+  private var isTabVisible = false
+  private var webConstraints = [NSLayoutConstraint]()
+  fileprivate static let browserUserAgent = BrowserUserAgent.mobileSafari
+
+  private static func makeWebView() -> WKWebView {
     let config = WKWebViewConfiguration()
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
@@ -58,32 +65,16 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     WebAdBlocker.install(on: config)
     config.preferences.javaScriptCanOpenWindowsAutomatically = true
     return WKWebView(frame: .zero, configuration: config)
-  }()
-  private var activeSources = [(StreamPlatform, Source)]()
-  fileprivate static let browserUserAgent = BrowserUserAgent.mobileSafari
+  }
 
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.04, alpha: 1)
-    // Kick (and others) sit behind Cloudflare bot protection that 400s requests that
-    // don't look like a real browser. A blank WKWebView sends a stripped UA, so
-    // kick.com/following 400s; advertising a real mobile Safari UA lets Cloudflare
-    // serve its JS challenge (which WKWebView, being WebKit, can actually solve).
-    web.customUserAgent = Self.browserUserAgent
-    web.navigationDelegate = self
-    web.uiDelegate = self
-    installStreamURLBridge()
-    web.allowsBackForwardNavigationGestures = true
     segmented.addTarget(self, action: #selector(sourceChanged), for: .valueChanged)
     segmented.translatesAutoresizingMaskIntoConstraints = false
-    web.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(web)
     view.addSubview(segmented)
+    installBrowserWebView(web)
     NSLayoutConstraint.activate([
-      web.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-      web.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-      web.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      web.bottomAnchor.constraint(equalTo: segmented.topAnchor, constant: -8),
       segmented.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
       segmented.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
       segmented.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -8),
@@ -92,11 +83,34 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     reloadOrder()
   }
 
+  override func viewWillAppear(_ animated: Bool) {
+    super.viewWillAppear(animated)
+    isTabVisible = true
+    if needsInitialPageLoad {
+      loadSelectedWhenVisible()
+    }
+  }
+
+  override func viewDidDisappear(_ animated: Bool) {
+    super.viewDidDisappear(animated)
+    isTabVisible = false
+  }
+
   deinit {
     web.configuration.userContentController.removeScriptMessageHandler(forName: "streamURL")
   }
 
   func sources() -> [(StreamPlatform, Source)] { [] }
+
+  func resetForTabExit() {
+    guard isViewLoaded else { return }
+    WebLoginCookies.sync()
+    replaceBrowserWebView()
+    if !activeSources.isEmpty {
+      segmented.selectedSegmentIndex = 0
+    }
+    needsInitialPageLoad = true
+  }
 
   func reloadOrder() {
     guard isViewLoaded else { return }
@@ -109,10 +123,19 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     if segmented.selectedSegmentIndex == UISegmentedControl.noSegment, !activeSources.isEmpty {
       segmented.selectedSegmentIndex = 0
     }
-    loadSelected()
+    loadSelectedWhenVisible()
   }
 
   @objc private func sourceChanged() {
+    loadSelectedWhenVisible()
+  }
+
+  private func loadSelectedWhenVisible() {
+    guard isTabVisible else {
+      needsInitialPageLoad = true
+      return
+    }
+    needsInitialPageLoad = false
     loadSelected()
   }
 
@@ -124,7 +147,41 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     }
   }
 
-  private func installStreamURLBridge() {
+  private func installBrowserWebView(_ webView: WKWebView) {
+    // Kick (and others) sit behind Cloudflare bot protection that 400s requests that
+    // don't look like a real browser. A blank WKWebView sends a stripped UA, so
+    // kick.com/following 400s; advertising a real mobile Safari UA lets Cloudflare
+    // serve its JS challenge (which WKWebView, being WebKit, can actually solve).
+    webView.customUserAgent = Self.browserUserAgent
+    webView.navigationDelegate = self
+    webView.uiDelegate = self
+    webView.allowsBackForwardNavigationGestures = true
+    installStreamURLBridge(on: webView)
+    webView.translatesAutoresizingMaskIntoConstraints = false
+    view.insertSubview(webView, belowSubview: segmented)
+    webConstraints = [
+      webView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      webView.bottomAnchor.constraint(equalTo: segmented.topAnchor, constant: -8)
+    ]
+    NSLayoutConstraint.activate(webConstraints)
+  }
+
+  private func replaceBrowserWebView() {
+    web.stopLoading()
+    web.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(function(el){ try { el.pause(); el.src = ''; el.load(); } catch(e) {} });", completionHandler: nil)
+    web.navigationDelegate = nil
+    web.uiDelegate = nil
+    web.configuration.userContentController.removeScriptMessageHandler(forName: "streamURL")
+    NSLayoutConstraint.deactivate(webConstraints)
+    webConstraints.removeAll()
+    web.removeFromSuperview()
+    web = Self.makeWebView()
+    installBrowserWebView(web)
+  }
+
+  private func installStreamURLBridge(on webView: WKWebView) {
     let source = """
     (function(){
       if (window.__multiViewURLBridge) return;
@@ -167,7 +224,7 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
       window.addEventListener('popstate', function(){ if (recentGesture()) notifySoon(location.href); });
     })();
     """
-    let controller = web.configuration.userContentController
+    let controller = webView.configuration.userContentController
     controller.add(self, name: "streamURL")
     controller.addUserScript(WKUserScript(source: source, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
   }
@@ -180,8 +237,8 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
        let url = navigationAction.request.url,
        navigationAction.targetFrame?.isMainFrame != false,
        let parsed = parseStream(url) {
-      addParsedStream(parsed)
       decisionHandler(.cancel)
+      addParsedStream(parsed)
       return
     }
     decisionHandler(.allow)
@@ -220,6 +277,7 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
 
   private func addParsedStream(_ parsed: (StreamPlatform, String)) {
     AppState.shared.add(platform: parsed.0, channel: parsed.1)
+    resetForTabExit()
     tabBarController?.selectedIndex = 2
     PlaybackCoordinator.shared.resumeAll()
   }
