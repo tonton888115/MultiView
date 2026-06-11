@@ -1089,12 +1089,12 @@ private enum YouTubeInnerTubeChatClient {
     let id = string(renderer["id"]) ?? "youtube:\(Date().timeIntervalSince1970):\(UUID().uuidString)"
     let authorObject = renderer["authorName"] as? [String: Any]
     let author = text(from: authorObject) ?? ""
-    var tokens: [NativeDanmakuToken] = []
+    var messageTokens: [NativeDanmakuToken] = []
     let sticker = renderer["sticker"] as? [String: Any]
     let stickerLabel = (((sticker?["accessibility"] as? [String: Any])?["accessibilityData"] as? [String: Any])?["label"] as? String)
       ?? (sticker?["label"] as? String)
     if let stickerURL = bestThumbnail(in: sticker?["thumbnails"]) ?? bestThumbnail(in: (sticker?["image"] as? [String: Any])?["thumbnails"]) {
-      tokens.append(.image(stickerURL))
+      messageTokens.append(.image(stickerURL))
     }
     let textObjects = [
       renderer["message"],
@@ -1106,13 +1106,13 @@ private enum YouTubeInnerTubeChatClient {
       renderer["text"]
     ]
     textObjects.forEach { value in
-      tokens.append(contentsOf: tokens(from: value))
+      messageTokens.append(contentsOf: tokens(from: value))
     }
-    if tokens.isEmpty, let stickerLabel, !stickerLabel.isEmpty {
-      tokens.append(.text(stickerLabel))
+    if messageTokens.isEmpty, let stickerLabel, !stickerLabel.isEmpty {
+      messageTokens.append(.text(stickerLabel))
     }
     let filterText = textObjects.compactMap { text(from: $0 as? [String: Any]) }.joined()
-    let displayText = filterText.isEmpty ? (stickerLabel ?? text(from: tokens)) : filterText
+    let displayText = filterText.isEmpty ? (stickerLabel ?? text(from: messageTokens)) : filterText
     let superInfo = text(from: renderer["purchaseAmountText"] as? [String: Any])
       ?? (((renderer["liveChatSponsorshipsHeaderRenderer"] as? [String: Any]) != nil) ? "メンバー加入" : nil)
     guard !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || superInfo != nil else {
@@ -1123,7 +1123,7 @@ private enum YouTubeInnerTubeChatClient {
       author: author,
       text: displayText.isEmpty ? (superInfo ?? "") : displayText,
       superInfo: superInfo,
-      tokens: tokens.isEmpty ? nil : tokens
+      tokens: messageTokens.isEmpty ? nil : messageTokens
     )
   }
 
