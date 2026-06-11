@@ -62,12 +62,13 @@ final class NativeDanmakuRenderer {
           return candidate
         }
       }
-      // Every lane still has a comment near the entry edge: signal "no room".
-      return -1
+      // Every lane still has a comment near the entry edge. Do not drop chat:
+      // choose the lane whose leading comment is furthest left so high-volume
+      // streams still show the full flow instead of silently losing messages.
+      return (0..<maxLines).min { lhs, rhs in
+        (laneFront[lhs] ?? -.greatestFiniteMagnitude) < (laneFront[rhs] ?? -.greatestFiniteMagnitude)
+      } ?? (laneCursor % maxLines)
     }()
-    // Screen is full — drop this comment instead of stacking it on an occupied lane, so a
-    // busy chat stays readable (a clearing flow, not a wall of overlapping text).
-    guard lane >= 0 else { return laneCursor }
     let comment = makeCommentView(
       tokens: tokens,
       fontSize: fontSize,
@@ -148,13 +149,11 @@ final class NativeDanmakuRenderer {
         imageView.contentMode = .scaleAspectFit
         imageView.alpha = CGFloat(opacity)
         // 画像はテキストと違い attributed shadow が使えないので CALayer shadow のまま。
-        // ただし shouldRasterize で 1 度だけビットマップ化し、以降は GPU 合成のみで済ます。
+        // Animated emotes must not be rasterized; otherwise some GIF/WebP frames freeze.
         imageView.layer.shadowColor = UIColor.black.cgColor
         imageView.layer.shadowRadius = 2
         imageView.layer.shadowOpacity = 1
         imageView.layer.shadowOffset = CGSize(width: 1, height: 1)
-        imageView.layer.shouldRasterize = true
-        imageView.layer.rasterizationScale = UIScreen.main.scale
         container.addSubview(imageView)
         loadImage(url, into: imageView)
         x += imageSide + 6
@@ -182,7 +181,7 @@ final class NativeDanmakuRenderer {
       return
     }
     URLSession.shared.dataTask(with: url) { data, _, _ in
-      guard let data, let image = animatedImage(from: data) ?? UIImage(data: data) else { return }
+      guard let data, let image = NativeAnimatedImageDecoder.image(from: data) else { return }
       imageCache.setObject(image, forKey: key)
       DispatchQueue.main.async {
         imageView.image = image

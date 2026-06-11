@@ -451,8 +451,17 @@ struct YouTubeLiveChatMessage {
   let id: String
   let author: String
   let text: String
+  let tokens: [NativeDanmakuToken]
   // Super Chat / Super Sticker / メンバー加入 のとき金額や種別の表示文字列。通常チャットは nil。
   let superInfo: String?
+
+  init(id: String, author: String, text: String, superInfo: String?, tokens: [NativeDanmakuToken]? = nil) {
+    self.id = id
+    self.author = author
+    self.text = text
+    self.superInfo = superInfo
+    self.tokens = tokens ?? NativeDanmakuRenderer.textTokens(text)
+  }
 }
 
 struct YouTubeLiveChatPage {

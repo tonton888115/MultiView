@@ -23,9 +23,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var fallbackWebView: WKWebView?
   private var isStopped = false
   private var iframeAudioEnabled = false
-  private var liveChatID: String?
-  private var liveChatAccessToken: String?
-  private var liveChatPageToken: String?
+  private var innerTubeChatSession: YouTubeInnerTubeChatSession?
   private var seenLiveChatMessageIDs = Set<String>()
   // YouTube live chat is polled (batches arrive every few seconds). Queue them and
   // drip one at a time so a batch doesn't stampede the screen all at once.
@@ -164,20 +162,17 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private func startLiveChatPolling(videoId: String) {
     guard settings.showChat else { return }
     chatPollWorkItem?.cancel(); chatPollWorkItem = nil
-    liveChatID = nil
-    liveChatAccessToken = nil
-    liveChatPageToken = nil
+    innerTubeChatSession = nil
     seenLiveChatMessageIDs.removeAll()
     pendingChatMessages.removeAll()
     chatDripWorkItem?.cancel(); chatDripWorkItem = nil
-    YouTubeAuthManager.shared.resolveLiveChat(videoID: videoId) { [weak self] result in
+    YouTubeInnerTubeChatClient.createSession(videoID: videoId) { [weak self] result in
       guard let self, !self.isStopped else { return }
       switch result {
       case .failure(let error):
         self.showStatus(error.localizedDescription)
-      case .success(let chat):
-        self.liveChatID = chat.liveChatID
-        self.liveChatAccessToken = chat.accessToken
+      case .success(let session):
+        self.innerTubeChatSession = session
         self.pollLiveChat()
       }
     }
@@ -186,19 +181,15 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private func pollLiveChat() {
     guard settings.showChat,
           !isStopped,
-          let liveChatID else { return }
-    // token は毎回自動更新。固定 token のままだと長時間視聴で 401→停止していた。
-    YouTubeAuthManager.shared.fetchLiveChatMessagesRefreshing(
-      liveChatID: liveChatID,
-      pageToken: liveChatPageToken
-    ) { [weak self] result in
+          let session = innerTubeChatSession else { return }
+    YouTubeInnerTubeChatClient.fetchPage(session: session) { [weak self] result in
       guard let self, !self.isStopped else { return }
       switch result {
       case .failure(let error):
         self.showStatus(error.localizedDescription)
         self.scheduleLiveChatPoll(after: 10)
       case .success(let page):
-        self.liveChatPageToken = page.nextPageToken
+        self.innerTubeChatSession?.continuation = page.nextPageToken ?? session.continuation
         let delay = max(2.0, Double(page.pollingIntervalMillis) / 1000.0)
         self.lastChatPollInterval = delay
         self.emitLiveChatMessages(page.messages)
@@ -225,12 +216,14 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     if seenLiveChatMessageIDs.count > 2000 {
       seenLiveChatMessageIDs = Set(fresh.map { $0.id })
     }
-    // Super Chat / メンバー加入 は投げ銭系としてニコ生風のリッチ表示で即時に出す。通常チャットは弾幕へ。
+    // Super Chat / メンバー加入 は投げ銭系としてニコ生風のリッチ表示でも出す。
+    // 弾幕にも流すので、ステッカー画像や本文を通常コメントと同じ流量で扱える。
     fresh.filter { $0.superInfo != nil }.forEach { emitYouTubeSuperChat($0) }
-    pendingChatMessages.append(contentsOf: fresh.filter { $0.superInfo == nil })
-    // A long stall can return a big backlog; cap it so we don't drip hundreds slowly.
-    if pendingChatMessages.count > 80 {
-      pendingChatMessages.removeFirst(pendingChatMessages.count - 80)
+    pendingChatMessages.append(contentsOf: fresh)
+    // Keep a large backlog instead of dropping normal burst batches. This is only a
+    // safety valve for extreme stalls, not normal high-volume chat.
+    if pendingChatMessages.count > 5000 {
+      pendingChatMessages.removeFirst(pendingChatMessages.count - 5000)
     }
     if chatDripWorkItem == nil {
       dripNextChatMessage()
@@ -259,7 +252,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     guard !isStopped, settings.showChat, !pendingChatMessages.isEmpty else { return }
     let message = pendingChatMessages.removeFirst()
     laneCursor = NativeDanmakuRenderer.emit(
-      tokens: NativeDanmakuRenderer.textTokens(message.text),
+      tokens: message.tokens,
       filterText: message.text,
       in: danmakuView,
       laneCursor: laneCursor,
@@ -963,4 +956,351 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   static let userAgent = BrowserUserAgent.mobileSafari
+}
+
+private struct YouTubeInnerTubeChatSession {
+  let apiKey: String
+  let context: [String: Any]
+  var continuation: String
+}
+
+private enum YouTubeInnerTubeChatClient {
+  static func createSession(videoID: String, completion: @escaping (Result<YouTubeInnerTubeChatSession, Error>) -> Void) {
+    guard let url = URL(string: "https://www.youtube.com/watch?v=\(videoID)") else {
+      finish(completion, .failure(NSError(domain: "YouTubeChat", code: -1, userInfo: [NSLocalizedDescriptionKey: "YouTubeライブURLが不正です"])))
+      return
+    }
+    var request = URLRequest(url: url)
+    request.setValue(YouTubeNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
+    URLSession.shared.dataTask(with: request) { data, _, error in
+      if let error {
+        finish(completion, .failure(error))
+        return
+      }
+      guard let data,
+            let html = String(data: data, encoding: .utf8) else {
+        finish(completion, .failure(messageError("YouTubeチャット初期HTMLを取得できません")))
+        return
+      }
+      guard let apiKey = firstCapture(in: html, pattern: #""INNERTUBE_API_KEY"\s*:\s*"([^"]+)""#)
+        ?? firstCapture(in: html, pattern: #"INNERTUBE_API_KEY['"]?\s*[:=]\s*['"]([^'"]+)"#) else {
+        finish(completion, .failure(messageError("YouTubeチャットAPIキーを取得できません")))
+        return
+      }
+      let clientVersion = firstCapture(in: html, pattern: #""INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)""#)
+        ?? "2.20240620.01.00"
+      let initialData = assignedJSON(in: html, name: "ytInitialData")
+      let continuation = initialData.flatMap { findLiveChatContinuation(in: $0) }
+        ?? firstCapture(in: html, pattern: #""continuation"\s*:\s*"([^"]+)""#)
+      guard let continuation, !continuation.isEmpty else {
+        finish(completion, .failure(messageError("YouTubeライブチャットのcontinuationを取得できません")))
+        return
+      }
+      finish(completion, .success(YouTubeInnerTubeChatSession(
+        apiKey: apiKey,
+        context: [
+          "client": [
+            "clientName": "WEB",
+            "clientVersion": clientVersion,
+            "hl": "ja",
+            "gl": "JP",
+            "userAgent": YouTubeNativePlayerView.userAgent
+          ]
+        ],
+        continuation: continuation
+      )))
+    }.resume()
+  }
+
+  static func fetchPage(session: YouTubeInnerTubeChatSession, completion: @escaping (Result<YouTubeLiveChatPage, Error>) -> Void) {
+    guard let url = URL(string: "https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=\(session.apiKey)") else {
+      finish(completion, .failure(messageError("YouTubeチャットAPI URLが不正です")))
+      return
+    }
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue(YouTubeNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: [
+      "context": session.context,
+      "continuation": session.continuation
+    ])
+    URLSession.shared.dataTask(with: request) { data, response, error in
+      if let error {
+        finish(completion, .failure(error))
+        return
+      }
+      guard let data,
+            let http = response as? HTTPURLResponse,
+            (200..<300).contains(http.statusCode),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        finish(completion, .failure(messageError("YouTubeコメント取得失敗 HTTP \(status)")))
+        return
+      }
+      let live = (((json["continuationContents"] as? [String: Any])?["liveChatContinuation"]) as? [String: Any]) ?? [:]
+      let actions = live["actions"] as? [Any] ?? []
+      let messages = actions.flatMap(messagesFromAction)
+      let continuations = live["continuations"] as? [Any]
+      let next = continuation(from: continuations)
+      let timeout = max(700, timeoutMillis(from: continuations) ?? 3000)
+      finish(completion, .success(YouTubeLiveChatPage(messages: messages, nextPageToken: next, pollingIntervalMillis: timeout)))
+    }.resume()
+  }
+
+  private static func messagesFromAction(_ action: Any) -> [YouTubeLiveChatMessage] {
+    let rendererKeys = [
+      "liveChatTextMessageRenderer",
+      "liveChatPaidMessageRenderer",
+      "liveChatPaidStickerRenderer",
+      "liveChatMembershipItemRenderer",
+      "liveChatSponsorshipsGiftPurchaseAnnouncementRenderer",
+      "liveChatSponsorshipsGiftRedemptionAnnouncementRenderer",
+      "liveChatGiftMembershipReceivedRenderer",
+      "liveChatViewerEngagementMessageRenderer",
+      "liveChatModeChangeMessageRenderer",
+      "liveChatPlaceholderItemRenderer"
+    ]
+    var renderers: [[String: Any]] = []
+    func walk(_ value: Any?) {
+      if let dict = value as? [String: Any] {
+        rendererKeys.forEach { key in
+          if let renderer = dict[key] as? [String: Any] {
+            renderers.append(renderer)
+          }
+        }
+        dict.values.forEach(walk)
+      } else if let array = value as? [Any] {
+        array.forEach(walk)
+      }
+    }
+    walk(action)
+    var seen = Set<String>()
+    return renderers.compactMap { renderer in
+      guard let parsed = message(from: renderer), !seen.contains(parsed.id) else { return nil }
+      seen.insert(parsed.id)
+      return parsed
+    }
+  }
+
+  private static func message(from renderer: [String: Any]) -> YouTubeLiveChatMessage? {
+    let id = string(renderer["id"]) ?? "youtube:\(Date().timeIntervalSince1970):\(UUID().uuidString)"
+    let authorObject = renderer["authorName"] as? [String: Any]
+    let author = text(from: authorObject) ?? ""
+    var tokens: [NativeDanmakuToken] = []
+    let sticker = renderer["sticker"] as? [String: Any]
+    let stickerLabel = (((sticker?["accessibility"] as? [String: Any])?["accessibilityData"] as? [String: Any])?["label"] as? String)
+      ?? (sticker?["label"] as? String)
+    if let stickerURL = bestThumbnail(in: sticker?["thumbnails"]) ?? bestThumbnail(in: (sticker?["image"] as? [String: Any])?["thumbnails"]) {
+      tokens.append(.image(stickerURL))
+    }
+    let textObjects = [
+      renderer["message"],
+      renderer["headerPrimaryText"],
+      renderer["headerSubtext"],
+      renderer["primaryText"],
+      renderer["subtext"],
+      renderer["bodyText"],
+      renderer["text"]
+    ]
+    textObjects.forEach { value in
+      tokens.append(contentsOf: tokens(from: value))
+    }
+    if tokens.isEmpty, let stickerLabel, !stickerLabel.isEmpty {
+      tokens.append(.text(stickerLabel))
+    }
+    let filterText = textObjects.compactMap { text(from: $0 as? [String: Any]) }.joined()
+    let displayText = filterText.isEmpty ? (stickerLabel ?? text(from: tokens)) : filterText
+    let superInfo = text(from: renderer["purchaseAmountText"] as? [String: Any])
+      ?? (((renderer["liveChatSponsorshipsHeaderRenderer"] as? [String: Any]) != nil) ? "メンバー加入" : nil)
+    guard !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || superInfo != nil else {
+      return nil
+    }
+    return YouTubeLiveChatMessage(
+      id: id,
+      author: author,
+      text: displayText.isEmpty ? (superInfo ?? "") : displayText,
+      superInfo: superInfo,
+      tokens: tokens.isEmpty ? nil : tokens
+    )
+  }
+
+  private static func tokens(from value: Any?) -> [NativeDanmakuToken] {
+    guard let value else { return [] }
+    if let dict = value as? [String: Any] {
+      if let runs = dict["runs"] as? [[String: Any]] {
+        return runs.flatMap(tokensFromRun)
+      }
+      if let simple = string(dict["simpleText"]), !simple.isEmpty {
+        return [.text(simple)]
+      }
+      return []
+    }
+    if let raw = string(value), !raw.isEmpty {
+      return [.text(raw)]
+    }
+    return []
+  }
+
+  private static func tokensFromRun(_ run: [String: Any]) -> [NativeDanmakuToken] {
+    if let text = string(run["text"]) {
+      return [.text(text)]
+    }
+    guard let emoji = run["emoji"] as? [String: Any],
+          let image = emoji["image"] as? [String: Any],
+          let url = bestThumbnail(in: image["thumbnails"]) else {
+      return []
+    }
+    return [.image(url)]
+  }
+
+  private static func text(from object: [String: Any]?) -> String? {
+    guard let object else { return nil }
+    if let simple = string(object["simpleText"]) { return simple }
+    if let runs = object["runs"] as? [[String: Any]] {
+      let value = runs.map { run in
+        string(run["text"])
+          ?? (((run["emoji"] as? [String: Any])?["shortcuts"] as? [String])?.first)
+          ?? ((run["emoji"] as? [String: Any])?["emojiId"] as? String)
+          ?? ""
+      }.joined()
+      return value.isEmpty ? nil : value
+    }
+    return nil
+  }
+
+  private static func text(from tokens: [NativeDanmakuToken]) -> String {
+    tokens.map { token in
+      switch token {
+      case .text(let text): return text
+      case .image: return ""
+      }
+    }.joined()
+  }
+
+  private static func bestThumbnail(in value: Any?) -> URL? {
+    guard let thumbnails = value as? [[String: Any]] else { return nil }
+    let sorted = thumbnails
+      .map { item -> (url: String, width: Int) in
+        (item["url"] as? String ?? "", item["width"] as? Int ?? 0)
+      }
+      .filter { !$0.url.isEmpty }
+      .sorted { $0.width > $1.width }
+    guard var raw = sorted.first?.url else { return nil }
+    if raw.hasPrefix("//") { raw = "https:\(raw)" }
+    return URL(string: raw)
+  }
+
+  private static func findLiveChatContinuation(in root: Any) -> String? {
+    if let dict = root as? [String: Any] {
+      if let renderer = dict["liveChatRenderer"] as? [String: Any],
+         let value = continuation(from: renderer["continuations"] as? [Any]) {
+        return value
+      }
+      for value in dict.values {
+        if let found = findLiveChatContinuation(in: value) {
+          return found
+        }
+      }
+    } else if let array = root as? [Any] {
+      for value in array {
+        if let found = findLiveChatContinuation(in: value) {
+          return found
+        }
+      }
+    }
+    return nil
+  }
+
+  private static func continuation(from list: [Any]?) -> String? {
+    guard let list else { return nil }
+    for item in list {
+      guard let dict = item as? [String: Any] else { continue }
+      for key in ["timedContinuationData", "invalidationContinuationData", "reloadContinuationData", "liveChatReplayContinuationData"] {
+        if let value = (dict[key] as? [String: Any])?["continuation"] as? String, !value.isEmpty {
+          return value
+        }
+      }
+    }
+    return nil
+  }
+
+  private static func timeoutMillis(from list: [Any]?) -> Int? {
+    guard let list else { return nil }
+    for item in list {
+      guard let dict = item as? [String: Any] else { continue }
+      for key in ["timedContinuationData", "invalidationContinuationData"] {
+        if let value = (dict[key] as? [String: Any])?["timeoutMs"] as? Int {
+          return value
+        }
+      }
+    }
+    return nil
+  }
+
+  private static func assignedJSON(in html: String, name: String) -> Any? {
+    for marker in ["var \(name) = ", "window[\"\(name)\"] = ", "\(name) = "] {
+      guard let markerRange = html.range(of: marker),
+            let start = html[markerRange.upperBound...].firstIndex(of: "{"),
+            let jsonText = balancedObject(in: html, from: start),
+            let data = jsonText.data(using: .utf8) else { continue }
+      return try? JSONSerialization.jsonObject(with: data)
+    }
+    return nil
+  }
+
+  private static func balancedObject(in text: String, from start: String.Index) -> String? {
+    var index = start
+    var depth = 0
+    var inString = false
+    var escaping = false
+    while index < text.endIndex {
+      let char = text[index]
+      if inString {
+        if escaping {
+          escaping = false
+        } else if char == "\\" {
+          escaping = true
+        } else if char == "\"" {
+          inString = false
+        }
+      } else if char == "\"" {
+        inString = true
+      } else if char == "{" {
+        depth += 1
+      } else if char == "}" {
+        depth -= 1
+        if depth == 0 {
+          return String(text[start...index])
+        }
+      }
+      index = text.index(after: index)
+    }
+    return nil
+  }
+
+  private static func firstCapture(in text: String, pattern: String) -> String? {
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+    guard let match = regex.firstMatch(in: text, range: nsRange),
+          match.numberOfRanges > 1,
+          let range = Range(match.range(at: 1), in: text) else { return nil }
+    return String(text[range])
+  }
+
+  private static func string(_ value: Any?) -> String? {
+    if let value = value as? String, !value.isEmpty { return value }
+    if let value = value as? NSNumber { return value.stringValue }
+    return nil
+  }
+
+  private static func messageError(_ message: String) -> NSError {
+    NSError(domain: "YouTubeChat", code: -1, userInfo: [NSLocalizedDescriptionKey: message])
+  }
+
+  private static func finish<T>(_ completion: @escaping (Result<T, Error>) -> Void, _ result: Result<T, Error>) {
+    DispatchQueue.main.async { completion(result) }
+  }
 }

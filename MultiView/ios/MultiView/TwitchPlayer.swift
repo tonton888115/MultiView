@@ -808,7 +808,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       if cursor < range.start {
         tokens.append(.text(String(chars[cursor..<range.start])))
       }
-      if let url = URL(string: "https://static-cdn.jtvnw.net/emoticons/v2/\(range.id)/default/dark/1.0") {
+      if let url = URL(string: "https://static-cdn.jtvnw.net/emoticons/v2/\(range.id)/animated/dark/2.0") {
         tokens.append(.image(url))
       }
       cursor = range.end + 1
