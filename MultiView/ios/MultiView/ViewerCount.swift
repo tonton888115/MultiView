@@ -120,7 +120,7 @@ enum ViewerCountProvider {
     }
     return jsonTask(url: url, headers: browserHeaders(referer: "https://kick.com/\(channel)")) { object in
       let live = (object as? [String: Any])?["livestream"] as? [String: Any]
-      completion(count(in: live, keys: kickKeys) ?? count(in: object, keys: kickKeys))
+      completion(live.flatMap { count(in: $0, keys: kickKeys) })
     }
   }
 

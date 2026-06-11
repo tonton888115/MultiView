@@ -4,6 +4,8 @@ npm-install.log
 
 # Build artifacts
 *.ipa
+artifacts/
+.tools/
 
 # Dependencies (also covered by MultiView/.gitignore)
 node_modules/
