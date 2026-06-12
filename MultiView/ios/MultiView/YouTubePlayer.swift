@@ -964,53 +964,145 @@ private struct YouTubeInnerTubeChatSession {
   var continuation: String
 }
 
+private struct YouTubeInitialChatTarget {
+  let url: URL
+  let referer: String?
+}
+
+private struct YouTubeInnerTubeChatState {
+  let apiKey: String?
+  let clientVersion: String?
+  let context: [String: Any]?
+  let continuation: String?
+}
+
 private enum YouTubeInnerTubeChatClient {
+  static let chatUserAgent = BrowserUserAgent.desktopSafari
+
   static func createSession(videoID: String, completion: @escaping (Result<YouTubeInnerTubeChatSession, Error>) -> Void) {
-    guard let url = URL(string: "https://www.youtube.com/watch?v=\(videoID)") else {
+    let targets = initialChatTargets(videoID: videoID)
+    guard !targets.isEmpty else {
       finish(completion, .failure(NSError(domain: "YouTubeChat", code: -1, userInfo: [NSLocalizedDescriptionKey: "YouTubeライブURLが不正です"])))
       return
     }
-    var request = URLRequest(url: url)
-    request.setValue(YouTubeNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
-    request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
-    URLSession.shared.dataTask(with: request) { data, _, error in
-      if let error {
-        finish(completion, .failure(error))
+
+    var states: [YouTubeInnerTubeChatState] = []
+    var lastError: Error?
+
+    func fetchTarget(_ index: Int) {
+      if index >= targets.count {
+        do {
+          finish(completion, .success(try session(from: states)))
+        } catch {
+          finish(completion, .failure(states.isEmpty ? (lastError ?? error) : error))
+        }
         return
       }
-      guard let data,
-            let html = String(data: data, encoding: .utf8) else {
-        finish(completion, .failure(messageError("YouTubeチャット初期HTMLを取得できません")))
-        return
+
+      let target = targets[index]
+      var request = URLRequest(url: target.url)
+      request.setValue(chatUserAgent, forHTTPHeaderField: "User-Agent")
+      request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
+      if let referer = target.referer {
+        request.setValue(referer, forHTTPHeaderField: "Referer")
       }
-      guard let apiKey = firstCapture(in: html, pattern: #""INNERTUBE_API_KEY"\s*:\s*"([^"]+)""#)
-        ?? firstCapture(in: html, pattern: #"INNERTUBE_API_KEY['"]?\s*[:=]\s*['"]([^'"]+)"#) else {
-        finish(completion, .failure(messageError("YouTubeチャットAPIキーを取得できません")))
-        return
-      }
-      let clientVersion = firstCapture(in: html, pattern: #""INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)""#)
-        ?? "2.20240620.01.00"
-      let initialData = assignedJSON(in: html, name: "ytInitialData")
-      let continuation = initialData.flatMap { findLiveChatContinuation(in: $0) }
-        ?? firstCapture(in: html, pattern: #""continuation"\s*:\s*"([^"]+)""#)
-      guard let continuation, !continuation.isEmpty else {
-        finish(completion, .failure(messageError("YouTubeライブチャットのcontinuationを取得できません")))
-        return
-      }
-      finish(completion, .success(YouTubeInnerTubeChatSession(
-        apiKey: apiKey,
-        context: [
-          "client": [
-            "clientName": "WEB",
-            "clientVersion": clientVersion,
-            "hl": "ja",
-            "gl": "JP",
-            "userAgent": YouTubeNativePlayerView.userAgent
-          ]
-        ],
-        continuation: continuation
-      )))
-    }.resume()
+      URLSession.shared.dataTask(with: request) { data, response, error in
+        if let error {
+          lastError = error
+          fetchTarget(index + 1)
+          return
+        }
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+          lastError = messageError("YouTubeチャット初期HTML取得失敗 HTTP \(http.statusCode)")
+          fetchTarget(index + 1)
+          return
+        }
+        guard let data,
+              let html = String(data: data, encoding: .utf8) else {
+          lastError = messageError("YouTubeチャット初期HTMLを取得できません")
+          fetchTarget(index + 1)
+          return
+        }
+        states.append(chatState(from: html))
+        if let session = try? session(from: states) {
+          finish(completion, .success(session))
+        } else {
+          fetchTarget(index + 1)
+        }
+      }.resume()
+    }
+
+    fetchTarget(0)
+  }
+
+  private static func initialChatTargets(videoID: String) -> [YouTubeInitialChatTarget] {
+    guard let encoded = videoID.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+          let watch = URL(string: "https://www.youtube.com/watch?v=\(encoded)") else {
+      return []
+    }
+    var targets = [YouTubeInitialChatTarget(url: watch, referer: nil)]
+    if let liveChat = URL(string: "https://www.youtube.com/live_chat?v=\(encoded)&is_popout=1") {
+      targets.append(YouTubeInitialChatTarget(url: liveChat, referer: watch.absoluteString))
+    }
+    return targets
+  }
+
+  private static func chatState(from html: String) -> YouTubeInnerTubeChatState {
+    let ytcfg = ytcfgObject(in: html)
+    let context = ytcfg?["INNERTUBE_CONTEXT"] as? [String: Any]
+    let initialData = assignedJSON(in: html, name: "ytInitialData")
+    let apiKey = firstCapture(in: html, pattern: #""INNERTUBE_API_KEY"\s*:\s*"([^"]+)""#)
+      ?? firstCapture(in: html, pattern: #"INNERTUBE_API_KEY['"]?\s*[:=]\s*['"]([^'"]+)"#)
+      ?? string(ytcfg?["INNERTUBE_API_KEY"])
+    let clientVersion = firstCapture(in: html, pattern: #""INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)""#)
+      ?? string(ytcfg?["INNERTUBE_CLIENT_VERSION"])
+      ?? string((context?["client"] as? [String: Any])?["clientVersion"])
+    let continuation = initialData.flatMap { findLiveChatContinuation(in: $0) }
+      ?? ytcfg.flatMap { findLiveChatContinuation(in: $0) }
+      ?? firstCapture(in: html, pattern: #""continuation"\s*:\s*"([^"]+)""#)
+    return YouTubeInnerTubeChatState(
+      apiKey: apiKey,
+      clientVersion: clientVersion,
+      context: context,
+      continuation: continuation
+    )
+  }
+
+  private static func session(from states: [YouTubeInnerTubeChatState]) throws -> YouTubeInnerTubeChatSession {
+    guard let apiKey = states.compactMap(\.apiKey).first, !apiKey.isEmpty else {
+      throw messageError("YouTubeチャットAPIキーを取得できません")
+    }
+    let context = states.compactMap(\.context).first
+    let contextVersion = string((context?["client"] as? [String: Any])?["clientVersion"])
+    let clientVersion = states.compactMap(\.clientVersion).first ?? contextVersion ?? "2.20240620.01.00"
+    guard let continuation = states.compactMap(\.continuation).first, !continuation.isEmpty else {
+      throw messageError("YouTubeライブチャットのcontinuationを取得できません")
+    }
+    return YouTubeInnerTubeChatSession(
+      apiKey: apiKey,
+      context: normalizedContext(context, clientVersion: clientVersion),
+      continuation: continuation
+    )
+  }
+
+  private static func normalizedContext(_ context: [String: Any]?, clientVersion: String) -> [String: Any] {
+    var normalized = context ?? [:]
+    var client = normalized["client"] as? [String: Any] ?? [:]
+    if string(client["clientName"]) == nil {
+      client["clientName"] = "WEB"
+    }
+    client["clientVersion"] = clientVersion
+    if string(client["hl"]) == nil {
+      client["hl"] = "ja"
+    }
+    if string(client["gl"]) == nil {
+      client["gl"] = "JP"
+    }
+    if string(client["userAgent"]) == nil {
+      client["userAgent"] = chatUserAgent
+    }
+    normalized["client"] = client
+    return normalized
   }
 
   static func fetchPage(session: YouTubeInnerTubeChatSession, completion: @escaping (Result<YouTubeLiveChatPage, Error>) -> Void) {
@@ -1021,7 +1113,7 @@ private enum YouTubeInnerTubeChatClient {
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue(YouTubeNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue(chatUserAgent, forHTTPHeaderField: "User-Agent")
     request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
     request.httpBody = try? JSONSerialization.data(withJSONObject: [
       "context": session.context,
@@ -1199,6 +1291,13 @@ private enum YouTubeInnerTubeChatClient {
          let value = continuation(from: renderer["continuations"] as? [Any]) {
         return value
       }
+      if let live = dict["liveChatContinuation"] as? [String: Any],
+         let value = continuation(from: live["continuations"] as? [Any]) {
+        return value
+      }
+      if let value = continuation(fromData: dict) {
+        return value
+      }
       for value in dict.values {
         if let found = findLiveChatContinuation(in: value) {
           return found
@@ -1214,14 +1313,21 @@ private enum YouTubeInnerTubeChatClient {
     return nil
   }
 
+  private static func continuation(fromData dict: [String: Any]) -> String? {
+    for key in ["timedContinuationData", "invalidationContinuationData", "reloadContinuationData", "liveChatReplayContinuationData"] {
+      if let value = (dict[key] as? [String: Any])?["continuation"] as? String, !value.isEmpty {
+        return value
+      }
+    }
+    return nil
+  }
+
   private static func continuation(from list: [Any]?) -> String? {
     guard let list else { return nil }
     for item in list {
       guard let dict = item as? [String: Any] else { continue }
-      for key in ["timedContinuationData", "invalidationContinuationData", "reloadContinuationData", "liveChatReplayContinuationData"] {
-        if let value = (dict[key] as? [String: Any])?["continuation"] as? String, !value.isEmpty {
-          return value
-        }
+      if let value = continuation(fromData: dict) {
+        return value
       }
     }
     return nil
@@ -1249,6 +1355,23 @@ private enum YouTubeInnerTubeChatClient {
       return try? JSONSerialization.jsonObject(with: data)
     }
     return nil
+  }
+
+  private static func ytcfgObject(in html: String) -> [String: Any]? {
+    let marker = "ytcfg.set("
+    var searchRange = html.startIndex..<html.endIndex
+    var merged: [String: Any] = [:]
+    while let markerRange = html.range(of: marker, range: searchRange) {
+      guard let start = html[markerRange.upperBound...].firstIndex(of: "{") else { break }
+      if let jsonText = balancedObject(in: html, from: start),
+         let data = jsonText.data(using: .utf8),
+         let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        object.forEach { key, value in merged[key] = value }
+      }
+      let next = html.index(after: start)
+      searchRange = next..<html.endIndex
+    }
+    return merged.isEmpty ? nil : merged
   }
 
   private static func balancedObject(in text: String, from start: String.Index) -> String? {
