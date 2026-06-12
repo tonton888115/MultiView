@@ -260,10 +260,11 @@ async function resolveYouTube(stream: StreamItem, settings: AppSettings): Promis
     };
   }
   return {
-    kind: 'youtube-iframe',
-    videoId,
-    label: 'YouTube iframe',
-    status: '独自オーバーレイ',
+    kind: 'web',
+    url: `https://m.youtube.com/watch?v=${encodeURIComponent(videoId)}`,
+    label: 'YouTube Web',
+    status: 'HLSなし/Webフォールバック',
+    reason: 'YouTubeが直接HLSを返さないためWeb再生に切り替えました。',
   };
 }
 

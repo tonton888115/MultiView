@@ -520,7 +520,7 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
       URLQueryItem(name: "client_id", value: config.clientId),
       URLQueryItem(name: "redirect_uri", value: redirectURI),
       URLQueryItem(name: "response_type", value: "code"),
-      URLQueryItem(name: "scope", value: "https://www.googleapis.com/auth/youtube.readonly"),
+      URLQueryItem(name: "scope", value: "https://www.googleapis.com/auth/youtube.force-ssl"),
       URLQueryItem(name: "state", value: state),
       URLQueryItem(name: "access_type", value: "offline"),
       URLQueryItem(name: "prompt", value: "consent"),

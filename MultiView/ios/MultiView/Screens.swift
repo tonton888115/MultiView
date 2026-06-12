@@ -1071,7 +1071,7 @@ final class SettingsController: UITableViewController {
 
     エラー 403: access_denied が出る場合は、OAuth同意画面の公開状態が「テスト」のままです。Google Cloud Consoleの「OAuth同意画面」>「対象」または「テストユーザー」で、この端末でログインするGoogleアカウントを追加してください。
 
-    弾幕取得だけなら youtube.readonly スコープを使います。コメント投稿まで使う場合は、投稿用に広い権限が必要になります。コメントが出ない場合は、配信側のチャット無効、ログイン切れ、Client ID誤り、API未有効化を確認してください。
+    このアプリはコメント投稿にも使うため youtube.force-ssl スコープで認証します。コメントが出ない/送れない場合は、配信側のチャット無効、ログイン切れ、Client ID誤り、API未有効化を確認してください。
     """
     let alert = UIAlertController(title: "YouTube Client ID 設定手順", message: message, preferredStyle: .alert)
     alert.addAction(UIAlertAction(title: "認証情報を開く", style: .default) { [weak self] _ in

@@ -14,11 +14,30 @@ import {
   TouchableOpacity,
   View,
   useWindowDimensions,
+  Linking,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {WebView, type WebViewMessageEvent} from 'react-native-webview';
 import {DanmakuOverlay} from './src/DanmakuOverlay';
 import {NativeHlsPlayer} from './src/NativeHlsPlayer';
+import {
+  AUTH_STORAGE_KEY,
+  authStatus,
+  completeOAuthRedirect,
+  createOAuthStart,
+  defaultAuthState,
+  openURL,
+  pollYouTubeDeviceToken,
+  postStreamComment,
+  requestYouTubeDeviceCode,
+  sanitizeAuthState,
+  serviceLabel,
+  signOut,
+  updateAuthConfig,
+  type AuthState,
+  type OAuthService,
+  type PendingOAuth,
+} from './src/auth';
 import {compactHandoffCode, decodeHandoff, handoffURL} from './src/handoff';
 import {
   chatURL,
@@ -224,6 +243,13 @@ export default function App() {
   const [streams, setStreams] = useState<StreamItem[]>([]);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [volumes, setVolumes] = useState<Record<string, number>>({});
+  const [auth, setAuth] = useState<AuthState>(defaultAuthState);
+  const [pendingOAuth, setPendingOAuth] = useState<PendingOAuth | null>(null);
+  const [niconicoLoginOpen, setNiconicoLoginOpen] = useState(false);
+  const authRef = useRef(auth);
+  const pendingOAuthRef = useRef(pendingOAuth);
+  authRef.current = auth;
+  pendingOAuthRef.current = pendingOAuth;
 
   useEffect(() => {
     let mounted = true;
@@ -231,8 +257,9 @@ export default function App() {
       AsyncStorage.getItem(STREAMS_KEY).then(value => value ?? AsyncStorage.getItem(LEGACY_STREAMS_KEY)),
       AsyncStorage.getItem(SETTINGS_KEY).then(value => value ?? AsyncStorage.getItem(LEGACY_SETTINGS_KEY)),
       AsyncStorage.getItem(VOLUMES_KEY),
+      AsyncStorage.getItem(AUTH_STORAGE_KEY),
     ])
-      .then(([savedStreams, savedSettings, savedVolumes]) => {
+      .then(([savedStreams, savedSettings, savedVolumes, savedAuth]) => {
         if (!mounted) {
           return;
         }
@@ -251,6 +278,9 @@ export default function App() {
         }
         if (savedVolumes) {
           setVolumes(JSON.parse(savedVolumes));
+        }
+        if (savedAuth) {
+          setAuth(sanitizeAuthState(JSON.parse(savedAuth)));
         }
       })
       .catch(() => {
@@ -279,6 +309,79 @@ export default function App() {
       AsyncStorage.setItem(VOLUMES_KEY, JSON.stringify(volumes)).catch(() => undefined);
     }
   }, [hydrated, volumes]);
+
+  useEffect(() => {
+    if (hydrated) {
+      AsyncStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(auth)).catch(() => undefined);
+    }
+  }, [auth, hydrated]);
+
+  useEffect(() => {
+    const handleURL = ({url}: {url: string}) => {
+      const pending = pendingOAuthRef.current;
+      if (!pending || !url.startsWith('multiview://')) {
+        return;
+      }
+      completeOAuthRedirect(authRef.current, pending, url)
+        .then(next => {
+          setAuth(next);
+          setPendingOAuth(null);
+          Alert.alert('ログイン完了', `${serviceLabel(pending.service)}にログインしました。`);
+        })
+        .catch(error => {
+          setPendingOAuth(null);
+          Alert.alert('ログイン失敗', error instanceof Error ? error.message : String(error));
+        });
+    };
+    const sub = Linking.addEventListener('url', handleURL);
+    Linking.getInitialURL().then(url => {
+      if (url) {
+        handleURL({url});
+      }
+    }).catch(() => undefined);
+    return () => sub.remove();
+  }, []);
+
+  const updateAuth = useCallback((next: AuthState) => {
+    setAuth(sanitizeAuthState(next));
+  }, []);
+
+  const startOAuthLogin = useCallback(async (service: OAuthService) => {
+    try {
+      if (service === 'youtube') {
+        const device = await requestYouTubeDeviceCode(authRef.current);
+        Alert.alert(
+          'YouTubeログイン',
+          `外部ブラウザで ${device.verificationUrl} を開き、コード ${device.userCode} を入力してください。完了まで自動で待機します。`,
+        );
+        openURL(device.verificationUrl).catch(() => undefined);
+        const poll = async () => {
+          if (Date.now() > device.expiresAt) {
+            Alert.alert('YouTubeログイン失敗', '認証コードの期限が切れました。もう一度ログインしてください。');
+            return;
+          }
+          try {
+            const next = await pollYouTubeDeviceToken(authRef.current, device);
+            if (next) {
+              setAuth(next);
+              Alert.alert('ログイン完了', 'YouTubeにログインしました。');
+              return;
+            }
+            setTimeout(poll, device.intervalSeconds * 1000);
+          } catch (error) {
+            Alert.alert('YouTubeログイン失敗', error instanceof Error ? error.message : String(error));
+          }
+        };
+        setTimeout(poll, device.intervalSeconds * 1000);
+        return;
+      }
+      const start = await createOAuthStart(authRef.current, service);
+      setPendingOAuth(start.pending);
+      await openURL(start.url);
+    } catch (error) {
+      Alert.alert('ログイン開始失敗', error instanceof Error ? error.message : String(error));
+    }
+  }, []);
 
   const addStream = useCallback((platform: PlatformId, rawChannel: string) => {
     const fromURL = parseStreamURL(rawChannel);
@@ -328,14 +431,6 @@ export default function App() {
   return (
     <SafeAreaView style={styles.app}>
       <StatusBar barStyle="light-content" backgroundColor="#05070a" translucent={false} />
-      <View style={styles.header}>
-        <View>
-          <Text style={styles.title}>MultiView</Text>
-          <Text style={styles.subtitle}>Android native-player edition</Text>
-        </View>
-        <Text style={styles.counter}>{streams.length} streams</Text>
-      </View>
-
       <View style={styles.content}>
         {activeTab === 'following' && (
           <SourceBrowser sources={orderedSources(followingSources, settings)} onAdd={addStream} />
@@ -351,8 +446,9 @@ export default function App() {
             onAdd={addStream}
             onRemove={removeStream}
             onMove={moveStream}
-            onSettings={updateSettings}
             onVolume={setStreamVolume}
+            auth={auth}
+            onAuth={updateAuth}
           />
         )}
         {activeTab === 'settings' && (
@@ -377,9 +473,14 @@ export default function App() {
               updateSettings({platformOrder: next});
             }}
             onClear={() => setStreams([])}
+            auth={auth}
+            onAuth={updateAuth}
+            onLogin={startOAuthLogin}
+            onNiconicoLogin={() => setNiconicoLoginOpen(true)}
           />
         )}
       </View>
+      <NiconicoLoginModal visible={niconicoLoginOpen} onClose={() => setNiconicoLoginOpen(false)} />
 
       <View style={styles.tabBar}>
         <TabButton active={activeTab === 'following'} label="フォロー" onPress={() => setActiveTab('following')} />
@@ -462,17 +563,6 @@ function SourceBrowser({sources, onAdd}: {sources: Source[]; onAdd: (platform: P
 
   return (
     <View style={styles.screen}>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.sourceTabs}>
-        {sources.map((item, index) => (
-          <Pill
-            key={item.platform}
-            active={selected === index}
-            color={platformInfo(item.platform).color}
-            label={item.label}
-            onPress={() => setSelected(index)}
-          />
-        ))}
-      </ScrollView>
       <View style={styles.browserFrame}>
         <WebView
           key={source.url}
@@ -488,6 +578,21 @@ function SourceBrowser({sources, onAdd}: {sources: Source[]; onAdd: (platform: P
           onShouldStartLoadWithRequest={intercept}
         />
       </View>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        style={styles.sourceTabs}
+        contentContainerStyle={styles.sourceTabsContent}>
+        {sources.map((item, index) => (
+          <Pill
+            key={item.platform}
+            active={selected === index}
+            color={platformInfo(item.platform).color}
+            label={item.label}
+            onPress={() => setSelected(index)}
+          />
+        ))}
+      </ScrollView>
     </View>
   );
 }
@@ -499,8 +604,9 @@ function ViewingScreen({
   onAdd,
   onRemove,
   onMove,
-  onSettings,
   onVolume,
+  auth,
+  onAuth,
 }: {
   streams: StreamItem[];
   settings: AppSettings;
@@ -508,8 +614,9 @@ function ViewingScreen({
   onAdd: (platform: PlatformId, channel: string) => void;
   onRemove: (id: string) => void;
   onMove: (index: number, delta: number) => void;
-  onSettings: (patch: Partial<AppSettings>) => void;
   onVolume: (stream: StreamItem, volume: number) => void;
+  auth: AuthState;
+  onAuth: (auth: AuthState) => void;
 }) {
   const {width} = useWindowDimensions();
   const [adding, setAdding] = useState(false);
@@ -526,11 +633,6 @@ function ViewingScreen({
             <Text style={styles.primaryButtonText}>追加</Text>
           </TouchableOpacity>
         </View>
-      </View>
-
-      <View style={styles.layoutSwitch}>
-        <Pill active={settings.layoutMode === 'stacked'} label="縦積み" onPress={() => onSettings({layoutMode: 'stacked'})} />
-        <Pill active={settings.layoutMode === 'grid'} label="グリッド" onPress={() => onSettings({layoutMode: 'grid'})} />
       </View>
 
       {streams.length === 0 ? (
@@ -556,6 +658,8 @@ function ViewingScreen({
                 onMove={onMove}
                 onRemove={onRemove}
                 onVolume={onVolume}
+                auth={auth}
+                onAuth={onAuth}
               />
             </View>
           ))}
@@ -578,6 +682,8 @@ function ViewingScreen({
         onVolume={onVolume}
         onClose={() => setFocused(null)}
         onRemove={onRemove}
+        auth={auth}
+        onAuth={onAuth}
       />
     </View>
   );
@@ -597,6 +703,8 @@ function StreamCell({
   onMove,
   onRemove,
   onVolume,
+  auth,
+  onAuth,
 }: {
   stream: StreamItem;
   settings: AppSettings;
@@ -611,10 +719,14 @@ function StreamCell({
   onMove: (index: number, delta: number) => void;
   onRemove: (id: string) => void;
   onVolume: (stream: StreamItem, volume: number) => void;
+  auth: AuthState;
+  onAuth: (auth: AuthState) => void;
 }) {
   const info = platformInfo(stream.platform);
   const [commentOpen, setCommentOpen] = useState(false);
   const [commentText, setCommentText] = useState('');
+  const [commentStatus, setCommentStatus] = useState('');
+  const webCommentRef = useRef<((text: string) => void) | null>(null);
   const reorderResponder = useMemo(
     () =>
       PanResponder.create({
@@ -635,9 +747,25 @@ function StreamCell({
     if (!text) {
       return;
     }
-    setCommentText('');
-    setCommentOpen(false);
-  }, [commentText]);
+    setCommentStatus('送信中');
+    postStreamComment(auth, stream, text)
+      .then(nextAuth => {
+        onAuth(nextAuth);
+        setCommentText('');
+        setCommentStatus('送信しました');
+        setTimeout(() => setCommentOpen(false), 450);
+      })
+      .catch(error => {
+        if (webCommentRef.current) {
+          webCommentRef.current(text);
+          setCommentText('');
+          setCommentStatus('Webチャットへ送信しました');
+          setTimeout(() => setCommentOpen(false), 450);
+          return;
+        }
+        setCommentStatus(error instanceof Error ? error.message : String(error));
+      });
+  }, [auth, commentText, onAuth, stream]);
 
   return (
     <View style={styles.streamCell}>
@@ -650,6 +778,9 @@ function StreamCell({
           muted={muted || volume <= 0}
           volume={volume}
           reloadKey={reloadKey}
+          onWebCommentBridge={send => {
+            webCommentRef.current = send;
+          }}
         />
         <View style={styles.playerChrome} pointerEvents="box-none">
           <View style={styles.cellTopControls} pointerEvents="box-none">
@@ -684,6 +815,7 @@ function StreamCell({
               <TouchableOpacity style={styles.commentSend} onPress={submitComment}>
                 <Text style={styles.commentSendText}>送信</Text>
               </TouchableOpacity>
+              {!!commentStatus && <Text style={styles.commentStatus} numberOfLines={1}>{commentStatus}</Text>}
             </View>
           )}
         </View>
@@ -700,6 +832,7 @@ function StreamPlayer({
   muted,
   volume,
   reloadKey,
+  onWebCommentBridge,
 }: {
   stream: StreamItem;
   settings: AppSettings;
@@ -708,6 +841,7 @@ function StreamPlayer({
   muted: boolean;
   volume: number;
   reloadKey: number;
+  onWebCommentBridge?: (send: ((text: string) => void) | null) => void;
 }) {
   const [source, setSource] = useState<PlaybackSource | null>(null);
   const [, setPlayerStatus] = useState('待機中');
@@ -740,6 +874,18 @@ function StreamPlayer({
       cancelled = true;
     };
   }, [stream, settings, streamCount, reloadKey]);
+
+  useEffect(() => {
+    if (!onWebCommentBridge) {
+      return;
+    }
+    if (!source || (source.kind !== 'web' && source.kind !== 'youtube-iframe')) {
+      onWebCommentBridge(null);
+      return;
+    }
+    onWebCommentBridge(text => injectWebComment(webRef.current, text));
+    return () => onWebCommentBridge(null);
+  }, [onWebCommentBridge, source, stream.platform]);
 
   useEffect(() => {
     if (!source || source.kind === 'native') {
@@ -822,7 +968,7 @@ function StreamPlayer({
           key={`${url}:${reloadKey}`}
           ref={webRef}
           source={{uri: url}}
-          userAgent={stream.platform === 'youtube' ? desktopUserAgent : mobileUserAgent}
+          userAgent={mobileUserAgent}
           javaScriptEnabled
           domStorageEnabled
           sharedCookiesEnabled
@@ -1155,6 +1301,8 @@ function FocusModal({
   onVolume,
   onClose,
   onRemove,
+  auth,
+  onAuth,
 }: {
   stream: StreamItem | null;
   settings: AppSettings;
@@ -1165,9 +1313,12 @@ function FocusModal({
   onVolume: (stream: StreamItem, volume: number) => void;
   onClose: () => void;
   onRemove: (id: string) => void;
+  auth: AuthState;
+  onAuth: (auth: AuthState) => void;
 }) {
   const chatRef = useRef<WebView>(null);
   const [commentText, setCommentText] = useState('');
+  const [commentStatus, setCommentStatus] = useState('');
   const chat = stream ? chatURL(stream) : null;
 
   useEffect(() => {
@@ -1176,31 +1327,26 @@ function FocusModal({
 
   const sendComment = useCallback(() => {
     const text = commentText.trim();
-    if (!text || !chatRef.current) {
+    if (!text || !stream) {
       return;
     }
-    const escaped = escapeForInjectedString(text);
-    chatRef.current.injectJavaScript(`
-      (function(){
-        var el = document.querySelector('textarea, input[type=text], [contenteditable=true]');
-        if (!el) return false;
-        el.focus();
-        if ('value' in el) {
-          el.value = '${escaped}';
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        } else {
-          el.textContent = '${escaped}';
-          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: '${escaped}' }));
+    setCommentStatus('送信中');
+    postStreamComment(auth, stream, text)
+      .then(nextAuth => {
+        onAuth(nextAuth);
+        setCommentText('');
+        setCommentStatus('送信しました');
+      })
+      .catch(error => {
+        if (!chatRef.current) {
+          setCommentStatus(error instanceof Error ? error.message : String(error));
+          return;
         }
-        var send = document.querySelector('button[aria-label*=Send], button[aria-label*=送信], button[type=submit], [role=button][aria-label*=Send], [role=button][aria-label*=送信]');
-        if (send) send.click();
-        return true;
-      })();
-      true;
-    `);
-    setCommentText('');
-  }, [commentText]);
+        injectWebComment(chatRef.current, text);
+        setCommentText('');
+        setCommentStatus('Webチャットへ送信しました');
+      });
+  }, [auth, commentText, onAuth, stream]);
 
   const removeFocused = useCallback(() => {
     if (!stream) {
@@ -1249,6 +1395,7 @@ function FocusModal({
               <TouchableOpacity style={styles.focusSend} onPress={sendComment}>
                 <Text style={styles.focusSendText}>送信</Text>
               </TouchableOpacity>
+              {!!commentStatus && <Text style={styles.focusStatus} numberOfLines={1}>{commentStatus}</Text>}
             </View>
             <View style={styles.focusPlayer}>
               <StreamPlayer
@@ -1285,6 +1432,72 @@ function escapeForInjectedString(value: string) {
     .replace(/\r?\n/g, ' ');
 }
 
+function injectWebComment(webView: WebView | null, text: string) {
+  if (!webView) {
+    return;
+  }
+  const escaped = escapeForInjectedString(text);
+  webView.injectJavaScript(`
+    (function(){
+      var text = '${escaped}';
+      var inputSelectors = [
+        'textarea[name=comment]',
+        'textarea',
+        'input[type=text]',
+        '[contenteditable=true]',
+        '#input #input',
+        'yt-live-chat-text-input-field-renderer #input',
+        '[data-testid*=chat][contenteditable=true]',
+        '[data-testid*=message][contenteditable=true]',
+        '.ProseMirror'
+      ];
+      var input = null;
+      for (var i = 0; i < inputSelectors.length && !input; i++) {
+        input = document.querySelector(inputSelectors[i]);
+      }
+      if (!input) return false;
+      input.focus();
+      if ('value' in input) {
+        input.value = text;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      } else {
+        input.textContent = text;
+        try {
+          input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+        } catch (e) {
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      }
+      var buttonSelectors = [
+        'yt-live-chat-message-input-renderer #send-button button',
+        '#send-button button',
+        'button[aria-label*=Send]',
+        'button[aria-label*=送信]',
+        'button[type=submit]',
+        '[role=button][aria-label*=Send]',
+        '[role=button][aria-label*=送信]',
+        '[data-testid*=send]',
+        '[data-testid*=Send]',
+        '.comment-post button',
+        '.CommentPost button'
+      ];
+      var send = null;
+      for (var j = 0; j < buttonSelectors.length && !send; j++) {
+        send = document.querySelector(buttonSelectors[j]);
+      }
+      if (send) {
+        send.click();
+      } else {
+        input.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', bubbles: true, cancelable: true}));
+        input.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', code: 'Enter', bubbles: true, cancelable: true}));
+      }
+      return true;
+    })();
+    true;
+  `);
+}
+
 function SettingsScreen({
   streams,
   settings,
@@ -1292,6 +1505,10 @@ function SettingsScreen({
   onImport,
   onMovePlatform,
   onClear,
+  auth,
+  onAuth,
+  onLogin,
+  onNiconicoLogin,
 }: {
   streams: StreamItem[];
   settings: AppSettings;
@@ -1299,6 +1516,10 @@ function SettingsScreen({
   onImport: (streams: StreamItem[], settings: Partial<AppSettings>) => void;
   onMovePlatform: (index: number, delta: number) => void;
   onClear: () => void;
+  auth: AuthState;
+  onAuth: (auth: AuthState) => void;
+  onLogin: (service: OAuthService) => void;
+  onNiconicoLogin: () => void;
 }) {
   const [handoff, setHandoff] = useState('');
   const order = orderedPlatforms(settings.platformOrder);
@@ -1382,6 +1603,13 @@ function SettingsScreen({
       <Text style={styles.sectionTitle}>Web</Text>
       <SettingSwitch title="Web広告ブロック" value={settings.blockWebAds} onValueChange={value => onSettings({blockWebAds: value})} />
 
+      <Text style={styles.sectionTitle}>認証・コメント送信</Text>
+      <AuthServicePanel service="kick" auth={auth} onAuth={onAuth} onLogin={onLogin} />
+      <AuthServicePanel service="twitch" auth={auth} onAuth={onAuth} onLogin={onLogin} />
+      <AuthServicePanel service="twitcasting" auth={auth} onAuth={onAuth} onLogin={onLogin} />
+      <AuthServicePanel service="youtube" auth={auth} onAuth={onAuth} onLogin={onLogin} />
+      <NiconicoLoginPanel onLogin={onNiconicoLogin} />
+
       <Text style={styles.sectionTitle}>引き継ぎ</Text>
       <Text style={styles.settingNote}>iOS互換の短いコードとURLも含めて出力します。</Text>
       <TextInput value={exportText} editable={false} multiline style={[styles.textArea, styles.readOnly]} />
@@ -1416,6 +1644,118 @@ function SettingSwitch({title, value, onValueChange}: {title: string; value: boo
       <Text style={styles.settingTitle}>{title}</Text>
       <Switch value={value} onValueChange={onValueChange} />
     </View>
+  );
+}
+
+function AuthServicePanel({
+  service,
+  auth,
+  onAuth,
+  onLogin,
+}: {
+  service: OAuthService;
+  auth: AuthState;
+  onAuth: (auth: AuthState) => void;
+  onLogin: (service: OAuthService) => void;
+}) {
+  const state = auth[service];
+  const label = serviceLabel(service);
+  const setConfig = (patch: Partial<typeof state.config>) => onAuth(updateAuthConfig(auth, service, patch));
+  const logout = () => onAuth(signOut(auth, service));
+  const redirectHelp = service === 'youtube'
+    ? 'YouTubeはbot判定を避けるため埋め込みWebViewではなく外部ブラウザのDevice Code認証を使います。Client IDはDevice/TVまたはInstalled app向けを使ってください。'
+    : 'Redirect URIは開発者ポータルに登録した値と完全一致させてください。';
+  return (
+    <View style={styles.authPanel}>
+      <View style={styles.authHeader}>
+        <View>
+          <Text style={styles.authTitle}>{label}</Text>
+          <Text style={styles.authStatus}>{authStatus(auth, service)}</Text>
+        </View>
+        <TouchableOpacity
+          style={[styles.smallButton, state.token && styles.dangerButton]}
+          onPress={() => (state.token ? logout() : onLogin(service))}>
+          <Text style={styles.smallButtonText}>{state.token ? 'ログアウト' : 'ログイン'}</Text>
+        </TouchableOpacity>
+      </View>
+      <TextInput
+        value={state.config.clientId}
+        onChangeText={value => setConfig({clientId: value})}
+        autoCapitalize="none"
+        autoCorrect={false}
+        placeholder={`${label} Client ID`}
+        placeholderTextColor="#7d8794"
+        style={styles.authInput}
+      />
+      {service === 'kick' && (
+        <TextInput
+          value={state.config.clientSecret ?? ''}
+          onChangeText={value => setConfig({clientSecret: value})}
+          autoCapitalize="none"
+          autoCorrect={false}
+          secureTextEntry
+          placeholder="Kick Client Secret (任意)"
+          placeholderTextColor="#7d8794"
+          style={styles.authInput}
+        />
+      )}
+      {service !== 'youtube' && (
+        <TextInput
+          value={state.config.redirectURI}
+          onChangeText={value => setConfig({redirectURI: value})}
+          autoCapitalize="none"
+          autoCorrect={false}
+          placeholder="Redirect URI"
+          placeholderTextColor="#7d8794"
+          style={styles.authInput}
+        />
+      )}
+      <Text style={styles.settingNote}>{redirectHelp}</Text>
+    </View>
+  );
+}
+
+function NiconicoLoginPanel({onLogin}: {onLogin: () => void}) {
+  return (
+    <View style={styles.authPanel}>
+      <View style={styles.authHeader}>
+        <View>
+          <Text style={styles.authTitle}>ニコ生</Text>
+          <Text style={styles.authStatus}>WebログインCookieを利用</Text>
+        </View>
+        <TouchableOpacity style={styles.smallButton} onPress={onLogin}>
+          <Text style={styles.smallButtonText}>ログイン</Text>
+        </TouchableOpacity>
+      </View>
+      <Text style={styles.settingNote}>
+        ニコ生は公開OAuthがないため、iOSと同じくアプリ内WebViewでログインしてCookieをプレイヤーとコメント送信に共有します。
+      </Text>
+    </View>
+  );
+}
+
+function NiconicoLoginModal({visible, onClose}: {visible: boolean; onClose: () => void}) {
+  return (
+    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
+      <SafeAreaView style={styles.modal}>
+        <View style={styles.loginHeader}>
+          <Text style={styles.loginTitle}>ニコ生ログイン</Text>
+          <TouchableOpacity style={styles.smallButton} onPress={onClose}>
+            <Text style={styles.smallButtonText}>完了</Text>
+          </TouchableOpacity>
+        </View>
+        <WebView
+          source={{uri: 'https://account.nicovideo.jp/login?site=niconico&next_url=%2F'}}
+          userAgent={mobileUserAgent}
+          javaScriptEnabled
+          domStorageEnabled
+          sharedCookiesEnabled
+          thirdPartyCookiesEnabled
+          setSupportMultipleWindows={false}
+          style={styles.loginWeb}
+        />
+      </SafeAreaView>
+    </Modal>
   );
 }
 
@@ -1529,31 +1869,7 @@ const styles = StyleSheet.create({
   app: {
     flex: 1,
     backgroundColor: '#05070a',
-    paddingTop: (StatusBar.currentHeight ?? 0) + 24,
-  },
-  header: {
-    minHeight: 62,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: '#18202b',
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  title: {
-    color: '#f7f9fc',
-    fontSize: 22,
-    fontWeight: '700',
-  },
-  subtitle: {
-    color: '#8c98a8',
-    fontSize: 12,
-    marginTop: 2,
-  },
-  counter: {
-    color: '#a9b5c6',
-    fontSize: 12,
+    paddingTop: (StatusBar.currentHeight ?? 0) + 4,
   },
   content: {
     flex: 1,
@@ -1589,9 +1905,16 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   sourceTabs: {
-    maxHeight: 48,
+    minHeight: 52,
+    maxHeight: 52,
+    borderTopWidth: 1,
+    borderTopColor: '#18202b',
+    backgroundColor: '#090d12',
+  },
+  sourceTabsContent: {
     paddingHorizontal: 10,
     paddingVertical: 8,
+    alignItems: 'center',
   },
   pill: {
     height: 32,
@@ -1620,7 +1943,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#000',
   },
   viewToolbar: {
-    minHeight: 50,
+    minHeight: 44,
     paddingHorizontal: 14,
     flexDirection: 'row',
     alignItems: 'center',
@@ -1672,11 +1995,6 @@ const styles = StyleSheet.create({
     color: '#dce6f3',
     fontSize: 12,
     fontWeight: '800',
-  },
-  layoutSwitch: {
-    minHeight: 42,
-    paddingHorizontal: 10,
-    flexDirection: 'row',
   },
   empty: {
     flex: 1,
@@ -1929,6 +2247,19 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '800',
   },
+  commentStatus: {
+    position: 'absolute',
+    left: 10,
+    right: 58,
+    bottom: 42,
+    minHeight: 20,
+    paddingHorizontal: 7,
+    borderRadius: 6,
+    backgroundColor: 'rgba(0,0,0,0.72)',
+    color: '#dce6f3',
+    fontSize: 10,
+    fontWeight: '700',
+  },
   smallButton: {
     minWidth: 54,
     height: 30,
@@ -2058,6 +2389,15 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
   },
+  focusStatus: {
+    position: 'absolute',
+    left: 12,
+    right: 70,
+    top: -22,
+    color: '#dce6f3',
+    fontSize: 11,
+    fontWeight: '700',
+  },
   focusInput: {
     flex: 1,
     height: 40,
@@ -2131,6 +2471,57 @@ const styles = StyleSheet.create({
     color: '#8c98a8',
     fontSize: 12,
     lineHeight: 17,
+  },
+  authPanel: {
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#18202b',
+  },
+  authHeader: {
+    minHeight: 36,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  authTitle: {
+    color: '#edf3fb',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  authStatus: {
+    marginTop: 2,
+    color: '#8c98a8',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  authInput: {
+    minHeight: 42,
+    marginTop: 8,
+    paddingHorizontal: 10,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: '#263241',
+    backgroundColor: '#101720',
+    color: '#f7f9fc',
+    fontSize: 13,
+  },
+  loginHeader: {
+    minHeight: 52,
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderBottomWidth: 1,
+    borderBottomColor: '#18202b',
+  },
+  loginTitle: {
+    color: '#edf3fb',
+    fontSize: 17,
+    fontWeight: '800',
+  },
+  loginWeb: {
+    flex: 1,
+    backgroundColor: '#05070a',
   },
   segment: {
     flexDirection: 'row',
