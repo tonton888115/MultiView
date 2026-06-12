@@ -492,7 +492,10 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
     }
   }
 
-  var isSignedIn: Bool { OAuthKeychain.load(account: tokenAccount)?.isValid == true }
+  var isSignedIn: Bool {
+    guard let token = OAuthKeychain.load(account: tokenAccount) else { return false }
+    return token.isValid || token.refreshToken?.isEmpty == false
+  }
 
   func signOut() {
     OAuthKeychain.save(nil, account: tokenAccount)
@@ -798,11 +801,12 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
         return
       }
       let expiresIn = json["expires_in"] as? Double ?? 3600
+      let existingRefreshToken = OAuthKeychain.load(account: self.tokenAccount)?.refreshToken
       OAuthKeychain.save(SimpleOAuthToken(
         accessToken: accessToken,
         expiresAt: Date().timeIntervalSince1970 + max(60, expiresIn - 60),
         userID: nil,
-        refreshToken: json["refresh_token"] as? String
+        refreshToken: (json["refresh_token"] as? String) ?? existingRefreshToken
       ), account: self.tokenAccount)
       Self.finish(completion, .success(()))
     }.resume()

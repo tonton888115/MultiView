@@ -5,6 +5,11 @@ import CryptoKit
 
 // Per-cell YouTube playback first tries native HLS via InnerTube, then falls back
 // to the official iframe.
+private enum YouTubeChatMode {
+  case innerTube
+  case dataAPI
+}
+
 final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, WKScriptMessageHandler {
   private static let instances = NSHashTable<YouTubeNativePlayerView>.weakObjects()
   private let stream: StreamItem
@@ -18,12 +23,21 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var sponsorTask: URLSessionDataTask?
   private var chatPollWorkItem: DispatchWorkItem?
   private var itemStatusObservation: NSKeyValueObservation?
+  private var itemFailedObserver: NSObjectProtocol?
+  private var itemStalledObserver: NSObjectProtocol?
+  private var liveCatchUpTimer: Timer?
   private var timeObserver: Any?
   private var sponsorSegments: [(start: Double, end: Double)] = []
   private var fallbackWebView: WKWebView?
   private var isStopped = false
   private var iframeAudioEnabled = false
+  private var currentNativeVideoID: String?
+  private var currentNativeIsLive = false
   private var innerTubeChatSession: YouTubeInnerTubeChatSession?
+  private var dataAPILiveChatID: String?
+  private var dataAPIPageToken: String?
+  private var liveChatVideoID: String?
+  private var chatMode: YouTubeChatMode = .innerTube
   private var seenLiveChatMessageIDs = Set<String>()
   // YouTube live chat is polled (batches arrive every few seconds). Queue them and
   // drip one at a time so a batch doesn't stampede the screen all at once.
@@ -32,6 +46,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var lastChatPollInterval: TimeInterval = 5
   private var laneCursor = 0
   private var extractionFailures: [String] = []
+  private lazy var stallWatchdog = StallWatchdog(player: player, threshold: 8, cooldown: 10) { [weak self] in
+    self?.recoverNativePlaybackFromStall()
+  }
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -45,7 +62,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
-    player.automaticallyWaitsToMinimizeStalling = false
+    // YouTube HLS is more sensitive to live-edge starvation than Kick/Twitch IVS.
+    // Keep AVPlayer's own rebuffering enabled and stay a few seconds behind live.
+    player.automaticallyWaitsToMinimizeStalling = true
     layer.addSublayer(playerLayer)
 
     danmakuView.isUserInteractionEnabled = false
@@ -163,15 +182,24 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     guard settings.showChat else { return }
     chatPollWorkItem?.cancel(); chatPollWorkItem = nil
     innerTubeChatSession = nil
+    dataAPILiveChatID = nil
+    dataAPIPageToken = nil
+    liveChatVideoID = videoId
+    chatMode = .innerTube
     seenLiveChatMessageIDs.removeAll()
     pendingChatMessages.removeAll()
     chatDripWorkItem?.cancel(); chatDripWorkItem = nil
+    createInnerTubeLiveChatSession(videoId: videoId)
+  }
+
+  private func createInnerTubeLiveChatSession(videoId: String) {
     YouTubeInnerTubeChatClient.createSession(videoID: videoId) { [weak self] result in
       guard let self, !self.isStopped else { return }
       switch result {
       case .failure(let error):
-        self.showStatus(error.localizedDescription)
+        self.startOAuthLiveChatFallback(videoId: videoId, reason: error.localizedDescription)
       case .success(let session):
+        self.chatMode = .innerTube
         self.innerTubeChatSession = session
         self.pollLiveChat()
       }
@@ -186,9 +214,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       guard let self, !self.isStopped else { return }
       switch result {
       case .failure(let error):
-        self.showStatus(error.localizedDescription)
-        self.scheduleLiveChatPoll(after: 10)
+        self.innerTubeChatSession = nil
+        self.startOAuthLiveChatFallback(videoId: self.liveChatVideoID ?? self.stream.channel, reason: error.localizedDescription)
       case .success(let page):
+        self.hideStatusIfPlaybackReady()
         self.innerTubeChatSession?.continuation = page.nextPageToken ?? session.continuation
         let delay = max(2.0, Double(page.pollingIntervalMillis) / 1000.0)
         self.lastChatPollInterval = delay
@@ -201,10 +230,80 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private func scheduleLiveChatPoll(after delay: TimeInterval) {
     chatPollWorkItem?.cancel()
     let work = DispatchWorkItem { [weak self] in
-      self?.pollLiveChat()
+      self?.pollCurrentLiveChat()
     }
     chatPollWorkItem = work
     DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+  }
+
+  private func pollCurrentLiveChat() {
+    switch chatMode {
+    case .innerTube:
+      pollLiveChat()
+    case .dataAPI:
+      pollDataAPILiveChat()
+    }
+  }
+
+  private func startOAuthLiveChatFallback(videoId: String, reason: String) {
+    guard !isStopped else { return }
+    guard YouTubeAuthManager.shared.isSignedIn else {
+      showStatus(reason)
+      scheduleInnerTubeSessionRefresh(videoId: videoId, after: 8)
+      return
+    }
+    showStatus("YouTubeコメントをOAuth経由に切替中")
+    chatMode = .dataAPI
+    chatPollWorkItem?.cancel(); chatPollWorkItem = nil
+    YouTubeAuthManager.shared.resolveLiveChat(videoID: videoId) { [weak self] result in
+      guard let self, !self.isStopped else { return }
+      switch result {
+      case .failure(let error):
+        self.showStatus(error.localizedDescription)
+        self.scheduleInnerTubeSessionRefresh(videoId: videoId, after: 8)
+      case .success(let resolved):
+        self.dataAPILiveChatID = resolved.liveChatID
+        self.dataAPIPageToken = nil
+        self.pollDataAPILiveChat()
+        self.scheduleInnerTubeSessionRefresh(videoId: videoId, after: 45)
+      }
+    }
+  }
+
+  private func pollDataAPILiveChat() {
+    guard settings.showChat,
+          !isStopped,
+          let liveChatID = dataAPILiveChatID else { return }
+    YouTubeAuthManager.shared.fetchLiveChatMessagesRefreshing(liveChatID: liveChatID, pageToken: dataAPIPageToken) { [weak self] result in
+      guard let self, !self.isStopped else { return }
+      switch result {
+      case .failure(let error):
+        self.showStatus(error.localizedDescription)
+        self.scheduleLiveChatPoll(after: 10)
+      case .success(let page):
+        self.hideStatusIfPlaybackReady()
+        self.dataAPIPageToken = page.nextPageToken ?? self.dataAPIPageToken
+        let delay = max(2.0, Double(page.pollingIntervalMillis) / 1000.0)
+        self.lastChatPollInterval = delay
+        self.emitLiveChatMessages(page.messages)
+        self.scheduleLiveChatPoll(after: delay)
+      }
+    }
+  }
+
+  private func scheduleInnerTubeSessionRefresh(videoId: String, after delay: TimeInterval) {
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, !self.isStopped else { return }
+      self.innerTubeChatSession = nil
+      self.createInnerTubeLiveChatSession(videoId: videoId)
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+  }
+
+  private func hideStatusIfPlaybackReady() {
+    if player.currentItem != nil || fallbackWebView != nil {
+      statusLabel.isHidden = true
+    }
   }
 
   private func emitLiveChatMessages(_ messages: [YouTubeLiveChatMessage]) {
@@ -292,6 +391,17 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     chatPollWorkItem?.cancel(); chatPollWorkItem = nil
     chatDripWorkItem?.cancel(); chatDripWorkItem = nil
     pendingChatMessages.removeAll()
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = nil
+    stallWatchdog.stop()
+    if let itemFailedObserver {
+      NotificationCenter.default.removeObserver(itemFailedObserver)
+      self.itemFailedObserver = nil
+    }
+    if let itemStalledObserver {
+      NotificationCenter.default.removeObserver(itemStalledObserver)
+      self.itemStalledObserver = nil
+    }
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
@@ -517,6 +627,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private func startPlayback(url: URL, videoId: String, isLive: Bool) {
     guard !isStopped else { return }
     statusLabel.isHidden = true
+    currentNativeVideoID = videoId
+    currentNativeIsLive = isLive
     let asset = AVURLAsset(url: url, options: [
       "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": Self.userAgent],
       // Live HLS never needs a precise duration; skip that analysis to trim startup.
@@ -524,9 +636,12 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     ])
     let item = AVPlayerItem(asset: asset)
     item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+    item.preferredPeakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: settings)
+    item.preferredForwardBufferDuration = isLive ? 6 : 3
     if isLive {
-      // LL-HLS配信なら効く(通常HLSはno-op)。ライブエッジ2秒を狙う(再詰め)。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 1.5, preferredTimescale: 600)
+      // YouTubeはライブ端を詰めすぎるとプレイリスト更新/広告境界で途切れやすい。
+      // 低遅延より安定を優先し、数秒後ろに置く。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 6, preferredTimescale: 600)
       item.automaticallyPreservesTimeOffsetFromLive = true
     }
     itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -534,8 +649,35 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       if item.status == .failed {
         DispatchQueue.main.async { self.installEmbedFallback(videoId: videoId) }
       } else if item.status == .readyToPlay {
-        DispatchQueue.main.async { self.resumePlayback() }
+        DispatchQueue.main.async {
+          self.resumePlayback()
+          self.stallWatchdog.start()
+          if isLive {
+            self.startLiveCatchUp()
+          }
+        }
       }
+    }
+    if let itemFailedObserver {
+      NotificationCenter.default.removeObserver(itemFailedObserver)
+    }
+    itemFailedObserver = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemFailedToPlayToEndTime,
+      object: item,
+      queue: .main
+    ) { [weak self] _ in
+      guard let self, !self.isStopped else { return }
+      self.installEmbedFallback(videoId: videoId)
+    }
+    if let itemStalledObserver {
+      NotificationCenter.default.removeObserver(itemStalledObserver)
+    }
+    itemStalledObserver = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemPlaybackStalled,
+      object: item,
+      queue: .main
+    ) { [weak self] _ in
+      self?.recoverNativePlaybackFromStall()
     }
     player.replaceCurrentItem(with: item)
     resumePlayback()
@@ -566,6 +708,41 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
+  private func startLiveCatchUp() {
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+      self?.catchUpToStableLiveOffset()
+    }
+  }
+
+  private func catchUpToStableLiveOffset() {
+    LiveEdgeCatchUp.seekIfNeeded(
+      player: player,
+      isStopped: isStopped,
+      fallbackActive: fallbackWebView != nil,
+      behindThreshold: 30,
+      targetOffset: 8,
+      toleranceBefore: 2
+    )
+  }
+
+  private func recoverNativePlaybackFromStall() {
+    guard !isStopped, fallbackWebView == nil, let item = player.currentItem else { return }
+    if currentNativeIsLive,
+       let liveRange = item.seekableTimeRanges.last?.timeRangeValue,
+       liveRange.duration.isNumeric {
+      let liveEdge = CMTimeAdd(liveRange.start, liveRange.duration)
+      let target = CMTimeSubtract(liveEdge, CMTime(seconds: 6, preferredTimescale: 600))
+      item.seek(to: target,
+                toleranceBefore: CMTime(seconds: 2, preferredTimescale: 600),
+                toleranceAfter: .zero) { [weak self] _ in
+        self?.resumePlayback()
+      }
+      return
+    }
+    resumePlayback()
+  }
+
   // YouTube often returns SABR-only/no direct URL. Extra extractor chains were
   // removed because they only added black-screen delay; fail fast to iframe.
   private func installEmbedFallback(videoId: String) {
@@ -594,6 +771,17 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   //    watch ページに遷移せず error メッセージを overlay 表示する。
   private func installAlternativeWebFallback(videoId: String) {
     guard !isStopped, fallbackWebView == nil else { return }
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = nil
+    stallWatchdog.stop()
+    if let itemFailedObserver {
+      NotificationCenter.default.removeObserver(itemFailedObserver)
+      self.itemFailedObserver = nil
+    }
+    if let itemStalledObserver {
+      NotificationCenter.default.removeObserver(itemStalledObserver)
+      self.itemStalledObserver = nil
+    }
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
@@ -771,7 +959,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     <button id="audio">音声をオン</button>
     <script src="https://www.youtube.com/iframe_api"></script>
     <script>
-      var player=null, READY=false, AUDIO=false, VOL=0, sb=[], hasPlayedOnce=false, userGesture=false;
+      var player=null, READY=false, AUDIO=false, VOL=0, sb=[], hasPlayedOnce=false, userGesture=false, WANT_PLAY=true, lastPlayingAt=0;
       // iOS autoplay policy: muted の playVideo() は許可されるが、
       // user gesture (touchstart) なしの unMute() は autoplay 違反として
       // 直後に video を pause させる。userGesture フラグで gesture 前は
@@ -779,7 +967,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       function apply(){
         if(!player||!READY)return;
         try{
-          player.playVideo();
+          if(WANT_PLAY) player.playVideo();
           if(AUDIO && userGesture){player.unMute();player.setVolume(VOL);}
           else{player.mute();}
         }catch(e){}
@@ -842,12 +1030,12 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           events:{
             onReady:function(){READY=true;apply();loadSB();},
             onStateChange:function(e){
-              if(e.data===YT.PlayerState.PLAYING){hasPlayedOnce=true;return;}
+              if(e.data===YT.PlayerState.PLAYING){hasPlayedOnce=true;lastPlayingAt=Date.now();return;}
               // 初回再生 (本編) に到達する前の UNSTARTED/CUED/PAUSED で固まる
               // (典型: 広告→本編 遷移で iframe が PAUSED に張り付く) ケースを
-              // aggressive に retry。一度 PLAYING に入ったら以降は user pause
-              // も尊重するため触らない。
-              if(!hasPlayedOnce && (
+              // aggressive に retry。初回再生後も広告境界/回線揺れで PAUSED/CUED に
+              // 張り付くことがあるので、アプリ側が WANT_PLAY の間だけ復帰させる。
+              if(WANT_PLAY && (!hasPlayedOnce || Date.now()-lastPlayingAt>3500) && (
                 e.data===YT.PlayerState.UNSTARTED||
                 e.data===YT.PlayerState.CUED||
                 e.data===YT.PlayerState.PAUSED
@@ -859,13 +1047,24 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           }
         });
       };
-      window.mvPlay=function(){apply();};
-      window.mvPause=function(){try{player&&player.pauseVideo();}catch(e){}};
+      window.mvPlay=function(){WANT_PLAY=true;apply();};
+      window.mvPause=function(){WANT_PLAY=false;try{player&&player.pauseVideo();}catch(e){}};
       window.mvSetVolume=function(v){
         var n=Math.max(0,Math.min(1,+v||0));
         VOL=Math.round(n*100); AUDIO=VOL>0;
         apply();
       };
+      setInterval(function(){
+        if(!player||!READY||!WANT_PLAY)return;
+        try{
+          var s=player.getPlayerState();
+          if(s!==YT.PlayerState.PLAYING && s!==YT.PlayerState.BUFFERING){
+            player.playVideo();
+          }else if(s===YT.PlayerState.PLAYING){
+            lastPlayingAt=Date.now();
+          }
+        }catch(e){}
+      },1800);
       setInterval(sbTick, 400);
     </script>
     </body>
@@ -1134,9 +1333,9 @@ private enum YouTubeInnerTubeChatClient {
       }
       let live = (((json["continuationContents"] as? [String: Any])?["liveChatContinuation"]) as? [String: Any]) ?? [:]
       let actions = live["actions"] as? [Any] ?? []
-      let messages = actions.flatMap(messagesFromAction)
+      let messages = actions.isEmpty ? messagesFromAction(json) : actions.flatMap(messagesFromAction)
       let continuations = live["continuations"] as? [Any]
-      let next = continuation(from: continuations)
+      let next = continuation(from: continuations) ?? findLiveChatContinuation(in: json)
       let timeout = max(700, timeoutMillis(from: continuations) ?? 3000)
       finish(completion, .success(YouTubeLiveChatPage(messages: messages, nextPageToken: next, pollingIntervalMillis: timeout)))
     }.resume()
