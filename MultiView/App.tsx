@@ -260,8 +260,17 @@ export default function App() {
   const [niconicoLoginOpen, setNiconicoLoginOpen] = useState(false);
   const authRef = useRef(auth);
   const pendingOAuthRef = useRef(pendingOAuth);
+  const pendingHandoffURLRef = useRef<string | null>(null);
   authRef.current = auth;
   pendingOAuthRef.current = pendingOAuth;
+
+  const applyHandoffURL = useCallback((url: string) => {
+    const decoded = decodeHandoff(url);
+    const nextStreams = decoded.streams.map(stream => makeStream(stream.platform, stream.channel));
+    setStreams(nextStreams);
+    setSettings(current => ({...current, ...decoded.settings}));
+    setActiveTab('viewing');
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -329,7 +338,32 @@ export default function App() {
   }, [auth, hydrated]);
 
   useEffect(() => {
+    if (!hydrated || !pendingHandoffURLRef.current) {
+      return;
+    }
+    const url = pendingHandoffURLRef.current;
+    pendingHandoffURLRef.current = null;
+    try {
+      applyHandoffURL(url);
+    } catch {
+      Alert.alert('読み込み失敗', '引き継ぎURLを読み込めませんでした。');
+    }
+  }, [applyHandoffURL, hydrated]);
+
+  useEffect(() => {
     const handleURL = ({url}: {url: string}) => {
+      if (url.startsWith('multiview://handoff')) {
+        if (!hydrated) {
+          pendingHandoffURLRef.current = url;
+          return;
+        }
+        try {
+          applyHandoffURL(url);
+        } catch {
+          Alert.alert('読み込み失敗', '引き継ぎURLを読み込めませんでした。');
+        }
+        return;
+      }
       const pending = pendingOAuthRef.current;
       if (!pending || !url.startsWith('multiview://')) {
         return;
@@ -352,7 +386,7 @@ export default function App() {
       }
     }).catch(() => undefined);
     return () => sub.remove();
-  }, []);
+  }, [applyHandoffURL, hydrated]);
 
   const updateAuth = useCallback((next: AuthState) => {
     setAuth(sanitizeAuthState(next));
