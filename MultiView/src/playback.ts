@@ -10,7 +10,6 @@ const mobileSafariUserAgent =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1';
 
 const youtubeIOSVersion = '21.17.3';
-const youtubeIOSStableVersion = '21.13.6';
 const youtubeAndroidVersion = '20.19.35';
 const twitchClientID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
 const twitchAccessTokenHash = '0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712';
@@ -246,18 +245,18 @@ async function resolveYouTube(stream: StreamItem, settings: AppSettings): Promis
       kind: 'youtube-iframe',
       videoId,
       label: 'YouTube iframe',
-      status: '公式エンジン/安定モード',
+      status: '安定モード',
     };
   }
   const direct = await requestYouTubeDirect(videoId);
   if (direct) {
     return {
       kind: 'native',
-      url: direct.url,
-      headers: {'User-Agent': direct.userAgent, Referer: 'https://www.youtube.com/'},
+      url: direct,
+      headers: {'User-Agent': mobileSafariUserAgent, Referer: 'https://www.youtube.com/'},
       liveTargetOffsetMs: settings.youtubeStableBuffer ? 12000 : 8000,
       label: 'YouTube HLS',
-      status: '独自プレイヤー/直HLS',
+      status: settings.youtubeStableBuffer ? '独自プレイヤー/安定バッファ' : '独自プレイヤー',
     };
   }
   return {
@@ -448,20 +447,18 @@ function extractYouTubeVideoID(html: string): string | null {
   return null;
 }
 
-type YouTubePlayableStream = {
+type YouTubeDirectCandidate = {
   url: string;
-  kind: 'hls' | 'progressive';
   isLive: boolean;
-  hasSabr: boolean;
+  isHLS: boolean;
 };
 
-async function requestYouTubeDirect(videoId: string): Promise<{url: string; userAgent: string} | null> {
+async function requestYouTubeDirect(videoId: string): Promise<string | null> {
   const clients = youtubeClients();
-  let fallback: {url: string; userAgent: string} | null = null;
+  let progressiveFallback: string | null = null;
   for (const client of clients) {
     try {
-      const cpn = makeYouTubeCPN();
-      const response = await fetchWithTimeout('https://youtubei.googleapis.com/youtubei/v1/player', {
+      const response = await fetch('https://youtubei.googleapis.com/youtubei/v1/player', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -478,28 +475,26 @@ async function requestYouTubeDirect(videoId: string): Promise<{url: string; user
           playbackContext: {
             contentPlaybackContext: {
               html5Preference: 'HTML5_PREF_WANTS',
-              referer: `https://www.youtube.com/watch?v=${videoId}`,
-              cpn,
             },
           },
         }),
-      }, 12000);
+      });
       if (!response.ok) {
         continue;
       }
       const json = await response.json();
-      const stream = extractPlayableYouTubeStream(json);
+      const stream = extractPlayableYouTubeURL(json);
       if (stream) {
-        if (stream.kind === 'hls' || !stream.isLive) {
-          return {url: stream.url, userAgent: client.userAgent};
+        if (stream.isHLS || !stream.isLive) {
+          return stream.url;
         }
-        fallback = fallback ?? {url: stream.url, userAgent: client.userAgent};
+        progressiveFallback = progressiveFallback ?? stream.url;
       }
     } catch {
       // Try the next InnerTube client.
     }
   }
-  return fallback;
+  return progressiveFallback;
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
@@ -521,16 +516,33 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 }
 
 function youtubeClients() {
-  const currentIosUA = youtubeIOSUserAgent(youtubeIOSVersion);
-  const stableIosUA = youtubeIOSUserAgent(youtubeIOSStableVersion);
+  const iosUA = `com.google.ios.youtube/${youtubeIOSVersion} (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X; ja_JP)`;
   const androidUA = `com.google.android.youtube/${youtubeAndroidVersion} (Linux; U; Android 15) gzip`;
   return [
+    {
+      headerClientName: '5',
+      version: youtubeIOSVersion,
+      userAgent: iosUA,
+      context: {
+        client: {
+          clientName: 'IOS',
+          clientVersion: youtubeIOSVersion,
+          deviceMake: 'Apple',
+          deviceModel: 'iPhone16,2',
+          osName: 'iOS',
+          osVersion: '17.5.1.21F90',
+          hl: 'ja',
+          gl: 'JP',
+          userAgent: iosUA,
+        },
+      },
+    },
     {
       headerClientName: '3',
       version: youtubeAndroidVersion,
       userAgent: androidUA,
       context: {
-        client: withYouTubeClientDefaults({
+        client: {
           clientName: 'ANDROID',
           clientVersion: youtubeAndroidVersion,
           androidSdkVersion: 35,
@@ -538,82 +550,25 @@ function youtubeClients() {
           deviceModel: 'Pixel 9 Pro',
           osName: 'Android',
           osVersion: '15',
+          hl: 'ja',
+          gl: 'JP',
           userAgent: androidUA,
-        }),
-      },
-    },
-    {
-      headerClientName: '5',
-      version: youtubeIOSStableVersion,
-      userAgent: stableIosUA,
-      context: {
-        client: withYouTubeClientDefaults({
-          clientName: 'IOS',
-          clientVersion: youtubeIOSStableVersion,
-          deviceMake: 'Apple',
-          deviceModel: 'iPhone16,2',
-          osName: 'iOS',
-          osVersion: '17.5.1.21F90',
-          userAgent: stableIosUA,
-        }),
-      },
-    },
-    {
-      headerClientName: '5',
-      version: youtubeIOSVersion,
-      userAgent: currentIosUA,
-      context: {
-        client: withYouTubeClientDefaults({
-          clientName: 'IOS',
-          clientVersion: youtubeIOSVersion,
-          deviceMake: 'Apple',
-          deviceModel: 'iPhone16,2',
-          osName: 'iOS',
-          osVersion: '17.5.1.21F90',
-          userAgent: currentIosUA,
-        }),
+        },
       },
     },
   ];
 }
 
-function youtubeIOSUserAgent(version: string): string {
-  return `com.google.ios.youtube/${version} (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X; ja_JP)`;
-}
-
-function withYouTubeClientDefaults<T extends Record<string, unknown>>(client: T): T & Record<string, unknown> {
-  return {
-    ...client,
-    hl: 'ja',
-    gl: 'JP',
-    timeZone: 'Asia/Tokyo',
-    utcOffsetMinutes: 540,
-    screenDensityFloat: 3,
-    screenWidthPoints: 393,
-    screenHeightPoints: 852,
-  };
-}
-
-function makeYouTubeCPN(): string {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
-  let out = '';
-  for (let i = 0; i < 16; i += 1) {
-    out += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return out;
-}
-
-function extractPlayableYouTubeStream(json: any): YouTubePlayableStream | null {
+function extractPlayableYouTubeURL(json: any): YouTubeDirectCandidate | null {
   const streamingData = json?.streamingData;
   if (!streamingData) {
     return null;
   }
   const details = json?.videoDetails;
   const isLive = details?.isLive === true || details?.isLiveContent === true;
-  const hasSabr = Boolean(stringValue(streamingData.serverAbrStreamingUrl));
   const hls = stringValue(streamingData.hlsManifestUrl);
   if (hls) {
-    return {url: hls, kind: 'hls', isLive, hasSabr};
+    return {url: hls, isLive, isHLS: true};
   }
   const formats = [...(streamingData.formats ?? []), ...(streamingData.adaptiveFormats ?? [])];
   const candidates = formats
@@ -633,7 +588,7 @@ function extractPlayableYouTubeStream(json: any): YouTubePlayableStream | null {
     .filter(Boolean) as Array<{url: string; height: number; bitrate: number}>;
   candidates.sort((a, b) => b.height - a.height || b.bitrate - a.bitrate);
   const progressive = candidates[0]?.url;
-  return progressive ? {url: progressive, kind: 'progressive', isLive, hasSabr} : null;
+  return progressive ? {url: progressive, isLive, isHLS: false} : null;
 }
 
 function stringValue(value: unknown): string | null {
@@ -664,11 +619,11 @@ iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000
 <div id="err"></div>
 <script src="https://www.youtube.com/iframe_api"></script>
 <script>
-var player=null,READY=false,AUDIO=false,VOL=0,WANT_PLAY=true,lastPlayingAt=0,sb=[];
+var player=null,READY=false,AUDIO=false,VOL=0,hasPlayedOnce=false,sb=[];
 function apply(){
   if(!player||!READY)return;
   try{
-    if(WANT_PLAY){player.playVideo();}
+    player.playVideo();
     if(AUDIO){player.unMute();player.setVolume(VOL);}else{player.mute();}
   }catch(e){}
 }
@@ -703,8 +658,8 @@ window.onYouTubeIframeAPIReady=function(){
     events:{
       onReady:function(){READY=true;apply();loadSB();},
       onStateChange:function(e){
-        if(e.data===YT.PlayerState.PLAYING){lastPlayingAt=Date.now();return;}
-        if(WANT_PLAY&&(e.data===YT.PlayerState.UNSTARTED||e.data===YT.PlayerState.CUED||e.data===YT.PlayerState.PAUSED||e.data===YT.PlayerState.BUFFERING)){
+        if(e.data===YT.PlayerState.PLAYING){hasPlayedOnce=true;return;}
+        if(!hasPlayedOnce&&(e.data===YT.PlayerState.UNSTARTED||e.data===YT.PlayerState.CUED||e.data===YT.PlayerState.PAUSED)){
           setTimeout(function(){try{e.target.playVideo();}catch(x){}},250);
         }
       },
@@ -712,17 +667,10 @@ window.onYouTubeIframeAPIReady=function(){
     }
   });
 };
-window.mvPlay=function(){WANT_PLAY=true;apply();};
-window.mvPause=function(){WANT_PLAY=false;try{player&&player.pauseVideo();}catch(e){}};
+window.mvPlay=function(){apply();};
+window.mvPause=function(){try{player&&player.pauseVideo();}catch(e){}};
 window.mvSetVolume=function(v){var n=Math.max(0,Math.min(1,+v||0));VOL=Math.round(n*100);AUDIO=VOL>0;apply();};
 setInterval(sbTick,400);
-setInterval(function(){
-  if(!player||!READY||!WANT_PLAY)return;
-  try{
-    var state=player.getPlayerState();
-    if(state!==YT.PlayerState.PLAYING&&Date.now()-lastPlayingAt>2500){player.playVideo();}
-  }catch(e){}
-},1200);
 </script>
 </body>
 </html>`;

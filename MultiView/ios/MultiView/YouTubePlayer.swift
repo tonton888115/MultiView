@@ -10,25 +10,6 @@ private enum YouTubeChatMode {
   case dataAPI
 }
 
-private enum YouTubeNativeStreamKind: Equatable {
-  case hls
-  case progressive
-}
-
-private struct YouTubeNativePlayableStream {
-  let url: URL
-  let isLive: Bool
-  let kind: YouTubeNativeStreamKind
-  let hasSABR: Bool
-}
-
-private struct YouTubeNativeStreamFallback {
-  let url: URL
-  let isLive: Bool
-  let userAgent: String
-  let label: String
-}
-
 final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, WKScriptMessageHandler {
   private static let instances = NSHashTable<YouTubeNativePlayerView>.weakObjects()
   private let stream: StreamItem
@@ -42,16 +23,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var sponsorTask: URLSessionDataTask?
   private var chatPollWorkItem: DispatchWorkItem?
   private var itemStatusObservation: NSKeyValueObservation?
-  private var itemFailedObserver: NSObjectProtocol?
-  private var itemStalledObserver: NSObjectProtocol?
-  private var liveCatchUpTimer: Timer?
   private var timeObserver: Any?
   private var sponsorSegments: [(start: Double, end: Double)] = []
   private var fallbackWebView: WKWebView?
   private var isStopped = false
   private var iframeAudioEnabled = false
-  private var currentNativeVideoID: String?
-  private var currentNativeIsLive = false
   private var innerTubeChatSession: YouTubeInnerTubeChatSession?
   private var dataAPILiveChatID: String?
   private var dataAPIPageToken: String?
@@ -66,9 +42,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var lastChatPollInterval: TimeInterval = 5
   private var laneCursor = 0
   private var extractionFailures: [String] = []
-  private lazy var stallWatchdog = StallWatchdog(player: player, threshold: 8, cooldown: 10) { [weak self] in
-    self?.recoverNativePlaybackFromStall()
-  }
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -82,9 +55,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     playerLayer.player = player
     playerLayer.videoGravity = .resizeAspect
     player.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
-    // YouTube HLS is more sensitive to live-edge starvation than Kick/Twitch IVS.
-    // Keep AVPlayer's own rebuffering enabled and stay a few seconds behind live.
-    player.automaticallyWaitsToMinimizeStalling = true
+    player.automaticallyWaitsToMinimizeStalling = false
     layer.addSublayer(playerLayer)
 
     danmakuView.isUserInteractionEnabled = false
@@ -422,17 +393,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     chatPollWorkItem?.cancel(); chatPollWorkItem = nil
     chatDripWorkItem?.cancel(); chatDripWorkItem = nil
     pendingChatMessages.removeAll()
-    liveCatchUpTimer?.invalidate()
-    liveCatchUpTimer = nil
-    stallWatchdog.stop()
-    if let itemFailedObserver {
-      NotificationCenter.default.removeObserver(itemFailedObserver)
-      self.itemFailedObserver = nil
-    }
-    if let itemStalledObserver {
-      NotificationCenter.default.removeObserver(itemStalledObserver)
-      self.itemStalledObserver = nil
-    }
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
@@ -459,13 +419,13 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     requestNativePlayer(videoId: videoId)
   }
 
-  private func requestNativePlayer(videoId: String, attempt: Int = 0, fallback: YouTubeNativeStreamFallback? = nil) {
+  private func requestNativePlayer(videoId: String, attempt: Int = 0, progressiveFallback: (url: URL, isLive: Bool)? = nil) {
     guard !isStopped, player.currentItem == nil else { return }
     let clients = Self.nativePlayerClients()
     guard clients.indices.contains(attempt) else {
-      if let fallback {
-        noteExtractionFailure("\(fallback.label): HLSなしのためformatで再生")
-        startPlayback(url: fallback.url, videoId: videoId, isLive: fallback.isLive, userAgent: fallback.userAgent)
+      if let progressiveFallback {
+        noteExtractionFailure("HLSなしのためformatで再生")
+        startPlayback(url: progressiveFallback.url, videoId: videoId, isLive: progressiveFallback.isLive)
         return
       }
       noteExtractionFailure("Native player: manifest取得失敗")
@@ -486,7 +446,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     request.setValue(client.headerClientName, forHTTPHeaderField: "X-YouTube-Client-Name")
     request.setValue(client.version, forHTTPHeaderField: "X-YouTube-Client-Version")
     request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
-    let cpn = Self.makeYouTubeCPN()
     request.httpBody = try? JSONSerialization.data(withJSONObject: [
       "context": client.context,
       "videoId": videoId,
@@ -494,9 +453,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       "racyCheckOk": true,
       "playbackContext": [
         "contentPlaybackContext": [
-          "html5Preference": "HTML5_PREF_WANTS",
-          "referer": "https://www.youtube.com/watch?v=\(videoId)",
-          "cpn": cpn
+          "html5Preference": "HTML5_PREF_WANTS"
         ]
       ]
     ])
@@ -515,17 +472,15 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       if let parsed, let stream = Self.extractPlayableStream(from: parsed) {
         DispatchQueue.main.async {
           guard !self.isStopped, self.player.currentItem == nil else { return }
-          if stream.kind == .hls || !stream.isLive {
-            self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive, userAgent: client.userAgent)
+          if stream.isHLS || !stream.isLive {
+            self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive)
           } else {
-            let nextFallback = fallback ?? YouTubeNativeStreamFallback(
-              url: stream.url,
-              isLive: stream.isLive,
-              userAgent: client.userAgent,
-              label: client.label
+            self.noteExtractionFailure("\(client.label): HLSなし / format保留")
+            self.requestNativePlayer(
+              videoId: videoId,
+              attempt: attempt + 1,
+              progressiveFallback: progressiveFallback ?? (url: stream.url, isLive: stream.isLive)
             )
-            self.noteExtractionFailure("\(client.label): HLSなし\(stream.hasSABR ? " / SABRあり" : "")")
-            self.requestNativePlayer(videoId: videoId, attempt: attempt + 1, fallback: nextFallback)
           }
         }
         return
@@ -533,7 +488,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       DispatchQueue.main.async {
         let httpCode = (response as? HTTPURLResponse)?.statusCode
         self.noteExtractionFailure(Self.youtubeIErrorSummary(clientName: client.label, httpCode: httpCode, parsed: parsed, data: data))
-        self.requestNativePlayer(videoId: videoId, attempt: attempt + 1, fallback: fallback)
+        self.requestNativePlayer(videoId: videoId, attempt: attempt + 1, progressiveFallback: progressiveFallback)
       }
     }
     let task = resolveTask
@@ -547,25 +502,42 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       task.cancel()
       self.resolveTask = nil
       self.noteExtractionFailure("\(client.label): 12秒タイムアウト")
-      self.requestNativePlayer(videoId: videoId, attempt: attempt + 1, fallback: fallback)
+      self.requestNativePlayer(videoId: videoId, attempt: attempt + 1, progressiveFallback: progressiveFallback)
     }
   }
 
   private static func nativePlayerClients() -> [(label: String, headerClientName: String, version: String, userAgent: String, context: [String: Any])] {
     let iosVersion = BrowserUserAgent.youtubeIOSVersion
     let iosUA = BrowserUserAgent.youtubeIOS(version: iosVersion)
-    let stableIOSVersion = BrowserUserAgent.youtubeIOSStableVersion
-    let stableIOSUA = BrowserUserAgent.youtubeIOS(version: stableIOSVersion)
     let androidVersion = BrowserUserAgent.youtubeAndroidVersion
     let androidUA = BrowserUserAgent.youtubeAndroid(version: androidVersion)
     return [
+      (
+        label: "IOS",
+        headerClientName: "5",
+        version: iosVersion,
+        userAgent: iosUA,
+        context: [
+          "client": [
+            "clientName": "IOS",
+            "clientVersion": iosVersion,
+            "deviceMake": "Apple",
+            "deviceModel": "iPhone16,2",
+            "osName": "iOS",
+            "osVersion": "17.5.1.21F90",
+            "hl": "ja",
+            "gl": "JP",
+            "userAgent": iosUA
+          ]
+        ]
+      ),
       (
         label: "ANDROID",
         headerClientName: "3",
         version: androidVersion,
         userAgent: androidUA,
         context: [
-          "client": youtubeClientDefaults([
+          "client": [
             "clientName": "ANDROID",
             "clientVersion": androidVersion,
             "androidSdkVersion": 35,
@@ -573,75 +545,25 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
             "deviceModel": "Pixel 9 Pro",
             "osName": "Android",
             "osVersion": "15",
+            "hl": "ja",
+            "gl": "JP",
             "userAgent": androidUA
-          ])
-        ]
-      ),
-      (
-        label: "IOS 21.13.6",
-        headerClientName: "5",
-        version: stableIOSVersion,
-        userAgent: stableIOSUA,
-        context: [
-          "client": youtubeClientDefaults([
-            "clientName": "IOS",
-            "clientVersion": stableIOSVersion,
-            "deviceMake": "Apple",
-            "deviceModel": "iPhone16,2",
-            "osName": "iOS",
-            "osVersion": "17.5.1.21F90",
-            "userAgent": stableIOSUA
-          ])
-        ]
-      ),
-      (
-        label: "IOS 21.17.3",
-        headerClientName: "5",
-        version: iosVersion,
-        userAgent: iosUA,
-        context: [
-          "client": youtubeClientDefaults([
-            "clientName": "IOS",
-            "clientVersion": iosVersion,
-            "deviceMake": "Apple",
-            "deviceModel": "iPhone16,2",
-            "osName": "iOS",
-            "osVersion": "17.5.1.21F90",
-            "userAgent": iosUA
-          ])
+          ]
         ]
       )
     ]
   }
 
-  private static func youtubeClientDefaults(_ client: [String: Any]) -> [String: Any] {
-    var value = client
-    value["hl"] = "ja"
-    value["gl"] = "JP"
-    value["timeZone"] = "Asia/Tokyo"
-    value["utcOffsetMinutes"] = 540
-    value["screenDensityFloat"] = 3
-    value["screenWidthPoints"] = 393
-    value["screenHeightPoints"] = 852
-    return value
-  }
-
-  private static func makeYouTubeCPN() -> String {
-    let chars = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
-    return String((0..<16).compactMap { _ in chars.randomElement() })
-  }
-
-  private static func extractPlayableStream(from parsed: [String: Any]) -> YouTubeNativePlayableStream? {
+  private static func extractPlayableStream(from parsed: [String: Any]) -> (url: URL, isLive: Bool, isHLS: Bool)? {
     guard let sd = parsed["streamingData"] as? [String: Any] else { return nil }
     let details = parsed["videoDetails"] as? [String: Any]
     let isLive = (details?["isLive"] as? Bool) ?? (details?["isLiveContent"] as? Bool) ?? false
-    let hasSABR = sd["serverAbrStreamingUrl"] is String
     if let hls = sd["hlsManifestUrl"] as? String, let url = URL(string: hls) {
-      return YouTubeNativePlayableStream(url: url, isLive: isLive, kind: .hls, hasSABR: hasSABR)
+      return (url, isLive, true)
     }
     let formats = ((sd["formats"] as? [[String: Any]]) ?? []) + ((sd["adaptiveFormats"] as? [[String: Any]]) ?? [])
     if let url = bestFormatURL(formats) {
-      return YouTubeNativePlayableStream(url: url, isLive: isLive, kind: .progressive, hasSABR: hasSABR)
+      return (url, isLive, false)
     }
     return nil
   }
@@ -707,24 +629,19 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     return (sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.2
   }
 
-  private func startPlayback(url: URL, videoId: String, isLive: Bool, userAgent: String) {
+  private func startPlayback(url: URL, videoId: String, isLive: Bool) {
     guard !isStopped else { return }
     statusLabel.isHidden = true
-    currentNativeVideoID = videoId
-    currentNativeIsLive = isLive
     let asset = AVURLAsset(url: url, options: [
-      "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": userAgent],
+      "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": Self.userAgent],
       // Live HLS never needs a precise duration; skip that analysis to trim startup.
       AVURLAssetPreferPreciseDurationAndTimingKey: false
     ])
     let item = AVPlayerItem(asset: asset)
     item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
-    item.preferredPeakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: settings)
-    item.preferredForwardBufferDuration = isLive ? 10 : 3
     if isLive {
-      // YouTubeはライブ端を詰めすぎるとプレイリスト更新/広告境界で途切れやすい。
-      // 低遅延より安定を優先し、数秒後ろに置く。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 12, preferredTimescale: 600)
+      // LL-HLS配信なら効く(通常HLSはno-op)。ライブエッジ2秒を狙う(再詰め)。
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 1.5, preferredTimescale: 600)
       item.automaticallyPreservesTimeOffsetFromLive = true
     }
     itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -732,35 +649,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       if item.status == .failed {
         DispatchQueue.main.async { self.installEmbedFallback(videoId: videoId) }
       } else if item.status == .readyToPlay {
-        DispatchQueue.main.async {
-          self.resumePlayback()
-          self.stallWatchdog.start()
-          if isLive {
-            self.startLiveCatchUp()
-          }
-        }
+        DispatchQueue.main.async { self.resumePlayback() }
       }
-    }
-    if let itemFailedObserver {
-      NotificationCenter.default.removeObserver(itemFailedObserver)
-    }
-    itemFailedObserver = NotificationCenter.default.addObserver(
-      forName: .AVPlayerItemFailedToPlayToEndTime,
-      object: item,
-      queue: .main
-    ) { [weak self] _ in
-      guard let self, !self.isStopped else { return }
-      self.installEmbedFallback(videoId: videoId)
-    }
-    if let itemStalledObserver {
-      NotificationCenter.default.removeObserver(itemStalledObserver)
-    }
-    itemStalledObserver = NotificationCenter.default.addObserver(
-      forName: .AVPlayerItemPlaybackStalled,
-      object: item,
-      queue: .main
-    ) { [weak self] _ in
-      self?.recoverNativePlaybackFromStall()
     }
     player.replaceCurrentItem(with: item)
     resumePlayback()
@@ -776,12 +666,12 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
     // AVPlayer が .failed に遷移せず ready のまま無音で固まるケース (signatureCipher
     // 経由の壊れた URL でよく起きる) に備え、6秒以内に再生開始しなければ iframe へ。
-    DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self, weak item] in
+    DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self, weak item] in
       guard let self, !self.isStopped,
             self.fallbackWebView == nil,
             let item, self.player.currentItem === item,
             self.player.timeControlStatus != .playing else { return }
-      self.noteExtractionFailure("10秒以内に再生されず: iframeへ")
+      self.noteExtractionFailure("6秒以内に再生されず: iframeへ")
       self.installEmbedFallback(videoId: videoId)
     }
     // SponsorBlock only applies to VOD (live has no segments).
@@ -789,41 +679,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       fetchSponsorBlock(videoId: videoId)
       installSponsorSkipObserver()
     }
-  }
-
-  private func startLiveCatchUp() {
-    liveCatchUpTimer?.invalidate()
-    liveCatchUpTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
-      self?.catchUpToStableLiveOffset()
-    }
-  }
-
-  private func catchUpToStableLiveOffset() {
-    LiveEdgeCatchUp.seekIfNeeded(
-      player: player,
-      isStopped: isStopped,
-      fallbackActive: fallbackWebView != nil,
-      behindThreshold: 30,
-      targetOffset: 12,
-      toleranceBefore: 2
-    )
-  }
-
-  private func recoverNativePlaybackFromStall() {
-    guard !isStopped, fallbackWebView == nil, let item = player.currentItem else { return }
-    if currentNativeIsLive,
-       let liveRange = item.seekableTimeRanges.last?.timeRangeValue,
-       liveRange.duration.isNumeric {
-      let liveEdge = CMTimeAdd(liveRange.start, liveRange.duration)
-      let target = CMTimeSubtract(liveEdge, CMTime(seconds: 12, preferredTimescale: 600))
-      item.seek(to: target,
-                toleranceBefore: CMTime(seconds: 2, preferredTimescale: 600),
-                toleranceAfter: .zero) { [weak self] _ in
-        self?.resumePlayback()
-      }
-      return
-    }
-    resumePlayback()
   }
 
   // YouTube often returns SABR-only/no direct URL. Extra extractor chains were
@@ -854,17 +709,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   //    watch ページに遷移せず error メッセージを overlay 表示する。
   private func installAlternativeWebFallback(videoId: String) {
     guard !isStopped, fallbackWebView == nil else { return }
-    liveCatchUpTimer?.invalidate()
-    liveCatchUpTimer = nil
-    stallWatchdog.stop()
-    if let itemFailedObserver {
-      NotificationCenter.default.removeObserver(itemFailedObserver)
-      self.itemFailedObserver = nil
-    }
-    if let itemStalledObserver {
-      NotificationCenter.default.removeObserver(itemStalledObserver)
-      self.itemStalledObserver = nil
-    }
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
