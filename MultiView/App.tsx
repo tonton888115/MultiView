@@ -45,6 +45,7 @@ import {
   mobileUserAgent,
   resolvePlaybackSource,
   webStreamURL,
+  youtubeIframeHTML,
 } from './src/playback';
 import type {AppSettings, PlatformId, PlaybackSource, Source, StreamItem, TabId} from './src/types';
 
@@ -64,10 +65,8 @@ const defaultSettings: AppSettings = {
   playAudio: true,
   autoFollowRaids: false,
   blockWebAds: true,
+  youtubePreferIframe: false,
   youtubeStableBuffer: true,
-  youtubeCookie: '',
-  youtubePoToken: '',
-  youtubeVisitorData: '',
   layoutMode: 'stacked',
   wifiQuality: 'high',
   mobileQuality: 'economy',
@@ -231,9 +230,6 @@ function sanitizeSettings(raw: unknown): AppSettings {
     ...defaultSettings,
     ...source,
     platformOrder: orderedPlatforms(Array.isArray(source.platformOrder) ? source.platformOrder : platformIds),
-    youtubeCookie: typeof source.youtubeCookie === 'string' ? source.youtubeCookie : '',
-    youtubePoToken: typeof source.youtubePoToken === 'string' ? source.youtubePoToken : '',
-    youtubeVisitorData: typeof source.youtubeVisitorData === 'string' ? source.youtubeVisitorData : '',
     layoutMode: source.layoutMode === 'grid' ? 'grid' : source.layoutMode === 'stacked' ? 'stacked' : defaultSettings.layoutMode,
     wifiQuality: source.wifiQuality === 'economy' ? 'economy' : 'high',
     mobileQuality: source.mobileQuality === 'high' ? 'high' : 'economy',
@@ -946,22 +942,10 @@ function StreamPlayer({
 }) {
   const [source, setSource] = useState<PlaybackSource | null>(null);
   const [, setPlayerStatus] = useState('待機中');
-  const [autoRetryKey, setAutoRetryKey] = useState(0);
   const webRef = useRef<WebView>(null);
 
   useEffect(() => {
     let cancelled = false;
-    let retryTimer: ReturnType<typeof setTimeout> | undefined;
-    const scheduleYouTubeRetry = () => {
-      if (stream.platform !== 'youtube') {
-        return;
-      }
-      retryTimer = setTimeout(() => {
-        if (!cancelled) {
-          setAutoRetryKey(value => value + 1);
-        }
-      }, 8000);
-    };
     setSource(null);
     setPlayerStatus('取得中');
     resolvePlaybackSource(stream, settings, streamCount)
@@ -969,40 +953,30 @@ function StreamPlayer({
         if (!cancelled) {
           setSource(next);
           setPlayerStatus(next.status);
-          if (next.kind === 'error' && !next.fallbackUrl) {
-            scheduleYouTubeRetry();
-          }
         }
       })
       .catch(error => {
         if (!cancelled) {
-          const next: PlaybackSource = {
+          setSource({
             kind: 'error',
             label: '取得失敗',
             status: 'エラー',
             reason: error instanceof Error ? error.message : String(error),
-          };
-          if (stream.platform !== 'youtube') {
-            next.fallbackUrl = webStreamURL(stream);
-          }
-          setSource(next);
+            fallbackUrl: webStreamURL(stream),
+          });
           setPlayerStatus('エラー');
-          scheduleYouTubeRetry();
         }
       });
     return () => {
       cancelled = true;
-      if (retryTimer) {
-        clearTimeout(retryTimer);
-      }
     };
-  }, [stream, settings, streamCount, reloadKey, autoRetryKey]);
+  }, [stream, settings, streamCount, reloadKey]);
 
   useEffect(() => {
     if (!onWebCommentBridge) {
       return;
     }
-    if (!source || source.kind !== 'web') {
+    if (!source || (source.kind !== 'web' && source.kind !== 'youtube-iframe')) {
       onWebCommentBridge(null);
       return;
     }
@@ -1057,10 +1031,26 @@ function StreamPlayer({
           onPlayerEvent={event => {
             const payload = event.nativeEvent;
             setPlayerStatus(payload.type === 'error' ? `エラー: ${payload.message}` : payload.message);
-            if (payload.type === 'error' && stream.platform === 'youtube') {
-              setAutoRetryKey(value => value + 1);
-            }
           }}
+        />
+        <DanmakuOverlay stream={stream} settings={settings} />
+      </>
+    );
+  }
+
+  if (source.kind === 'youtube-iframe') {
+    return (
+      <>
+        <WebView
+          key={`${source.videoId}:${reloadKey}`}
+          ref={webRef}
+          source={{html: youtubeIframeHTML(source.videoId), baseUrl: 'https://tonton888115.github.io/MultiView/'}}
+          javaScriptEnabled
+          domStorageEnabled
+          allowsInlineMediaPlayback
+          mediaPlaybackRequiresUserAction={false}
+          setSupportMultipleWindows={false}
+          style={styles.webPlayer}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
       </>
@@ -1665,37 +1655,8 @@ function SettingsScreen({
       <SettingSwitch title="拡大時にチャットを表示" value={settings.showChat} onValueChange={value => onSettings({showChat: value})} />
       <SettingSwitch title="タップ時に同接数を左下に表示" value={settings.showViewerCount} onValueChange={value => onSettings({showViewerCount: value})} />
       <SettingSwitch title="レイド先を自動追加" value={settings.autoFollowRaids} onValueChange={value => onSettings({autoFollowRaids: value})} />
+      <SettingSwitch title="YouTubeをiframe優先で再生" value={settings.youtubePreferIframe} onValueChange={value => onSettings({youtubePreferIframe: value})} />
       <SettingSwitch title="YouTubeライブを安定バッファで再生" value={settings.youtubeStableBuffer} onValueChange={value => onSettings({youtubeStableBuffer: value})} />
-      <TextInput
-        value={settings.youtubeCookie}
-        onChangeText={value => onSettings({youtubeCookie: value})}
-        autoCapitalize="none"
-        autoCorrect={false}
-        multiline
-        placeholder="YouTube HLS Cookie"
-        placeholderTextColor="#7d8794"
-        style={[styles.authInput, styles.textArea]}
-      />
-      <TextInput
-        value={settings.youtubePoToken}
-        onChangeText={value => onSettings({youtubePoToken: value})}
-        autoCapitalize="none"
-        autoCorrect={false}
-        secureTextEntry
-        placeholder="YouTube PO Token"
-        placeholderTextColor="#7d8794"
-        style={styles.authInput}
-      />
-      <TextInput
-        value={settings.youtubeVisitorData}
-        onChangeText={value => onSettings({youtubeVisitorData: value})}
-        autoCapitalize="none"
-        autoCorrect={false}
-        placeholder="YouTube Visitor Data"
-        placeholderTextColor="#7d8794"
-        style={styles.authInput}
-      />
-      <Text style={styles.settingNote}>YouTubeがbot確認でHLSを返さない場合だけ使います。</Text>
 
       <Text style={styles.sectionTitle}>表示</Text>
       <LayoutModeSettingRow value={settings.layoutMode} onChange={value => onSettings({layoutMode: value})} />

@@ -1,10 +1,10 @@
 import UIKit
+import WebKit
 import AVFoundation
 import CryptoKit
 
-// Per-cell YouTube playback uses native HLS via InnerTube. Do not fall back to
-// official embedded Web playback: that path shows embed restrictions, official
-// controls, and ads, and was a failed approach for this app's player UX.
+// Per-cell YouTube playback first tries native HLS via InnerTube, then falls back
+// to the official iframe.
 private enum YouTubeChatMode {
   case innerTube
   case dataAPI
@@ -22,13 +22,14 @@ private struct YouTubeNativePlayableStream {
   let hasSABR: Bool
 }
 
-private struct YouTubePlaybackAuth {
-  let headers: [String: String]
-  let poToken: String?
-  let visitorData: String?
+private struct YouTubeNativeStreamFallback {
+  let url: URL
+  let isLive: Bool
+  let userAgent: String
+  let label: String
 }
 
-final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
+final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, WKScriptMessageHandler {
   private static let instances = NSHashTable<YouTubeNativePlayerView>.weakObjects()
   private let stream: StreamItem
   private let settings: AppSettings
@@ -46,7 +47,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var liveCatchUpTimer: Timer?
   private var timeObserver: Any?
   private var sponsorSegments: [(start: Double, end: Double)] = []
+  private var fallbackWebView: WKWebView?
   private var isStopped = false
+  private var iframeAudioEnabled = false
   private var currentNativeVideoID: String?
   private var currentNativeIsLive = false
   private var innerTubeChatSession: YouTubeInnerTubeChatSession?
@@ -72,6 +75,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     self.settings = settings
     let storedVolume = StreamVolumeStore.volume(for: stream)
     self.playbackVolume = storedVolume <= 0 ? 1 : storedVolume
+    self.iframeAudioEnabled = true
     super.init(frame: .zero)
     backgroundColor = .black
 
@@ -122,10 +126,16 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   override func layoutSubviews() {
     super.layoutSubviews()
     playerLayer.frame = bounds
+    fallbackWebView?.frame = bounds
   }
 
   func resumePlayback() {
     guard !isStopped else { return }
+    if let fallbackWebView {
+      applyIframeVolume(to: fallbackWebView)
+      fallbackWebView.evaluateJavaScript("window.mvPlay && window.mvPlay();")
+      return
+    }
     let session = AVAudioSession.sharedInstance()
     try? session.setCategory(.playback, mode: .default, options: [])
     try? session.setActive(true)
@@ -136,16 +146,37 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   func pausePlayback() {
     guard !isStopped else { return }
     player.pause()
+    fallbackWebView?.evaluateJavaScript("window.mvPause && window.mvPause();")
   }
 
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
+    iframeAudioEnabled = true
+    if iframeAudioEnabled {
+      Self.focusAudio(on: self)
+    }
     applyVolume()
+    applyIframeVolume()
   }
 
   private func applyVolume() {
     player.isMuted = false
     player.volume = max(0.01, playbackVolume)
+  }
+
+  private func iframeEffectiveVolume() -> Float {
+    iframeAudioEnabled ? max(0.01, playbackVolume) : 0
+  }
+
+  private static func focusAudio(on active: YouTubeNativePlayerView) {
+    for object in instances.allObjects where object !== active {
+      object.muteIframeAudio()
+    }
+  }
+
+  private func muteIframeAudio() {
+    iframeAudioEnabled = false
+    applyIframeVolume()
   }
 
   func postComment(_ text: String, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -301,7 +332,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private func hideStatusIfPlaybackReady() {
-    if player.currentItem != nil {
+    if player.currentItem != nil || fallbackWebView != nil {
       statusLabel.isHidden = true
     }
   }
@@ -409,6 +440,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     itemStatusObservation = nil
     player.pause()
     player.replaceCurrentItem(with: nil)
+    fallbackWebView?.configuration.userContentController.removeScriptMessageHandler(forName: "youtubeAudio")
+    fallbackWebView?.stopLoadingAndRemove()
+    fallbackWebView = nil
   }
 
   private func loadPlayer() {
@@ -425,17 +459,23 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     requestNativePlayer(videoId: videoId)
   }
 
-  private func requestNativePlayer(videoId: String, attempt: Int = 0) {
+  private func requestNativePlayer(videoId: String, attempt: Int = 0, fallback: YouTubeNativeStreamFallback? = nil) {
     guard !isStopped, player.currentItem == nil else { return }
     let clients = Self.nativePlayerClients()
     guard clients.indices.contains(attempt) else {
-      scheduleNativeHLSRetry(videoId: videoId, reason: youtubeHLSRetryReason())
+      if let fallback {
+        noteExtractionFailure("\(fallback.label): HLSなしのためformatで再生")
+        startPlayback(url: fallback.url, videoId: videoId, isLive: fallback.isLive, userAgent: fallback.userAgent)
+        return
+      }
+      noteExtractionFailure("Native player: manifest取得失敗")
+      installAlternativeWebFallback(videoId: videoId)
       return
     }
     let client = clients[attempt]
     showStatus("YouTube HLS取得中\n\(client.label) \(attempt + 1)/\(clients.count)")
     guard let url = URL(string: "https://youtubei.googleapis.com/youtubei/v1/player") else {
-      scheduleNativeHLSRetry(videoId: videoId, reason: "Native player: player endpoint不正", delay: 6)
+      installAlternativeWebFallback(videoId: videoId)
       return
     }
     var request = URLRequest(url: url)
@@ -447,13 +487,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     request.setValue(client.version, forHTTPHeaderField: "X-YouTube-Client-Version")
     request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
     let cpn = Self.makeYouTubeCPN()
-    let auth = youtubePlaybackAuth(origin: "https://www.youtube.com")
-    auth.headers.forEach { key, value in
-      request.setValue(value, forHTTPHeaderField: key)
-    }
-    let context = auth.visitorData.map { Self.contextWithVisitorData(client.context, visitorData: $0) } ?? client.context
-    var body: [String: Any] = [
-      "context": context,
+    request.httpBody = try? JSONSerialization.data(withJSONObject: [
+      "context": client.context,
       "videoId": videoId,
       "contentCheckOk": true,
       "racyCheckOk": true,
@@ -464,11 +499,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           "cpn": cpn
         ]
       ]
-    ]
-    if let poToken = auth.poToken {
-      body["serviceIntegrityDimensions"] = ["poToken": poToken]
-    }
-    request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    ])
     resolveTask?.cancel()
     resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       guard let self else { return }
@@ -487,8 +518,14 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
           if stream.kind == .hls || !stream.isLive {
             self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive, userAgent: client.userAgent)
           } else {
+            let nextFallback = fallback ?? YouTubeNativeStreamFallback(
+              url: stream.url,
+              isLive: stream.isLive,
+              userAgent: client.userAgent,
+              label: client.label
+            )
             self.noteExtractionFailure("\(client.label): HLSなし\(stream.hasSABR ? " / SABRあり" : "")")
-            self.requestNativePlayer(videoId: videoId, attempt: attempt + 1)
+            self.requestNativePlayer(videoId: videoId, attempt: attempt + 1, fallback: nextFallback)
           }
         }
         return
@@ -496,7 +533,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       DispatchQueue.main.async {
         let httpCode = (response as? HTTPURLResponse)?.statusCode
         self.noteExtractionFailure(Self.youtubeIErrorSummary(clientName: client.label, httpCode: httpCode, parsed: parsed, data: data))
-        self.requestNativePlayer(videoId: videoId, attempt: attempt + 1)
+        self.requestNativePlayer(videoId: videoId, attempt: attempt + 1, fallback: fallback)
       }
     }
     let task = resolveTask
@@ -510,82 +547,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       task.cancel()
       self.resolveTask = nil
       self.noteExtractionFailure("\(client.label): 12秒タイムアウト")
-      self.requestNativePlayer(videoId: videoId, attempt: attempt + 1)
+      self.requestNativePlayer(videoId: videoId, attempt: attempt + 1, fallback: fallback)
     }
-  }
-
-  private func scheduleNativeHLSRetry(videoId: String, reason: String, delay: TimeInterval = 8) {
-    noteExtractionFailure(reason)
-    guard !isStopped else { return }
-    showStatus("YouTube HLS再取得待ち\n\(reason)")
-    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-      guard let self,
-            !self.isStopped,
-            self.player.currentItem == nil else { return }
-      self.requestNativePlayer(videoId: videoId)
-    }
-  }
-
-  private func retryNativePlayback(videoId: String, reason: String, delay: TimeInterval = 4) {
-    liveCatchUpTimer?.invalidate()
-    liveCatchUpTimer = nil
-    stallWatchdog.stop()
-    if let itemFailedObserver {
-      NotificationCenter.default.removeObserver(itemFailedObserver)
-      self.itemFailedObserver = nil
-    }
-    if let itemStalledObserver {
-      NotificationCenter.default.removeObserver(itemStalledObserver)
-      self.itemStalledObserver = nil
-    }
-    if let timeObserver {
-      player.removeTimeObserver(timeObserver)
-      self.timeObserver = nil
-    }
-    itemStatusObservation = nil
-    player.pause()
-    player.replaceCurrentItem(with: nil)
-    currentNativeVideoID = nil
-    currentNativeIsLive = false
-    scheduleNativeHLSRetry(videoId: videoId, reason: reason, delay: delay)
-  }
-
-  private func youtubePlaybackAuth(origin: String) -> YouTubePlaybackAuth {
-    let cookie = settings.youtubeCookie.trimmingCharacters(in: .whitespacesAndNewlines)
-    let poToken = settings.youtubePoToken.trimmingCharacters(in: .whitespacesAndNewlines)
-    let visitorData = settings.youtubeVisitorData.trimmingCharacters(in: .whitespacesAndNewlines)
-    var headers: [String: String] = [:]
-
-    if !cookie.isEmpty {
-      headers["Cookie"] = cookie
-      if let sapisid = Self.cookieValue(in: cookie, names: ["SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID"]) {
-        let timestamp = Int(Date().timeIntervalSince1970)
-        let decoded = sapisid.removingPercentEncoding ?? sapisid
-        headers["Authorization"] = "SAPISIDHASH \(timestamp)_\(Self.sapisidHash(timestamp: timestamp, sapisid: decoded, origin: origin))"
-        headers["Origin"] = origin
-        headers["X-Origin"] = origin
-      }
-    }
-
-    if !visitorData.isEmpty {
-      headers["X-Goog-Visitor-Id"] = visitorData
-    }
-
-    return YouTubePlaybackAuth(
-      headers: headers,
-      poToken: poToken.isEmpty ? nil : poToken,
-      visitorData: visitorData.isEmpty ? nil : visitorData
-    )
-  }
-
-  private func youtubeHLSRetryReason() -> String {
-    let hasAuth = !settings.youtubeCookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      || !settings.youtubePoToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      || !settings.youtubeVisitorData.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    if hasAuth {
-      return "入力済みのHLS認証材料でもHLS manifest取得失敗"
-    }
-    return "YouTubeがbot確認でHLSを返していません。設定でHLS Cookie/PO Token/Visitor Dataを入力してください"
   }
 
   private static func nativePlayerClients() -> [(label: String, headerClientName: String, version: String, userAgent: String, context: [String: Any])] {
@@ -661,35 +624,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     value["screenWidthPoints"] = 393
     value["screenHeightPoints"] = 852
     return value
-  }
-
-  private static func contextWithVisitorData(_ context: [String: Any], visitorData: String) -> [String: Any] {
-    var output = context
-    var client = (context["client"] as? [String: Any]) ?? [:]
-    client["visitorData"] = visitorData
-    output["client"] = client
-    return output
-  }
-
-  private static func cookieValue(in cookie: String, names: [String]) -> String? {
-    let accepted = Set(names)
-    for part in cookie.split(separator: ";", omittingEmptySubsequences: false) {
-      let trimmed = String(part).trimmingCharacters(in: .whitespacesAndNewlines)
-      guard let separator = trimmed.firstIndex(of: "=") else { continue }
-      let name = String(trimmed[..<separator])
-      guard accepted.contains(name) else { continue }
-      let valueStart = trimmed.index(after: separator)
-      let value = String(trimmed[valueStart...])
-      if !value.isEmpty { return value }
-    }
-    return nil
-  }
-
-  private static func sapisidHash(timestamp: Int, sapisid: String, origin: String) -> String {
-    let value = "\(timestamp) \(sapisid) \(origin)"
-    return Insecure.SHA1.hash(data: Data(value.utf8))
-      .map { String(format: "%02x", $0) }
-      .joined()
   }
 
   private static func makeYouTubeCPN() -> String {
@@ -796,10 +730,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
       guard let self else { return }
       if item.status == .failed {
-        let detail = item.error?.localizedDescription ?? "AVPlayer item failed"
-        DispatchQueue.main.async {
-          self.retryNativePlayback(videoId: videoId, reason: "\(detail): HLS再取得", delay: 4)
-        }
+        DispatchQueue.main.async { self.installEmbedFallback(videoId: videoId) }
       } else if item.status == .readyToPlay {
         DispatchQueue.main.async {
           self.resumePlayback()
@@ -819,7 +750,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       queue: .main
     ) { [weak self] _ in
       guard let self, !self.isStopped else { return }
-      self.retryNativePlayback(videoId: videoId, reason: "AVPlayer failedToPlayToEnd: HLS再取得", delay: 4)
+      self.installEmbedFallback(videoId: videoId)
     }
     if let itemStalledObserver {
       NotificationCenter.default.removeObserver(itemStalledObserver)
@@ -838,17 +769,20 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         guard let self,
               !self.isStopped,
               let item,
-              self.player.currentItem === item else { return }
+              self.player.currentItem === item,
+              self.fallbackWebView == nil else { return }
         self.resumePlayback()
       }
     }
     // AVPlayer が .failed に遷移せず ready のまま無音で固まるケース (signatureCipher
-    // 経由の壊れた URL でよく起きる) に備え、再生開始しなければHLSを取り直す。
+    // 経由の壊れた URL でよく起きる) に備え、6秒以内に再生開始しなければ iframe へ。
     DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self, weak item] in
       guard let self, !self.isStopped,
+            self.fallbackWebView == nil,
             let item, self.player.currentItem === item,
             self.player.timeControlStatus != .playing else { return }
-      self.retryNativePlayback(videoId: videoId, reason: "10秒以内に再生されず: HLS再取得", delay: 4)
+      self.noteExtractionFailure("10秒以内に再生されず: iframeへ")
+      self.installEmbedFallback(videoId: videoId)
     }
     // SponsorBlock only applies to VOD (live has no segments).
     if !isLive {
@@ -868,7 +802,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     LiveEdgeCatchUp.seekIfNeeded(
       player: player,
       isStopped: isStopped,
-      fallbackActive: false,
+      fallbackActive: fallbackWebView != nil,
       behindThreshold: 30,
       targetOffset: 12,
       toleranceBefore: 2
@@ -876,7 +810,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private func recoverNativePlaybackFromStall() {
-    guard !isStopped, let item = player.currentItem else { return }
+    guard !isStopped, fallbackWebView == nil, let item = player.currentItem else { return }
     if currentNativeIsLive,
        let liveRange = item.seekableTimeRanges.last?.timeRangeValue,
        liveRange.duration.isNumeric {
@@ -890,6 +824,81 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       return
     }
     resumePlayback()
+  }
+
+  // YouTube often returns SABR-only/no direct URL. Extra extractor chains were
+  // removed because they only added black-screen delay; fail fast to iframe.
+  private func installEmbedFallback(videoId: String) {
+    guard !isStopped else { return }
+    if player.currentItem != nil {
+      itemStatusObservation = nil
+      player.pause()
+      player.replaceCurrentItem(with: nil)
+    }
+    noteExtractionFailure("抽出失敗: YouTube iframe fallback")
+    installAlternativeWebFallback(videoId: videoId)
+  }
+
+  // YouTube official iframe player: YouTube 公式 iframe API (embedHTML) を
+  // WKWebView に loadHTMLString する。watch ページ遷移や CSS chrome 隠しは
+  // 廃止 (player 初期化を壊して thumbnail すら出ない問題があったため)。
+  //
+  // 動作仕様:
+  //  - 自動再生は iOS WebKit ルールに合わせて muted 起動する。
+  //  - ネイティブ音量操作で「音声をオン」ボタンを iframe 内に出し、WebView 内の
+  //    user gesture で unmute する。ネイティブ側だけでは iOS が解除を拒否し得る。
+  //  - iframe fallback の音声は focusAudio(on:) で 1 つに絞り、同時出力を避ける。
+  //  - 広告は WebAdBlocker のコンテンツルール + embedHTML 内の iv_load_policy=3
+  //    アノテーション無効化で抑制 (YouTube は完全には防げない)。
+  //  - iframe が onError 102/150/152 (埋め込み禁止) を返した場合は、無理に
+  //    watch ページに遷移せず error メッセージを overlay 表示する。
+  private func installAlternativeWebFallback(videoId: String) {
+    guard !isStopped, fallbackWebView == nil else { return }
+    liveCatchUpTimer?.invalidate()
+    liveCatchUpTimer = nil
+    stallWatchdog.stop()
+    if let itemFailedObserver {
+      NotificationCenter.default.removeObserver(itemFailedObserver)
+      self.itemFailedObserver = nil
+    }
+    if let itemStalledObserver {
+      NotificationCenter.default.removeObserver(itemStalledObserver)
+      self.itemStalledObserver = nil
+    }
+    if let timeObserver {
+      player.removeTimeObserver(timeObserver)
+      self.timeObserver = nil
+    }
+    itemStatusObservation = nil
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    showStatus("YouTube公式iframeで再生")
+    let config = WKWebViewConfiguration()
+    config.allowsInlineMediaPlayback = true
+    config.mediaTypesRequiringUserActionForPlayback = []
+    config.websiteDataStore = .default()
+    config.userContentController.add(self, name: "youtubeAudio")
+    WebAdBlocker.install(on: config)
+    let web = WKWebView(frame: bounds, configuration: config)
+    web.isOpaque = false
+    web.backgroundColor = .black
+    web.scrollView.backgroundColor = .black
+    web.scrollView.isScrollEnabled = false
+    web.scrollView.contentInsetAdjustmentBehavior = .never
+    web.customUserAgent = Self.userAgent
+    web.navigationDelegate = self
+    web.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    insertSubview(web, at: 0)
+    fallbackWebView = web
+    // ★重要★ baseURL は **自分の HTTPS ドメイン** にする。youtube.com や nil を指定
+    // すると YouTube iframe API が embedder origin を不正と判定して error 152 を
+    // 返す (8321d49 で確認済み)。tonton888115.github.io は GitHub Pages 経由で
+    // SSL 有効、Origin として認められる。
+    web.loadHTMLString(Self.embedHTML(videoId: videoId), baseURL: URL(string: "https://tonton888115.github.io/MultiView/"))
+    statusLabel.isHidden = true
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+      self?.resumePlayback()
+    }
   }
 
   // MARK: - SponsorBlock (VOD)
@@ -978,6 +987,172 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       self.statusLabel.text = text
       self.statusLabel.isHidden = false
     }
+  }
+
+  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+    guard !isStopped else { return }
+    showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
+  }
+
+  func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+    guard !isStopped else { return }
+    showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
+  }
+
+  func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+    guard !isStopped else { return }
+    if message.name == "youtubeAudio" {
+      iframeAudioEnabled = true
+      Self.focusAudio(on: self)
+      applyIframeVolume()
+      return
+    }
+  }
+
+  private func applyIframeVolume(to webView: WKWebView? = nil) {
+    let effective = iframeEffectiveVolume()
+    (webView ?? fallbackWebView)?.evaluateJavaScript("window.mvSetVolume && window.mvSetVolume(\(effective));")
+  }
+
+  // YouTube official embed: YouTube 公式 iframe API。当時 (8321d49) 動いてた構造を踏襲。
+  //
+  // iOS WebKit の autoplay policy: video.muted=true (初期) でない限り autoplay は
+  // 拒否される。だから playerVars に **mute:1** が必須。mute を抜くと iframe は
+  // サムネ + 再生ボタンで待機状態 (まさにユーザ報告のスピナー)。
+  //
+  // 構造:
+  //  - playerVars: autoplay:1 + **mute:1** で初期 muted の自動再生を許可
+  //  - onReady: playVideo() を呼んで再生開始
+  //  - onStateChange: UNSTARTED/CUED に戻ったら playVideo() を再試行
+  //    (広告挿入後や autoplay 拒否時に CUED で固まるケースの保険)
+  //  - apply(): 音量制御。AUDIO=true なら unMute+setVolume、false なら mute
+  //  - mvVolume bridge は Swift 側 setPlaybackVolume(0-1) を受けて 0-100 に変換
+  //  - onError は err overlay に日本語メッセージ表示 (watch ページ遷移はしない)
+  //  - SponsorBlock スキッパ内蔵 (VOD 用、live では no-op)
+  private static func embedHTML(videoId: String) -> String {
+    let sbCategories = "%5B%22sponsor%22%2C%22selfpromo%22%2C%22interaction%22%2C%22intro%22%2C%22outro%22%2C%22preview%22%2C%22music_offtopic%22%5D"
+    return """
+    <!doctype html>
+    <html>
+    <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <style>html,body,#player{margin:0;width:100%;height:100%;background:#000;overflow:hidden}iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}#err{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#fff;font-family:-apple-system;text-align:center;padding:18px;font-size:13px;line-height:1.5}#err a{color:#9ecbff}#audio{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:20;display:none;align-items:center;justify-content:center;padding:10px 16px;border-radius:18px;border:1px solid rgba(255,255,255,.34);background:rgba(18,24,32,.88);color:#fff;font:700 13px -apple-system,BlinkMacSystemFont,sans-serif}</style></head>
+    <body>
+    <div id="player"></div>
+    <div id="err"></div>
+    <button id="audio">音声をオン</button>
+    <script src="https://www.youtube.com/iframe_api"></script>
+    <script>
+      var player=null, READY=false, AUDIO=false, VOL=0, sb=[], hasPlayedOnce=false, userGesture=false, WANT_PLAY=true, lastPlayingAt=0;
+      // iOS autoplay policy: muted の playVideo() は許可されるが、
+      // user gesture (touchstart) なしの unMute() は autoplay 違反として
+      // 直後に video を pause させる。userGesture フラグで gesture 前は
+      // 必ず mute を維持して video の継続再生を保証する。
+      function apply(){
+        if(!player||!READY)return;
+        try{
+          if(WANT_PLAY) player.playVideo();
+          if(AUDIO && userGesture){player.unMute();player.setVolume(VOL);}
+          else{player.mute();}
+        }catch(e){}
+        updateAudioButton();
+      }
+      function updateAudioButton(){
+        var b=document.getElementById('audio');
+        if(!b)return;
+        b.style.display=(AUDIO && !userGesture)?'flex':'none';
+      }
+      // user gesture を検出したら即 unmute トライ
+      function onGesture(){
+        if(userGesture) return;
+        userGesture = true;
+        try{window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.youtubeAudio.postMessage('focus');}catch(e){}
+        try{ if(player && READY && AUDIO){player.unMute();player.setVolume(VOL);} }catch(e){}
+        updateAudioButton();
+      }
+      document.addEventListener('touchstart', onGesture, {capture:true, passive:true});
+      document.addEventListener('click', onGesture, {capture:true});
+      function loadSB(){
+        try{
+          fetch('https://sponsor.ajay.app/api/skipSegments?videoID=\(videoId)&categories=\(sbCategories)&actionTypes=%5B%22skip%22%5D')
+            .then(function(r){return r.ok?r.json():[];})
+            .then(function(list){sb=(list||[]).filter(function(s){return s.actionType==='skip'&&s.segment;}).map(function(s){return {s:s.segment[0],e:s.segment[1]};});})
+            .catch(function(){});
+        }catch(e){}
+      }
+      function sbTick(){
+        if(!player||!READY||!sb.length)return;
+        try{
+          var t=player.getCurrentTime();
+          for(var i=0;i<sb.length;i++){if(t>=sb[i].s&&t<sb[i].e-0.15){player.seekTo(sb[i].e+0.1,true);break;}}
+        }catch(e){}
+      }
+      function describeError(code){
+        switch(code){
+          case 2: return '動画ID不正';
+          case 5: return 'HTML5プレイヤー初期化失敗';
+          case 100: return '動画が見つかりません/非公開';
+          case 101:
+          case 150:
+          case 152: return '配信者が埋め込み再生を禁止しています';
+          case 153: return 'HTML5再生制限';
+          case 157: return 'ネットワーク経路エラー';
+          default: return 'YouTube iframe エラー: '+code;
+        }
+      }
+      function showError(code){
+        var el=document.getElementById('err');
+        el.innerHTML=describeError(code)+'<br><br><a href="https://www.youtube.com/watch?v=\(videoId)" target="_blank">YouTube アプリで開く</a>';
+        el.style.display='flex';
+        document.getElementById('player').style.display='none';
+      }
+      window.onYouTubeIframeAPIReady=function(){
+        player=new YT.Player('player',{
+          width:'100%',height:'100%',videoId:'\(videoId)',
+          host:'https://www.youtube.com',
+          playerVars:{autoplay:1,mute:1,playsinline:1,controls:0,disablekb:1,rel:0,fs:0,iv_load_policy:3,origin:'https://tonton888115.github.io'},
+          events:{
+            onReady:function(){READY=true;apply();loadSB();},
+            onStateChange:function(e){
+              if(e.data===YT.PlayerState.PLAYING){hasPlayedOnce=true;lastPlayingAt=Date.now();return;}
+              // 初回再生 (本編) に到達する前の UNSTARTED/CUED/PAUSED で固まる
+              // (典型: 広告→本編 遷移で iframe が PAUSED に張り付く) ケースを
+              // aggressive に retry。初回再生後も広告境界/回線揺れで PAUSED/CUED に
+              // 張り付くことがあるので、アプリ側が WANT_PLAY の間だけ復帰させる。
+              if(WANT_PLAY && (!hasPlayedOnce || Date.now()-lastPlayingAt>3500) && (
+                e.data===YT.PlayerState.UNSTARTED||
+                e.data===YT.PlayerState.CUED||
+                e.data===YT.PlayerState.PAUSED
+              )){
+                setTimeout(function(){try{e.target.playVideo();}catch(x){}},250);
+              }
+            },
+            onError:function(e){showError(e.data);}
+          }
+        });
+      };
+      window.mvPlay=function(){WANT_PLAY=true;apply();};
+      window.mvPause=function(){WANT_PLAY=false;try{player&&player.pauseVideo();}catch(e){}};
+      window.mvSetVolume=function(v){
+        var n=Math.max(0,Math.min(1,+v||0));
+        VOL=Math.round(n*100); AUDIO=VOL>0;
+        apply();
+      };
+      setInterval(function(){
+        if(!player||!READY||!WANT_PLAY)return;
+        try{
+          var s=player.getPlayerState();
+          if(s!==YT.PlayerState.PLAYING && s!==YT.PlayerState.BUFFERING){
+            player.playVideo();
+          }else if(s===YT.PlayerState.PLAYING){
+            lastPlayingAt=Date.now();
+          }
+        }catch(e){}
+      },1800);
+      setInterval(sbTick, 400);
+    </script>
+    </body>
+    </html>
+    """
   }
 
   static func videoID(from raw: String) -> String? {

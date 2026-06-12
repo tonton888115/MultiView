@@ -488,7 +488,7 @@ final class SettingsController: UITableViewController {
     case .kick: return 5
     case .twitch: return 4
     case .twitcasting: return 4
-    case .youtube: return 8
+    case .youtube: return 5
     case .niconico: return 2
     case .webData: return 2
     case .add: return 1
@@ -645,16 +645,12 @@ final class SettingsController: UITableViewController {
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
     case .youtube:
-      let settings = AppState.shared.settings
       switch indexPath.row {
       case 0: cell.textLabel?.text = YouTubeAuthManager.shared.isSignedIn ? "ログアウト" : "ログイン"
       case 1: cell.textLabel?.text = "Google Cloud 認証情報を開く"
       case 2: cell.textLabel?.text = YouTubeAuthManager.shared.config.clientId.isEmpty ? "Client ID 未設定" : "Client ID 設定済み"
       case 3: cell.textLabel?.text = "設定手順を表示"
-      case 4: cell.textLabel?.text = "Redirect URI をコピー"
-      case 5: cell.textLabel?.text = settings.youtubeCookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "HLS Cookie 未設定" : "HLS Cookie 設定済み"
-      case 6: cell.textLabel?.text = settings.youtubePoToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "HLS PO Token 未設定" : "HLS PO Token 設定済み"
-      default: cell.textLabel?.text = settings.youtubeVisitorData.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "HLS Visitor Data 未設定" : "HLS Visitor Data 設定済み"
+      default: cell.textLabel?.text = "Redirect URI をコピー"
       }
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
@@ -990,12 +986,6 @@ final class SettingsController: UITableViewController {
       let uri = YouTubeAuthManager.effectiveRedirectURI(for: YouTubeAuthManager.shared.config)
       UIPasteboard.general.string = uri
       presentCopiedRedirectAlert(service: "YouTube", uri: uri) { [weak self] in self?.editYouTubeRedirectURI() }
-    case 5:
-      editYouTubeHLSCookie()
-    case 6:
-      editYouTubePoToken()
-    case 7:
-      editYouTubeVisitorData()
     default:
       break
     }
@@ -1064,35 +1054,6 @@ final class SettingsController: UITableViewController {
     }
   }
 
-  private func editYouTubeHLSCookie() {
-    let message = "YouTubeがbot確認でHLSを返さない場合だけ使います。ブラウザのYouTubeログインCookieをそのまま貼り付けてください。"
-    editText(title: "YouTube HLS Cookie", message: message, text: AppState.shared.settings.youtubeCookie, keyboard: .default) { [weak self] value in
-      var settings = AppState.shared.settings
-      settings.youtubeCookie = value
-      AppState.shared.settings = settings
-      self?.tableView.reloadData()
-    }
-  }
-
-  private func editYouTubePoToken() {
-    let message = "YouTube player endpoint が要求する場合だけ入力します。Cookieとは別に保存されます。"
-    editText(title: "YouTube PO Token", message: message, text: AppState.shared.settings.youtubePoToken, keyboard: .default, secure: true) { [weak self] value in
-      var settings = AppState.shared.settings
-      settings.youtubePoToken = value
-      AppState.shared.settings = settings
-      self?.tableView.reloadData()
-    }
-  }
-
-  private func editYouTubeVisitorData() {
-    editText(title: "YouTube Visitor Data", message: nil, text: AppState.shared.settings.youtubeVisitorData, keyboard: .default) { [weak self] value in
-      var settings = AppState.shared.settings
-      settings.youtubeVisitorData = value
-      AppState.shared.settings = settings
-      self?.tableView.reloadData()
-    }
-  }
-
   private func presentYouTubeSetupGuide() {
     let config = YouTubeAuthManager.shared.config
     let redirectURI = YouTubeAuthManager.effectiveRedirectURI(for: config)
@@ -1120,14 +1081,13 @@ final class SettingsController: UITableViewController {
     present(alert, animated: true)
   }
 
-  private func editText(title: String, message: String?, text: String, keyboard: UIKeyboardType, secure: Bool = false, onSave: @escaping (String) -> Void) {
+  private func editText(title: String, message: String?, text: String, keyboard: UIKeyboardType, onSave: @escaping (String) -> Void) {
     let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
     alert.addTextField { field in
       field.text = text
       field.keyboardType = keyboard
       field.autocapitalizationType = .none
       field.autocorrectionType = .no
-      field.isSecureTextEntry = secure
     }
     alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
     alert.addAction(UIAlertAction(title: "保存", style: .default) { _ in

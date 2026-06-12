@@ -106,9 +106,6 @@ final class AppState {
         || settings.playAudio != oldValue.playAudio
         || settings.showChat != oldValue.showChat
         || settings.showViewerCount != oldValue.showViewerCount
-        || settings.youtubeCookie != oldValue.youtubeCookie
-        || settings.youtubePoToken != oldValue.youtubePoToken
-        || settings.youtubeVisitorData != oldValue.youtubeVisitorData
         || settings.layoutMode != oldValue.layoutMode
         || settings.platformOrder != oldValue.platformOrder
         || settings.autoEconomyOnManyStreams != oldValue.autoEconomyOnManyStreams

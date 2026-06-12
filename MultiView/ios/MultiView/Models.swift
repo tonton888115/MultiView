@@ -46,9 +46,6 @@ struct AppSettings: Codable {
   var playAudio = true
   var autoFollowRaids = false
   var blockWebAds = true
-  var youtubeCookie = ""
-  var youtubePoToken = ""
-  var youtubeVisitorData = ""
   var layoutMode: LayoutMode = .stacked
   var wifiQuality: PlaybackQuality = .high
   var mobileQuality: PlaybackQuality = .economy
@@ -75,9 +72,6 @@ struct AppSettings: Codable {
     playAudio = try container.decodeIfPresent(Bool.self, forKey: .playAudio) ?? true
     autoFollowRaids = try container.decodeIfPresent(Bool.self, forKey: .autoFollowRaids) ?? false
     blockWebAds = try container.decodeIfPresent(Bool.self, forKey: .blockWebAds) ?? true
-    youtubeCookie = try container.decodeIfPresent(String.self, forKey: .youtubeCookie) ?? ""
-    youtubePoToken = try container.decodeIfPresent(String.self, forKey: .youtubePoToken) ?? ""
-    youtubeVisitorData = try container.decodeIfPresent(String.self, forKey: .youtubeVisitorData) ?? ""
     layoutMode = try container.decodeIfPresent(LayoutMode.self, forKey: .layoutMode) ?? .stacked
     wifiQuality = try container.decodeIfPresent(PlaybackQuality.self, forKey: .wifiQuality) ?? .high
     mobileQuality = try container.decodeIfPresent(PlaybackQuality.self, forKey: .mobileQuality) ?? .economy

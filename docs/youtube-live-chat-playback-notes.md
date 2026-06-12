@@ -2,9 +2,9 @@
 
 ## Do not repeat these failed approaches
 
-- Do not use the YouTube iframe player as an Android/iOS playback path.
+- Do not use the YouTube iframe player as the primary Android/iOS playback path.
   - It can show embed restrictions, official controls, and ads.
-  - Do not keep it as a fallback; retry direct HLS instead.
+  - Keep it only as an explicit fallback when direct playback cannot be resolved.
 - Do not use the YouTube Data API as the read path for live comments.
   - It can return OAuth/API 403 errors.
   - `displayMessage` flattens or loses custom emoji/sticker image data.
@@ -14,9 +14,6 @@
 - Do not rely only on iOS InnerTube clients for direct playback.
   - Some iOS clients return `serverAbrStreamingUrl`/SABR without `hlsManifestUrl`.
   - Android InnerTube should be tried first for live HLS, then iOS fallback clients.
-- Do not treat YouTube OAuth as the playback fix.
-  - OAuth remains the comment-send path.
-  - Direct playback may require the user's normal YouTube playback auth material: Cookie, PO Token, and Visitor Data.
 - Do not ship or verify Android with debug APKs for this app.
   - Debug APKs can fail with `Unable to load script` if Metro is not running.
   - Use `assembleRelease` and verify the bundled release APK.
@@ -29,9 +26,7 @@
 - Comment parsing must preserve text runs plus custom emoji/sticker image tokens.
 - If chat fetching fails, UI should show reconnecting state and retry. It must not expose raw HTTP 400/403 to users.
 - Direct YouTube playback should prefer HLS returned by Android InnerTube client first, then iOS stable/current fallback clients.
-- Attach configured YouTube HLS Cookie / PO Token / Visitor Data to InnerTube `player` requests.
-- Generate `SAPISIDHASH` from configured Cookie when a SAPISID-family cookie is present.
-- Iframe/Web playback is not a fallback for Android/iOS. Keep retrying direct HLS and surface a recoverable HLS state that tells the user when playback auth material is missing.
+- Iframe is fallback only, not the primary UX.
 
 ## Verification requirements before saying "works"
 
