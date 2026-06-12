@@ -111,10 +111,37 @@ export function kickFilterText(content: string): string {
 export function estimateTokenWidth(tokens: DanmakuToken[], fontSize: number): number {
   return tokens.reduce((sum, token) => {
     if (token.kind === 'image') {
-      return sum + Math.max(22, fontSize * 1.5);
+      return sum + Math.max(18, fontSize * 1.4) + 6;
     }
-    return sum + Array.from(token.text).length * fontSize * 0.72;
+    return sum + estimateTextWidth(token.text, fontSize);
   }, 12);
+}
+
+function estimateTextWidth(text: string, fontSize: number): number {
+  let units = 0;
+  for (const char of Array.from(text)) {
+    const code = char.codePointAt(0) ?? 0;
+    if (/\s/.test(char)) {
+      units += 0.35;
+    } else if (isWideGlyph(code)) {
+      units += 1;
+    } else {
+      units += 0.58;
+    }
+  }
+  return units * fontSize;
+}
+
+function isWideGlyph(code: number): boolean {
+  return (
+    (code >= 0x1100 && code <= 0x11ff) ||
+    (code >= 0x2e80 && code <= 0xa4cf) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe10 && code <= 0xfe6f) ||
+    (code >= 0xff00 && code <= 0xffef) ||
+    (code >= 0x1f000 && code <= 0x1faff)
+  );
 }
 
 export function textFromTokens(tokens: DanmakuToken[]): string {

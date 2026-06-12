@@ -1,4 +1,4 @@
-import {desktopUserAgent, mobileUserAgent, webStreamURL, youtubeVideoId} from './playback';
+import {desktopUserAgent, mobileUserAgent, resolveLiveYouTubeVideoID, webStreamURL, youtubeVideoId} from './playback';
 import {kickFilterText, kickTokens, makeChatEvent, parseTwitchTags, textTokens, twitchTokens} from './danmaku';
 import type {AppSettings, ChatEvent, DanmakuToken, PlatformId, StreamItem} from './types';
 
@@ -8,8 +8,22 @@ export type ChatClient = {
 
 type Emit = (event: ChatEvent) => void;
 type Status = (message: string) => void;
-type YouTubeChatSession = {apiKey: string; context: any; continuation: string};
-type YouTubeChatConfig = {apiKey?: string; clientVersion?: string; context?: any; continuation?: string};
+type YouTubeChatSession = {
+  apiKey: string;
+  context: any;
+  continuation: string;
+  headerClientName?: string;
+  clientVersion?: string;
+  visitorData?: string;
+};
+type YouTubeChatConfig = {
+  apiKey?: string;
+  headerClientName?: string;
+  clientVersion?: string;
+  visitorData?: string;
+  context?: any;
+  continuation?: string;
+};
 
 export function startChatClient(stream: StreamItem, settings: AppSettings, emit: Emit, status: Status): ChatClient {
   if (!settings.showChat || !settings.showDanmaku) {
@@ -243,7 +257,11 @@ function startYouTubeChat(stream: StreamItem, emit: Emit, status: Status): ChatC
   const run = async () => {
     try {
       status('YouTubeチャット初期化中');
-      const session = await createYouTubeChatSession(videoId ?? stream.channel);
+      const session = await withTimeout(
+        createYouTubeChatSession(videoId ?? stream.channel),
+        15000,
+        'YouTubeチャット初期化タイムアウト',
+      );
       let continuation = session.continuation;
       status('YouTubeコメント接続済み');
       const poll = async () => {
@@ -251,7 +269,7 @@ function startYouTubeChat(stream: StreamItem, emit: Emit, status: Status): ChatC
           return;
         }
         try {
-          const page = await fetchYouTubeChatPage(session.apiKey, session.context, continuation);
+          const page = await fetchYouTubeChatPage(session, continuation);
           continuation = page.continuation ?? continuation;
           page.events.forEach(event => {
             if (!seen.has(event.id)) {
@@ -265,14 +283,14 @@ function startYouTubeChat(stream: StreamItem, emit: Emit, status: Status): ChatC
             keep.forEach(id => seen.add(id));
           }
           timer = setTimeout(poll, page.timeoutMs);
-        } catch (error) {
-          status(error instanceof Error ? error.message : String(error));
-          timer = setTimeout(poll, 8000);
+        } catch {
+          status('YouTubeコメント再接続中');
+          timer = setTimeout(run, 8000);
         }
       };
       poll();
-    } catch (error) {
-      status(error instanceof Error ? error.message : String(error));
+    } catch {
+      status('YouTubeライブチャット待機中');
       if (!stopped) {
         timer = setTimeout(run, 10000);
       }
@@ -290,7 +308,9 @@ function startYouTubeChat(stream: StreamItem, emit: Emit, status: Status): ChatC
 }
 
 async function createYouTubeChatSession(raw: string): Promise<YouTubeChatSession> {
-  const video = youtubeVideoId(raw) ?? youtubeVideoId(webStreamURL({id: 'youtube:tmp', platform: 'youtube', channel: raw}));
+  const video = youtubeVideoId(raw)
+    ?? youtubeVideoId(webStreamURL({id: 'youtube:tmp', platform: 'youtube', channel: raw}))
+    ?? await resolveLiveYouTubeVideoID(raw);
   const targets = youtubeInitialChatTargets(video, raw);
   const htmlDocuments: string[] = [];
   let lastError: unknown;
@@ -319,19 +339,19 @@ function youtubeInitialChatTargets(video: string | null, raw: string): Array<{ur
   }
   const watch = `https://www.youtube.com/watch?v=${encodeURIComponent(video)}`;
   return [
-    {url: watch},
     {url: `https://www.youtube.com/live_chat?v=${encodeURIComponent(video)}&is_popout=1`, referer: watch},
+    {url: watch},
   ];
 }
 
 async function fetchYouTubeHTML(url: string, referer?: string): Promise<string> {
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: {
       'User-Agent': desktopUserAgent,
       'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
       ...(referer ? {Referer: referer} : {}),
     },
-  });
+  }, 10000);
   if (!response.ok) {
     throw new Error(`YouTubeチャット初期HTML取得失敗 HTTP ${response.status}`);
   }
@@ -348,6 +368,9 @@ export function extractYouTubeChatSessionFromHTML(htmlDocuments: string[]): YouT
   const clientVersion = firstDefined(configs.map(config => config.clientVersion))
     ?? context?.client?.clientVersion
     ?? '2.20240620.01.00';
+  const visitorData = firstDefined(configs.map(config => config.visitorData))
+    ?? stringValue(context?.client?.visitorData)
+    ?? undefined;
   const continuation = firstDefined(configs.map(config => config.continuation));
   if (!continuation) {
     throw new Error('YouTubeライブチャットのcontinuationを取得できません');
@@ -355,7 +378,10 @@ export function extractYouTubeChatSessionFromHTML(htmlDocuments: string[]): YouT
   return {
     apiKey,
     continuation,
-    context: normalizeYouTubeContext(context, clientVersion),
+    headerClientName: firstDefined(configs.map(config => config.headerClientName)),
+    clientVersion,
+    visitorData,
+    context: normalizeYouTubeContext(context, clientVersion, visitorData),
   };
 }
 
@@ -371,6 +397,12 @@ function extractYouTubeChatConfig(html: string): YouTubeChatConfig {
       ?? stringValue(ytcfg?.INNERTUBE_CLIENT_VERSION)
       ?? stringValue(ytcfg?.INNERTUBE_CONTEXT?.client?.clientVersion)
       ?? undefined,
+    headerClientName: regexGroup(html, /"INNERTUBE_CONTEXT_CLIENT_NAME"\s*:\s*"?(\d+)"?/)
+      ?? stringValue(ytcfg?.INNERTUBE_CONTEXT_CLIENT_NAME)
+      ?? undefined,
+    visitorData: stringValue(ytcfg?.VISITOR_DATA)
+      ?? stringValue(ytcfg?.INNERTUBE_CONTEXT?.client?.visitorData)
+      ?? undefined,
     context: ytcfg?.INNERTUBE_CONTEXT,
     continuation: (initialData ? findLiveChatContinuation(initialData) : null)
       ?? findLiveChatContinuation(ytcfg)
@@ -379,7 +411,7 @@ function extractYouTubeChatConfig(html: string): YouTubeChatConfig {
   };
 }
 
-function normalizeYouTubeContext(context: any, clientVersion: string): any {
+function normalizeYouTubeContext(context: any, clientVersion: string, visitorData?: string): any {
   return {
     ...(context ?? {}),
     client: {
@@ -389,27 +421,37 @@ function normalizeYouTubeContext(context: any, clientVersion: string): any {
       hl: context?.client?.hl ?? 'ja',
       gl: context?.client?.gl ?? 'JP',
       userAgent: context?.client?.userAgent ?? desktopUserAgent,
+      ...(visitorData ? {visitorData} : {}),
     },
   };
 }
 
-async function fetchYouTubeChatPage(apiKey: string, context: any, continuation: string): Promise<{events: ChatEvent[]; continuation?: string; timeoutMs: number}> {
-  const response = await fetch(`https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${encodeURIComponent(apiKey)}`, {
+async function fetchYouTubeChatPage(session: YouTubeChatSession, continuation: string): Promise<{events: ChatEvent[]; continuation?: string; timeoutMs: number}> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'User-Agent': desktopUserAgent,
+    'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
+  };
+  if (session.headerClientName) {
+    headers['X-YouTube-Client-Name'] = session.headerClientName;
+  }
+  if (session.clientVersion) {
+    headers['X-YouTube-Client-Version'] = session.clientVersion;
+  }
+  if (session.visitorData) {
+    headers['X-Goog-Visitor-Id'] = session.visitorData;
+  }
+  const response = await fetchWithTimeout(`https://www.youtube.com/youtubei/v1/live_chat/get_live_chat?key=${encodeURIComponent(session.apiKey)}`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': desktopUserAgent,
-      'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
-    },
-    body: JSON.stringify({context, continuation}),
-  });
+    headers,
+    body: JSON.stringify({context: session.context, continuation}),
+  }, 10000);
   if (!response.ok) {
-    throw new Error(`YouTubeコメント取得失敗 HTTP ${response.status}`);
+    throw new Error('YouTubeコメント再接続中');
   }
   const json = await response.json();
   const live = json?.continuationContents?.liveChatContinuation;
-  const actions = live?.actions ?? [];
-  const events = actions.flatMap((action: any) => youtubeChatEventsFromAction(action));
+  const events = youtubeChatEventsFromAction(json);
   const next = continuationFromList(live?.continuations) ?? continuationFromList(json?.continuationContents?.liveChatContinuation?.continuations);
   const timeoutMs = Math.max(1000, Number(timeoutFromContinuations(live?.continuations) ?? 3000));
   return {events, continuation: next, timeoutMs};
@@ -427,6 +469,13 @@ export function youtubeChatEventsFromAction(action: any): ChatEvent[] {
     'liveChatViewerEngagementMessageRenderer',
     'liveChatModeChangeMessageRenderer',
     'liveChatPlaceholderItemRenderer',
+    'liveChatAutoModMessageRenderer',
+    'liveChatBannerRenderer',
+    'liveChatBannerHeaderRenderer',
+    'liveChatTickerPaidMessageItemRenderer',
+    'liveChatTickerSponsorItemRenderer',
+    'liveChatDonationAnnouncementRenderer',
+    'liveChatPollRenderer',
   ];
   const renderers: any[] = [];
   const walk = (value: any) => {
@@ -634,6 +683,10 @@ function walkCommentItems(value: any): any[] {
 }
 
 function findLiveChatContinuation(root: any): string | null {
+  const allMessagesContinuation = findAllMessagesLiveChatContinuation(root);
+  if (allMessagesContinuation) {
+    return allMessagesContinuation;
+  }
   const direct = root?.contents?.twoColumnWatchNextResults?.conversationBar?.liveChatRenderer?.continuations;
   const fromDirect = continuationFromList(direct);
   if (fromDirect) {
@@ -659,10 +712,43 @@ function findLiveChatContinuation(root: any): string | null {
       found = continuationFromList(value.liveChatContinuation.continuations) ?? null;
       return;
     }
-    const directContinuation = continuationFromData(value);
-    if (directContinuation) {
-      found = directContinuation;
+    Object.values(value).forEach(walk);
+  };
+  walk(root);
+  return found;
+}
+
+function findAllMessagesLiveChatContinuation(root: any): string | null {
+  let found: string | null = null;
+  const walk = (value: any) => {
+    if (found || !value) {
       return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(walk);
+      return;
+    }
+    if (typeof value !== 'object') {
+      return;
+    }
+    const menu = value.sortFilterSubMenuRenderer;
+    const items = Array.isArray(menu?.subMenuItems) ? menu.subMenuItems : [];
+    for (const item of items) {
+      const title = youtubeTextObjectText(item?.title) ?? '';
+      const subtitle = youtubeTextObjectText(item?.subtitle) ?? '';
+      const label = stringValue(item?.accessibility?.accessibilityData?.label) ?? '';
+      const haystack = `${title} ${subtitle} ${label}`.toLowerCase();
+      const isTopChat = haystack.includes('top chat') || haystack.includes('トップチャット');
+      const isAllMessages = haystack.includes('live chat')
+        || haystack.includes('all messages')
+        || haystack.includes('すべてのメッセージ')
+        || (haystack.includes('チャット') && !isTopChat);
+      if (!isTopChat && isAllMessages) {
+        found = continuationFromData(item?.continuation) ?? continuationFromData(item?.serviceEndpoint) ?? null;
+        if (found) {
+          return;
+        }
+      }
     }
     Object.values(value).forEach(walk);
   };
@@ -676,6 +762,10 @@ function continuationFromData(value: any): string | undefined {
     if (typeof continuation === 'string' && continuation) {
       return continuation;
     }
+  }
+  const commandToken = value?.continuationCommand?.token;
+  if (typeof commandToken === 'string' && commandToken) {
+    return commandToken;
   }
   return undefined;
 }
@@ -812,6 +902,38 @@ function parseJSON(text: string): any | null {
     return JSON.parse(text);
   } catch {
     return null;
+  }
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<Response>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`Request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([fetch(url, {...init, signal: controller.signal}), timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
 }
 

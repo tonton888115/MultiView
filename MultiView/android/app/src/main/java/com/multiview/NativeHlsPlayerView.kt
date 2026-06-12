@@ -2,6 +2,9 @@ package com.multiview
 
 import android.content.Context
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.media3.common.C
@@ -10,6 +13,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.MediaSource
@@ -19,7 +23,18 @@ import androidx.media3.ui.PlayerView
 
 @UnstableApi
 class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
-  private val exoPlayer = ExoPlayer.Builder(context).build()
+  private val exoPlayer = ExoPlayer.Builder(context)
+    .setLoadControl(
+      DefaultLoadControl.Builder()
+        .setBufferDurationsMs(
+          10_000,
+          50_000,
+          1_500,
+          5_000,
+        )
+        .build(),
+    )
+    .build()
   private val playerView = PlayerView(context).apply {
     useController = false
     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
@@ -35,6 +50,15 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
   private var muted = false
   private var volume = 1f
   private var liveTargetOffsetMs = 2_000L
+  private val mainHandler = Handler(Looper.getMainLooper())
+  private var lastPositionMs = 0L
+  private var lastProgressAtMs = SystemClock.elapsedRealtime()
+  private val stallWatchdog = object : Runnable {
+    override fun run() {
+      recoverIfStalled()
+      mainHandler.postDelayed(this, 2_500)
+    }
+  }
 
   init {
     setBackgroundColor(android.graphics.Color.BLACK)
@@ -51,6 +75,9 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
       }
 
       override fun onIsPlayingChanged(isPlaying: Boolean) {
+        if (isPlaying) {
+          noteProgress()
+        }
         emit("status", if (isPlaying) "playing" else "paused")
       }
 
@@ -58,6 +85,7 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
         emit("error", error.localizedMessage ?: error.errorCodeName)
       }
     })
+    mainHandler.postDelayed(stallWatchdog, 2_500)
   }
 
   fun setSourceUrl(next: String?) {
@@ -126,6 +154,7 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
   }
 
   fun release() {
+    mainHandler.removeCallbacks(stallWatchdog)
     exoPlayer.release()
   }
 
@@ -146,11 +175,47 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
       return
     }
     preparedUrl = url
+    noteProgress()
     emit("status", "loading")
     exoPlayer.setMediaSource(mediaSourceFor(url))
     exoPlayer.prepare()
     exoPlayer.playWhenReady = !paused
     applyVolume()
+  }
+
+  private fun noteProgress() {
+    lastPositionMs = exoPlayer.currentPosition
+    lastProgressAtMs = SystemClock.elapsedRealtime()
+  }
+
+  private fun recoverIfStalled() {
+    if (paused || sourceUrl == null || exoPlayer.currentMediaItem == null) {
+      noteProgress()
+      return
+    }
+    val state = exoPlayer.playbackState
+    if (state == Player.STATE_IDLE || state == Player.STATE_ENDED) {
+      noteProgress()
+      return
+    }
+    val current = exoPlayer.currentPosition
+    if (current > lastPositionMs + 250) {
+      noteProgress()
+      return
+    }
+    val stalledFor = SystemClock.elapsedRealtime() - lastProgressAtMs
+    if (stalledFor < 6_000) {
+      return
+    }
+    lastProgressAtMs = SystemClock.elapsedRealtime()
+    emit("status", "recovering")
+    try {
+      exoPlayer.seekToDefaultPosition()
+      exoPlayer.playWhenReady = true
+      exoPlayer.play()
+    } catch (_: RuntimeException) {
+      prepareIfNeeded(force = true)
+    }
   }
 
   private fun mediaSourceFor(url: String): MediaSource {

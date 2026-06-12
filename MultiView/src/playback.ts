@@ -10,6 +10,7 @@ const mobileSafariUserAgent =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1';
 
 const youtubeIOSVersion = '21.17.3';
+const youtubeIOSStableVersion = '21.13.6';
 const youtubeAndroidVersion = '20.19.35';
 const twitchClientID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
 const twitchAccessTokenHash = '0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712';
@@ -245,18 +246,18 @@ async function resolveYouTube(stream: StreamItem, settings: AppSettings): Promis
       kind: 'youtube-iframe',
       videoId,
       label: 'YouTube iframe',
-      status: '安定モード',
+      status: '公式エンジン/安定モード',
     };
   }
   const direct = await requestYouTubeDirect(videoId);
   if (direct) {
     return {
       kind: 'native',
-      url: direct,
-      headers: {'User-Agent': mobileSafariUserAgent, Referer: 'https://www.youtube.com/'},
+      url: direct.url,
+      headers: {'User-Agent': direct.userAgent, Referer: 'https://www.youtube.com/'},
       liveTargetOffsetMs: settings.youtubeStableBuffer ? 12000 : 8000,
       label: 'YouTube HLS',
-      status: settings.youtubeStableBuffer ? '独自プレイヤー/安定バッファ' : '独自プレイヤー',
+      status: '独自プレイヤー/直HLS',
     };
   }
   return {
@@ -392,17 +393,20 @@ export function youtubeVideoId(raw: string): string | null {
   return null;
 }
 
-async function resolveLiveYouTubeVideoID(raw: string): Promise<string | null> {
+export async function resolveLiveYouTubeVideoID(raw: string): Promise<string | null> {
   const url = liveResolutionURL(raw);
   if (!url) {
     return null;
   }
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: {
       'User-Agent': mobileSafariUserAgent,
       'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
     },
-  });
+  }, 10000);
+  if (!response.ok) {
+    return null;
+  }
   const finalId = youtubeVideoId(response.url);
   if (finalId) {
     return finalId;
@@ -444,11 +448,20 @@ function extractYouTubeVideoID(html: string): string | null {
   return null;
 }
 
-async function requestYouTubeDirect(videoId: string): Promise<string | null> {
+type YouTubePlayableStream = {
+  url: string;
+  kind: 'hls' | 'progressive';
+  isLive: boolean;
+  hasSabr: boolean;
+};
+
+async function requestYouTubeDirect(videoId: string): Promise<{url: string; userAgent: string} | null> {
   const clients = youtubeClients();
+  let fallback: {url: string; userAgent: string} | null = null;
   for (const client of clients) {
     try {
-      const response = await fetch('https://youtubei.googleapis.com/youtubei/v1/player', {
+      const cpn = makeYouTubeCPN();
+      const response = await fetchWithTimeout('https://youtubei.googleapis.com/youtubei/v1/player', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -465,53 +478,59 @@ async function requestYouTubeDirect(videoId: string): Promise<string | null> {
           playbackContext: {
             contentPlaybackContext: {
               html5Preference: 'HTML5_PREF_WANTS',
+              referer: `https://www.youtube.com/watch?v=${videoId}`,
+              cpn,
             },
           },
         }),
-      });
+      }, 12000);
       if (!response.ok) {
         continue;
       }
       const json = await response.json();
-      const stream = extractPlayableYouTubeURL(json);
+      const stream = extractPlayableYouTubeStream(json);
       if (stream) {
-        return stream;
+        if (stream.kind === 'hls' || !stream.isLive) {
+          return {url: stream.url, userAgent: client.userAgent};
+        }
+        fallback = fallback ?? {url: stream.url, userAgent: client.userAgent};
       }
     } catch {
       // Try the next InnerTube client.
     }
   }
-  return null;
+  return fallback;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<Response>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`Request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([fetch(url, {...init, signal: controller.signal}), timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function youtubeClients() {
-  const iosUA = `com.google.ios.youtube/${youtubeIOSVersion} (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X; ja_JP)`;
+  const currentIosUA = youtubeIOSUserAgent(youtubeIOSVersion);
+  const stableIosUA = youtubeIOSUserAgent(youtubeIOSStableVersion);
   const androidUA = `com.google.android.youtube/${youtubeAndroidVersion} (Linux; U; Android 15) gzip`;
   return [
-    {
-      headerClientName: '5',
-      version: youtubeIOSVersion,
-      userAgent: iosUA,
-      context: {
-        client: {
-          clientName: 'IOS',
-          clientVersion: youtubeIOSVersion,
-          deviceMake: 'Apple',
-          deviceModel: 'iPhone16,2',
-          osName: 'iOS',
-          osVersion: '17.5.1.21F90',
-          hl: 'ja',
-          gl: 'JP',
-          userAgent: iosUA,
-        },
-      },
-    },
     {
       headerClientName: '3',
       version: youtubeAndroidVersion,
       userAgent: androidUA,
       context: {
-        client: {
+        client: withYouTubeClientDefaults({
           clientName: 'ANDROID',
           clientVersion: youtubeAndroidVersion,
           androidSdkVersion: 35,
@@ -519,23 +538,82 @@ function youtubeClients() {
           deviceModel: 'Pixel 9 Pro',
           osName: 'Android',
           osVersion: '15',
-          hl: 'ja',
-          gl: 'JP',
           userAgent: androidUA,
-        },
+        }),
+      },
+    },
+    {
+      headerClientName: '5',
+      version: youtubeIOSStableVersion,
+      userAgent: stableIosUA,
+      context: {
+        client: withYouTubeClientDefaults({
+          clientName: 'IOS',
+          clientVersion: youtubeIOSStableVersion,
+          deviceMake: 'Apple',
+          deviceModel: 'iPhone16,2',
+          osName: 'iOS',
+          osVersion: '17.5.1.21F90',
+          userAgent: stableIosUA,
+        }),
+      },
+    },
+    {
+      headerClientName: '5',
+      version: youtubeIOSVersion,
+      userAgent: currentIosUA,
+      context: {
+        client: withYouTubeClientDefaults({
+          clientName: 'IOS',
+          clientVersion: youtubeIOSVersion,
+          deviceMake: 'Apple',
+          deviceModel: 'iPhone16,2',
+          osName: 'iOS',
+          osVersion: '17.5.1.21F90',
+          userAgent: currentIosUA,
+        }),
       },
     },
   ];
 }
 
-function extractPlayableYouTubeURL(json: any): string | null {
+function youtubeIOSUserAgent(version: string): string {
+  return `com.google.ios.youtube/${version} (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X; ja_JP)`;
+}
+
+function withYouTubeClientDefaults<T extends Record<string, unknown>>(client: T): T & Record<string, unknown> {
+  return {
+    ...client,
+    hl: 'ja',
+    gl: 'JP',
+    timeZone: 'Asia/Tokyo',
+    utcOffsetMinutes: 540,
+    screenDensityFloat: 3,
+    screenWidthPoints: 393,
+    screenHeightPoints: 852,
+  };
+}
+
+function makeYouTubeCPN(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  let out = '';
+  for (let i = 0; i < 16; i += 1) {
+    out += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return out;
+}
+
+function extractPlayableYouTubeStream(json: any): YouTubePlayableStream | null {
   const streamingData = json?.streamingData;
   if (!streamingData) {
     return null;
   }
+  const details = json?.videoDetails;
+  const isLive = details?.isLive === true || details?.isLiveContent === true;
+  const hasSabr = Boolean(stringValue(streamingData.serverAbrStreamingUrl));
   const hls = stringValue(streamingData.hlsManifestUrl);
   if (hls) {
-    return hls;
+    return {url: hls, kind: 'hls', isLive, hasSabr};
   }
   const formats = [...(streamingData.formats ?? []), ...(streamingData.adaptiveFormats ?? [])];
   const candidates = formats
@@ -554,7 +632,8 @@ function extractPlayableYouTubeURL(json: any): string | null {
     })
     .filter(Boolean) as Array<{url: string; height: number; bitrate: number}>;
   candidates.sort((a, b) => b.height - a.height || b.bitrate - a.bitrate);
-  return candidates[0]?.url ?? null;
+  const progressive = candidates[0]?.url;
+  return progressive ? {url: progressive, kind: 'progressive', isLive, hasSabr} : null;
 }
 
 function stringValue(value: unknown): string | null {
@@ -585,11 +664,11 @@ iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000
 <div id="err"></div>
 <script src="https://www.youtube.com/iframe_api"></script>
 <script>
-var player=null,READY=false,AUDIO=false,VOL=0,hasPlayedOnce=false,sb=[];
+var player=null,READY=false,AUDIO=false,VOL=0,WANT_PLAY=true,lastPlayingAt=0,sb=[];
 function apply(){
   if(!player||!READY)return;
   try{
-    player.playVideo();
+    if(WANT_PLAY){player.playVideo();}
     if(AUDIO){player.unMute();player.setVolume(VOL);}else{player.mute();}
   }catch(e){}
 }
@@ -624,8 +703,8 @@ window.onYouTubeIframeAPIReady=function(){
     events:{
       onReady:function(){READY=true;apply();loadSB();},
       onStateChange:function(e){
-        if(e.data===YT.PlayerState.PLAYING){hasPlayedOnce=true;return;}
-        if(!hasPlayedOnce&&(e.data===YT.PlayerState.UNSTARTED||e.data===YT.PlayerState.CUED||e.data===YT.PlayerState.PAUSED)){
+        if(e.data===YT.PlayerState.PLAYING){lastPlayingAt=Date.now();return;}
+        if(WANT_PLAY&&(e.data===YT.PlayerState.UNSTARTED||e.data===YT.PlayerState.CUED||e.data===YT.PlayerState.PAUSED||e.data===YT.PlayerState.BUFFERING)){
           setTimeout(function(){try{e.target.playVideo();}catch(x){}},250);
         }
       },
@@ -633,10 +712,17 @@ window.onYouTubeIframeAPIReady=function(){
     }
   });
 };
-window.mvPlay=function(){apply();};
-window.mvPause=function(){try{player&&player.pauseVideo();}catch(e){}};
+window.mvPlay=function(){WANT_PLAY=true;apply();};
+window.mvPause=function(){WANT_PLAY=false;try{player&&player.pauseVideo();}catch(e){}};
 window.mvSetVolume=function(v){var n=Math.max(0,Math.min(1,+v||0));VOL=Math.round(n*100);AUDIO=VOL>0;apply();};
 setInterval(sbTick,400);
+setInterval(function(){
+  if(!player||!READY||!WANT_PLAY)return;
+  try{
+    var state=player.getPlayerState();
+    if(state!==YT.PlayerState.PLAYING&&Date.now()-lastPlayingAt>2500){player.playVideo();}
+  }catch(e){}
+},1200);
 </script>
 </body>
 </html>`;

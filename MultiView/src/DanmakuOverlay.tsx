@@ -17,11 +17,9 @@ type VisibleItem = {
   x: Animated.Value;
   fontSize: number;
   lineHeight: number;
-};
-
-type LaneState = {
-  nextAvailableAt: number;
-  lastUsedAt: number;
+  widthEstimate: number;
+  startedAt: number;
+  duration: number;
 };
 
 export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings: AppSettings}) {
@@ -29,7 +27,8 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
   const [visible, setVisible] = useState<VisibleItem[]>([]);
   const [status, setStatus] = useState('');
   const queueRef = useRef<ChatEvent[]>([]);
-  const laneStatesRef = useRef<LaneState[]>([]);
+  const visibleRef = useRef<VisibleItem[]>([]);
+  const laneCursorRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -45,38 +44,46 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       : Math.max(1, Math.floor(layout.height / lineHeight));
   }, [layout.height, lineHeight, settings.danmakuMaxLines]);
 
-  const removeVisible = useCallback((key: string) => {
-    setVisible(current => current.filter(item => item.key !== key));
+  const updateVisible = useCallback((updater: (current: VisibleItem[]) => VisibleItem[]) => {
+    setVisible(current => {
+      const next = updater(current);
+      visibleRef.current = next;
+      return next;
+    });
   }, []);
 
-  const normalizeLaneStates = useCallback(() => {
-    const lanes = laneStatesRef.current;
-    while (lanes.length < laneCount) {
-      lanes.push({nextAvailableAt: 0, lastUsedAt: 0});
-    }
-    if (lanes.length > laneCount) {
-      lanes.length = laneCount;
-    }
-  }, [laneCount]);
+  const removeVisible = useCallback((key: string) => {
+    updateVisible(current => current.filter(item => item.key !== key));
+  }, [updateVisible]);
 
-  useEffect(() => {
-    normalizeLaneStates();
-  }, [normalizeLaneStates]);
-
-  const pickReadyLane = useCallback(
-    (now: number): number | null => {
-      normalizeLaneStates();
-      const ready = laneStatesRef.current
-        .map((state, lane) => ({lane, state}))
-        .filter(item => item.state.nextAvailableAt <= now);
-      if (ready.length === 0) {
-        return null;
+  const pickLane = useCallback(
+    (now: number): number => {
+      const fronts = Array.from({length: laneCount}, () => Number.NEGATIVE_INFINITY);
+      const startX = layout.width + 12;
+      for (const item of visibleRef.current) {
+        if (item.lane < 0 || item.lane >= laneCount) {
+          continue;
+        }
+        const progress = Math.max(0, Math.min(1, (now - item.startedAt) / item.duration));
+        const currentX = startX + (-item.widthEstimate - 12 - startX) * progress;
+        fronts[item.lane] = Math.max(fronts[item.lane], currentX + item.widthEstimate);
       }
-      const oldest = Math.min(...ready.map(item => item.state.lastUsedAt));
-      const candidates = ready.filter(item => item.state.lastUsedAt <= oldest + 120);
-      return candidates[Math.floor(Math.random() * candidates.length)]?.lane ?? ready[0].lane;
+      const clearThreshold = layout.width - 36;
+      for (let offset = 0; offset < laneCount; offset += 1) {
+        const candidate = (laneCursorRef.current + offset) % laneCount;
+        if ((fronts[candidate] ?? Number.NEGATIVE_INFINITY) < clearThreshold) {
+          return candidate;
+        }
+      }
+      let furthestLane = 0;
+      for (let lane = 1; lane < laneCount; lane += 1) {
+        if ((fronts[lane] ?? Number.NEGATIVE_INFINITY) < (fronts[furthestLane] ?? Number.NEGATIVE_INFINITY)) {
+          furthestLane = lane;
+        }
+      }
+      return furthestLane;
     },
-    [normalizeLaneStates],
+    [laneCount, layout.width],
   );
 
   const emitNow = useCallback(
@@ -94,31 +101,24 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       }
       const tokens = currentSettings.showEmotes ? event.tokens : textTokens(textFromTokens(event.tokens));
       const widthEstimate = estimateTokenWidth(tokens, fontSize);
-      const travel = layout.width + widthEstimate + 32;
+      const travel = layout.width + widthEstimate + 36;
       const pixelsPerSecond = Math.max(35, layout.width * currentSettings.danmakuSpeed);
-      const duration = Math.max(4500, Math.round((travel / pixelsPerSecond) * 1000));
+      const duration = Math.max(250, Math.round((travel / pixelsPerSecond) * 1000));
       const now = Date.now();
-      const lane = pickReadyLane(now);
-      if (lane == null) {
-        return false;
-      }
-      const holdMs = Math.min(2600, Math.max(380, Math.round((widthEstimate / pixelsPerSecond) * 1000 + 260)));
-      laneStatesRef.current[lane] = {
-        nextAvailableAt: now + holdMs,
-        lastUsedAt: now,
-      };
+      const lane = pickLane(now);
+      laneCursorRef.current = lane + 1;
       const key = `${event.id}:${event.createdAt}:${Math.random()}`;
       const x = new Animated.Value(layout.width + 12);
-      const item: VisibleItem = {key, event, tokens, lane, x, fontSize, lineHeight};
-      setVisible(current => [...current, item]);
+      const item: VisibleItem = {key, event, tokens, lane, x, fontSize, lineHeight, widthEstimate, startedAt: now, duration};
+      updateVisible(current => [...current, item]);
       Animated.timing(x, {
-        toValue: -widthEstimate - 24,
+        toValue: -widthEstimate - 12,
         duration,
         useNativeDriver: true,
       }).start(() => removeVisible(key));
       return true;
     },
-    [fontSize, layout.height, layout.width, lineHeight, pickReadyLane, removeVisible],
+    [fontSize, layout.height, layout.width, lineHeight, pickLane, removeVisible, updateVisible],
   );
 
   const scheduleDrain = useCallback(() => {
@@ -128,7 +128,7 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
     const drain = () => {
       timerRef.current = null;
       let consumed = 0;
-      const maxBurst = Math.max(2, laneCount * 2);
+      const maxBurst = Math.max(3, laneCount * 3);
       while (queueRef.current.length > 0 && consumed < maxBurst) {
         const next = queueRef.current[0];
         if (!emitNow(next)) {
@@ -138,16 +138,14 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
         consumed += 1;
       }
       if (queueRef.current.length > 0) {
-        normalizeLaneStates();
-        const nextReadyAt = Math.min(...laneStatesRef.current.map(state => state.nextAvailableAt));
         const waitMs = layout.width <= 0 || layout.height <= 0
           ? 120
-          : Math.max(16, Math.min(180, nextReadyAt - Date.now()));
+          : 16;
         timerRef.current = setTimeout(drain, waitMs);
       }
     };
     timerRef.current = setTimeout(drain, 16);
-  }, [emitNow, laneCount, layout.height, layout.width, normalizeLaneStates]);
+  }, [emitNow, laneCount, layout.height, layout.width]);
 
   useEffect(() => {
     if (!settings.showChat || !settings.showDanmaku) {
@@ -172,9 +170,9 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
         clearTimeout(timerRef.current);
         timerRef.current = null;
       }
-      setVisible([]);
+      updateVisible(() => []);
     };
-  }, [scheduleDrain, settings, stream]);
+  }, [scheduleDrain, settings, stream, updateVisible]);
 
   if (!settings.showChat || !settings.showDanmaku) {
     return null;
@@ -192,7 +190,7 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
             styles.item,
             item.event.highlighted && styles.highlighted,
             {
-              top: item.lane * item.lineHeight + 4,
+              top: item.lane * item.lineHeight + 6,
               minHeight: item.lineHeight,
               transform: [{translateX: item.x}],
             },
@@ -206,13 +204,15 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
                 style={[
                   styles.emote,
                   {
-                    width: Math.max(22, item.fontSize * 1.45),
-                    height: Math.max(22, item.fontSize * 1.45),
+                    width: Math.max(18, item.fontSize * 1.4),
+                    height: Math.max(18, item.fontSize * 1.4),
                   },
                 ]}
               />
             ) : (
-              <Text key={`${item.key}:txt:${index}`} style={[styles.text, {fontSize: item.fontSize, lineHeight: item.lineHeight}]}>
+              <Text
+                key={`${item.key}:txt:${index}`}
+                style={[styles.text, {fontSize: item.fontSize, lineHeight: item.lineHeight, color: `rgba(255,255,255,${settings.danmakuOpacity})`}]}>
                 {token.text}
               </Text>
             ),
@@ -256,14 +256,13 @@ const styles = StyleSheet.create({
     flexWrap: 'nowrap',
   },
   highlighted: {
-    paddingHorizontal: 6,
-    borderRadius: 5,
-    borderWidth: 1,
+    paddingHorizontal: 8,
+    borderRadius: 4,
+    borderWidth: 2,
     borderColor: '#ffe46b',
     backgroundColor: 'rgba(255, 222, 80, 0.12)',
   },
   text: {
-    color: 'rgba(255,255,255,0.96)',
     fontWeight: '900',
     textShadowColor: 'rgba(0,0,0,0.95)',
     textShadowRadius: 3,

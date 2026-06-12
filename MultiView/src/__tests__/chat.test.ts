@@ -11,6 +11,17 @@ describe('extractYouTubeChatSessionFromHTML', () => {
     expect(session.continuation).toBe('live-cont');
     expect(session.context.client.clientVersion).toBe('watch-version');
   });
+
+  it('prefers YouTube live chat all-messages continuation over top chat', () => {
+    const session = extractYouTubeChatSessionFromHTML([
+      '<script>ytcfg.set({"INNERTUBE_API_KEY":"chat-key","INNERTUBE_CONTEXT_CLIENT_NAME":1,"VISITOR_DATA":"visitor-1","INNERTUBE_CONTEXT":{"client":{"clientName":"WEB","clientVersion":"chat-version"}}});</script><script>window["ytInitialData"] = {"contents":{"liveChatRenderer":{"continuations":[{"reloadContinuationData":{"continuation":"top-renderer-cont"}}]},"sortFilterSubMenuRenderer":{"subMenuItems":[{"title":"トップチャット","selected":true,"continuation":{"reloadContinuationData":{"continuation":"top-cont"}}},{"title":"チャット","subtitle":"すべてのメッセージが表示されます","selected":false,"continuation":{"reloadContinuationData":{"continuation":"all-cont"}}}]}}};</script>',
+    ]);
+
+    expect(session.continuation).toBe('all-cont');
+    expect(session.headerClientName).toBe('1');
+    expect(session.visitorData).toBe('visitor-1');
+    expect(session.context.client.visitorData).toBe('visitor-1');
+  });
 });
 
 describe('youtubeChatEventsFromAction', () => {

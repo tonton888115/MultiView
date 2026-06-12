@@ -13,7 +13,6 @@ import {
   TextInput,
   TouchableOpacity,
   View,
-  useWindowDimensions,
   Linking,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -234,7 +233,20 @@ function sanitizeSettings(raw: unknown): AppSettings {
     layoutMode: source.layoutMode === 'grid' ? 'grid' : source.layoutMode === 'stacked' ? 'stacked' : defaultSettings.layoutMode,
     wifiQuality: source.wifiQuality === 'economy' ? 'economy' : 'high',
     mobileQuality: source.mobileQuality === 'high' ? 'high' : 'economy',
+    danmakuFontSize: clampNumber(source.danmakuFontSize, 12, 40, defaultSettings.danmakuFontSize),
+    danmakuSpeed: clampNumber(source.danmakuSpeed, 0.026, 0.39, defaultSettings.danmakuSpeed),
+    danmakuOpacity: clampNumber(source.danmakuOpacity, 0.3, 1, defaultSettings.danmakuOpacity),
+    danmakuMaxLines: Math.round(clampNumber(source.danmakuMaxLines, 0, 20, defaultSettings.danmakuMaxLines)),
+    danmakuMaxLength: Math.round(clampNumber(source.danmakuMaxLength, 0, 500, defaultSettings.danmakuMaxLength)),
   };
+}
+
+function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+  const number = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(number)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, number));
 }
 
 export default function App() {
@@ -407,15 +419,18 @@ export default function App() {
     });
   }, []);
 
-  const moveStream = useCallback((index: number, delta: number) => {
+  const moveStreamTo = useCallback((index: number, target: number) => {
     setStreams(current => {
-      const target = index + delta;
-      if (target < 0 || target >= current.length) {
+      if (index < 0 || index >= current.length) {
+        return current;
+      }
+      const nextTarget = Math.max(0, Math.min(target, current.length - 1));
+      if (nextTarget === index) {
         return current;
       }
       const next = current.slice();
       const [item] = next.splice(index, 1);
-      next.splice(target, 0, item);
+      next.splice(nextTarget, 0, item);
       return next;
     });
   }, []);
@@ -445,8 +460,9 @@ export default function App() {
             volumes={volumes}
             onAdd={addStream}
             onRemove={removeStream}
-            onMove={moveStream}
+            onMove={moveStreamTo}
             onVolume={setStreamVolume}
+            onSettings={updateSettings}
             auth={auth}
             onAuth={updateAuth}
           />
@@ -605,6 +621,7 @@ function ViewingScreen({
   onRemove,
   onMove,
   onVolume,
+  onSettings,
   auth,
   onAuth,
 }: {
@@ -613,58 +630,71 @@ function ViewingScreen({
   volumes: Record<string, number>;
   onAdd: (platform: PlatformId, channel: string) => void;
   onRemove: (id: string) => void;
-  onMove: (index: number, delta: number) => void;
+  onMove: (index: number, target: number) => void;
   onVolume: (stream: StreamItem, volume: number) => void;
+  onSettings: (patch: Partial<AppSettings>) => void;
   auth: AuthState;
   onAuth: (auth: AuthState) => void;
 }) {
-  const {width} = useWindowDimensions();
   const [adding, setAdding] = useState(false);
   const [focused, setFocused] = useState<StreamItem | null>(null);
-  const columns = settings.layoutMode === 'grid' && width >= 700 ? 2 : 1;
-  const cellWidth = columns === 2 ? '50%' : '100%';
+  const columns = settings.layoutMode === 'grid' ? 2 : 1;
+  const slots = useMemo(() => gridSlots(streams, settings.layoutMode), [settings.layoutMode, streams]);
 
   return (
     <View style={styles.screen}>
-      <View style={styles.viewToolbar}>
-        <Text style={styles.sectionTitle}>視聴</Text>
-        <View style={styles.toolbarActions}>
-          <TouchableOpacity style={styles.primaryButton} onPress={() => setAdding(true)}>
-            <Text style={styles.primaryButtonText}>追加</Text>
-          </TouchableOpacity>
-        </View>
+      <View style={styles.viewBody}>
+        {streams.length === 0 ? (
+          <View style={styles.empty}>
+            <Text style={styles.emptyTitle}>配信がありません</Text>
+            <Text style={styles.emptyText}>追加ボタン、ランキング、フォロー画面から配信を追加できます。</Text>
+          </View>
+        ) : (
+          <ScrollView contentContainerStyle={styles.streamGrid}>
+            {slots.map(({stream, index, width}) => (
+              <View key={stream.id} style={[styles.streamCellWrap, {width}]}>
+                <StreamCell
+                  stream={stream}
+                  settings={settings}
+                  streamCount={streams.length}
+                  volume={volumes[stream.id] ?? 1}
+                  paused={focused?.id === stream.id}
+                  muted={!settings.playAudio}
+                  reloadKey={0}
+                  index={index}
+                  count={streams.length}
+                  columns={columns}
+                  onFocus={() => setFocused(stream)}
+                  onMove={onMove}
+                  onRemove={onRemove}
+                  onVolume={onVolume}
+                  auth={auth}
+                  onAuth={onAuth}
+                />
+              </View>
+            ))}
+          </ScrollView>
+        )}
       </View>
 
-      {streams.length === 0 ? (
-        <View style={styles.empty}>
-          <Text style={styles.emptyTitle}>配信がありません</Text>
-          <Text style={styles.emptyText}>追加ボタン、ランキング、フォロー画面から配信を追加できます。</Text>
+      <View style={styles.viewBottomControls}>
+        <View style={styles.iconSegment}>
+          <TouchableOpacity
+            style={[styles.iconSegmentButton, settings.layoutMode === 'stacked' && styles.iconSegmentButtonActive]}
+            onPress={() => onSettings({layoutMode: 'stacked'})}>
+            <Text style={[styles.iconSegmentText, settings.layoutMode === 'stacked' && styles.iconSegmentTextActive]}>▥</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.iconSegmentButton, settings.layoutMode === 'grid' && styles.iconSegmentButtonActive]}
+            onPress={() => onSettings({layoutMode: 'grid'})}>
+            <Text style={[styles.iconSegmentText, settings.layoutMode === 'grid' && styles.iconSegmentTextActive]}>▦</Text>
+          </TouchableOpacity>
         </View>
-      ) : (
-        <ScrollView contentContainerStyle={styles.streamGrid}>
-          {streams.map((stream, index) => (
-            <View key={stream.id} style={[styles.streamCellWrap, {width: cellWidth}]}>
-              <StreamCell
-                stream={stream}
-                settings={settings}
-                streamCount={streams.length}
-                volume={volumes[stream.id] ?? 1}
-                paused={focused?.id === stream.id}
-                muted={!settings.playAudio}
-                reloadKey={0}
-                index={index}
-                count={streams.length}
-                onFocus={() => setFocused(stream)}
-                onMove={onMove}
-                onRemove={onRemove}
-                onVolume={onVolume}
-                auth={auth}
-                onAuth={onAuth}
-              />
-            </View>
-          ))}
-        </ScrollView>
-      )}
+        <View style={styles.viewBottomSpacer} />
+        <TouchableOpacity style={styles.bottomIconButton} onPress={() => setAdding(true)}>
+          <Text style={styles.bottomIconText}>＋</Text>
+        </TouchableOpacity>
+      </View>
 
       <AddStreamModal
         visible={adding}
@@ -689,6 +719,19 @@ function ViewingScreen({
   );
 }
 
+function gridSlots(streams: StreamItem[], layoutMode: AppSettings['layoutMode']): Array<{stream: StreamItem; index: number; width: '50%' | '100%'}> {
+  if (layoutMode !== 'grid') {
+    return streams.map((stream, index) => ({stream, index, width: '100%'}));
+  }
+  const bigCount = streams.length % 2 === 0 ? 2 : 1;
+  const pairedCount = Math.max(0, streams.length - bigCount);
+  return streams.map((stream, index) => ({
+    stream,
+    index,
+    width: index < pairedCount ? '50%' : '100%',
+  }));
+}
+
 function StreamCell({
   stream,
   settings,
@@ -699,6 +742,7 @@ function StreamCell({
   reloadKey,
   index,
   count,
+  columns,
   onFocus,
   onMove,
   onRemove,
@@ -715,8 +759,9 @@ function StreamCell({
   reloadKey: number;
   index: number;
   count: number;
+  columns: number;
   onFocus: () => void;
-  onMove: (index: number, delta: number) => void;
+  onMove: (index: number, target: number) => void;
   onRemove: (id: string) => void;
   onVolume: (stream: StreamItem, volume: number) => void;
   auth: AuthState;
@@ -726,21 +771,39 @@ function StreamCell({
   const [commentOpen, setCommentOpen] = useState(false);
   const [commentText, setCommentText] = useState('');
   const [commentStatus, setCommentStatus] = useState('');
+  const [cellLayout, setCellLayout] = useState({width: 0, height: 0});
+  const dragOriginRef = useRef(index);
+  const dragCurrentRef = useRef(index);
   const webCommentRef = useRef<((text: string) => void) | null>(null);
+  const updateDragTarget = useCallback(
+    (dx: number, dy: number) => {
+      const rowHeight = Math.max(80, cellLayout.height || 0);
+      const colWidth = Math.max(80, cellLayout.width || 0);
+      const rowDelta = Math.round(dy / rowHeight);
+      const colDelta = columns > 1 ? Math.round(dx / colWidth) : 0;
+      const target = Math.max(0, Math.min(count - 1, dragOriginRef.current + rowDelta * columns + colDelta));
+      if (target !== dragCurrentRef.current) {
+        onMove(dragCurrentRef.current, target);
+        dragCurrentRef.current = target;
+      }
+    },
+    [cellLayout.height, cellLayout.width, columns, count, onMove],
+  );
   const reorderResponder = useMemo(
     () =>
       PanResponder.create({
         onStartShouldSetPanResponder: () => true,
         onMoveShouldSetPanResponder: () => true,
+        onPanResponderGrant: () => {
+          dragOriginRef.current = index;
+          dragCurrentRef.current = index;
+        },
+        onPanResponderMove: (_, gesture) => updateDragTarget(gesture.dx, gesture.dy),
         onPanResponderRelease: (_, gesture) => {
-          if (gesture.dy < -24 && index > 0) {
-            onMove(index, -1);
-          } else if (gesture.dy > 24 && index < count - 1) {
-            onMove(index, 1);
-          }
+          updateDragTarget(gesture.dx, gesture.dy);
         },
       }),
-    [count, index, onMove],
+    [index, updateDragTarget],
   );
   const submitComment = useCallback(() => {
     const text = commentText.trim();
@@ -768,7 +831,7 @@ function StreamCell({
   }, [auth, commentText, onAuth, stream]);
 
   return (
-    <View style={styles.streamCell}>
+    <View style={styles.streamCell} onLayout={event => setCellLayout(event.nativeEvent.layout)}>
       <View style={styles.player}>
         <StreamPlayer
           stream={stream}
@@ -1561,6 +1624,9 @@ function SettingsScreen({
       <SettingSwitch title="YouTubeをiframe優先で再生" value={settings.youtubePreferIframe} onValueChange={value => onSettings({youtubePreferIframe: value})} />
       <SettingSwitch title="YouTubeライブを安定バッファで再生" value={settings.youtubeStableBuffer} onValueChange={value => onSettings({youtubeStableBuffer: value})} />
 
+      <Text style={styles.sectionTitle}>表示</Text>
+      <LayoutModeSettingRow value={settings.layoutMode} onChange={value => onSettings({layoutMode: value})} />
+
       <Text style={styles.sectionTitle}>画質</Text>
       <QualityRow title="Wi-Fi時の画質" value={settings.wifiQuality} onChange={value => onSettings({wifiQuality: value})} />
       <QualityRow title="モバイル通信時の画質" value={settings.mobileQuality} onChange={value => onSettings({mobileQuality: value})} />
@@ -1578,6 +1644,50 @@ function SettingsScreen({
       <Text style={styles.sectionTitle}>弾幕・通知</Text>
       <SettingSwitch title="弾幕を表示" value={settings.showDanmaku} onValueChange={value => onSettings({showDanmaku: value})} />
       <SettingSwitch title="スタンプ/絵文字を弾幕に表示" value={settings.showEmotes} onValueChange={value => onSettings({showEmotes: value})} />
+      <NumberSettingRow
+        title="文字サイズ"
+        value={settings.danmakuFontSize}
+        min={12}
+        max={40}
+        step={1}
+        onChange={value => onSettings({danmakuFontSize: Math.round(value)})}
+      />
+      <NumberSettingRow
+        title="速度"
+        value={Math.round((settings.danmakuSpeed / 0.13) * 100)}
+        min={20}
+        max={300}
+        step={10}
+        formatValue={value => `${Math.round(value)}%`}
+        onChange={value => onSettings({danmakuSpeed: (Math.round(value) / 100) * 0.13})}
+      />
+      <NumberSettingRow
+        title="透過度"
+        value={Math.round(settings.danmakuOpacity * 100)}
+        min={30}
+        max={100}
+        step={5}
+        formatValue={value => `${Math.round(value)}%`}
+        onChange={value => onSettings({danmakuOpacity: Math.round(value) / 100})}
+      />
+      <NumberSettingRow
+        title="最大行数"
+        value={settings.danmakuMaxLines}
+        min={0}
+        max={20}
+        step={1}
+        formatValue={value => (value === 0 ? '自動' : String(Math.round(value)))}
+        onChange={value => onSettings({danmakuMaxLines: Math.round(value)})}
+      />
+      <NumberSettingRow
+        title="最大文字数"
+        value={settings.danmakuMaxLength}
+        min={0}
+        max={500}
+        step={25}
+        formatValue={value => (value === 0 ? '無制限' : String(Math.round(value)))}
+        onChange={value => onSettings({danmakuMaxLength: Math.round(value)})}
+      />
       <SettingSwitch title="ギフト演出を表示" value={settings.showGiftEffects} onValueChange={value => onSettings({showGiftEffects: value, niconicoShowGift: value})} />
       <SettingSwitch title="ギフト通知音" value={settings.giftSoundEnabled} onValueChange={value => onSettings({giftSoundEnabled: value})} />
       <SettingSwitch title="ニコ生 ニコニ広告を表示" value={settings.niconicoShowNicoad} onValueChange={value => onSettings({niconicoShowNicoad: value})} />
@@ -1643,6 +1753,60 @@ function SettingSwitch({title, value, onValueChange}: {title: string; value: boo
     <View style={styles.settingRow}>
       <Text style={styles.settingTitle}>{title}</Text>
       <Switch value={value} onValueChange={onValueChange} />
+    </View>
+  );
+}
+
+function LayoutModeSettingRow({value, onChange}: {value: AppSettings['layoutMode']; onChange: (value: AppSettings['layoutMode']) => void}) {
+  return (
+    <View style={styles.settingRow}>
+      <Text style={styles.settingTitle}>表示レイアウト</Text>
+      <View style={styles.iconSegment}>
+        <TouchableOpacity
+          style={[styles.iconSegmentButton, value === 'stacked' && styles.iconSegmentButtonActive]}
+          onPress={() => onChange('stacked')}>
+          <Text style={[styles.iconSegmentText, value === 'stacked' && styles.iconSegmentTextActive]}>▥</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.iconSegmentButton, value === 'grid' && styles.iconSegmentButtonActive]}
+          onPress={() => onChange('grid')}>
+          <Text style={[styles.iconSegmentText, value === 'grid' && styles.iconSegmentTextActive]}>▦</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
+function NumberSettingRow({
+  title,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+  formatValue = numericValue => String(Math.round(numericValue)),
+}: {
+  title: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (value: number) => void;
+  formatValue?: (value: number) => string;
+}) {
+  const setValue = (next: number) => onChange(Math.min(max, Math.max(min, next)));
+  return (
+    <View style={styles.settingRow}>
+      <Text style={styles.settingTitle}>{title}</Text>
+      <View style={styles.stepper}>
+        <TouchableOpacity style={styles.stepperButton} onPress={() => setValue(value - step)}>
+          <Text style={styles.stepperButtonText}>−</Text>
+        </TouchableOpacity>
+        <Text style={styles.stepperValue}>{formatValue(value)}</Text>
+        <TouchableOpacity style={styles.stepperButton} onPress={() => setValue(value + step)}>
+          <Text style={styles.stepperButtonText}>＋</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 }
@@ -1942,6 +2106,64 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#000',
   },
+  viewBody: {
+    flex: 1,
+  },
+  viewBottomControls: {
+    minHeight: 56,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#18202b',
+    backgroundColor: 'rgba(9,13,18,0.96)',
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  iconSegment: {
+    width: 96,
+    height: 36,
+    padding: 2,
+    borderRadius: 8,
+    backgroundColor: '#101720',
+    borderWidth: 1,
+    borderColor: '#263241',
+    flexDirection: 'row',
+  },
+  iconSegmentButton: {
+    flex: 1,
+    borderRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  iconSegmentButtonActive: {
+    backgroundColor: '#2f8cff',
+  },
+  iconSegmentText: {
+    color: '#9aa7b7',
+    fontSize: 18,
+    fontWeight: '900',
+    lineHeight: 22,
+  },
+  iconSegmentTextActive: {
+    color: '#fff',
+  },
+  viewBottomSpacer: {
+    flex: 1,
+  },
+  bottomIconButton: {
+    width: 40,
+    height: 36,
+    borderRadius: 8,
+    backgroundColor: '#1a2532',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  bottomIconText: {
+    color: '#dce6f3',
+    fontSize: 24,
+    fontWeight: '800',
+    lineHeight: 26,
+  },
   viewToolbar: {
     minHeight: 44,
     paddingHorizontal: 14,
@@ -2049,7 +2271,7 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   player: {
-    height: 230,
+    aspectRatio: 16 / 9,
     backgroundColor: '#000',
     position: 'relative',
   },
@@ -2525,6 +2747,36 @@ const styles = StyleSheet.create({
   },
   segment: {
     flexDirection: 'row',
+  },
+  stepper: {
+    minWidth: 128,
+    height: 36,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#263241',
+    backgroundColor: '#101720',
+    flexDirection: 'row',
+    alignItems: 'center',
+    overflow: 'hidden',
+  },
+  stepperButton: {
+    width: 38,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stepperButtonText: {
+    color: '#dce6f3',
+    fontSize: 22,
+    fontWeight: '800',
+    lineHeight: 24,
+  },
+  stepperValue: {
+    flex: 1,
+    color: '#f7f9fc',
+    fontSize: 13,
+    fontWeight: '800',
+    textAlign: 'center',
   },
   orderRow: {
     minHeight: 48,

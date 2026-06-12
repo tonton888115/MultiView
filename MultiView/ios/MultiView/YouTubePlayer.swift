@@ -10,6 +10,25 @@ private enum YouTubeChatMode {
   case dataAPI
 }
 
+private enum YouTubeNativeStreamKind: Equatable {
+  case hls
+  case progressive
+}
+
+private struct YouTubeNativePlayableStream {
+  let url: URL
+  let isLive: Bool
+  let kind: YouTubeNativeStreamKind
+  let hasSABR: Bool
+}
+
+private struct YouTubeNativeStreamFallback {
+  let url: URL
+  let isLive: Bool
+  let userAgent: String
+  let label: String
+}
+
 final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, WKScriptMessageHandler {
   private static let instances = NSHashTable<YouTubeNativePlayerView>.weakObjects()
   private let stream: StreamItem
@@ -38,6 +57,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var dataAPIPageToken: String?
   private var liveChatVideoID: String?
   private var chatMode: YouTubeChatMode = .innerTube
+  private var innerTubeChatFailureCount = 0
   private var seenLiveChatMessageIDs = Set<String>()
   // YouTube live chat is polled (batches arrive every few seconds). Queue them and
   // drip one at a time so a batch doesn't stampede the screen all at once.
@@ -186,6 +206,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     dataAPIPageToken = nil
     liveChatVideoID = videoId
     chatMode = .innerTube
+    innerTubeChatFailureCount = 0
     seenLiveChatMessageIDs.removeAll()
     pendingChatMessages.removeAll()
     chatDripWorkItem?.cancel(); chatDripWorkItem = nil
@@ -196,9 +217,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     YouTubeInnerTubeChatClient.createSession(videoID: videoId) { [weak self] result in
       guard let self, !self.isStopped else { return }
       switch result {
-      case .failure(let error):
-        self.startOAuthLiveChatFallback(videoId: videoId, reason: error.localizedDescription)
+      case .failure:
+        self.handleInnerTubeChatFailure(videoId: videoId, reason: error.localizedDescription)
       case .success(let session):
+        self.innerTubeChatFailureCount = 0
         self.chatMode = .innerTube
         self.innerTubeChatSession = session
         self.pollLiveChat()
@@ -213,10 +235,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     YouTubeInnerTubeChatClient.fetchPage(session: session) { [weak self] result in
       guard let self, !self.isStopped else { return }
       switch result {
-      case .failure(let error):
+      case .failure:
         self.innerTubeChatSession = nil
-        self.startOAuthLiveChatFallback(videoId: self.liveChatVideoID ?? self.stream.channel, reason: error.localizedDescription)
+        self.handleInnerTubeChatFailure(videoId: self.liveChatVideoID ?? self.stream.channel, reason: error.localizedDescription)
       case .success(let page):
+        self.innerTubeChatFailureCount = 0
         self.hideStatusIfPlaybackReady()
         self.innerTubeChatSession?.continuation = page.nextPageToken ?? session.continuation
         let delay = max(2.0, Double(page.pollingIntervalMillis) / 1000.0)
@@ -248,7 +271,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private func startOAuthLiveChatFallback(videoId: String, reason: String) {
     guard !isStopped else { return }
     guard YouTubeAuthManager.shared.isSignedIn else {
-      showStatus(reason)
+      showStatus("YouTubeコメント再接続中")
       scheduleInnerTubeSessionRefresh(videoId: videoId, after: 8)
       return
     }
@@ -258,8 +281,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     YouTubeAuthManager.shared.resolveLiveChat(videoID: videoId) { [weak self] result in
       guard let self, !self.isStopped else { return }
       switch result {
-      case .failure(let error):
-        self.showStatus(error.localizedDescription)
+      case .failure:
+        self.showStatus("YouTubeコメント再接続中")
         self.scheduleInnerTubeSessionRefresh(videoId: videoId, after: 8)
       case .success(let resolved):
         self.dataAPILiveChatID = resolved.liveChatID
@@ -270,6 +293,13 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
+  private func handleInnerTubeChatFailure(videoId: String, reason: String) {
+    innerTubeChatFailureCount += 1
+    let delay = min(30.0, 4.0 + Double(innerTubeChatFailureCount * 3))
+    showStatus("YouTubeコメント再接続中")
+    scheduleInnerTubeSessionRefresh(videoId: videoId, after: delay)
+  }
+
   private func pollDataAPILiveChat() {
     guard settings.showChat,
           !isStopped,
@@ -277,9 +307,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     YouTubeAuthManager.shared.fetchLiveChatMessagesRefreshing(liveChatID: liveChatID, pageToken: dataAPIPageToken) { [weak self] result in
       guard let self, !self.isStopped else { return }
       switch result {
-      case .failure(let error):
-        self.showStatus(error.localizedDescription)
-        self.scheduleLiveChatPoll(after: 10)
+      case .failure:
+        self.chatMode = .innerTube
+        self.showStatus("YouTubeコメント再接続中")
+        self.scheduleInnerTubeSessionRefresh(videoId: self.liveChatVideoID ?? self.stream.channel, after: 8)
       case .success(let page):
         self.hideStatusIfPlaybackReady()
         self.dataAPIPageToken = page.nextPageToken ?? self.dataAPIPageToken
@@ -428,10 +459,15 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     requestNativePlayer(videoId: videoId)
   }
 
-  private func requestNativePlayer(videoId: String, attempt: Int = 0) {
+  private func requestNativePlayer(videoId: String, attempt: Int = 0, fallback: YouTubeNativeStreamFallback? = nil) {
     guard !isStopped, player.currentItem == nil else { return }
     let clients = Self.nativePlayerClients()
     guard clients.indices.contains(attempt) else {
+      if let fallback {
+        noteExtractionFailure("\(fallback.label): HLSなしのためformatで再生")
+        startPlayback(url: fallback.url, videoId: videoId, isLive: fallback.isLive, userAgent: fallback.userAgent)
+        return
+      }
       noteExtractionFailure("Native player: manifest取得失敗")
       installAlternativeWebFallback(videoId: videoId)
       return
@@ -450,6 +486,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     request.setValue(client.headerClientName, forHTTPHeaderField: "X-YouTube-Client-Name")
     request.setValue(client.version, forHTTPHeaderField: "X-YouTube-Client-Version")
     request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
+    let cpn = Self.makeYouTubeCPN()
     request.httpBody = try? JSONSerialization.data(withJSONObject: [
       "context": client.context,
       "videoId": videoId,
@@ -457,7 +494,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       "racyCheckOk": true,
       "playbackContext": [
         "contentPlaybackContext": [
-          "html5Preference": "HTML5_PREF_WANTS"
+          "html5Preference": "HTML5_PREF_WANTS",
+          "referer": "https://www.youtube.com/watch?v=\(videoId)",
+          "cpn": cpn
         ]
       ]
     ])
@@ -476,14 +515,25 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       if let parsed, let stream = Self.extractPlayableStream(from: parsed) {
         DispatchQueue.main.async {
           guard !self.isStopped, self.player.currentItem == nil else { return }
-          self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive)
+          if stream.kind == .hls || !stream.isLive {
+            self.startPlayback(url: stream.url, videoId: videoId, isLive: stream.isLive, userAgent: client.userAgent)
+          } else {
+            let nextFallback = fallback ?? YouTubeNativeStreamFallback(
+              url: stream.url,
+              isLive: stream.isLive,
+              userAgent: client.userAgent,
+              label: client.label
+            )
+            self.noteExtractionFailure("\(client.label): HLSなし\(stream.hasSABR ? " / SABRあり" : "")")
+            self.requestNativePlayer(videoId: videoId, attempt: attempt + 1, fallback: nextFallback)
+          }
         }
         return
       }
       DispatchQueue.main.async {
         let httpCode = (response as? HTTPURLResponse)?.statusCode
         self.noteExtractionFailure(Self.youtubeIErrorSummary(clientName: client.label, httpCode: httpCode, parsed: parsed, data: data))
-        self.requestNativePlayer(videoId: videoId, attempt: attempt + 1)
+        self.requestNativePlayer(videoId: videoId, attempt: attempt + 1, fallback: fallback)
       }
     }
     let task = resolveTask
@@ -497,42 +547,25 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       task.cancel()
       self.resolveTask = nil
       self.noteExtractionFailure("\(client.label): 12秒タイムアウト")
-      self.requestNativePlayer(videoId: videoId, attempt: attempt + 1)
+      self.requestNativePlayer(videoId: videoId, attempt: attempt + 1, fallback: fallback)
     }
   }
 
   private static func nativePlayerClients() -> [(label: String, headerClientName: String, version: String, userAgent: String, context: [String: Any])] {
     let iosVersion = BrowserUserAgent.youtubeIOSVersion
     let iosUA = BrowserUserAgent.youtubeIOS(version: iosVersion)
+    let stableIOSVersion = BrowserUserAgent.youtubeIOSStableVersion
+    let stableIOSUA = BrowserUserAgent.youtubeIOS(version: stableIOSVersion)
     let androidVersion = BrowserUserAgent.youtubeAndroidVersion
     let androidUA = BrowserUserAgent.youtubeAndroid(version: androidVersion)
     return [
-      (
-        label: "IOS",
-        headerClientName: "5",
-        version: iosVersion,
-        userAgent: iosUA,
-        context: [
-          "client": [
-            "clientName": "IOS",
-            "clientVersion": iosVersion,
-            "deviceMake": "Apple",
-            "deviceModel": "iPhone16,2",
-            "osName": "iOS",
-            "osVersion": "17.5.1.21F90",
-            "hl": "ja",
-            "gl": "JP",
-            "userAgent": iosUA
-          ]
-        ]
-      ),
       (
         label: "ANDROID",
         headerClientName: "3",
         version: androidVersion,
         userAgent: androidUA,
         context: [
-          "client": [
+          "client": youtubeClientDefaults([
             "clientName": "ANDROID",
             "clientVersion": androidVersion,
             "androidSdkVersion": 35,
@@ -540,25 +573,75 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
             "deviceModel": "Pixel 9 Pro",
             "osName": "Android",
             "osVersion": "15",
-            "hl": "ja",
-            "gl": "JP",
             "userAgent": androidUA
-          ]
+          ])
+        ]
+      ),
+      (
+        label: "IOS 21.13.6",
+        headerClientName: "5",
+        version: stableIOSVersion,
+        userAgent: stableIOSUA,
+        context: [
+          "client": youtubeClientDefaults([
+            "clientName": "IOS",
+            "clientVersion": stableIOSVersion,
+            "deviceMake": "Apple",
+            "deviceModel": "iPhone16,2",
+            "osName": "iOS",
+            "osVersion": "17.5.1.21F90",
+            "userAgent": stableIOSUA
+          ])
+        ]
+      ),
+      (
+        label: "IOS 21.17.3",
+        headerClientName: "5",
+        version: iosVersion,
+        userAgent: iosUA,
+        context: [
+          "client": youtubeClientDefaults([
+            "clientName": "IOS",
+            "clientVersion": iosVersion,
+            "deviceMake": "Apple",
+            "deviceModel": "iPhone16,2",
+            "osName": "iOS",
+            "osVersion": "17.5.1.21F90",
+            "userAgent": iosUA
+          ])
         ]
       )
     ]
   }
 
-  private static func extractPlayableStream(from parsed: [String: Any]) -> (url: URL, isLive: Bool)? {
+  private static func youtubeClientDefaults(_ client: [String: Any]) -> [String: Any] {
+    var value = client
+    value["hl"] = "ja"
+    value["gl"] = "JP"
+    value["timeZone"] = "Asia/Tokyo"
+    value["utcOffsetMinutes"] = 540
+    value["screenDensityFloat"] = 3
+    value["screenWidthPoints"] = 393
+    value["screenHeightPoints"] = 852
+    return value
+  }
+
+  private static func makeYouTubeCPN() -> String {
+    let chars = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+    return String((0..<16).compactMap { _ in chars.randomElement() })
+  }
+
+  private static func extractPlayableStream(from parsed: [String: Any]) -> YouTubeNativePlayableStream? {
     guard let sd = parsed["streamingData"] as? [String: Any] else { return nil }
     let details = parsed["videoDetails"] as? [String: Any]
     let isLive = (details?["isLive"] as? Bool) ?? (details?["isLiveContent"] as? Bool) ?? false
+    let hasSABR = sd["serverAbrStreamingUrl"] is String
     if let hls = sd["hlsManifestUrl"] as? String, let url = URL(string: hls) {
-      return (url, isLive)
+      return YouTubeNativePlayableStream(url: url, isLive: isLive, kind: .hls, hasSABR: hasSABR)
     }
     let formats = ((sd["formats"] as? [[String: Any]]) ?? []) + ((sd["adaptiveFormats"] as? [[String: Any]]) ?? [])
     if let url = bestFormatURL(formats) {
-      return (url, isLive)
+      return YouTubeNativePlayableStream(url: url, isLive: isLive, kind: .progressive, hasSABR: hasSABR)
     }
     return nil
   }
@@ -624,24 +707,24 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     return (sorted.last(where: { $0.0 <= 720 }) ?? sorted.last)?.2
   }
 
-  private func startPlayback(url: URL, videoId: String, isLive: Bool) {
+  private func startPlayback(url: URL, videoId: String, isLive: Bool, userAgent: String) {
     guard !isStopped else { return }
     statusLabel.isHidden = true
     currentNativeVideoID = videoId
     currentNativeIsLive = isLive
     let asset = AVURLAsset(url: url, options: [
-      "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": Self.userAgent],
+      "AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": userAgent],
       // Live HLS never needs a precise duration; skip that analysis to trim startup.
       AVURLAssetPreferPreciseDurationAndTimingKey: false
     ])
     let item = AVPlayerItem(asset: asset)
     item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
     item.preferredPeakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: settings)
-    item.preferredForwardBufferDuration = isLive ? 6 : 3
+    item.preferredForwardBufferDuration = isLive ? 10 : 3
     if isLive {
       // YouTubeはライブ端を詰めすぎるとプレイリスト更新/広告境界で途切れやすい。
       // 低遅延より安定を優先し、数秒後ろに置く。
-      item.configuredTimeOffsetFromLive = CMTime(seconds: 6, preferredTimescale: 600)
+      item.configuredTimeOffsetFromLive = CMTime(seconds: 12, preferredTimescale: 600)
       item.automaticallyPreservesTimeOffsetFromLive = true
     }
     itemStatusObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
@@ -693,12 +776,12 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
     // AVPlayer が .failed に遷移せず ready のまま無音で固まるケース (signatureCipher
     // 経由の壊れた URL でよく起きる) に備え、6秒以内に再生開始しなければ iframe へ。
-    DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self, weak item] in
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) { [weak self, weak item] in
       guard let self, !self.isStopped,
             self.fallbackWebView == nil,
             let item, self.player.currentItem === item,
             self.player.timeControlStatus != .playing else { return }
-      self.noteExtractionFailure("6秒以内に再生されず: iframeへ")
+      self.noteExtractionFailure("10秒以内に再生されず: iframeへ")
       self.installEmbedFallback(videoId: videoId)
     }
     // SponsorBlock only applies to VOD (live has no segments).
@@ -721,7 +804,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       isStopped: isStopped,
       fallbackActive: fallbackWebView != nil,
       behindThreshold: 30,
-      targetOffset: 8,
+      targetOffset: 12,
       toleranceBefore: 2
     )
   }
@@ -732,7 +815,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
        let liveRange = item.seekableTimeRanges.last?.timeRangeValue,
        liveRange.duration.isNumeric {
       let liveEdge = CMTimeAdd(liveRange.start, liveRange.duration)
-      let target = CMTimeSubtract(liveEdge, CMTime(seconds: 6, preferredTimescale: 600))
+      let target = CMTimeSubtract(liveEdge, CMTime(seconds: 12, preferredTimescale: 600))
       item.seek(to: target,
                 toleranceBefore: CMTime(seconds: 2, preferredTimescale: 600),
                 toleranceAfter: .zero) { [weak self] _ in
@@ -1026,7 +1109,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         player=new YT.Player('player',{
           width:'100%',height:'100%',videoId:'\(videoId)',
           host:'https://www.youtube.com',
-          playerVars:{autoplay:1,mute:1,playsinline:1,controls:1,rel:0,fs:1,iv_load_policy:3,origin:'https://tonton888115.github.io'},
+          playerVars:{autoplay:1,mute:1,playsinline:1,controls:0,disablekb:1,rel:0,fs:0,iv_load_policy:3,origin:'https://tonton888115.github.io'},
           events:{
             onReady:function(){READY=true;apply();loadSB();},
             onStateChange:function(e){
@@ -1161,6 +1244,9 @@ private struct YouTubeInnerTubeChatSession {
   let apiKey: String
   let context: [String: Any]
   var continuation: String
+  let headerClientName: String?
+  let clientVersion: String?
+  let visitorData: String?
 }
 
 private struct YouTubeInitialChatTarget {
@@ -1170,7 +1256,9 @@ private struct YouTubeInitialChatTarget {
 
 private struct YouTubeInnerTubeChatState {
   let apiKey: String?
+  let headerClientName: String?
   let clientVersion: String?
+  let visitorData: String?
   let context: [String: Any]?
   let continuation: String?
 }
@@ -1200,6 +1288,7 @@ private enum YouTubeInnerTubeChatClient {
 
       let target = targets[index]
       var request = URLRequest(url: target.url)
+      request.timeoutInterval = 12
       request.setValue(chatUserAgent, forHTTPHeaderField: "User-Agent")
       request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
       if let referer = target.referer {
@@ -1239,10 +1328,11 @@ private enum YouTubeInnerTubeChatClient {
           let watch = URL(string: "https://www.youtube.com/watch?v=\(encoded)") else {
       return []
     }
-    var targets = [YouTubeInitialChatTarget(url: watch, referer: nil)]
+    var targets: [YouTubeInitialChatTarget] = []
     if let liveChat = URL(string: "https://www.youtube.com/live_chat?v=\(encoded)&is_popout=1") {
       targets.append(YouTubeInitialChatTarget(url: liveChat, referer: watch.absoluteString))
     }
+    targets.append(YouTubeInitialChatTarget(url: watch, referer: nil))
     return targets
   }
 
@@ -1256,12 +1346,18 @@ private enum YouTubeInnerTubeChatClient {
     let clientVersion = firstCapture(in: html, pattern: #""INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)""#)
       ?? string(ytcfg?["INNERTUBE_CLIENT_VERSION"])
       ?? string((context?["client"] as? [String: Any])?["clientVersion"])
+    let headerClientName = firstCapture(in: html, pattern: #""INNERTUBE_CONTEXT_CLIENT_NAME"\s*:\s*"?(\d+)"?"#)
+      ?? string(ytcfg?["INNERTUBE_CONTEXT_CLIENT_NAME"])
+    let visitorData = string(ytcfg?["VISITOR_DATA"])
+      ?? string((context?["client"] as? [String: Any])?["visitorData"])
     let continuation = initialData.flatMap { findLiveChatContinuation(in: $0) }
       ?? ytcfg.flatMap { findLiveChatContinuation(in: $0) }
       ?? firstCapture(in: html, pattern: #""continuation"\s*:\s*"([^"]+)""#)
     return YouTubeInnerTubeChatState(
       apiKey: apiKey,
+      headerClientName: headerClientName,
       clientVersion: clientVersion,
+      visitorData: visitorData,
       context: context,
       continuation: continuation
     )
@@ -1274,17 +1370,21 @@ private enum YouTubeInnerTubeChatClient {
     let context = states.compactMap(\.context).first
     let contextVersion = string((context?["client"] as? [String: Any])?["clientVersion"])
     let clientVersion = states.compactMap(\.clientVersion).first ?? contextVersion ?? "2.20240620.01.00"
+    let visitorData = states.compactMap(\.visitorData).first ?? string((context?["client"] as? [String: Any])?["visitorData"])
     guard let continuation = states.compactMap(\.continuation).first, !continuation.isEmpty else {
       throw messageError("YouTubeライブチャットのcontinuationを取得できません")
     }
     return YouTubeInnerTubeChatSession(
       apiKey: apiKey,
-      context: normalizedContext(context, clientVersion: clientVersion),
-      continuation: continuation
+      context: normalizedContext(context, clientVersion: clientVersion, visitorData: visitorData),
+      continuation: continuation,
+      headerClientName: states.compactMap(\.headerClientName).first,
+      clientVersion: clientVersion,
+      visitorData: visitorData
     )
   }
 
-  private static func normalizedContext(_ context: [String: Any]?, clientVersion: String) -> [String: Any] {
+  private static func normalizedContext(_ context: [String: Any]?, clientVersion: String, visitorData: String?) -> [String: Any] {
     var normalized = context ?? [:]
     var client = normalized["client"] as? [String: Any] ?? [:]
     if string(client["clientName"]) == nil {
@@ -1300,6 +1400,9 @@ private enum YouTubeInnerTubeChatClient {
     if string(client["userAgent"]) == nil {
       client["userAgent"] = chatUserAgent
     }
+    if let visitorData, !visitorData.isEmpty {
+      client["visitorData"] = visitorData
+    }
     normalized["client"] = client
     return normalized
   }
@@ -1311,9 +1414,19 @@ private enum YouTubeInnerTubeChatClient {
     }
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
+    request.timeoutInterval = 12
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue(chatUserAgent, forHTTPHeaderField: "User-Agent")
     request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
+    if let headerClientName = session.headerClientName, !headerClientName.isEmpty {
+      request.setValue(headerClientName, forHTTPHeaderField: "X-YouTube-Client-Name")
+    }
+    if let clientVersion = session.clientVersion, !clientVersion.isEmpty {
+      request.setValue(clientVersion, forHTTPHeaderField: "X-YouTube-Client-Version")
+    }
+    if let visitorData = session.visitorData, !visitorData.isEmpty {
+      request.setValue(visitorData, forHTTPHeaderField: "X-Goog-Visitor-Id")
+    }
     request.httpBody = try? JSONSerialization.data(withJSONObject: [
       "context": session.context,
       "continuation": session.continuation
@@ -1327,13 +1440,11 @@ private enum YouTubeInnerTubeChatClient {
             let http = response as? HTTPURLResponse,
             (200..<300).contains(http.statusCode),
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-        finish(completion, .failure(messageError("YouTubeコメント取得失敗 HTTP \(status)")))
+        finish(completion, .failure(messageError("YouTubeコメント再接続中")))
         return
       }
       let live = (((json["continuationContents"] as? [String: Any])?["liveChatContinuation"]) as? [String: Any]) ?? [:]
-      let actions = live["actions"] as? [Any] ?? []
-      let messages = actions.isEmpty ? messagesFromAction(json) : actions.flatMap(messagesFromAction)
+      let messages = messagesFromAction(json)
       let continuations = live["continuations"] as? [Any]
       let next = continuation(from: continuations) ?? findLiveChatContinuation(in: json)
       let timeout = max(700, timeoutMillis(from: continuations) ?? 3000)
@@ -1352,7 +1463,14 @@ private enum YouTubeInnerTubeChatClient {
       "liveChatGiftMembershipReceivedRenderer",
       "liveChatViewerEngagementMessageRenderer",
       "liveChatModeChangeMessageRenderer",
-      "liveChatPlaceholderItemRenderer"
+      "liveChatPlaceholderItemRenderer",
+      "liveChatAutoModMessageRenderer",
+      "liveChatBannerRenderer",
+      "liveChatBannerHeaderRenderer",
+      "liveChatTickerPaidMessageItemRenderer",
+      "liveChatTickerSponsorItemRenderer",
+      "liveChatDonationAnnouncementRenderer",
+      "liveChatPollRenderer"
     ]
     var renderers: [[String: Any]] = []
     func walk(_ value: Any?) {
@@ -1485,6 +1603,9 @@ private enum YouTubeInnerTubeChatClient {
   }
 
   private static func findLiveChatContinuation(in root: Any) -> String? {
+    if let allMessages = allMessagesContinuation(in: root) {
+      return allMessages
+    }
     if let dict = root as? [String: Any] {
       if let renderer = dict["liveChatRenderer"] as? [String: Any],
          let value = continuation(from: renderer["continuations"] as? [Any]) {
@@ -1492,9 +1613,6 @@ private enum YouTubeInnerTubeChatClient {
       }
       if let live = dict["liveChatContinuation"] as? [String: Any],
          let value = continuation(from: live["continuations"] as? [Any]) {
-        return value
-      }
-      if let value = continuation(fromData: dict) {
         return value
       }
       for value in dict.values {
@@ -1512,11 +1630,65 @@ private enum YouTubeInnerTubeChatClient {
     return nil
   }
 
+  private static func allMessagesContinuation(in root: Any) -> String? {
+    if let dict = root as? [String: Any] {
+      if let menu = dict["sortFilterSubMenuRenderer"] as? [String: Any],
+         let items = menu["subMenuItems"] as? [[String: Any]] {
+        for item in items {
+          let title = textValue(from: item["title"])
+          let subtitle = textValue(from: item["subtitle"])
+          let label = textValue(from: (item["accessibility"] as? [String: Any])?["accessibilityData"])
+          let haystack = "\(title) \(subtitle) \(label)".lowercased()
+          let isTopChat = haystack.contains("top chat") || haystack.contains("トップチャット")
+          let isAllMessages = haystack.contains("live chat")
+            || haystack.contains("all messages")
+            || haystack.contains("すべてのメッセージ")
+            || (haystack.contains("チャット") && !isTopChat)
+          if !isTopChat, isAllMessages {
+            let itemContinuation = (item["continuation"] as? [String: Any]).flatMap { continuation(fromData: $0) }
+            let serviceContinuation = (item["serviceEndpoint"] as? [String: Any]).flatMap { continuation(fromData: $0) }
+            if let continuation = itemContinuation ?? serviceContinuation {
+              return continuation
+            }
+          }
+        }
+      }
+      for value in dict.values {
+        if let found = allMessagesContinuation(in: value) {
+          return found
+        }
+      }
+    } else if let array = root as? [Any] {
+      for value in array {
+        if let found = allMessagesContinuation(in: value) {
+          return found
+        }
+      }
+    }
+    return nil
+  }
+
+  private static func textValue(from value: Any?) -> String {
+    if let raw = value as? String {
+      return raw
+    }
+    guard let dict = value as? [String: Any] else {
+      return ""
+    }
+    if let label = dict["label"] as? String {
+      return label
+    }
+    return text(from: dict) ?? ""
+  }
+
   private static func continuation(fromData dict: [String: Any]) -> String? {
     for key in ["timedContinuationData", "invalidationContinuationData", "reloadContinuationData", "liveChatReplayContinuationData"] {
       if let value = (dict[key] as? [String: Any])?["continuation"] as? String, !value.isEmpty {
         return value
       }
+    }
+    if let value = (dict["continuationCommand"] as? [String: Any])?["token"] as? String, !value.isEmpty {
+      return value
     }
     return nil
   }
