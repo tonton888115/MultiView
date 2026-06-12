@@ -217,7 +217,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     YouTubeInnerTubeChatClient.createSession(videoID: videoId) { [weak self] result in
       guard let self, !self.isStopped else { return }
       switch result {
-      case .failure:
+      case .failure(let error):
         self.handleInnerTubeChatFailure(videoId: videoId, reason: error.localizedDescription)
       case .success(let session):
         self.innerTubeChatFailureCount = 0
@@ -235,7 +235,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     YouTubeInnerTubeChatClient.fetchPage(session: session) { [weak self] result in
       guard let self, !self.isStopped else { return }
       switch result {
-      case .failure:
+      case .failure(let error):
         self.innerTubeChatSession = nil
         self.handleInnerTubeChatFailure(videoId: self.liveChatVideoID ?? self.stream.channel, reason: error.localizedDescription)
       case .success(let page):
