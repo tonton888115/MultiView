@@ -98,13 +98,16 @@ export async function resolvePlaybackSource(
         return niconicoWebFallback(stream, settings, streamCount);
     }
   } catch (error) {
-    return {
+    const source: PlaybackSource = {
       kind: 'error',
       label: '取得失敗',
       status: 'フォールバック待機',
       reason: error instanceof Error ? error.message : String(error),
-      fallbackUrl: webStreamURL(stream),
     };
+    if (stream.platform !== 'youtube') {
+      source.fallbackUrl = webStreamURL(stream);
+    }
+    return source;
   }
 }
 
@@ -234,22 +237,13 @@ async function resolveYouTube(stream: StreamItem, settings: AppSettings): Promis
   const videoId = youtubeVideoId(raw) ?? (await resolveLiveYouTubeVideoID(raw));
   if (!videoId) {
     return {
-      kind: 'web',
-      url: webStreamURL(stream),
-      label: 'YouTube Web',
+      kind: 'error',
+      label: 'YouTube HLS',
       status: '動画ID未解決',
       reason: '@handle/live から現在のライブ動画IDを解決できませんでした。',
     };
   }
-  if (settings.youtubePreferIframe) {
-    return {
-      kind: 'youtube-iframe',
-      videoId,
-      label: 'YouTube iframe',
-      status: '公式エンジン/安定モード',
-    };
-  }
-  const direct = await requestYouTubeDirect(videoId);
+  const direct = await requestYouTubeDirect(videoId, settings);
   if (direct) {
     return {
       kind: 'native',
@@ -261,12 +255,21 @@ async function resolveYouTube(stream: StreamItem, settings: AppSettings): Promis
     };
   }
   return {
-    kind: 'web',
-    url: `https://m.youtube.com/watch?v=${encodeURIComponent(videoId)}`,
-    label: 'YouTube Web',
-    status: 'HLSなし/Webフォールバック',
-    reason: 'YouTubeが直接HLSを返さないためWeb再生に切り替えました。',
+    kind: 'error',
+    label: 'YouTube HLS',
+    status: 'HLS再取得待ち',
+    reason: hasYouTubePlaybackAuth(settings)
+      ? 'YouTubeが入力済みのHLS認証材料でも直接HLSを返していません。公式Web再生には切り替えず再取得します。'
+      : 'YouTubeがbot確認でHLSを返していません。設定でYouTube HLS Cookie、PO Token、Visitor Dataを入力してください。公式Web再生には切り替えません。',
   };
+}
+
+function hasYouTubePlaybackAuth(settings: AppSettings): boolean {
+  return Boolean(
+    settings.youtubeCookie.trim()
+    || settings.youtubePoToken.trim()
+    || settings.youtubeVisitorData.trim()
+  );
 }
 
 async function resolveTwitcasting(stream: StreamItem): Promise<PlaybackSource> {
@@ -455,12 +458,29 @@ type YouTubePlayableStream = {
   hasSabr: boolean;
 };
 
-async function requestYouTubeDirect(videoId: string): Promise<{url: string; userAgent: string} | null> {
+async function requestYouTubeDirect(videoId: string, settings: AppSettings): Promise<{url: string; userAgent: string} | null> {
   const clients = youtubeClients();
-  let fallback: {url: string; userAgent: string} | null = null;
   for (const client of clients) {
     try {
       const cpn = makeYouTubeCPN();
+      const auth = youtubePlaybackAuth(settings, 'https://www.youtube.com');
+      const context = auth.visitorData ? withYouTubeVisitorData(client.context, auth.visitorData) : client.context;
+      const body: Record<string, unknown> = {
+        context,
+        videoId,
+        contentCheckOk: true,
+        racyCheckOk: true,
+        playbackContext: {
+          contentPlaybackContext: {
+            html5Preference: 'HTML5_PREF_WANTS',
+            referer: `https://www.youtube.com/watch?v=${videoId}`,
+            cpn,
+          },
+        },
+      };
+      if (auth.poToken) {
+        body.serviceIntegrityDimensions = {poToken: auth.poToken};
+      }
       const response = await fetchWithTimeout('https://youtubei.googleapis.com/youtubei/v1/player', {
         method: 'POST',
         headers: {
@@ -469,20 +489,9 @@ async function requestYouTubeDirect(videoId: string): Promise<{url: string; user
           'X-YouTube-Client-Name': client.headerClientName,
           'X-YouTube-Client-Version': client.version,
           'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
+          ...auth.headers,
         },
-        body: JSON.stringify({
-          context: client.context,
-          videoId,
-          contentCheckOk: true,
-          racyCheckOk: true,
-          playbackContext: {
-            contentPlaybackContext: {
-              html5Preference: 'HTML5_PREF_WANTS',
-              referer: `https://www.youtube.com/watch?v=${videoId}`,
-              cpn,
-            },
-          },
-        }),
+        body: JSON.stringify(body),
       }, 12000);
       if (!response.ok) {
         continue;
@@ -493,13 +502,12 @@ async function requestYouTubeDirect(videoId: string): Promise<{url: string; user
         if (stream.kind === 'hls' || !stream.isLive) {
           return {url: stream.url, userAgent: client.userAgent};
         }
-        fallback = fallback ?? {url: stream.url, userAgent: client.userAgent};
       }
     } catch {
       // Try the next InnerTube client.
     }
   }
-  return fallback;
+  return null;
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
@@ -519,6 +527,129 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
     }
   }
 }
+
+function youtubePlaybackAuth(settings: AppSettings, origin: string): {headers: Record<string, string>; poToken?: string; visitorData?: string} {
+  const cookie = settings.youtubeCookie.trim();
+  const poToken = settings.youtubePoToken.trim();
+  const visitorData = settings.youtubeVisitorData.trim();
+  const headers: Record<string, string> = {};
+  if (cookie) {
+    headers.Cookie = cookie;
+    const sapisid = youtubeCookieValue(cookie, ['SAPISID', '__Secure-1PAPISID', '__Secure-3PAPISID']);
+    if (sapisid) {
+      const timestamp = Math.floor(Date.now() / 1000);
+      headers.Authorization = `SAPISIDHASH ${timestamp}_${sha1Hex(`${timestamp} ${decodeURIComponentSafe(sapisid)} ${origin}`)}`;
+      headers.Origin = origin;
+      headers['X-Origin'] = origin;
+    }
+  }
+  if (visitorData) {
+    headers['X-Goog-Visitor-Id'] = visitorData;
+  }
+  return {
+    headers,
+    ...(poToken ? {poToken} : {}),
+    ...(visitorData ? {visitorData} : {}),
+  };
+}
+
+function withYouTubeVisitorData(context: Record<string, unknown>, visitorData: string): Record<string, unknown> {
+  const client = typeof context.client === 'object' && context.client ? context.client as Record<string, unknown> : {};
+  return {
+    ...context,
+    client: {
+      ...client,
+      visitorData,
+    },
+  };
+}
+
+function youtubeCookieValue(cookie: string, names: string[]): string | null {
+  const values = cookie.split(';');
+  for (const part of values) {
+    const [rawName, ...rawValue] = part.trim().split('=');
+    if (names.includes(rawName) && rawValue.length) {
+      return rawValue.join('=');
+    }
+  }
+  return null;
+}
+
+function decodeURIComponentSafe(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/* eslint-disable no-bitwise */
+function sha1Hex(input: string): string {
+  const bytes = Array.from(unescape(encodeURIComponent(input)), char => char.charCodeAt(0));
+  const bitLength = bytes.length * 8;
+  bytes.push(0x80);
+  while ((bytes.length % 64) !== 56) {
+    bytes.push(0);
+  }
+  const high = Math.floor(bitLength / 0x100000000);
+  const low = bitLength >>> 0;
+  for (let i = 3; i >= 0; i -= 1) {
+    bytes.push((high >>> (i * 8)) & 0xff);
+  }
+  for (let i = 3; i >= 0; i -= 1) {
+    bytes.push((low >>> (i * 8)) & 0xff);
+  }
+  let h0 = 0x67452301;
+  let h1 = 0xefcdab89;
+  let h2 = 0x98badcfe;
+  let h3 = 0x10325476;
+  let h4 = 0xc3d2e1f0;
+  for (let i = 0; i < bytes.length; i += 64) {
+    const words = new Array<number>(80);
+    for (let j = 0; j < 16; j += 1) {
+      words[j] = (bytes[i + j * 4] << 24) | (bytes[i + j * 4 + 1] << 16) | (bytes[i + j * 4 + 2] << 8) | bytes[i + j * 4 + 3];
+    }
+    for (let j = 16; j < 80; j += 1) {
+      const value = words[j - 3] ^ words[j - 8] ^ words[j - 14] ^ words[j - 16];
+      words[j] = (value << 1) | (value >>> 31);
+    }
+    let a = h0;
+    let b = h1;
+    let c = h2;
+    let d = h3;
+    let e = h4;
+    for (let j = 0; j < 80; j += 1) {
+      let f: number;
+      let k: number;
+      if (j < 20) {
+        f = (b & c) | (~b & d);
+        k = 0x5a827999;
+      } else if (j < 40) {
+        f = b ^ c ^ d;
+        k = 0x6ed9eba1;
+      } else if (j < 60) {
+        f = (b & c) | (b & d) | (c & d);
+        k = 0x8f1bbcdc;
+      } else {
+        f = b ^ c ^ d;
+        k = 0xca62c1d6;
+      }
+      const temp = (((a << 5) | (a >>> 27)) + f + e + k + words[j]) | 0;
+      e = d;
+      d = c;
+      c = (b << 30) | (b >>> 2);
+      b = a;
+      a = temp;
+    }
+    h0 = (h0 + a) | 0;
+    h1 = (h1 + b) | 0;
+    h2 = (h2 + c) | 0;
+    h3 = (h3 + d) | 0;
+    h4 = (h4 + e) | 0;
+  }
+  return [h0, h1, h2, h3, h4].map(word => (word >>> 0).toString(16).padStart(8, '0')).join('');
+}
+/* eslint-enable no-bitwise */
 
 function youtubeClients() {
   const currentIosUA = youtubeIOSUserAgent(youtubeIOSVersion);
@@ -644,103 +775,4 @@ function stringValue(value: unknown): string | null {
     return String(value);
   }
   return null;
-}
-
-export function youtubeIframeHTML(videoId: string): string {
-  const escaped = escapeHTML(videoId);
-  return `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<style>
-html,body,#player{margin:0;width:100%;height:100%;background:#000;overflow:hidden}
-iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000}
-#err{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:#fff;font-family:sans-serif;text-align:center;padding:18px;font-size:13px;line-height:1.5}
-</style>
-</head>
-<body>
-<div id="player"></div>
-<div id="err"></div>
-<script src="https://www.youtube.com/iframe_api"></script>
-<script>
-var player=null,READY=false,AUDIO=false,VOL=0,WANT_PLAY=true,lastPlayingAt=0,sb=[];
-function apply(){
-  if(!player||!READY)return;
-  try{
-    if(WANT_PLAY){player.playVideo();}
-    if(AUDIO){player.unMute();player.setVolume(VOL);}else{player.mute();}
-  }catch(e){}
-}
-function loadSB(){
-  try{
-    var cats='%5B%22sponsor%22%2C%22selfpromo%22%2C%22interaction%22%2C%22intro%22%2C%22outro%22%2C%22preview%22%2C%22music_offtopic%22%5D';
-    fetch('https://sponsor.ajay.app/api/skipSegments?videoID=${escaped}&categories='+cats+'&actionTypes=%5B%22skip%22%5D')
-      .then(function(r){return r.ok?r.json():[];})
-      .then(function(list){sb=(list||[]).filter(function(s){return s.actionType==='skip'&&s.segment;}).map(function(s){return {s:s.segment[0],e:s.segment[1]};});})
-      .catch(function(){});
-  }catch(e){}
-}
-function sbTick(){
-  if(!player||!READY||!sb.length)return;
-  try{
-    var t=player.getCurrentTime();
-    for(var i=0;i<sb.length;i++){
-      if(t>=sb[i].s&&t<sb[i].e-0.15){player.seekTo(sb[i].e+0.1,true);break;}
-    }
-  }catch(e){}
-}
-function showError(code){
-  var el=document.getElementById('err');
-  el.textContent='YouTube iframe error: '+code;
-  el.style.display='flex';
-}
-window.onYouTubeIframeAPIReady=function(){
-  player=new YT.Player('player',{
-    width:'100%',height:'100%',videoId:'${escaped}',
-    host:'https://www.youtube.com',
-    playerVars:{autoplay:1,mute:1,playsinline:1,controls:0,rel:0,fs:0,iv_load_policy:3,modestbranding:1,origin:'https://tonton888115.github.io'},
-    events:{
-      onReady:function(){READY=true;apply();loadSB();},
-      onStateChange:function(e){
-        if(e.data===YT.PlayerState.PLAYING){lastPlayingAt=Date.now();return;}
-        if(WANT_PLAY&&(e.data===YT.PlayerState.UNSTARTED||e.data===YT.PlayerState.CUED||e.data===YT.PlayerState.PAUSED||e.data===YT.PlayerState.BUFFERING)){
-          setTimeout(function(){try{e.target.playVideo();}catch(x){}},250);
-        }
-      },
-      onError:function(e){showError(e.data);}
-    }
-  });
-};
-window.mvPlay=function(){WANT_PLAY=true;apply();};
-window.mvPause=function(){WANT_PLAY=false;try{player&&player.pauseVideo();}catch(e){}};
-window.mvSetVolume=function(v){var n=Math.max(0,Math.min(1,+v||0));VOL=Math.round(n*100);AUDIO=VOL>0;apply();};
-setInterval(sbTick,400);
-setInterval(function(){
-  if(!player||!READY||!WANT_PLAY)return;
-  try{
-    var state=player.getPlayerState();
-    if(state!==YT.PlayerState.PLAYING&&Date.now()-lastPlayingAt>2500){player.playVideo();}
-  }catch(e){}
-},1200);
-</script>
-</body>
-</html>`;
-}
-
-function escapeHTML(value: string): string {
-  return value.replace(/[&<>"']/g, char => {
-    switch (char) {
-      case '&':
-        return '&amp;';
-      case '<':
-        return '&lt;';
-      case '>':
-        return '&gt;';
-      case '"':
-        return '&quot;';
-      default:
-        return '&#39;';
-    }
-  });
 }

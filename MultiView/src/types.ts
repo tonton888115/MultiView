@@ -17,8 +17,10 @@ export type AppSettings = {
   playAudio: boolean;
   autoFollowRaids: boolean;
   blockWebAds: boolean;
-  youtubePreferIframe: boolean;
   youtubeStableBuffer: boolean;
+  youtubeCookie: string;
+  youtubePoToken: string;
+  youtubeVisitorData: string;
   layoutMode: LayoutMode;
   wifiQuality: PlaybackQuality;
   mobileQuality: PlaybackQuality;
@@ -43,12 +45,6 @@ export type PlaybackSource =
       url: string;
       headers?: Record<string, string>;
       liveTargetOffsetMs?: number;
-      label: string;
-      status: string;
-    }
-  | {
-      kind: 'youtube-iframe';
-      videoId: string;
       label: string;
       status: string;
     }
