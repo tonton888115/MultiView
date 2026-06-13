@@ -4,6 +4,8 @@ import {estimateTokenWidth, textFromTokens, textTokens} from './danmaku';
 import {startChatClient} from './chat';
 import type {AppSettings, ChatEvent, DanmakuToken, StreamItem} from './types';
 
+const danmakuBacklogLimit = 20000;
+
 type Layout = {
   width: number;
   height: number;
@@ -128,7 +130,7 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
     const drain = () => {
       timerRef.current = null;
       let consumed = 0;
-      const maxBurst = Math.max(3, laneCount * 3);
+      const maxBurst = Math.max(5, laneCount * 5);
       while (queueRef.current.length > 0 && consumed < maxBurst) {
         const next = queueRef.current[0];
         if (!emitNow(next)) {
@@ -140,7 +142,7 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       if (queueRef.current.length > 0) {
         const waitMs = layout.width <= 0 || layout.height <= 0
           ? 120
-          : 16;
+          : 8;
         timerRef.current = setTimeout(drain, waitMs);
       }
     };
@@ -156,8 +158,8 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       settings,
       event => {
         queueRef.current.push(event);
-        if (queueRef.current.length > 5000) {
-          queueRef.current.splice(0, queueRef.current.length - 5000);
+        if (queueRef.current.length > danmakuBacklogLimit) {
+          queueRef.current.splice(0, queueRef.current.length - danmakuBacklogLimit);
         }
         scheduleDrain();
       },

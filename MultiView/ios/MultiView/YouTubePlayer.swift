@@ -10,6 +10,22 @@ private enum YouTubeChatMode {
   case dataAPI
 }
 
+private let youtubeChatMinPollInterval: TimeInterval = 0.7
+private let youtubeChatMaxPollInterval: TimeInterval = 1.6
+private let youtubeChatReconnectInterval: TimeInterval = 3.5
+private let youtubeChatBacklogLimit = 20000
+private let youtubeChatSeenLimit = 20000
+private let youtubeChatSeenKeep = 12000
+
+private extension Array where Element == NativeDanmakuToken {
+  var containsImage: Bool {
+    contains { token in
+      if case .image = token { return true }
+      return false
+    }
+  }
+}
+
 final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, WKScriptMessageHandler {
   private static let instances = NSHashTable<YouTubeNativePlayerView>.weakObjects()
   private let stream: StreamItem
@@ -35,6 +51,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var chatMode: YouTubeChatMode = .innerTube
   private var innerTubeChatFailureCount = 0
   private var seenLiveChatMessageIDs = Set<String>()
+  private var seenLiveChatMessageOrder: [String] = []
   // YouTube live chat is polled (batches arrive every few seconds). Queue them and
   // drip one at a time so a batch doesn't stampede the screen all at once.
   private var pendingChatMessages: [YouTubeLiveChatMessage] = []
@@ -179,6 +196,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     chatMode = .innerTube
     innerTubeChatFailureCount = 0
     seenLiveChatMessageIDs.removeAll()
+    seenLiveChatMessageOrder.removeAll()
     pendingChatMessages.removeAll()
     chatDripWorkItem?.cancel(); chatDripWorkItem = nil
     createInnerTubeLiveChatSession(videoId: videoId)
@@ -213,7 +231,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         self.innerTubeChatFailureCount = 0
         self.hideStatusIfPlaybackReady()
         self.innerTubeChatSession?.continuation = page.nextPageToken ?? session.continuation
-        let delay = max(2.0, Double(page.pollingIntervalMillis) / 1000.0)
+        let delay = self.youtubeChatPollDelay(milliseconds: page.pollingIntervalMillis)
         self.lastChatPollInterval = delay
         self.emitLiveChatMessages(page.messages)
         self.scheduleLiveChatPoll(after: delay)
@@ -243,7 +261,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     guard !isStopped else { return }
     guard YouTubeAuthManager.shared.isSignedIn else {
       showStatus("YouTubeコメント再接続中")
-      scheduleInnerTubeSessionRefresh(videoId: videoId, after: 8)
+      scheduleInnerTubeSessionRefresh(videoId: videoId, after: youtubeChatReconnectInterval)
       return
     }
     showStatus("YouTubeコメントをOAuth経由に切替中")
@@ -254,7 +272,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       switch result {
       case .failure:
         self.showStatus("YouTubeコメント再接続中")
-        self.scheduleInnerTubeSessionRefresh(videoId: videoId, after: 8)
+        self.scheduleInnerTubeSessionRefresh(videoId: videoId, after: youtubeChatReconnectInterval)
       case .success(let resolved):
         self.dataAPILiveChatID = resolved.liveChatID
         self.dataAPIPageToken = nil
@@ -266,7 +284,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   private func handleInnerTubeChatFailure(videoId: String, reason: String) {
     innerTubeChatFailureCount += 1
-    let delay = min(30.0, 4.0 + Double(innerTubeChatFailureCount * 3))
+    let delay = min(18.0, youtubeChatReconnectInterval + Double(innerTubeChatFailureCount * 2))
     showStatus("YouTubeコメント再接続中")
     scheduleInnerTubeSessionRefresh(videoId: videoId, after: delay)
   }
@@ -281,11 +299,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       case .failure:
         self.chatMode = .innerTube
         self.showStatus("YouTubeコメント再接続中")
-        self.scheduleInnerTubeSessionRefresh(videoId: self.liveChatVideoID ?? self.stream.channel, after: 8)
+        self.scheduleInnerTubeSessionRefresh(videoId: self.liveChatVideoID ?? self.stream.channel, after: youtubeChatReconnectInterval)
       case .success(let page):
         self.hideStatusIfPlaybackReady()
         self.dataAPIPageToken = page.nextPageToken ?? self.dataAPIPageToken
-        let delay = max(2.0, Double(page.pollingIntervalMillis) / 1000.0)
+        let delay = self.youtubeChatPollDelay(milliseconds: page.pollingIntervalMillis)
         self.lastChatPollInterval = delay
         self.emitLiveChatMessages(page.messages)
         self.scheduleLiveChatPoll(after: delay)
@@ -308,14 +326,23 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
+  private func youtubeChatPollDelay(milliseconds: Int) -> TimeInterval {
+    let requested = TimeInterval(milliseconds) / 1000.0
+    return min(youtubeChatMaxPollInterval, max(youtubeChatMinPollInterval, requested))
+  }
+
   private func emitLiveChatMessages(_ messages: [YouTubeLiveChatMessage]) {
     let fresh = messages.filter { !seenLiveChatMessageIDs.contains($0.id) }
     guard !fresh.isEmpty else { return }
-    fresh.forEach { seenLiveChatMessageIDs.insert($0.id) }
-    // Trim the dedupe set without fully clearing it — a full reset let the very next
-    // poll re-show messages whose IDs were just forgotten. Keep the current batch's IDs.
-    if seenLiveChatMessageIDs.count > 2000 {
-      seenLiveChatMessageIDs = Set(fresh.map { $0.id })
+    fresh.forEach {
+      seenLiveChatMessageIDs.insert($0.id)
+      seenLiveChatMessageOrder.append($0.id)
+    }
+    if seenLiveChatMessageOrder.count > youtubeChatSeenLimit {
+      let removeCount = seenLiveChatMessageOrder.count - youtubeChatSeenKeep
+      let removed = seenLiveChatMessageOrder.prefix(removeCount)
+      removed.forEach { seenLiveChatMessageIDs.remove($0) }
+      seenLiveChatMessageOrder.removeFirst(removeCount)
     }
     // Super Chat / メンバー加入 は投げ銭系としてニコ生風のリッチ表示でも出す。
     // 弾幕にも流すので、ステッカー画像や本文を通常コメントと同じ流量で扱える。
@@ -323,8 +350,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     pendingChatMessages.append(contentsOf: fresh)
     // Keep a large backlog instead of dropping normal burst batches. This is only a
     // safety valve for extreme stalls, not normal high-volume chat.
-    if pendingChatMessages.count > 5000 {
-      pendingChatMessages.removeFirst(pendingChatMessages.count - 5000)
+    if pendingChatMessages.count > youtubeChatBacklogLimit {
+      pendingChatMessages.removeFirst(pendingChatMessages.count - youtubeChatBacklogLimit)
     }
     if chatDripWorkItem == nil {
       dripNextChatMessage()
@@ -393,6 +420,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     chatPollWorkItem?.cancel(); chatPollWorkItem = nil
     chatDripWorkItem?.cancel(); chatDripWorkItem = nil
     pendingChatMessages.removeAll()
+    seenLiveChatMessageOrder.removeAll()
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
@@ -1365,7 +1393,9 @@ private enum YouTubeInnerTubeChatClient {
       messageTokens.append(.text(stickerLabel))
     }
     let filterText = textObjects.compactMap { text(from: $0 as? [String: Any]) }.joined()
-    let displayText = filterText.isEmpty ? (stickerLabel ?? text(from: messageTokens)) : filterText
+    let tokenText = text(from: messageTokens)
+    let imageOnlyFallback = messageTokens.containsImage ? (stickerLabel ?? "emoji") : ""
+    let displayText = filterText.isEmpty ? (stickerLabel ?? (tokenText.isEmpty ? imageOnlyFallback : tokenText)) : filterText
     let superInfo = text(from: renderer["purchaseAmountText"] as? [String: Any])
       ?? (((renderer["liveChatSponsorshipsHeaderRenderer"] as? [String: Any]) != nil) ? "メンバー加入" : nil)
     guard !displayText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || superInfo != nil else {

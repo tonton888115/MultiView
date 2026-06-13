@@ -30,3 +30,5 @@
 
 - `MultiView/src/__tests__/youtubePlaybackHarness.test.ts` scans the playback runtime files.
 - It fails if the rejected CF Worker or b59 auth-material prompt route is added back.
+- The same harness also checks YouTube chat parity: when chat polling, high-volume queues, or image-only emote/sticker handling are changed, both Android/React Native and iOS/Swift paths must carry the matching fix.
+- For user-requested YouTube playback/chat fixes, build both artifacts before handoff: Android APK via local Gradle/ADB and iOS IPA via Codemagic after commit/push.

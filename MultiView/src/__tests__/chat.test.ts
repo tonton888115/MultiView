@@ -1,4 +1,4 @@
-import {extractYouTubeChatSessionFromHTML, youtubeChatEventsFromAction} from '../chat';
+import {extractYouTubeChatSessionFromHTML, youtubeChatEventsFromAction, youtubeChatPollDelayMs} from '../chat';
 
 describe('extractYouTubeChatSessionFromHTML', () => {
   it('falls back to the live_chat HTML when the watch page has no continuation', () => {
@@ -138,5 +138,39 @@ describe('youtubeChatEventsFromAction', () => {
     expect(events[0].tokens).toEqual([{kind: 'image', url: 'https://example.test/wave.webp', alt: ':wave:'}]);
     expect(events[1].text).toContain('gift membership received');
     expect(events[1].tokens).toContainEqual({kind: 'image', url: 'https://example.test/spark.gif', alt: ':spark:'});
+  });
+
+  it('keeps image-only YouTube custom emoji even when YouTube omits shortcuts', () => {
+    const events = youtubeChatEventsFromAction({
+      addChatItemAction: {
+        item: {
+          liveChatTextMessageRenderer: {
+            id: 'emoji-no-shortcut',
+            authorName: {simpleText: 'frank'},
+            message: {
+              runs: [
+                {
+                  emoji: {
+                    image: {thumbnails: [{url: 'https://example.test/original-stamp.webp', width: 96}]},
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0].text).toBe('emoji');
+    expect(events[0].tokens).toEqual([{kind: 'image', url: 'https://example.test/original-stamp.webp', alt: 'emoji'}]);
+  });
+});
+
+describe('youtubeChatPollDelayMs', () => {
+  it('polls YouTube live chat more frequently than the default continuation timeout while staying bounded', () => {
+    expect(youtubeChatPollDelayMs(3000)).toBe(1600);
+    expect(youtubeChatPollDelayMs(500)).toBe(700);
+    expect(youtubeChatPollDelayMs(undefined)).toBe(1600);
   });
 });

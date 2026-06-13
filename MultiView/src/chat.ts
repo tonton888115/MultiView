@@ -25,6 +25,12 @@ type YouTubeChatConfig = {
   continuation?: string;
 };
 
+const youtubeChatMinPollMs = 700;
+const youtubeChatMaxPollMs = 1600;
+const youtubeChatReconnectMs = 3500;
+const youtubeChatSeenLimit = 20000;
+const youtubeChatSeenKeep = 12000;
+
 export function startChatClient(stream: StreamItem, settings: AppSettings, emit: Emit, status: Status): ChatClient {
   if (!settings.showChat || !settings.showDanmaku) {
     return emptyClient();
@@ -277,22 +283,22 @@ function startYouTubeChat(stream: StreamItem, emit: Emit, status: Status): ChatC
               emit(event);
             }
           });
-          if (seen.size > 5000) {
-            const keep = Array.from(seen).slice(-1000);
+          if (seen.size > youtubeChatSeenLimit) {
+            const keep = Array.from(seen).slice(-youtubeChatSeenKeep);
             seen.clear();
             keep.forEach(id => seen.add(id));
           }
           timer = setTimeout(poll, page.timeoutMs);
         } catch {
           status('YouTubeコメント再接続中');
-          timer = setTimeout(run, 8000);
+          timer = setTimeout(run, youtubeChatReconnectMs);
         }
       };
       poll();
     } catch {
       status('YouTubeライブチャット待機中');
       if (!stopped) {
-        timer = setTimeout(run, 10000);
+        timer = setTimeout(run, 5000);
       }
     }
   };
@@ -452,9 +458,16 @@ async function fetchYouTubeChatPage(session: YouTubeChatSession, continuation: s
   const json = await response.json();
   const live = json?.continuationContents?.liveChatContinuation;
   const events = youtubeChatEventsFromAction(json);
-  const next = continuationFromList(live?.continuations) ?? continuationFromList(json?.continuationContents?.liveChatContinuation?.continuations);
-  const timeoutMs = Math.max(1000, Number(timeoutFromContinuations(live?.continuations) ?? 3000));
+  const next = continuationFromList(live?.continuations) ?? findLiveChatContinuation(json) ?? continuation;
+  const timeoutMs = youtubeChatPollDelayMs(timeoutFromContinuations(live?.continuations));
   return {events, continuation: next, timeoutMs};
+}
+
+export function youtubeChatPollDelayMs(serverTimeoutMs?: number): number {
+  const requested = Number.isFinite(serverTimeoutMs) && serverTimeoutMs != null
+    ? serverTimeoutMs
+    : youtubeChatMaxPollMs;
+  return Math.min(youtubeChatMaxPollMs, Math.max(youtubeChatMinPollMs, requested));
 }
 
 export function youtubeChatEventsFromAction(action: any): ChatEvent[] {
@@ -574,7 +587,14 @@ function youtubeRunsToTokens(runs: any[]): DanmakuToken[] {
     const emoji = run?.emoji;
     const url = bestThumbnail(emoji?.image?.thumbnails);
     if (url) {
-      tokens.push({kind: 'image', url, alt: stringValue(emoji?.shortcuts?.[0]) ?? stringValue(emoji?.emojiId) ?? undefined});
+      tokens.push({
+        kind: 'image',
+        url,
+        alt: stringValue(emoji?.shortcuts?.[0])
+          ?? stringValue(emoji?.emojiId)
+          ?? stringValue(emoji?.searchTerms?.[0])
+          ?? 'emoji',
+      });
     }
   });
   return tokens;
