@@ -1,12 +1,13 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
-import {Animated, Image, StyleSheet, Text, View} from 'react-native';
+import {Animated, Easing, Image, StyleSheet, Text, View} from 'react-native';
 import {estimateTokenWidth, textFromTokens, textTokens} from './danmaku';
 import {startChatClient} from './chat';
 import {YouTubeOfficialChatBridge} from './YouTubeOfficialChatBridge';
 import type {AppSettings, ChatEvent, DanmakuToken, StreamItem} from './types';
 
 const danmakuBacklogLimit = 20000;
-const duplicateWindowMs = 4000;
+const duplicateWindowMs = 10000;
+const officialYouTubePrimaryMs = 10000;
 
 type Layout = {
   width: number;
@@ -26,15 +27,26 @@ type VisibleItem = {
   duration: number;
 };
 
+type LaneReservation = {
+  lane: number;
+  widthEstimate: number;
+  startedAt: number;
+  duration: number;
+  startX: number;
+  endX: number;
+};
+
 export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings: AppSettings}) {
   const [layout, setLayout] = useState<Layout>({width: 0, height: 0});
   const [visible, setVisible] = useState<VisibleItem[]>([]);
   const [status, setStatus] = useState('');
   const queueRef = useRef<ChatEvent[]>([]);
   const visibleRef = useRef<VisibleItem[]>([]);
+  const laneReservationsRef = useRef<LaneReservation[]>([]);
   const laneCursorRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recentFingerprintsRef = useRef<Map<string, number>>(new Map());
+  const officialYouTubeActiveUntilRef = useRef(0);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
 
@@ -61,17 +73,36 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
     updateVisible(current => current.filter(item => item.key !== key));
   }, [updateVisible]);
 
+  useEffect(() => {
+    laneReservationsRef.current = [];
+    laneCursorRef.current = 0;
+  }, [laneCount, layout.width, layout.height]);
+
   const pickLane = useCallback(
     (now: number): number => {
       const fronts = Array.from({length: laneCount}, () => Number.NEGATIVE_INFINITY);
       const startX = layout.width + 12;
+      const activeReservations = laneReservationsRef.current.filter(
+        reservation => reservation.lane >= 0
+          && reservation.lane < laneCount
+          && now - reservation.startedAt <= reservation.duration,
+      );
+      laneReservationsRef.current = activeReservations;
+      const addFront = (lane: number, front: number) => {
+        fronts[lane] = Math.max(fronts[lane] ?? Number.NEGATIVE_INFINITY, front);
+      };
       for (const item of visibleRef.current) {
         if (item.lane < 0 || item.lane >= laneCount) {
           continue;
         }
         const progress = Math.max(0, Math.min(1, (now - item.startedAt) / item.duration));
         const currentX = startX + (-item.widthEstimate - 12 - startX) * progress;
-        fronts[item.lane] = Math.max(fronts[item.lane], currentX + item.widthEstimate);
+        addFront(item.lane, currentX + item.widthEstimate);
+      }
+      for (const reservation of activeReservations) {
+        const progress = Math.max(0, Math.min(1, (now - reservation.startedAt) / reservation.duration));
+        const currentX = reservation.startX + (reservation.endX - reservation.startX) * progress;
+        addFront(reservation.lane, currentX + reservation.widthEstimate);
       }
       const clearThreshold = layout.width - 36;
       for (let offset = 0; offset < laneCount; offset += 1) {
@@ -87,6 +118,17 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
         }
       }
       return furthestLane;
+    },
+    [laneCount, layout.width],
+  );
+
+  const reserveLane = useCallback(
+    (lane: number, now: number, widthEstimate: number, duration: number) => {
+      const startX = layout.width + 12;
+      const endX = -widthEstimate - 12;
+      laneReservationsRef.current = laneReservationsRef.current
+        .filter(reservation => now - reservation.startedAt <= reservation.duration && reservation.lane >= 0 && reservation.lane < laneCount)
+        .concat({lane, widthEstimate, startedAt: now, duration, startX, endX});
     },
     [laneCount, layout.width],
   );
@@ -111,7 +153,8 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       const duration = Math.max(250, Math.round((travel / pixelsPerSecond) * 1000));
       const now = Date.now();
       const lane = pickLane(now);
-      laneCursorRef.current = lane + 1;
+      laneCursorRef.current = (lane + 1) % laneCount;
+      reserveLane(lane, now, widthEstimate, duration);
       const key = `${event.id}:${event.createdAt}:${Math.random()}`;
       const x = new Animated.Value(layout.width + 12);
       const item: VisibleItem = {key, event, tokens, lane, x, fontSize, lineHeight, widthEstimate, startedAt: now, duration};
@@ -119,11 +162,12 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       Animated.timing(x, {
         toValue: -widthEstimate - 12,
         duration,
+        easing: Easing.linear,
         useNativeDriver: true,
       }).start(() => removeVisible(key));
       return true;
     },
-    [fontSize, layout.height, layout.width, lineHeight, pickLane, removeVisible, updateVisible],
+    [fontSize, laneCount, layout.height, layout.width, lineHeight, pickLane, removeVisible, reserveLane, updateVisible],
   );
 
   const scheduleDrain = useCallback(() => {
@@ -136,6 +180,10 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       const maxBurst = Math.max(5, laneCount * 5);
       while (queueRef.current.length > 0 && consumed < maxBurst) {
         const next = queueRef.current[0];
+        if (isSuppressedYouTubeFallback(next, officialYouTubeActiveUntilRef.current)) {
+          queueRef.current.shift();
+          continue;
+        }
         if (!emitNow(next)) {
           break;
         }
@@ -154,6 +202,14 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
 
   const enqueueEvent = useCallback(
     (event: ChatEvent) => {
+      if (isOfficialYouTubeEvent(event)) {
+        officialYouTubeActiveUntilRef.current = Date.now() + officialYouTubePrimaryMs;
+        queueRef.current = queueRef.current.filter(
+          queued => !isSuppressedYouTubeFallback(queued, officialYouTubeActiveUntilRef.current),
+        );
+      } else if (isSuppressedYouTubeFallback(event, officialYouTubeActiveUntilRef.current)) {
+        return;
+      }
       if (isRecentDuplicate(event, recentFingerprintsRef.current)) {
         return;
       }
@@ -180,7 +236,9 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
     return () => {
       client.stop();
       queueRef.current = [];
+      laneReservationsRef.current = [];
       recentFingerprints.clear();
+      officialYouTubeActiveUntilRef.current = 0;
       if (timerRef.current) {
         clearTimeout(timerRef.current);
         timerRef.current = null;
@@ -264,16 +322,31 @@ function isRecentDuplicate(event: ChatEvent, recent: Map<string, number>): boole
 }
 
 function eventFingerprint(event: ChatEvent): string {
+  if (event.platform !== 'youtube') {
+    return [event.platform, event.id].join('\u001f');
+  }
+  const author = normalizeFingerprintText(event.author ?? '').toLowerCase();
+  const visibleText = normalizeFingerprintText(event.text === 'emoji' ? textFromTokens(event.tokens) : event.text);
+  const superInfo = normalizeFingerprintText(event.superInfo ?? '');
+  if (visibleText && visibleText !== 'emoji') {
+    return [event.platform, author, visibleText, superInfo].join('\u001f');
+  }
   const tokenKey = event.tokens
-    .map(token => (token.kind === 'image' ? `img:${token.url}` : `txt:${token.text.trim()}`))
+    .map(token => (token.kind === 'image' ? `img:${token.url}:${token.alt ?? ''}` : `txt:${normalizeFingerprintText(token.text)}`))
     .join('|');
-  return [
-    event.platform,
-    (event.author ?? '').trim().toLowerCase(),
-    event.text.trim(),
-    event.superInfo ?? '',
-    tokenKey,
-  ].join('\u001f');
+  return [event.platform, author, visibleText || 'emoji', superInfo, tokenKey].join('\u001f');
+}
+
+function normalizeFingerprintText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function isOfficialYouTubeEvent(event: ChatEvent): boolean {
+  return event.platform === 'youtube' && event.id.startsWith('yt-dom:');
+}
+
+function isSuppressedYouTubeFallback(event: ChatEvent, officialActiveUntil: number): boolean {
+  return event.platform === 'youtube' && !isOfficialYouTubeEvent(event) && Date.now() < officialActiveUntil;
 }
 
 function scaledFontSize(base: number, width: number): number {

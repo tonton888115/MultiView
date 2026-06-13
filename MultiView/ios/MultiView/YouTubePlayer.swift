@@ -16,7 +16,8 @@ private let youtubeChatReconnectInterval: TimeInterval = 3.5
 private let youtubeChatBacklogLimit = 20000
 private let youtubeChatSeenLimit = 20000
 private let youtubeChatSeenKeep = 12000
-private let youtubeChatDuplicateWindow: TimeInterval = 4
+private let youtubeChatDuplicateWindow: TimeInterval = 10
+private let youtubeOfficialChatPrimaryWindow: TimeInterval = 10
 
 private extension Array where Element == NativeDanmakuToken {
   var containsImage: Bool {
@@ -55,11 +56,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var seenLiveChatMessageIDs = Set<String>()
   private var seenLiveChatMessageOrder: [String] = []
   private var seenLiveChatFingerprints: [String: Date] = [:]
-  // YouTube live chat is polled (batches arrive every few seconds). Queue them and
-  // drip one at a time so a batch doesn't stampede the screen all at once.
+  // YouTube live chat can arrive as official DOM events or polled fallback batches.
+  // Queue it briefly, but drain fast so busy chats do not crawl one line at a time.
   private var pendingChatMessages: [YouTubeLiveChatMessage] = []
   private var chatDripWorkItem: DispatchWorkItem?
-  private var lastChatPollInterval: TimeInterval = 5
+  private var officialChatActiveUntil = Date.distantPast
   private var laneCursor = 0
   private var extractionFailures: [String] = []
 
@@ -204,6 +205,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     seenLiveChatFingerprints.removeAll()
     pendingChatMessages.removeAll()
     chatDripWorkItem?.cancel(); chatDripWorkItem = nil
+    officialChatActiveUntil = .distantPast
     startOfficialChatBridge(videoId: videoId)
     createInnerTubeLiveChatSession(videoId: videoId)
   }
@@ -258,6 +260,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || superInfo != nil else {
       return
     }
+    officialChatActiveUntil = Date().addingTimeInterval(youtubeOfficialChatPrimaryWindow)
     let id = Self.bridgeString(payload["id"]) ?? "\(Date().timeIntervalSince1970):\(UUID().uuidString)"
     let author = Self.bridgeString(payload["author"]) ?? ""
     emitLiveChatMessages([
@@ -338,7 +341,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         self.hideStatusIfPlaybackReady()
         self.innerTubeChatSession?.continuation = page.nextPageToken ?? session.continuation
         let delay = self.youtubeChatPollDelay(milliseconds: page.pollingIntervalMillis)
-        self.lastChatPollInterval = delay
         self.emitLiveChatMessages(page.messages)
         self.scheduleLiveChatPoll(after: delay)
       }
@@ -410,7 +412,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         self.hideStatusIfPlaybackReady()
         self.dataAPIPageToken = page.nextPageToken ?? self.dataAPIPageToken
         let delay = self.youtubeChatPollDelay(milliseconds: page.pollingIntervalMillis)
-        self.lastChatPollInterval = delay
         self.emitLiveChatMessages(page.messages)
         self.scheduleLiveChatPoll(after: delay)
       }
@@ -439,8 +440,16 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   private func emitLiveChatMessages(_ messages: [YouTubeLiveChatMessage]) {
     let now = Date()
+    if messages.contains(where: isOfficialChatMessage) {
+      officialChatActiveUntil = now.addingTimeInterval(youtubeOfficialChatPrimaryWindow)
+      pendingChatMessages.removeAll { !isOfficialChatMessage($0) }
+    }
+    let sourceFiltered = messages.filter { message in
+      isOfficialChatMessage(message) || now >= officialChatActiveUntil
+    }
+    guard !sourceFiltered.isEmpty else { return }
     seenLiveChatFingerprints = seenLiveChatFingerprints.filter { now.timeIntervalSince($0.value) <= youtubeChatDuplicateWindow }
-    let fresh = messages.filter {
+    let fresh = sourceFiltered.filter {
       let fingerprint = liveChatFingerprint($0)
       return !seenLiveChatMessageIDs.contains($0.id) && seenLiveChatFingerprints[fingerprint] == nil
     }
@@ -470,21 +479,42 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
   }
 
+  private func isOfficialChatMessage(_ message: YouTubeLiveChatMessage) -> Bool {
+    message.id.hasPrefix("yt-dom:")
+  }
+
   private func liveChatFingerprint(_ message: YouTubeLiveChatMessage) -> String {
+    let author = Self.normalizedFingerprintText(message.author).lowercased()
+    let visibleText = Self.normalizedFingerprintText(message.text == "emoji" ? Self.text(from: message.tokens) : message.text)
+    let superInfo = Self.normalizedFingerprintText(message.superInfo ?? "")
+    if !visibleText.isEmpty, visibleText != "emoji" {
+      return [
+        author,
+        visibleText,
+        superInfo
+      ].joined(separator: "\u{1F}")
+    }
     let tokenKey = message.tokens.map { token -> String in
       switch token {
       case .text(let text):
-        return "txt:\(text.trimmingCharacters(in: .whitespacesAndNewlines))"
+        return "txt:\(Self.normalizedFingerprintText(text))"
       case .image(let url):
         return "img:\(url.absoluteString)"
       }
     }.joined(separator: "|")
     return [
-      message.author.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-      message.text.trimmingCharacters(in: .whitespacesAndNewlines),
-      message.superInfo ?? "",
+      author,
+      visibleText.isEmpty ? "emoji" : visibleText,
+      superInfo,
       tokenKey
     ].joined(separator: "\u{1F}")
+  }
+
+  private static func normalizedFingerprintText(_ value: String) -> String {
+    value
+      .components(separatedBy: .whitespacesAndNewlines)
+      .filter { !$0.isEmpty }
+      .joined(separator: " ")
   }
 
   private func emitYouTubeSuperChat(_ message: YouTubeLiveChatMessage) {
@@ -502,8 +532,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     )
   }
 
-  // Emit one queued message, then schedule the next so a polled batch is spread over
-  // roughly one poll interval instead of all appearing at the same instant.
+  // Emit one queued message, then schedule the next with a short fixed cadence.
+  // The renderer handles lane choice; keeping this tied to the poll interval made
+  // busy YouTube chats crawl one item at a time.
   private func dripNextChatMessage() {
     chatDripWorkItem = nil
     guard !isStopped, settings.showChat, !pendingChatMessages.isEmpty else { return }
@@ -516,27 +547,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       settings: settings
     )
     guard !pendingChatMessages.isEmpty else { return }
-    // Cap the emit rate to what the danmaku lanes can hold (lane count × one comment's
-    // screen-crossing time). A busy chat polled in big batches otherwise exceeds lane
-    // capacity and comments overlap on the same lane.
-    let laneCapacity: TimeInterval = {
-      let width = danmakuView.bounds.width
-      guard width > 0 else { return 0.25 }
-      let speed = max(35, width * CGFloat(settings.danmakuSpeed))
-      let travel = width * 2 + 24
-      let passTime = TimeInterval(travel / speed)
-      let fontSize = CGFloat(settings.danmakuFontSize > 0 ? settings.danmakuFontSize : 17)
-      let lineHeight = fontSize + 8
-      let maxLines = settings.danmakuMaxLines > 0
-        ? settings.danmakuMaxLines
-        : max(1, Int(danmakuView.bounds.height / lineHeight))
-      return passTime / Double(maxLines)
-    }()
-    // Spread the batch across ~one poll interval (burstSpacing) but never faster than the
-    // lanes can absorb (laneCapacity). The upper cap is generous so small batches fill the
-    // gap until the next poll instead of draining early and leaving a blank.
-    let burstSpacing = lastChatPollInterval / Double(pendingChatMessages.count + 1)
-    let spacing = min(max(max(burstSpacing, laneCapacity), 0.18), 2.5)
+    let spacing: TimeInterval = pendingChatMessages.count > 20 ? 0.025 : 0.04
     let work = DispatchWorkItem { [weak self] in self?.dripNextChatMessage() }
     chatDripWorkItem = work
     DispatchQueue.main.asyncAfter(deadline: .now() + spacing, execute: work)
@@ -552,6 +563,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     seenLiveChatMessageIDs.removeAll()
     seenLiveChatMessageOrder.removeAll()
     seenLiveChatFingerprints.removeAll()
+    officialChatActiveUntil = .distantPast
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
