@@ -485,7 +485,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   private func liveChatFingerprint(_ message: YouTubeLiveChatMessage) -> String {
     let author = Self.normalizedFingerprintText(message.author).lowercased()
-    let visibleText = Self.normalizedFingerprintText(message.text == "emoji" ? Self.text(from: message.tokens) : message.text)
+    let visibleText = Self.normalizedFingerprintText(message.text == "emoji" ? Self.officialTokenText(message.tokens) : message.text)
     let superInfo = Self.normalizedFingerprintText(message.superInfo ?? "")
     if !visibleText.isEmpty, visibleText != "emoji" {
       return [
