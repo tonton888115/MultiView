@@ -16,6 +16,7 @@ describe('YouTube playback regression harness', () => {
     'src/types.ts',
     'ios/MultiView/BrowserUserAgent.swift',
     'ios/MultiView/YouTubePlayer.swift',
+    'src/YouTubeOfficialChatBridge.tsx',
     'android/app/src/main/java/com/multiview/NativeHlsPlayerView.kt',
   ];
 
@@ -57,6 +58,7 @@ describe('YouTube playback regression harness', () => {
   it('requires YouTube chat fixes to exist on both Android JS and iOS Swift paths', () => {
     const chat = readProjectFile('src/chat.ts');
     const overlay = readProjectFile('src/DanmakuOverlay.tsx');
+    const officialBridge = readProjectFile('src/YouTubeOfficialChatBridge.tsx');
     const swift = readProjectFile('ios/MultiView/YouTubePlayer.swift');
 
     expect(chat).toContain('const youtubeChatMinPollMs = 700');
@@ -64,11 +66,21 @@ describe('YouTube playback regression harness', () => {
     expect(chat).toContain('export function youtubeChatPollDelayMs');
     expect(chat).toContain("?? 'emoji'");
     expect(overlay).toContain('const danmakuBacklogLimit = 20000');
+    expect(overlay).toContain('YouTubeOfficialChatBridge');
+    expect(overlay).toContain('duplicateWindowMs = 4000');
+    expect(officialBridge).toContain('youtubeOfficialChatObserverScript');
+    expect(officialBridge).toContain('MutationObserver');
+    expect(officialBridge).toContain('yt-live-chat-text-message-renderer');
+    expect(officialBridge).toContain('yt-live-chat-paid-sticker-renderer');
 
     expect(swift).toContain('private let youtubeChatMinPollInterval: TimeInterval = 0.7');
     expect(swift).toContain('private let youtubeChatMaxPollInterval: TimeInterval = 1.6');
     expect(swift).toContain('private let youtubeChatBacklogLimit = 20000');
     expect(swift).toContain('var containsImage: Bool');
     expect(swift).toContain('let imageOnlyFallback = messageTokens.containsImage');
+    expect(swift).toContain('private let youtubeChatDuplicateWindow: TimeInterval = 4');
+    expect(swift).toContain('startOfficialChatBridge(videoId: videoId)');
+    expect(swift).toContain('youtubeOfficialChat');
+    expect(swift).toContain('yt-live-chat-paid-sticker-renderer');
   });
 });

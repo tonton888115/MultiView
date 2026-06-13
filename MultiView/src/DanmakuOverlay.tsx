@@ -2,9 +2,11 @@ import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {Animated, Image, StyleSheet, Text, View} from 'react-native';
 import {estimateTokenWidth, textFromTokens, textTokens} from './danmaku';
 import {startChatClient} from './chat';
+import {YouTubeOfficialChatBridge} from './YouTubeOfficialChatBridge';
 import type {AppSettings, ChatEvent, DanmakuToken, StreamItem} from './types';
 
 const danmakuBacklogLimit = 20000;
+const duplicateWindowMs = 4000;
 
 type Layout = {
   width: number;
@@ -32,6 +34,7 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
   const visibleRef = useRef<VisibleItem[]>([]);
   const laneCursorRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recentFingerprintsRef = useRef<Map<string, number>>(new Map());
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
 
@@ -149,32 +152,42 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
     timerRef.current = setTimeout(drain, 16);
   }, [emitNow, laneCount, layout.height, layout.width]);
 
+  const enqueueEvent = useCallback(
+    (event: ChatEvent) => {
+      if (isRecentDuplicate(event, recentFingerprintsRef.current)) {
+        return;
+      }
+      queueRef.current.push(event);
+      if (queueRef.current.length > danmakuBacklogLimit) {
+        queueRef.current.splice(0, queueRef.current.length - danmakuBacklogLimit);
+      }
+      scheduleDrain();
+    },
+    [scheduleDrain],
+  );
+
   useEffect(() => {
     if (!settings.showChat || !settings.showDanmaku) {
       return;
     }
+    const recentFingerprints = recentFingerprintsRef.current;
     const client = startChatClient(
       stream,
       settings,
-      event => {
-        queueRef.current.push(event);
-        if (queueRef.current.length > danmakuBacklogLimit) {
-          queueRef.current.splice(0, queueRef.current.length - danmakuBacklogLimit);
-        }
-        scheduleDrain();
-      },
+      enqueueEvent,
       setStatus,
     );
     return () => {
       client.stop();
       queueRef.current = [];
+      recentFingerprints.clear();
       if (timerRef.current) {
         clearTimeout(timerRef.current);
         timerRef.current = null;
       }
       updateVisible(() => []);
     };
-  }, [scheduleDrain, settings, stream, updateVisible]);
+  }, [enqueueEvent, settings, stream, updateVisible]);
 
   if (!settings.showChat || !settings.showDanmaku) {
     return null;
@@ -228,8 +241,39 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
           </Text>
         </View>
       )}
+      {stream.platform === 'youtube' && (
+        <YouTubeOfficialChatBridge stream={stream} onEvent={enqueueEvent} onStatus={setStatus} />
+      )}
     </View>
   );
+}
+
+function isRecentDuplicate(event: ChatEvent, recent: Map<string, number>): boolean {
+  const now = Date.now();
+  for (const [key, timestamp] of recent) {
+    if (now - timestamp > duplicateWindowMs) {
+      recent.delete(key);
+    }
+  }
+  const key = eventFingerprint(event);
+  if (recent.has(key)) {
+    return true;
+  }
+  recent.set(key, now);
+  return false;
+}
+
+function eventFingerprint(event: ChatEvent): string {
+  const tokenKey = event.tokens
+    .map(token => (token.kind === 'image' ? `img:${token.url}` : `txt:${token.text.trim()}`))
+    .join('|');
+  return [
+    event.platform,
+    (event.author ?? '').trim().toLowerCase(),
+    event.text.trim(),
+    event.superInfo ?? '',
+    tokenKey,
+  ].join('\u001f');
 }
 
 function scaledFontSize(base: number, width: number): number {

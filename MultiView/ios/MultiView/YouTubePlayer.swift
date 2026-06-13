@@ -16,6 +16,7 @@ private let youtubeChatReconnectInterval: TimeInterval = 3.5
 private let youtubeChatBacklogLimit = 20000
 private let youtubeChatSeenLimit = 20000
 private let youtubeChatSeenKeep = 12000
+private let youtubeChatDuplicateWindow: TimeInterval = 4
 
 private extension Array where Element == NativeDanmakuToken {
   var containsImage: Bool {
@@ -42,6 +43,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var timeObserver: Any?
   private var sponsorSegments: [(start: Double, end: Double)] = []
   private var fallbackWebView: WKWebView?
+  private var officialChatWebView: WKWebView?
   private var isStopped = false
   private var iframeAudioEnabled = false
   private var innerTubeChatSession: YouTubeInnerTubeChatSession?
@@ -52,6 +54,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var innerTubeChatFailureCount = 0
   private var seenLiveChatMessageIDs = Set<String>()
   private var seenLiveChatMessageOrder: [String] = []
+  private var seenLiveChatFingerprints: [String: Date] = [:]
   // YouTube live chat is polled (batches arrive every few seconds). Queue them and
   // drip one at a time so a batch doesn't stampede the screen all at once.
   private var pendingChatMessages: [YouTubeLiveChatMessage] = []
@@ -115,6 +118,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     super.layoutSubviews()
     playerLayer.frame = bounds
     fallbackWebView?.frame = bounds
+    officialChatWebView?.frame = CGRect(x: -2, y: -2, width: 1, height: 1)
   }
 
   func resumePlayback() {
@@ -197,9 +201,111 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     innerTubeChatFailureCount = 0
     seenLiveChatMessageIDs.removeAll()
     seenLiveChatMessageOrder.removeAll()
+    seenLiveChatFingerprints.removeAll()
     pendingChatMessages.removeAll()
     chatDripWorkItem?.cancel(); chatDripWorkItem = nil
+    startOfficialChatBridge(videoId: videoId)
     createInnerTubeLiveChatSession(videoId: videoId)
+  }
+
+  private func startOfficialChatBridge(videoId: String) {
+    officialChatWebView?.configuration.userContentController.removeScriptMessageHandler(forName: "youtubeOfficialChat")
+    officialChatWebView?.stopLoadingAndRemove()
+    officialChatWebView = nil
+
+    guard let encoded = videoId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+          let url = URL(string: "https://www.youtube.com/live_chat?v=\(encoded)&is_popout=1") else {
+      return
+    }
+    let config = WKWebViewConfiguration()
+    config.websiteDataStore = .default()
+    config.userContentController.add(self, name: "youtubeOfficialChat")
+    config.userContentController.addUserScript(WKUserScript(source: Self.officialChatObserverScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+    let web = WKWebView(frame: CGRect(x: -2, y: -2, width: 1, height: 1), configuration: config)
+    web.customUserAgent = BrowserUserAgent.desktopSafari
+    web.navigationDelegate = self
+    web.isOpaque = false
+    web.backgroundColor = .clear
+    web.alpha = 0.01
+    web.isUserInteractionEnabled = false
+    web.accessibilityElementsHidden = true
+    addSubview(web)
+    var request = URLRequest(url: url)
+    request.setValue(BrowserUserAgent.desktopSafari, forHTTPHeaderField: "User-Agent")
+    request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
+    web.load(request)
+    officialChatWebView = web
+  }
+
+  private func handleOfficialChatBridgeMessage(_ body: Any) {
+    guard let payload = body as? [String: Any],
+          let type = payload["type"] as? String else {
+      return
+    }
+    if type == "status" {
+      if let message = payload["message"] as? String, !message.isEmpty {
+        showStatus(message)
+        hideStatusIfPlaybackReady()
+      }
+      return
+    }
+    guard type == "chat" else { return }
+    let tokens = Self.officialChatTokens(from: payload["tokens"])
+    let tokenText = Self.officialTokenText(tokens)
+    let hasImage = tokens.containsImage
+    let text = Self.bridgeString(payload["text"]) ?? (tokenText.isEmpty && hasImage ? "emoji" : tokenText)
+    let superInfo = Self.bridgeString(payload["superInfo"])
+    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || superInfo != nil else {
+      return
+    }
+    let id = Self.bridgeString(payload["id"]) ?? "\(Date().timeIntervalSince1970):\(UUID().uuidString)"
+    let author = Self.bridgeString(payload["author"]) ?? ""
+    emitLiveChatMessages([
+      YouTubeLiveChatMessage(
+        id: "yt-dom:\(id)",
+        author: author,
+        text: text.isEmpty ? (superInfo ?? "") : text,
+        superInfo: superInfo,
+        tokens: tokens.isEmpty ? nil : tokens
+      )
+    ])
+  }
+
+  private static func officialChatTokens(from value: Any?) -> [NativeDanmakuToken] {
+    guard let items = value as? [[String: Any]] else { return [] }
+    return items.compactMap { item in
+      guard let kind = item["kind"] as? String else { return nil }
+      if kind == "text", let text = item["text"] as? String, !text.isEmpty {
+        return .text(text)
+      }
+      if kind == "image",
+         let raw = bridgeString(item["url"]),
+         let url = URL(string: raw.hasPrefix("//") ? "https:\(raw)" : raw) {
+        return .image(url)
+      }
+      return nil
+    }
+  }
+
+  private static func officialTokenText(_ tokens: [NativeDanmakuToken]) -> String {
+    tokens.map { token in
+      switch token {
+      case .text(let text): return text
+      case .image: return ""
+      }
+    }.joined()
+  }
+
+  private static func bridgeString(_ value: Any?) -> String? {
+    guard let value else { return nil }
+    if let raw = value as? String {
+      let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+      return trimmed.isEmpty ? nil : trimmed
+    }
+    if let number = value as? NSNumber {
+      return number.stringValue
+    }
+    return nil
   }
 
   private func createInnerTubeLiveChatSession(videoId: String) {
@@ -332,11 +438,17 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private func emitLiveChatMessages(_ messages: [YouTubeLiveChatMessage]) {
-    let fresh = messages.filter { !seenLiveChatMessageIDs.contains($0.id) }
+    let now = Date()
+    seenLiveChatFingerprints = seenLiveChatFingerprints.filter { now.timeIntervalSince($0.value) <= youtubeChatDuplicateWindow }
+    let fresh = messages.filter {
+      let fingerprint = liveChatFingerprint($0)
+      return !seenLiveChatMessageIDs.contains($0.id) && seenLiveChatFingerprints[fingerprint] == nil
+    }
     guard !fresh.isEmpty else { return }
     fresh.forEach {
       seenLiveChatMessageIDs.insert($0.id)
       seenLiveChatMessageOrder.append($0.id)
+      seenLiveChatFingerprints[liveChatFingerprint($0)] = now
     }
     if seenLiveChatMessageOrder.count > youtubeChatSeenLimit {
       let removeCount = seenLiveChatMessageOrder.count - youtubeChatSeenKeep
@@ -356,6 +468,23 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     if chatDripWorkItem == nil {
       dripNextChatMessage()
     }
+  }
+
+  private func liveChatFingerprint(_ message: YouTubeLiveChatMessage) -> String {
+    let tokenKey = message.tokens.map { token -> String in
+      switch token {
+      case .text(let text):
+        return "txt:\(text.trimmingCharacters(in: .whitespacesAndNewlines))"
+      case .image(let url):
+        return "img:\(url.absoluteString)"
+      }
+    }.joined(separator: "|")
+    return [
+      message.author.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+      message.text.trimmingCharacters(in: .whitespacesAndNewlines),
+      message.superInfo ?? "",
+      tokenKey
+    ].joined(separator: "\u{1F}")
   }
 
   private func emitYouTubeSuperChat(_ message: YouTubeLiveChatMessage) {
@@ -420,7 +549,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     chatPollWorkItem?.cancel(); chatPollWorkItem = nil
     chatDripWorkItem?.cancel(); chatDripWorkItem = nil
     pendingChatMessages.removeAll()
+    seenLiveChatMessageIDs.removeAll()
     seenLiveChatMessageOrder.removeAll()
+    seenLiveChatFingerprints.removeAll()
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
@@ -431,6 +562,9 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     fallbackWebView?.configuration.userContentController.removeScriptMessageHandler(forName: "youtubeAudio")
     fallbackWebView?.stopLoadingAndRemove()
     fallbackWebView = nil
+    officialChatWebView?.configuration.userContentController.removeScriptMessageHandler(forName: "youtubeOfficialChat")
+    officialChatWebView?.stopLoadingAndRemove()
+    officialChatWebView = nil
   }
 
   private func loadPlayer() {
@@ -863,11 +997,19 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
     guard !isStopped else { return }
+    if webView === officialChatWebView {
+      showStatus("YouTube公式チャット再接続中")
+      return
+    }
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
   func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
     guard !isStopped else { return }
+    if webView === officialChatWebView {
+      showStatus("YouTube公式チャット再接続中")
+      return
+    }
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
   }
 
@@ -879,7 +1021,215 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       applyIframeVolume()
       return
     }
+    if message.name == "youtubeOfficialChat" {
+      handleOfficialChatBridgeMessage(message.body)
+      return
+    }
   }
+
+  private static let officialChatObserverScript = #"""
+(function() {
+  if (window.__mvYouTubeOfficialChatObserverInstalled) {
+    return true;
+  }
+  window.__mvYouTubeOfficialChatObserverInstalled = true;
+  var seen = new Set();
+  var seenOrder = [];
+  var maxSeen = 20000;
+  var keepSeen = 12000;
+  var rendererSelector = [
+    'yt-live-chat-text-message-renderer',
+    'yt-live-chat-paid-message-renderer',
+    'yt-live-chat-paid-sticker-renderer',
+    'yt-live-chat-membership-item-renderer',
+    'yt-live-chat-sponsorships-gift-purchase-announcement-renderer',
+    'yt-live-chat-sponsorships-gift-redemption-announcement-renderer',
+    'yt-live-chat-gift-membership-received-renderer',
+    'yt-live-chat-viewer-engagement-message-renderer',
+    'yt-live-chat-mode-change-message-renderer',
+    'yt-live-chat-auto-mod-message-renderer'
+  ].join(',');
+
+  function post(payload) {
+    try {
+      window.webkit.messageHandlers.youtubeOfficialChat.postMessage(payload);
+    } catch (error) {}
+  }
+
+  function visibleText(node) {
+    if (!node) { return ''; }
+    return String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function absoluteURL(value) {
+    if (!value) { return ''; }
+    var raw = String(value);
+    if (raw.indexOf('//') === 0) { return 'https:' + raw; }
+    return raw;
+  }
+
+  function srcFromSet(value) {
+    if (!value) { return ''; }
+    var best = '';
+    var bestScore = -1;
+    String(value).split(',').forEach(function(part) {
+      var bits = part.trim().split(/\s+/);
+      var url = bits[0] || '';
+      var score = 0;
+      if (bits[1]) {
+        if (bits[1].indexOf('w') > -1) {
+          score = parseInt(bits[1], 10) || 0;
+        } else if (bits[1].indexOf('x') > -1) {
+          score = Math.round((parseFloat(bits[1]) || 0) * 1000);
+        }
+      }
+      if (url && score >= bestScore) {
+        best = url;
+        bestScore = score;
+      }
+    });
+    return best;
+  }
+
+  function imageURL(img) {
+    return absoluteURL(img.currentSrc || img.src || img.getAttribute('data-thumb') || srcFromSet(img.getAttribute('srcset')));
+  }
+
+  function pushText(tokens, value) {
+    var text = String(value || '').replace(/\s+/g, ' ');
+    if (!text) { return; }
+    var last = tokens[tokens.length - 1];
+    if (last && last.kind === 'text') {
+      last.text += text;
+    } else {
+      tokens.push({kind: 'text', text: text});
+    }
+  }
+
+  function collectTokens(node, tokens) {
+    if (!node) { return; }
+    if (node.nodeType === Node.TEXT_NODE) {
+      pushText(tokens, node.nodeValue || '');
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) { return; }
+    var element = node;
+    if (element.matches && element.matches('img')) {
+      var url = imageURL(element);
+      if (url) {
+        tokens.push({kind: 'image', url: url, alt: element.alt || element.getAttribute('aria-label') || 'emoji'});
+      }
+      return;
+    }
+    Array.prototype.forEach.call(element.childNodes || [], function(child) {
+      collectTokens(child, tokens);
+    });
+  }
+
+  function normalizeTokens(tokens) {
+    var normalized = [];
+    tokens.forEach(function(token) {
+      if (token.kind === 'text') {
+        pushText(normalized, token.text);
+      } else if (token.kind === 'image' && token.url) {
+        normalized.push(token);
+      }
+    });
+    return normalized.filter(function(token) {
+      return token.kind === 'image' || String(token.text || '').trim();
+    });
+  }
+
+  function parseRenderer(element) {
+    var tokens = [];
+    Array.prototype.forEach.call(element.querySelectorAll('#sticker img, #content img.emoji'), function(img) {
+      var url = imageURL(img);
+      if (url) {
+        tokens.push({kind: 'image', url: url, alt: img.alt || img.getAttribute('aria-label') || 'sticker'});
+      }
+    });
+    var messageRoot = element.querySelector('#message');
+    if (messageRoot) {
+      collectTokens(messageRoot, tokens);
+    } else {
+      ['#header-primary-text', '#header-subtext', '#primary-text', '#subtext', '#body', '#content'].forEach(function(selector) {
+        var root = element.querySelector(selector);
+        if (root) {
+          collectTokens(root, tokens);
+        }
+      });
+    }
+    tokens = normalizeTokens(tokens);
+    var author = visibleText(element.querySelector('#author-name'));
+    var superInfo = visibleText(element.querySelector('#purchase-amount, #purchase-amount-chip, #content #purchase-amount'));
+    var text = tokens.map(function(token) {
+      return token.kind === 'text' ? token.text : (token.alt || '');
+    }).join('').replace(/\s+/g, ' ').trim();
+    if (!text && tokens.some(function(token) { return token.kind === 'image'; })) {
+      text = 'emoji';
+    }
+    if (!text && !superInfo) { return null; }
+    var id = element.id || element.getAttribute('data-id') || [author, text, superInfo, tokens.map(function(token) { return token.url || token.text || ''; }).join('|')].join('|');
+    return {type: 'chat', id: id, author: author, text: text, tokens: tokens, superInfo: superInfo || undefined};
+  }
+
+  function remember(id) {
+    if (!id || seen.has(id)) { return false; }
+    seen.add(id);
+    seenOrder.push(id);
+    if (seenOrder.length > maxSeen) {
+      var removed = seenOrder.splice(0, seenOrder.length - keepSeen);
+      removed.forEach(function(value) { seen.delete(value); });
+    }
+    return true;
+  }
+
+  function scan(root) {
+    if (!root || !root.querySelectorAll) { return; }
+    if (root.matches && root.matches(rendererSelector)) {
+      var own = parseRenderer(root);
+      if (own && remember(own.id)) { post(own); }
+    }
+    Array.prototype.forEach.call(root.querySelectorAll(rendererSelector), function(element) {
+      var parsed = parseRenderer(element);
+      if (parsed && remember(parsed.id)) { post(parsed); }
+    });
+  }
+
+  function preferAllMessages() {
+    var buttons = Array.prototype.slice.call(document.querySelectorAll('button, yt-icon-button, tp-yt-paper-item, ytd-menu-service-item-renderer'));
+    var topSelected = buttons.some(function(button) {
+      var label = visibleText(button).toLowerCase() + ' ' + String(button.getAttribute('aria-label') || '').toLowerCase();
+      return label.indexOf('top chat') >= 0 || label.indexOf('トップチャット') >= 0;
+    });
+    if (!topSelected) { return; }
+    var menuButton = document.querySelector('#menu-button button, yt-sort-filter-sub-menu-renderer button, button[aria-label*="chat"], button[aria-label*="チャット"]');
+    if (menuButton) { try { menuButton.click(); } catch (error) {} }
+    setTimeout(function() {
+      Array.prototype.forEach.call(document.querySelectorAll('tp-yt-paper-item, ytd-menu-service-item-renderer, yt-formatted-string'), function(item) {
+        var label = visibleText(item).toLowerCase();
+        var isTop = label.indexOf('top chat') >= 0 || label.indexOf('トップチャット') >= 0;
+        var isAll = label.indexOf('live chat') >= 0 || label.indexOf('all messages') >= 0 || label.indexOf('すべてのメッセージ') >= 0 || (label.indexOf('チャット') >= 0 && !isTop);
+        if (isAll && !isTop) {
+          try { item.click(); } catch (error) {}
+        }
+      });
+    }, 250);
+  }
+
+  var observer = new MutationObserver(function(mutations) {
+    mutations.forEach(function(mutation) {
+      Array.prototype.forEach.call(mutation.addedNodes || [], scan);
+    });
+  });
+  observer.observe(document.documentElement || document, {childList: true, subtree: true});
+  setInterval(function() { scan(document); }, 2000);
+  setTimeout(function() { scan(document); post({type: 'status', message: 'YouTube公式チャット監視中'}); }, 800);
+  setInterval(preferAllMessages, 5000);
+  preferAllMessages();
+  return true;
+})();
+"""#
 
   private func applyIframeVolume(to webView: WKWebView? = nil) {
     let effective = iframeEffectiveVolume()

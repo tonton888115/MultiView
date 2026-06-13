@@ -4,6 +4,8 @@
 
 - Restore the YouTube direct playback path to the b57-era InnerTube player request.
 - Keep later non-playback fixes, especially chat continuation, all-message selection, emote/sticker token preservation, OAuth send support, Android UI, and shared danmaku work.
+- The current stable video baseline is tagged as `stable-b63-youtube-video-hls`.
+  - If a later comment-source change destabilizes YouTube playback, compare against or restore from this tag before changing HLS extraction again.
 
 ## Do not reintroduce
 
@@ -31,4 +33,5 @@
 - `MultiView/src/__tests__/youtubePlaybackHarness.test.ts` scans the playback runtime files.
 - It fails if the rejected CF Worker or b59 auth-material prompt route is added back.
 - The same harness also checks YouTube chat parity: when chat polling, high-volume queues, or image-only emote/sticker handling are changed, both Android/React Native and iOS/Swift paths must carry the matching fix.
+- Dr.Maggot-style chat changes must keep the official `live_chat` DOM observer present on both Android/React Native and iOS/Swift, while preserving InnerTube polling as the stable base path.
 - For user-requested YouTube playback/chat fixes, build both artifacts before handoff: Android APK via local Gradle/ADB and iOS IPA via Codemagic after commit/push.
