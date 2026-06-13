@@ -415,8 +415,12 @@ enum ViewerCountProvider {
     guard let html else { return nil }
     let decoded = decodeHTMLEntities(html)
     let patterns = [
-      #"watch-count[^>]*>[\s\S]*?data-value=["']([0-9,]+)["']"#,
-      #""watchCount"\s*:\s*"?([0-9,]+)"?"#
+      #""currentViewers"\s*:\s*"?([0-9,]+)"?"#,
+      #""currentViewerCount"\s*:\s*"?([0-9,]+)"?"#,
+      #""current_viewers"\s*:\s*"?([0-9,]+)"?"#,
+      #""current_viewer_count"\s*:\s*"?([0-9,]+)"?"#,
+      #""viewersCount"\s*:\s*"?([0-9,]+)"?"#,
+      #""viewerCount"\s*:\s*"?([0-9,]+)"?"#
     ]
     for pattern in patterns {
       if let value = firstMatch(in: decoded, pattern: pattern) {
@@ -427,7 +431,20 @@ enum ViewerCountProvider {
   }
 
   private static func youtubeCount(in value: Any?) -> Int? {
-    count(in: value, keys: youtubeKeys) ?? liveViewerCount(in: value)
+    guard let value else { return nil }
+    if let dict = value as? [String: Any] {
+      if let details = dict["videoDetails"] as? [String: Any],
+         let count = intValue(details["concurrentViewers"]) {
+        return count
+      }
+      if let microformat = dict["microformat"] as? [String: Any],
+         let renderer = microformat["playerMicroformatRenderer"] as? [String: Any],
+         let live = renderer["liveBroadcastDetails"] as? [String: Any],
+         let count = intValue(live["concurrentViewers"]) {
+        return count
+      }
+    }
+    return count(in: value, keys: youtubeKeys) ?? liveViewerCount(in: value)
   }
 
   private static func youtubeCount(inHTML html: String?) -> Int? {
@@ -598,5 +615,5 @@ enum ViewerCountProvider {
   private static let kickKeys: Set<String> = ["viewer_count", "viewerCount", "viewers", "viewersCount", "currentViewers"]
   private static let twitcastingKeys: Set<String> = ["current_view_count", "currentViewerCount", "current_viewer_count", "viewer_count", "viewerCount", "viewers"]
   private static let youtubeKeys: Set<String> = ["concurrentViewers", "concurrent_viewers"]
-  private static let niconicoKeys: Set<String> = ["watchCount", "viewers", "viewersCount", "viewerCount", "currentViewers", "audienceCount", "visitorCount"]
+  private static let niconicoKeys: Set<String> = ["currentViewers", "currentViewerCount", "current_viewers", "current_viewer_count", "viewersCount", "viewerCount"]
 }

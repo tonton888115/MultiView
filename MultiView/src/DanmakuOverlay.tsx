@@ -39,7 +39,6 @@ type LaneReservation = {
 export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings: AppSettings}) {
   const [layout, setLayout] = useState<Layout>({width: 0, height: 0});
   const [visible, setVisible] = useState<VisibleItem[]>([]);
-  const [status, setStatus] = useState('');
   const queueRef = useRef<ChatEvent[]>([]);
   const visibleRef = useRef<VisibleItem[]>([]);
   const laneReservationsRef = useRef<LaneReservation[]>([]);
@@ -221,6 +220,7 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
     },
     [scheduleDrain],
   );
+  const ignoreStatus = useCallback(() => undefined, []);
 
   useEffect(() => {
     if (!settings.showChat || !settings.showDanmaku) {
@@ -231,7 +231,7 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       stream,
       settings,
       enqueueEvent,
-      setStatus,
+      ignoreStatus,
     );
     return () => {
       client.stop();
@@ -245,7 +245,7 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       }
       updateVisible(() => []);
     };
-  }, [enqueueEvent, settings, stream, updateVisible]);
+  }, [enqueueEvent, ignoreStatus, settings, stream, updateVisible]);
 
   if (!settings.showChat || !settings.showDanmaku) {
     return null;
@@ -292,15 +292,8 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
           )}
         </Animated.View>
       ))}
-      {!!status && (
-        <View style={styles.status}>
-          <Text style={styles.statusText} numberOfLines={1}>
-            {status}
-          </Text>
-        </View>
-      )}
       {stream.platform === 'youtube' && (
-        <YouTubeOfficialChatBridge stream={stream} onEvent={enqueueEvent} onStatus={setStatus} />
+        <YouTubeOfficialChatBridge stream={stream} onEvent={enqueueEvent} onStatus={ignoreStatus} />
       )}
     </View>
   );
@@ -390,21 +383,5 @@ const styles = StyleSheet.create({
   },
   emote: {
     marginHorizontal: 3,
-  },
-  status: {
-    position: 'absolute',
-    top: 8,
-    left: 8,
-    maxWidth: '72%',
-    minHeight: 22,
-    paddingHorizontal: 8,
-    borderRadius: 7,
-    backgroundColor: 'rgba(5,7,10,0.62)',
-    justifyContent: 'center',
-  },
-  statusText: {
-    color: '#b8c6d8',
-    fontSize: 10,
-    fontWeight: '700',
   },
 });

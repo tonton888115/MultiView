@@ -6,6 +6,7 @@ import {
   SafeAreaView,
   ScrollView,
   PanResponder,
+  Pressable,
   StatusBar,
   StyleSheet,
   Switch,
@@ -44,8 +45,11 @@ import {
   makeStream,
   mobileUserAgent,
   resolvePlaybackSource,
+  resolveLiveYouTubeVideoID,
   webStreamURL,
+  youtubeClients,
   youtubeIframeHTML,
+  youtubeVideoId,
 } from './src/playback';
 import type {AppSettings, PlatformId, PlaybackSource, Source, StreamItem, TabId} from './src/types';
 
@@ -54,8 +58,11 @@ const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
 const SETTINGS_KEY = 'multiview.android.settings.v2';
 const LEGACY_SETTINGS_KEY = 'multiview.android.settings.v1';
 const VOLUMES_KEY = 'multiview.android.volumes.v1';
+const chromeAutoHideDelayMs = 2400;
 
 const platformIds: PlatformId[] = ['kick', 'twitch', 'youtube', 'niconico', 'twitcasting'];
+const youtubeViewerKeys = ['concurrentViewers', 'concurrent_viewers'];
+const niconicoCurrentViewerKeys = ['currentViewers', 'currentViewerCount', 'current_viewers', 'current_viewer_count', 'viewerCount', 'viewersCount'];
 
 const defaultSettings: AppSettings = {
   showChat: true,
@@ -247,6 +254,34 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
     return fallback;
   }
   return Math.min(max, Math.max(min, number));
+}
+
+function useAutoHidingChrome(resetKey: unknown) {
+  const [visible, setVisible] = useState(true);
+  const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearHideTimer = useCallback(() => {
+    if (hideTimerRef.current) {
+      clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = null;
+    }
+  }, []);
+
+  const show = useCallback(() => {
+    clearHideTimer();
+    setVisible(true);
+    hideTimerRef.current = setTimeout(() => {
+      hideTimerRef.current = null;
+      setVisible(false);
+    }, chromeAutoHideDelayMs);
+  }, [clearHideTimer]);
+
+  useEffect(() => {
+    show();
+    return clearHideTimer;
+  }, [clearHideTimer, resetKey, show]);
+
+  return {chromeVisible: visible, showChrome: show};
 }
 
 export default function App() {
@@ -809,8 +844,10 @@ function StreamCell({
   const dragOriginRef = useRef(index);
   const dragCurrentRef = useRef(index);
   const webCommentRef = useRef<((text: string) => void) | null>(null);
+  const {chromeVisible, showChrome} = useAutoHidingChrome(stream.id);
   const updateDragTarget = useCallback(
     (dx: number, dy: number) => {
+      showChrome();
       const rowHeight = Math.max(80, cellLayout.height || 0);
       const colWidth = Math.max(80, cellLayout.width || 0);
       const rowDelta = Math.round(dy / rowHeight);
@@ -821,7 +858,7 @@ function StreamCell({
         dragCurrentRef.current = target;
       }
     },
-    [cellLayout.height, cellLayout.width, columns, count, onMove],
+    [cellLayout.height, cellLayout.width, columns, count, onMove, showChrome],
   );
   const reorderResponder = useMemo(
     () =>
@@ -829,6 +866,7 @@ function StreamCell({
         onStartShouldSetPanResponder: () => true,
         onMoveShouldSetPanResponder: () => true,
         onPanResponderGrant: () => {
+          showChrome();
           dragOriginRef.current = index;
           dragCurrentRef.current = index;
         },
@@ -837,7 +875,7 @@ function StreamCell({
           updateDragTarget(gesture.dx, gesture.dy);
         },
       }),
-    [index, updateDragTarget],
+    [index, showChrome, updateDragTarget],
   );
   const submitComment = useCallback(() => {
     const text = commentText.trim();
@@ -866,7 +904,7 @@ function StreamCell({
 
   return (
     <View style={styles.streamCell} onLayout={event => setCellLayout(event.nativeEvent.layout)}>
-      <View style={styles.player}>
+      <View style={styles.player} onTouchStart={showChrome}>
         <StreamPlayer
           stream={stream}
           settings={settings}
@@ -880,21 +918,26 @@ function StreamCell({
           }}
         />
         <View style={styles.playerChrome} pointerEvents="box-none">
-          <View style={styles.cellTopControls} pointerEvents="box-none">
-            <TouchableOpacity style={styles.overlayButton} onPress={() => setCommentOpen(current => !current)}>
-              <Text style={styles.overlayIcon}>□</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.overlayButton} onPress={onFocus}>
-              <Text style={styles.overlayIcon}>↗</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.overlayButton} onPress={() => onRemove(stream.id)}>
-              <Text style={styles.overlayIcon}>×</Text>
-            </TouchableOpacity>
-          </View>
-          <VolumeOverlay stream={stream} volume={volume} color={info.color} onVolume={onVolume} />
-          {settings.showViewerCount && <ViewerCountBadge stream={stream} />}
-          <View style={styles.reorderHandle} {...reorderResponder.panHandlers}>
-            <Text style={styles.reorderIcon}>≡</Text>
+          {!chromeVisible && <Pressable style={styles.chromeRevealTouch} onPress={showChrome} />}
+          <View
+            style={[styles.autoHideChrome, !chromeVisible && styles.autoHideChromeHidden]}
+            pointerEvents={chromeVisible ? 'box-none' : 'none'}>
+            <View style={styles.cellTopControls} pointerEvents="box-none">
+              <TouchableOpacity style={styles.overlayButton} onPress={() => setCommentOpen(current => !current)}>
+                <Text style={styles.overlayIcon}>□</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.overlayButton} onPress={onFocus}>
+                <Text style={styles.overlayIcon}>↗</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.overlayButton} onPress={() => onRemove(stream.id)}>
+                <Text style={styles.overlayIcon}>×</Text>
+              </TouchableOpacity>
+            </View>
+            <VolumeOverlay stream={stream} volume={volume} color={info.color} onVolume={onVolume} onInteract={showChrome} />
+            {settings.showViewerCount && <ViewerCountBadge stream={stream} />}
+            <View style={styles.reorderHandle} {...reorderResponder.panHandlers}>
+              <Text style={styles.reorderIcon}>≡</Text>
+            </View>
           </View>
           {commentOpen && (
             <View style={styles.commentBar}>
@@ -1104,12 +1147,14 @@ function VolumeOverlay({
   volume,
   color,
   onVolume,
+  onInteract,
   mode = 'cell',
 }: {
   stream: StreamItem;
   volume: number;
   color: string;
   onVolume: (stream: StreamItem, volume: number) => void;
+  onInteract?: () => void;
   mode?: 'cell' | 'focus';
 }) {
   const [height, setHeight] = useState(0);
@@ -1118,10 +1163,11 @@ function VolumeOverlay({
       if (height <= 0) {
         return;
       }
+      onInteract?.();
       const next = 1 - Math.max(0, Math.min(height, locationY)) / height;
       onVolume(stream, next);
     },
-    [height, onVolume, stream],
+    [height, onInteract, onVolume, stream],
   );
   const responder = useMemo(
     () =>
@@ -1195,7 +1241,7 @@ async function fetchViewerCount(stream: StreamItem): Promise<number | null> {
     case 'youtube':
       return fetchYouTubeViewerCount(stream.channel);
     case 'niconico':
-      return fetchHTMLViewerCount(webStreamURL(stream), ['watchCount', 'viewers', 'viewersCount', 'viewerCount', 'currentViewers', 'audienceCount', 'visitorCount']);
+      return fetchHTMLViewerCount(webStreamURL(stream), niconicoCurrentViewerKeys);
     case 'twitcasting':
       return fetchHTMLViewerCount(webStreamURL(stream), ['current_view_count', 'currentViewerCount', 'current_viewer_count', 'viewer_count', 'viewerCount', 'viewers']);
   }
@@ -1232,19 +1278,65 @@ async function fetchTwitchViewerCount(rawChannel: string): Promise<number | null
 }
 
 async function fetchYouTubeViewerCount(rawChannel: string): Promise<number | null> {
+  let videoId = youtubeVideoId(rawChannel);
+  try {
+    videoId = videoId ?? await resolveLiveYouTubeVideoID(rawChannel);
+  } catch {
+    videoId = videoId ?? null;
+  }
+  if (videoId) {
+    const playerCount = await fetchYouTubePlayerViewerCount(videoId);
+    if (playerCount != null) {
+      return playerCount;
+    }
+    const response = await fetch(`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`, {headers: {'User-Agent': desktopUserAgent}});
+    return youtubeViewerCountFromText(await response.text());
+  }
   const url = youtubeViewerURL(rawChannel);
   if (!url) {
     return null;
   }
   const response = await fetch(url, {headers: {'User-Agent': desktopUserAgent}});
-  const html = await response.text();
-  return numberFromText(html, ['concurrentViewers', 'concurrent_viewers']);
+  return youtubeViewerCountFromText(await response.text());
+}
+
+async function fetchYouTubePlayerViewerCount(videoId: string): Promise<number | null> {
+  for (const client of youtubeClients()) {
+    try {
+      const response = await fetch('https://youtubei.googleapis.com/youtubei/v1/player', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': client.userAgent,
+          'X-YouTube-Client-Name': client.headerClientName,
+          'X-YouTube-Client-Version': client.version,
+          'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
+        },
+        body: JSON.stringify({
+          context: client.context,
+          videoId,
+          contentCheckOk: true,
+          racyCheckOk: true,
+        }),
+      });
+      if (!response.ok) {
+        continue;
+      }
+      const count = youtubeViewerCountFromJSON(await response.json());
+      if (count != null) {
+        return count;
+      }
+    } catch {
+      // Try the next client/fallback path.
+    }
+  }
+  return null;
 }
 
 async function fetchHTMLViewerCount(url: string, keys: string[]): Promise<number | null> {
   const response = await fetch(url, {headers: {'User-Agent': desktopUserAgent}});
   const html = await response.text();
-  return numberFromText(html, keys);
+  return numberFromText(decodeHTMLEntities(html), keys);
 }
 
 function youtubeViewerURL(raw: string): string | null {
@@ -1303,6 +1395,67 @@ function numberFromText(text: string, keys: string[]): number | null {
     }
   }
   return null;
+}
+
+function youtubeViewerCountFromJSON(value: unknown): number | null {
+  const object = value as any;
+  return toNumber(object?.videoDetails?.concurrentViewers)
+    ?? toNumber(object?.microformat?.playerMicroformatRenderer?.liveBroadcastDetails?.concurrentViewers)
+    ?? numberFromKeys(value, youtubeViewerKeys)
+    ?? liveViewerCountFromValue(value);
+}
+
+function youtubeViewerCountFromText(text: string): number | null {
+  const decoded = decodeHTMLEntities(text);
+  return numberFromText(decoded, youtubeViewerKeys) ?? liveViewerCountFromText(decoded);
+}
+
+function liveViewerCountFromValue(value: unknown): number | null {
+  if (typeof value === 'string') {
+    return liveViewerCountFromText(value);
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const count = liveViewerCountFromValue(item);
+      if (count != null) {
+        return count;
+      }
+    }
+  } else if (value && typeof value === 'object') {
+    for (const item of Object.values(value)) {
+      const count = liveViewerCountFromValue(item);
+      if (count != null) {
+        return count;
+      }
+    }
+  }
+  return null;
+}
+
+function liveViewerCountFromText(text: string): number | null {
+  const patterns = [
+    /([0-9][0-9,]*)\s*(?:watching now|watching)/i,
+    /([0-9][0-9,]*)\s*人が視聴(?:中|しています)?/,
+  ];
+  for (const pattern of patterns) {
+    const count = toNumber(text.match(pattern)?.[1]);
+    if (count != null) {
+      return count;
+    }
+  }
+  return null;
+}
+
+function decodeHTMLEntities(text: string): string {
+  return text
+    .replace(/&quot;/g, '"')
+    .replace(/&#34;/g, '"')
+    .replace(/&#x22;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
 }
 
 function toNumber(value: unknown): number | null {
@@ -1417,6 +1570,7 @@ function FocusModal({
   const [commentText, setCommentText] = useState('');
   const [commentStatus, setCommentStatus] = useState('');
   const chat = stream ? chatURL(stream) : null;
+  const {chromeVisible, showChrome} = useAutoHidingChrome(stream?.id ?? 'closed');
 
   useEffect(() => {
     setCommentText('');
@@ -1494,7 +1648,7 @@ function FocusModal({
               </TouchableOpacity>
               {!!commentStatus && <Text style={styles.focusStatus} numberOfLines={1}>{commentStatus}</Text>}
             </View>
-            <View style={styles.focusPlayer}>
+            <View style={styles.focusPlayer} onTouchStart={showChrome}>
               <StreamPlayer
                 stream={stream}
                 settings={settings}
@@ -1505,14 +1659,26 @@ function FocusModal({
                 reloadKey={reloadKey}
               />
               <View style={styles.playerChrome} pointerEvents="box-none">
-                <TouchableOpacity style={[styles.overlayButton, styles.focusCloseButton]} onPress={onClose}>
-                  <Text style={styles.overlayIcon}>‹</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={[styles.overlayButton, styles.focusRemoveButton]} onPress={removeFocused}>
-                  <Text style={styles.overlayIcon}>×</Text>
-                </TouchableOpacity>
-                <VolumeOverlay stream={stream} volume={volume} color={platformInfo(stream.platform).color} onVolume={onVolume} mode="focus" />
-                {settings.showViewerCount && <ViewerCountBadge stream={stream} />}
+                {!chromeVisible && <Pressable style={styles.chromeRevealTouch} onPress={showChrome} />}
+                <View
+                  style={[styles.autoHideChrome, !chromeVisible && styles.autoHideChromeHidden]}
+                  pointerEvents={chromeVisible ? 'box-none' : 'none'}>
+                  <TouchableOpacity style={[styles.overlayButton, styles.focusCloseButton]} onPress={onClose}>
+                    <Text style={styles.overlayIcon}>‹</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.overlayButton, styles.focusRemoveButton]} onPress={removeFocused}>
+                    <Text style={styles.overlayIcon}>×</Text>
+                  </TouchableOpacity>
+                  <VolumeOverlay
+                    stream={stream}
+                    volume={volume}
+                    color={platformInfo(stream.platform).color}
+                    onVolume={onVolume}
+                    onInteract={showChrome}
+                    mode="focus"
+                  />
+                  {settings.showViewerCount && <ViewerCountBadge stream={stream} />}
+                </View>
               </View>
             </View>
           </View>
@@ -2318,6 +2484,24 @@ const styles = StyleSheet.create({
     backgroundColor: '#000',
   },
   playerChrome: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+  },
+  autoHideChrome: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    opacity: 1,
+  },
+  autoHideChromeHidden: {
+    opacity: 0,
+  },
+  chromeRevealTouch: {
     position: 'absolute',
     top: 0,
     right: 0,

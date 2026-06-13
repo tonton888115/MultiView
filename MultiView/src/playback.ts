@@ -515,7 +515,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
-function youtubeClients() {
+export function youtubeClients() {
   const iosUA = `com.google.ios.youtube/${youtubeIOSVersion} (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X; ja_JP)`;
   const androidUA = `com.google.android.youtube/${youtubeAndroidVersion} (Linux; U; Android 15) gzip`;
   return [
