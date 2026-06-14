@@ -1401,49 +1401,12 @@ function youtubeViewerCountFromJSON(value: unknown): number | null {
   const object = value as any;
   return toNumber(object?.videoDetails?.concurrentViewers)
     ?? toNumber(object?.microformat?.playerMicroformatRenderer?.liveBroadcastDetails?.concurrentViewers)
-    ?? numberFromKeys(value, youtubeViewerKeys)
-    ?? liveViewerCountFromValue(value);
+    ?? numberFromKeys(value, youtubeViewerKeys);
 }
 
 function youtubeViewerCountFromText(text: string): number | null {
   const decoded = decodeHTMLEntities(text);
-  return numberFromText(decoded, youtubeViewerKeys) ?? liveViewerCountFromText(decoded);
-}
-
-function liveViewerCountFromValue(value: unknown): number | null {
-  if (typeof value === 'string') {
-    return liveViewerCountFromText(value);
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const count = liveViewerCountFromValue(item);
-      if (count != null) {
-        return count;
-      }
-    }
-  } else if (value && typeof value === 'object') {
-    for (const item of Object.values(value)) {
-      const count = liveViewerCountFromValue(item);
-      if (count != null) {
-        return count;
-      }
-    }
-  }
-  return null;
-}
-
-function liveViewerCountFromText(text: string): number | null {
-  const patterns = [
-    /([0-9][0-9,]*)\s*(?:watching now|watching)/i,
-    /([0-9][0-9,]*)\s*人が視聴(?:中|しています)?/,
-  ];
-  for (const pattern of patterns) {
-    const count = toNumber(text.match(pattern)?.[1]);
-    if (count != null) {
-      return count;
-    }
-  }
-  return null;
+  return numberFromText(decoded, youtubeViewerKeys);
 }
 
 function decodeHTMLEntities(text: string): string {

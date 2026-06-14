@@ -1056,10 +1056,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     'yt-live-chat-membership-item-renderer',
     'yt-live-chat-sponsorships-gift-purchase-announcement-renderer',
     'yt-live-chat-sponsorships-gift-redemption-announcement-renderer',
-    'yt-live-chat-gift-membership-received-renderer',
-    'yt-live-chat-viewer-engagement-message-renderer',
-    'yt-live-chat-mode-change-message-renderer',
-    'yt-live-chat-auto-mod-message-renderer'
+    'yt-live-chat-gift-membership-received-renderer'
   ].join(',');
 
   function post(payload) {
@@ -1695,16 +1692,7 @@ private enum YouTubeInnerTubeChatClient {
       "liveChatSponsorshipsGiftPurchaseAnnouncementRenderer",
       "liveChatSponsorshipsGiftRedemptionAnnouncementRenderer",
       "liveChatGiftMembershipReceivedRenderer",
-      "liveChatViewerEngagementMessageRenderer",
-      "liveChatModeChangeMessageRenderer",
-      "liveChatPlaceholderItemRenderer",
-      "liveChatAutoModMessageRenderer",
-      "liveChatBannerRenderer",
-      "liveChatBannerHeaderRenderer",
-      "liveChatTickerPaidMessageItemRenderer",
-      "liveChatTickerSponsorItemRenderer",
       "liveChatDonationAnnouncementRenderer",
-      "liveChatPollRenderer"
     ]
     var renderers: [[String: Any]] = []
     func walk(_ value: Any?) {

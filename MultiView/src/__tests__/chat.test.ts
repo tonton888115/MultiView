@@ -93,6 +93,38 @@ describe('youtubeChatEventsFromAction', () => {
     expect(events[0].text).toBe('only once');
   });
 
+  it('drops YouTube system guidance renderers from danmaku', () => {
+    const events = youtubeChatEventsFromAction({
+      guide: {
+        liveChatViewerEngagementMessageRenderer: {
+          id: 'rules',
+          message: {runs: [{text: 'ルールを守ってチャットしてください'}]},
+        },
+      },
+      mode: {
+        liveChatModeChangeMessageRenderer: {
+          id: 'mode',
+          text: {runs: [{text: 'チャンネル登録者限定モードです'}]},
+        },
+      },
+      autoMod: {
+        liveChatAutoModMessageRenderer: {
+          id: 'auto-mod',
+          message: {runs: [{text: 'このメッセージは保留中です'}]},
+        },
+      },
+      realComment: {
+        liveChatTextMessageRenderer: {
+          id: 'real',
+          authorName: {simpleText: 'alice'},
+          message: {runs: [{text: 'real chat'}]},
+        },
+      },
+    });
+
+    expect(events.map(event => event.id)).toEqual(['real']);
+  });
+
   it('keeps image-only YouTube custom emoji and membership gift renderers', () => {
     const events = youtubeChatEventsFromAction({
       addChatItemAction: {

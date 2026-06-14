@@ -153,10 +153,7 @@ export const youtubeOfficialChatObserverScript = `
     'yt-live-chat-membership-item-renderer',
     'yt-live-chat-sponsorships-gift-purchase-announcement-renderer',
     'yt-live-chat-sponsorships-gift-redemption-announcement-renderer',
-    'yt-live-chat-gift-membership-received-renderer',
-    'yt-live-chat-viewer-engagement-message-renderer',
-    'yt-live-chat-mode-change-message-renderer',
-    'yt-live-chat-auto-mod-message-renderer'
+    'yt-live-chat-gift-membership-received-renderer'
   ].join(',');
 
   function post(payload) {

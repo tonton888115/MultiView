@@ -444,15 +444,14 @@ enum ViewerCountProvider {
         return count
       }
     }
-    return count(in: value, keys: youtubeKeys) ?? liveViewerCount(in: value)
+    return count(in: value, keys: youtubeKeys)
   }
 
   private static func youtubeCount(inHTML html: String?) -> Int? {
     guard let html else { return nil }
     let decoded = decodeHTMLEntities(html)
     let patterns = [
-      #""concurrentViewers"\s*:\s*"?([0-9,]+)"?"#,
-      #"([0-9][0-9,]*)\s*(?:watching now|watching|人が視聴中|人が視聴しています)"#
+      #""concurrentViewers"\s*:\s*"?([0-9,]+)"?"#
     ]
     for pattern in patterns {
       if let value = firstMatch(in: decoded, pattern: pattern) {
@@ -464,36 +463,6 @@ enum ViewerCountProvider {
             let object = parseJSON(json.data(using: .utf8)),
             let count = youtubeCount(in: object) else { continue }
       return count
-    }
-    return nil
-  }
-
-  private static func liveViewerCount(in value: Any?) -> Int? {
-    guard let value else { return nil }
-    if let text = value as? String {
-      return liveViewerCount(inText: text)
-    }
-    if let dict = value as? [String: Any] {
-      for nested in dict.values {
-        if let count = liveViewerCount(in: nested) { return count }
-      }
-    } else if let array = value as? [Any] {
-      for nested in array {
-        if let count = liveViewerCount(in: nested) { return count }
-      }
-    }
-    return nil
-  }
-
-  private static func liveViewerCount(inText text: String) -> Int? {
-    let patterns = [
-      #"([0-9][0-9,]*)\s*(?:watching now|watching)"#,
-      #"([0-9][0-9,]*)\s*人が視聴(?:中|しています)"#
-    ]
-    for pattern in patterns {
-      if let value = firstMatch(in: text, pattern: pattern) {
-        return intValue(value)
-      }
     }
     return nil
   }

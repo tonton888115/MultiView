@@ -479,16 +479,7 @@ export function youtubeChatEventsFromAction(action: any): ChatEvent[] {
     'liveChatSponsorshipsGiftPurchaseAnnouncementRenderer',
     'liveChatSponsorshipsGiftRedemptionAnnouncementRenderer',
     'liveChatGiftMembershipReceivedRenderer',
-    'liveChatViewerEngagementMessageRenderer',
-    'liveChatModeChangeMessageRenderer',
-    'liveChatPlaceholderItemRenderer',
-    'liveChatAutoModMessageRenderer',
-    'liveChatBannerRenderer',
-    'liveChatBannerHeaderRenderer',
-    'liveChatTickerPaidMessageItemRenderer',
-    'liveChatTickerSponsorItemRenderer',
     'liveChatDonationAnnouncementRenderer',
-    'liveChatPollRenderer',
   ];
   const renderers: any[] = [];
   const walk = (value: any) => {

@@ -76,6 +76,9 @@ describe('YouTube playback regression harness', () => {
     expect(officialBridge).toContain('MutationObserver');
     expect(officialBridge).toContain('yt-live-chat-text-message-renderer');
     expect(officialBridge).toContain('yt-live-chat-paid-sticker-renderer');
+    expect(officialBridge).not.toContain('yt-live-chat-viewer-engagement-message-renderer');
+    expect(officialBridge).not.toContain('yt-live-chat-mode-change-message-renderer');
+    expect(officialBridge).not.toContain('yt-live-chat-auto-mod-message-renderer');
 
     expect(swift).toContain('private let youtubeChatMinPollInterval: TimeInterval = 0.7');
     expect(swift).toContain('private let youtubeChatMaxPollInterval: TimeInterval = 1.6');
@@ -89,8 +92,23 @@ describe('YouTube playback regression harness', () => {
     expect(swift).toContain('startOfficialChatBridge(videoId: videoId)');
     expect(swift).toContain('youtubeOfficialChat');
     expect(swift).toContain('yt-live-chat-paid-sticker-renderer');
+    expect(swift).not.toContain('yt-live-chat-viewer-engagement-message-renderer');
+    expect(swift).not.toContain('yt-live-chat-mode-change-message-renderer');
+    expect(swift).not.toContain('yt-live-chat-auto-mod-message-renderer');
     expect(swift).not.toContain('lastChatPollInterval');
     expect(swift).not.toContain('laneCapacity');
     expect(swift).not.toContain('burstSpacing');
+  });
+
+  it('does not infer YouTube viewer counts from page text snippets', () => {
+    const app = readProjectFile('App.tsx');
+    const viewerCount = readProjectFile('ios/MultiView/ViewerCount.swift');
+
+    expect(app).toContain('concurrentViewers');
+    expect(app).not.toContain('watching now');
+    expect(app).not.toContain('人が視聴');
+    expect(viewerCount).toContain('concurrentViewers');
+    expect(viewerCount).not.toContain('watching now');
+    expect(viewerCount).not.toContain('人が視聴');
   });
 });
