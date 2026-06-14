@@ -105,9 +105,15 @@ describe('YouTube playback regression harness', () => {
     const viewerCount = readProjectFile('ios/MultiView/ViewerCount.swift');
 
     expect(app).toContain('concurrentViewers');
+    expect(app).toContain('videoPrimaryInfoRenderer');
+    expect(app).toContain('videoViewCountRenderer');
+    expect(app).toContain('originalViewCount');
     expect(app).not.toContain('watching now');
     expect(app).not.toContain('人が視聴');
     expect(viewerCount).toContain('concurrentViewers');
+    expect(viewerCount).toContain('videoPrimaryInfoRenderer');
+    expect(viewerCount).toContain('videoViewCountRenderer');
+    expect(viewerCount).toContain('originalViewCount');
     expect(viewerCount).not.toContain('watching now');
     expect(viewerCount).not.toContain('人が視聴');
   });

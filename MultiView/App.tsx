@@ -1401,12 +1401,94 @@ function youtubeViewerCountFromJSON(value: unknown): number | null {
   const object = value as any;
   return toNumber(object?.videoDetails?.concurrentViewers)
     ?? toNumber(object?.microformat?.playerMicroformatRenderer?.liveBroadcastDetails?.concurrentViewers)
+    ?? youtubePrimaryViewerCountFromJSON(value)
     ?? numberFromKeys(value, youtubeViewerKeys);
 }
 
 function youtubeViewerCountFromText(text: string): number | null {
   const decoded = decodeHTMLEntities(text);
-  return numberFromText(decoded, youtubeViewerKeys);
+  const direct = numberFromText(decoded, youtubeViewerKeys);
+  if (direct != null) {
+    return direct;
+  }
+  for (const token of ['ytInitialPlayerResponse', 'ytInitialData']) {
+    const json = jsonObjectStringAfterToken(token, decoded);
+    if (!json) {
+      continue;
+    }
+    try {
+      const count = youtubeViewerCountFromJSON(JSON.parse(json));
+      if (count != null) {
+        return count;
+      }
+    } catch {
+      // Try the next embedded object.
+    }
+  }
+  return null;
+}
+
+function youtubePrimaryViewerCountFromJSON(value: unknown): number | null {
+  const object = value as any;
+  const contents = object?.contents?.twoColumnWatchNextResults?.results?.results?.contents;
+  if (!Array.isArray(contents)) {
+    return null;
+  }
+  for (const item of contents) {
+    const renderer = item?.videoPrimaryInfoRenderer?.viewCount?.videoViewCountRenderer;
+    const count = youtubeVideoViewCountRendererCount(renderer);
+    if (count != null) {
+      return count;
+    }
+  }
+  return null;
+}
+
+function youtubeVideoViewCountRendererCount(renderer: any): number | null {
+  if (!renderer || renderer.isLive !== true) {
+    return null;
+  }
+  return toNumber(renderer.originalViewCount);
+}
+
+function jsonObjectStringAfterToken(token: string, text: string): string | null {
+  let position = 0;
+  while (position < text.length) {
+    const tokenIndex = text.indexOf(token, position);
+    if (tokenIndex < 0) {
+      return null;
+    }
+    const start = text.indexOf('{', tokenIndex + token.length);
+    if (start < 0) {
+      return null;
+    }
+    let depth = 0;
+    let inString = false;
+    let escaping = false;
+    for (let index = start; index < text.length; index += 1) {
+      const character = text[index];
+      if (inString) {
+        if (escaping) {
+          escaping = false;
+        } else if (character === '\\') {
+          escaping = true;
+        } else if (character === '"') {
+          inString = false;
+        }
+      } else if (character === '"') {
+        inString = true;
+      } else if (character === '{') {
+        depth += 1;
+      } else if (character === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          return text.slice(start, index + 1);
+        }
+      }
+    }
+    position = tokenIndex + token.length;
+  }
+  return null;
 }
 
 function decodeHTMLEntities(text: string): string {

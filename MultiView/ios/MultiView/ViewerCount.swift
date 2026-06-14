@@ -444,7 +444,7 @@ enum ViewerCountProvider {
         return count
       }
     }
-    return count(in: value, keys: youtubeKeys)
+    return youtubePrimaryViewerCount(in: value) ?? count(in: value, keys: youtubeKeys)
   }
 
   private static func youtubeCount(inHTML html: String?) -> Int? {
@@ -465,6 +465,32 @@ enum ViewerCountProvider {
       return count
     }
     return nil
+  }
+
+  private static func youtubePrimaryViewerCount(in value: Any?) -> Int? {
+    guard let root = value as? [String: Any],
+          let contentsRoot = root["contents"] as? [String: Any],
+          let twoColumn = contentsRoot["twoColumnWatchNextResults"] as? [String: Any],
+          let results = twoColumn["results"] as? [String: Any],
+          let nestedResults = results["results"] as? [String: Any],
+          let contents = nestedResults["contents"] as? [[String: Any]] else {
+      return nil
+    }
+    for item in contents {
+      guard let primary = item["videoPrimaryInfoRenderer"] as? [String: Any],
+            let viewCount = primary["viewCount"] as? [String: Any],
+            let renderer = viewCount["videoViewCountRenderer"] as? [String: Any],
+            let count = youtubeVideoViewCountRendererCount(renderer) else {
+        continue
+      }
+      return count
+    }
+    return nil
+  }
+
+  private static func youtubeVideoViewCountRendererCount(_ renderer: [String: Any]) -> Int? {
+    guard let isLive = renderer["isLive"] as? Bool, isLive else { return nil }
+    return intValue(renderer["originalViewCount"])
   }
 
   private static func jsonObjectString(afterToken token: String, in text: String) -> String? {
