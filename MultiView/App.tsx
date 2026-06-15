@@ -720,6 +720,21 @@ function ViewingScreen({
 }) {
   const [adding, setAdding] = useState(false);
   const [focused, setFocused] = useState<StreamItem | null>(null);
+  // reloadKey をインクリメントするとプレイヤー(native/iframe/web)が再マウントされ
+  // ソース解決もやり直す。更新ボタン(全体/セル別)の実体。
+  const [reloadKeys, setReloadKeys] = useState<Record<string, number>>({});
+  const reloadStream = useCallback((id: string) => {
+    setReloadKeys(current => ({...current, [id]: (current[id] ?? 0) + 1}));
+  }, []);
+  const reloadAll = useCallback(() => {
+    setReloadKeys(current => {
+      const next = {...current};
+      streams.forEach(stream => {
+        next[stream.id] = (next[stream.id] ?? 0) + 1;
+      });
+      return next;
+    });
+  }, [streams]);
   const columns = settings.layoutMode === 'grid' ? 2 : 1;
   const slots = useMemo(() => gridSlots(streams, settings.layoutMode), [settings.layoutMode, streams]);
 
@@ -742,11 +757,12 @@ function ViewingScreen({
                   volume={volumes[stream.id] ?? 1}
                   paused={focused?.id === stream.id}
                   muted={!settings.playAudio}
-                  reloadKey={0}
+                  reloadKey={reloadKeys[stream.id] ?? 0}
                   index={index}
                   count={streams.length}
                   columns={columns}
                   onFocus={() => setFocused(stream)}
+                  onReload={() => reloadStream(stream.id)}
                   onMove={onMove}
                   onRemove={onRemove}
                   onVolume={onVolume}
@@ -773,6 +789,11 @@ function ViewingScreen({
           </TouchableOpacity>
         </View>
         <View style={styles.viewBottomSpacer} />
+        {streams.length > 0 && (
+          <TouchableOpacity style={styles.bottomIconButton} onPress={reloadAll}>
+            <Text style={styles.bottomIconText}>↻</Text>
+          </TouchableOpacity>
+        )}
         <TouchableOpacity style={styles.bottomIconButton} onPress={() => setAdding(true)}>
           <Text style={styles.bottomIconText}>＋</Text>
         </TouchableOpacity>
@@ -790,7 +811,8 @@ function ViewingScreen({
         streamCount={streams.length}
         volume={focused ? volumes[focused.id] ?? 1 : 1}
         muted={!settings.playAudio}
-        reloadKey={0}
+        reloadKey={focused ? reloadKeys[focused.id] ?? 0 : 0}
+        onReload={() => focused && reloadStream(focused.id)}
         onVolume={onVolume}
         onClose={() => setFocused(null)}
         onRemove={onRemove}
@@ -805,7 +827,9 @@ function gridSlots(streams: StreamItem[], layoutMode: AppSettings['layoutMode'])
   if (layoutMode !== 'grid') {
     return streams.map((stream, index) => ({stream, index, width: '100%'}));
   }
-  const bigCount = streams.length % 2 === 0 ? 2 : 1;
+  // 2列で詰め、奇数のときだけ最後の1本を全幅にする。
+  // (旧実装は偶数だと末尾2本が全幅化し、2本=実質スタック表示になるバグがあった)
+  const bigCount = streams.length % 2 === 0 ? 0 : 1;
   const pairedCount = Math.max(0, streams.length - bigCount);
   return streams.map((stream, index) => ({
     stream,
@@ -826,6 +850,7 @@ function StreamCell({
   count,
   columns,
   onFocus,
+  onReload,
   onMove,
   onRemove,
   onVolume,
@@ -843,6 +868,7 @@ function StreamCell({
   count: number;
   columns: number;
   onFocus: () => void;
+  onReload: () => void;
   onMove: (index: number, target: number) => void;
   onRemove: (id: string) => void;
   onVolume: (stream: StreamItem, volume: number) => void;
@@ -944,6 +970,9 @@ function StreamCell({
               </TouchableOpacity>
               <TouchableOpacity style={styles.overlayButton} onPress={onFocus}>
                 <Text style={styles.overlayIcon}>↗</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.overlayButton} onPress={onReload}>
+                <Text style={styles.overlayIcon}>↻</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.overlayButton} onPress={() => onRemove(stream.id)}>
                 <Text style={styles.overlayIcon}>×</Text>
@@ -1899,6 +1928,7 @@ function FocusModal({
   volume,
   muted,
   reloadKey,
+  onReload,
   onVolume,
   onClose,
   onRemove,
@@ -1911,6 +1941,7 @@ function FocusModal({
   volume: number;
   muted: boolean;
   reloadKey: number;
+  onReload: () => void;
   onVolume: (stream: StreamItem, volume: number) => void;
   onClose: () => void;
   onRemove: (id: string) => void;
@@ -2020,6 +2051,9 @@ function FocusModal({
                   pointerEvents={chromeVisible ? 'box-none' : 'none'}>
                   <TouchableOpacity style={[styles.overlayButton, styles.focusCloseButton]} onPress={onClose}>
                     <Text style={styles.overlayIcon}>‹</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.overlayButton, styles.focusReloadButton]} onPress={onReload}>
+                    <Text style={styles.overlayIcon}>↻</Text>
                   </TouchableOpacity>
                   <TouchableOpacity style={[styles.overlayButton, styles.focusRemoveButton]} onPress={removeFocused}>
                     <Text style={styles.overlayIcon}>×</Text>
@@ -3350,6 +3384,15 @@ const styles = StyleSheet.create({
     position: 'absolute',
     top: 10,
     right: 10,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    marginLeft: 0,
+  },
+  focusReloadButton: {
+    position: 'absolute',
+    top: 10,
+    right: 54,
     width: 36,
     height: 36,
     borderRadius: 18,

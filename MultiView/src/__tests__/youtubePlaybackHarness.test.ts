@@ -1,3 +1,5 @@
+import {extractPlayableYouTubeURL} from '../playback';
+
 declare const __dirname: string;
 
 const fs = require('fs') as {readFileSync(filePath: string, encoding: 'utf8'): string};
@@ -43,8 +45,11 @@ describe('YouTube playback regression harness', () => {
 
     expect(playback).toContain("const youtubeIOSVersion = '21.17.3';");
     expect(playback).toContain("html5Preference: 'HTML5_PREF_WANTS'");
-    expect(playback).toContain('function extractPlayableYouTubeURL');
+    expect(playback).toContain('export function extractPlayableYouTubeURL');
     expect(playback).toContain('stream.isHLS || !stream.isLive');
+    // ライブ動画ID解決はタイムアウトでフルWebページへ落とさず、
+    // モバイル→デスクトップUAで再試行する(=映像だけのHLS経路を維持する)。
+    expect(playback).toContain('const userAgents = [mobileSafariUserAgent, desktopUserAgent];');
     expect(playback.indexOf("headerClientName: '5'")).toBeGreaterThanOrEqual(0);
     expect(playback.indexOf("headerClientName: '5'")).toBeLessThan(playback.indexOf("headerClientName: '3'"));
 
@@ -53,6 +58,22 @@ describe('YouTube playback regression harness', () => {
     expect(swift).toContain('stream.isHLS || !stream.isLive');
     expect(swift.indexOf('label: "IOS"')).toBeGreaterThanOrEqual(0);
     expect(swift.indexOf('label: "IOS"')).toBeLessThan(swift.indexOf('label: "ANDROID"'));
+  });
+
+  it('keeps iOS-parity YouTube timeouts so HLS is not dropped to the ad-laden web page', () => {
+    // FAILED METHODS — do not reintroduce (these made Android unstable while iOS was fine):
+    //  - InnerTube /player request with an 8s timeout: too short, dropped live HLS and fell to
+    //    the YouTube iframe. iOS (YouTubePlayer.swift) waits 12s per client.
+    //  - @handle/live videoId resolution with a single 10s attempt that THREW on timeout:
+    //    collapsed the whole stream to the full m.youtube.com web page (ads + YouTube UI,
+    //    NOT 映像だけ). iOS waits up to URLSession default (~60s) with a mobileSafari UA +
+    //    Accept header and never hard-fails to the page.
+    const playback = readProjectFile('src/playback.ts');
+    expect(playback).toContain('12000,'); // InnerTube /player per-client timeout (iOS parity)
+    expect(playback).toContain('20000,'); // @handle/live resolution patience
+    expect(playback).toContain("Accept: 'text/html,application/xhtml+xml"); // iOS-parity resolution header
+    // the rejected aggressive /player timeout must not come back as the request cutoff
+    expect(playback).not.toContain('        8000,\n      );');
   });
 
   it('requires YouTube chat fixes to exist on both Android JS and iOS Swift paths', () => {
@@ -116,5 +137,45 @@ describe('YouTube playback regression harness', () => {
     expect(viewerCount).toContain('originalViewCount');
     expect(viewerCount).not.toContain('watching now');
     expect(viewerCount).not.toContain('人が視聴');
+  });
+});
+
+describe('YouTube HLS video-only extraction', () => {
+  it('prefers hlsManifestUrl so playback is clean HLS (映像だけ), not the iframe/web page', () => {
+    const result = extractPlayableYouTubeURL({
+      videoDetails: {isLive: true, isLiveContent: true},
+      streamingData: {
+        hlsManifestUrl:
+          'https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1/file/index.m3u8',
+        formats: [
+          {url: 'https://progressive.example/muxed', mimeType: 'video/mp4; codecs="avc1.4d401f,mp4a.40.2"', height: 720, bitrate: 1_000},
+        ],
+      },
+    });
+    expect(result).not.toBeNull();
+    expect(result?.isHLS).toBe(true);
+    expect(result?.isLive).toBe(true);
+    expect(result?.url).toContain('.m3u8');
+  });
+
+  it('returns null when there is no streamingData (drives iframe fallback, never the full web page)', () => {
+    expect(extractPlayableYouTubeURL({})).toBeNull();
+    expect(extractPlayableYouTubeURL({videoDetails: {isLive: true}})).toBeNull();
+  });
+
+  it('falls back to a muxed (audio+video) progressive format only when HLS is absent, skipping video-only tracks', () => {
+    const result = extractPlayableYouTubeURL({
+      videoDetails: {isLive: false, isLiveContent: true},
+      streamingData: {
+        formats: [
+          // higher quality but video-only -> must be skipped (would play silent)
+          {url: 'https://progressive.example/video-only-1080', mimeType: 'video/mp4; codecs="avc1.640028"', height: 1080, bitrate: 5_000},
+          // muxed audio+video -> the only valid pick
+          {url: 'https://progressive.example/muxed-720', mimeType: 'video/mp4; codecs="avc1.4d401f,mp4a.40.2"', height: 720, bitrate: 3_000},
+        ],
+      },
+    });
+    expect(result?.isHLS).toBe(false);
+    expect(result?.url).toBe('https://progressive.example/muxed-720');
   });
 });

@@ -396,21 +396,41 @@ export async function resolveLiveYouTubeVideoID(raw: string): Promise<string | n
   if (!url) {
     return null;
   }
-  const response = await fetchWithTimeout(url, {
-    headers: {
-      'User-Agent': mobileSafariUserAgent,
-      'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
-    },
-  }, 10000);
-  if (!response.ok) {
-    return null;
+  // @handle/live ページからライブ動画IDを解決する。HTMLが重く失敗しやすいので、
+  // タイムアウトでも throw せず(=フルWebページへ落とさず)、モバイル→デスクトップUAの
+  // 2回まで試行する。最終的に解決できなければ null を返し、呼び出し側で扱う。
+  // iOS (resolveLiveVideoID) は mobileSafari UA + Accept ヘッダで URLSession 既定(最大60秒)
+  // まで我慢して待つので安定している。Androidも取りこぼさないよう十分に待つ。
+  const userAgents = [mobileSafariUserAgent, desktopUserAgent];
+  for (const userAgent of userAgents) {
+    try {
+      const response = await fetchWithTimeout(
+        url,
+        {
+          headers: {
+            'User-Agent': userAgent,
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
+          },
+        },
+        20000,
+      );
+      if (!response.ok) {
+        continue;
+      }
+      const finalId = youtubeVideoId(response.url);
+      if (finalId) {
+        return finalId;
+      }
+      const extracted = extractYouTubeVideoID(await response.text());
+      if (extracted) {
+        return extracted;
+      }
+    } catch {
+      // タイムアウト/ネットワーク失敗。次のUAで再試行し、尽きたら null。
+    }
   }
-  const finalId = youtubeVideoId(response.url);
-  if (finalId) {
-    return finalId;
-  }
-  const html = await response.text();
-  return extractYouTubeVideoID(html);
+  return null;
 }
 
 function liveResolutionURL(raw: string): string | null {
@@ -480,7 +500,9 @@ async function requestYouTubeDirect(videoId: string): Promise<string | null> {
             },
           }),
         },
-        8000,
+        // iOS (YouTubePlayer.swift requestNativePlayer) は各クライアント12秒待つ。
+        // 8秒だと取りこぼしてiframe/webへ落ちやすかったのでiOSと同値に揃える。
+        12000,
       );
       if (!response.ok) {
         continue;
@@ -560,7 +582,7 @@ export function youtubeClients() {
   ];
 }
 
-function extractPlayableYouTubeURL(json: any): YouTubeDirectCandidate | null {
+export function extractPlayableYouTubeURL(json: any): YouTubeDirectCandidate | null {
   const streamingData = json?.streamingData;
   if (!streamingData) {
     return null;
