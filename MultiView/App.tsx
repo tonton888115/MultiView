@@ -2,6 +2,7 @@ import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   Modal,
   SafeAreaView,
   ScrollView,
@@ -63,12 +64,16 @@ const chromeAutoHideDelayMs = 2400;
 const platformIds: PlatformId[] = ['kick', 'twitch', 'youtube', 'niconico', 'twitcasting'];
 const youtubeViewerKeys = ['concurrentViewers', 'concurrent_viewers'];
 const niconicoCurrentViewerKeys = ['currentViewers', 'currentViewerCount', 'current_viewers', 'current_viewer_count', 'viewerCount', 'viewersCount'];
+const settingsSchemaVersion = 3;
+const youtubeViewerFetchTimeoutMs = 30000;
+const youtubePlayerViewerFetchTimeoutMs = 8000;
 
 const defaultSettings: AppSettings = {
+  settingsVersion: settingsSchemaVersion,
   showChat: true,
   showDanmaku: true,
   showEmotes: true,
-  showViewerCount: false,
+  showViewerCount: true,
   playAudio: true,
   autoFollowRaids: false,
   blockWebAds: true,
@@ -233,9 +238,17 @@ function parseStreamURL(raw: string): {platform: PlatformId; channel: string} | 
 
 function sanitizeSettings(raw: unknown): AppSettings {
   const source = typeof raw === 'object' && raw ? (raw as Partial<AppSettings>) : {};
+  const sourceVersion = typeof source.settingsVersion === 'number' ? source.settingsVersion : 0;
+  const migrateViewerCountDefault = source.showViewerCount === false && sourceVersion < settingsSchemaVersion;
   return {
     ...defaultSettings,
     ...source,
+    settingsVersion: settingsSchemaVersion,
+    showViewerCount: migrateViewerCountDefault
+      ? true
+      : typeof source.showViewerCount === 'boolean'
+        ? source.showViewerCount
+        : defaultSettings.showViewerCount,
     platformOrder: orderedPlatforms(Array.isArray(source.platformOrder) ? source.platformOrder : platformIds),
     layoutMode: source.layoutMode === 'grid' ? 'grid' : source.layoutMode === 'stacked' ? 'stacked' : defaultSettings.layoutMode,
     wifiQuality: source.wifiQuality === 'economy' ? 'economy' : 'high',
@@ -841,6 +854,7 @@ function StreamCell({
   const [commentText, setCommentText] = useState('');
   const [commentStatus, setCommentStatus] = useState('');
   const [cellLayout, setCellLayout] = useState({width: 0, height: 0});
+  const [webViewerCount, setWebViewerCount] = useState<number | null>(null);
   const dragOriginRef = useRef(index);
   const dragCurrentRef = useRef(index);
   const webCommentRef = useRef<((text: string) => void) | null>(null);
@@ -916,9 +930,11 @@ function StreamCell({
           onWebCommentBridge={send => {
             webCommentRef.current = send;
           }}
+          onViewerCount={setWebViewerCount}
         />
         <View style={styles.playerChrome} pointerEvents="box-none">
           {!chromeVisible && <Pressable style={styles.chromeRevealTouch} onPress={showChrome} />}
+          {settings.showViewerCount && <ViewerCountBadge stream={stream} externalCount={webViewerCount} visible={chromeVisible} />}
           <View
             style={[styles.autoHideChrome, !chromeVisible && styles.autoHideChromeHidden]}
             pointerEvents={chromeVisible ? 'box-none' : 'none'}>
@@ -934,7 +950,6 @@ function StreamCell({
               </TouchableOpacity>
             </View>
             <VolumeOverlay stream={stream} volume={volume} color={info.color} onVolume={onVolume} onInteract={showChrome} />
-            {settings.showViewerCount && <ViewerCountBadge stream={stream} />}
             <View style={styles.reorderHandle} {...reorderResponder.panHandlers}>
               <Text style={styles.reorderIcon}>≡</Text>
             </View>
@@ -973,6 +988,7 @@ function StreamPlayer({
   volume,
   reloadKey,
   onWebCommentBridge,
+  onViewerCount,
 }: {
   stream: StreamItem;
   settings: AppSettings;
@@ -982,10 +998,26 @@ function StreamPlayer({
   volume: number;
   reloadKey: number;
   onWebCommentBridge?: (send: ((text: string) => void) | null) => void;
+  onViewerCount?: (count: number) => void;
 }) {
   const [source, setSource] = useState<PlaybackSource | null>(null);
   const [, setPlayerStatus] = useState('待機中');
   const webRef = useRef<WebView>(null);
+
+  const handleWebMessage = useCallback(
+    (event: WebViewMessageEvent) => {
+      try {
+        const payload = JSON.parse(event.nativeEvent.data);
+        const count = Number(payload?.count);
+        if (payload?.type === 'viewerCount' && Number.isFinite(count) && count >= 0) {
+          onViewerCount?.(Math.round(count));
+        }
+      } catch {
+        // Ignore bridge noise from websites.
+      }
+    },
+    [onViewerCount],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -1095,6 +1127,21 @@ function StreamPlayer({
           setSupportMultipleWindows={false}
           style={styles.webPlayer}
         />
+        <WebView
+          key={`viewer:${source.videoId}:${reloadKey}`}
+          source={{uri: `https://m.youtube.com/watch?v=${encodeURIComponent(source.videoId)}`}}
+          userAgent={mobileUserAgent}
+          javaScriptEnabled
+          domStorageEnabled
+          sharedCookiesEnabled
+          thirdPartyCookiesEnabled
+          allowsInlineMediaPlayback
+          mediaPlaybackRequiresUserAction
+          setSupportMultipleWindows={false}
+          injectedJavaScript={webFallbackScript(settings.blockWebAds)}
+          onMessage={handleWebMessage}
+          style={styles.hiddenBridgeWeb}
+        />
         <DanmakuOverlay stream={stream} settings={settings} />
       </>
     );
@@ -1117,6 +1164,7 @@ function StreamPlayer({
           mediaPlaybackRequiresUserAction={false}
           setSupportMultipleWindows={false}
           injectedJavaScript={webFallbackScript(settings.blockWebAds)}
+          onMessage={handleWebMessage}
           style={styles.webPlayer}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
@@ -1194,22 +1242,84 @@ function VolumeOverlay({
   );
 }
 
-function ViewerCountBadge({stream}: {stream: StreamItem}) {
+function ViewerCountBadge({
+  stream,
+  externalCount,
+  visible,
+}: {
+  stream: StreamItem;
+  externalCount?: number | null;
+  visible: boolean;
+}) {
   const [count, setCount] = useState<number | null>(null);
+  const opacity = useRef(new Animated.Value(0)).current;
+  const inFlightRef = useRef(false);
+  const hideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearHideTimer = useCallback(() => {
+    if (hideTimerRef.current) {
+      clearTimeout(hideTimerRef.current);
+      hideTimerRef.current = null;
+    }
+  }, []);
+
+  const reveal = useCallback(() => {
+    clearHideTimer();
+    Animated.timing(opacity, {
+      toValue: 1,
+      duration: 140,
+      useNativeDriver: true,
+    }).start();
+    hideTimerRef.current = setTimeout(() => {
+      Animated.timing(opacity, {
+        toValue: 0,
+        duration: 520,
+        useNativeDriver: true,
+      }).start();
+      hideTimerRef.current = null;
+    }, chromeAutoHideDelayMs);
+  }, [clearHideTimer, opacity]);
+
+  useEffect(() => {
+    if (externalCount != null && externalCount >= 0) {
+      setCount(Math.round(externalCount));
+      reveal();
+    }
+  }, [externalCount, reveal]);
+
+  useEffect(() => {
+    setCount(null);
+    opacity.setValue(0);
+    clearHideTimer();
+  }, [clearHideTimer, opacity, stream.id]);
+
+  useEffect(() => {
+    if (visible && count != null && count >= 0) {
+      reveal();
+    }
+  }, [count, reveal, visible]);
+
+  useEffect(() => () => clearHideTimer(), [clearHideTimer]);
 
   useEffect(() => {
     let cancelled = false;
     const refresh = () => {
+      if (inFlightRef.current) {
+        return;
+      }
+      inFlightRef.current = true;
       fetchViewerCount(stream)
         .then(value => {
-          if (!cancelled) {
+          if (!cancelled && value != null) {
             setCount(value);
+            reveal();
           }
         })
         .catch(() => {
-          if (!cancelled) {
-            setCount(null);
-          }
+          // Keep the last known count, including values bridged from a YouTube WebView.
+        })
+        .finally(() => {
+          inFlightRef.current = false;
         });
     };
     refresh();
@@ -1218,17 +1328,17 @@ function ViewerCountBadge({stream}: {stream: StreamItem}) {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [stream]);
+  }, [reveal, stream]);
 
   if (count == null || count < 0) {
     return null;
   }
 
   return (
-    <View style={styles.viewerBadge}>
+    <Animated.View style={[styles.viewerBadge, {opacity}]} pointerEvents="none">
       <Text style={styles.viewerBadgeIcon}>◇</Text>
       <Text style={styles.viewerBadgeText}>{count}人</Text>
-    </View>
+    </Animated.View>
   );
 }
 
@@ -1285,44 +1395,97 @@ async function fetchYouTubeViewerCount(rawChannel: string): Promise<number | nul
     videoId = videoId ?? null;
   }
   if (videoId) {
-    const playerCount = await fetchYouTubePlayerViewerCount(videoId);
-    if (playerCount != null) {
-      return playerCount;
+    const firstCount = await firstViewerCount([
+      fetchYouTubePlayerViewerCount(videoId),
+      fetchYouTubeWatchViewerCount(videoId),
+    ]);
+    if (firstCount != null) {
+      return firstCount;
     }
-    const response = await fetch(`https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`, {headers: {'User-Agent': desktopUserAgent}});
-    return youtubeViewerCountFromText(await response.text());
   }
   const url = youtubeViewerURL(rawChannel);
   if (!url) {
     return null;
   }
-  const response = await fetch(url, {headers: {'User-Agent': desktopUserAgent}});
+  const response = await fetchWithTimeout(url, {headers: {'User-Agent': desktopUserAgent}}, youtubeViewerFetchTimeoutMs);
   return youtubeViewerCountFromText(await response.text());
+}
+
+async function firstViewerCount(promises: Array<Promise<number | null>>): Promise<number | null> {
+  return new Promise(resolve => {
+    let pending = promises.length;
+    let resolved = false;
+    const settle = (value: number | null) => {
+      if (!resolved && value != null) {
+        resolved = true;
+        resolve(value);
+        return;
+      }
+      pending -= 1;
+      if (!resolved && pending <= 0) {
+        resolved = true;
+        resolve(null);
+      }
+    };
+    for (const promise of promises) {
+      promise.then(settle).catch(() => settle(null));
+    }
+  });
+}
+
+async function fetchYouTubeWatchViewerCount(videoId: string): Promise<number | null> {
+  try {
+    const mobileResponse = await fetchWithTimeout(
+      `https://m.youtube.com/watch?v=${encodeURIComponent(videoId)}`,
+      {headers: {'User-Agent': mobileUserAgent, 'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6'}},
+      youtubeViewerFetchTimeoutMs,
+    );
+    const mobileCount = youtubeViewerCountFromText(await mobileResponse.text());
+    if (mobileCount != null) {
+      return mobileCount;
+    }
+  } catch {
+    // Try the desktop watch page below.
+  }
+  try {
+    const response = await fetchWithTimeout(
+      `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`,
+      {headers: {'User-Agent': desktopUserAgent}},
+      youtubeViewerFetchTimeoutMs,
+    );
+    return youtubeViewerCountFromText(await response.text());
+  } catch {
+    return null;
+  }
 }
 
 async function fetchYouTubePlayerViewerCount(videoId: string): Promise<number | null> {
   for (const client of youtubeClients()) {
     try {
-      const response = await fetch('https://youtubei.googleapis.com/youtubei/v1/player', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': client.userAgent,
-          'X-YouTube-Client-Name': client.headerClientName,
-          'X-YouTube-Client-Version': client.version,
-          'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
+      const response = await fetchWithTimeout(
+        'https://youtubei.googleapis.com/youtubei/v1/player',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': client.userAgent,
+            'X-YouTube-Client-Name': client.headerClientName,
+            'X-YouTube-Client-Version': client.version,
+            'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
+          },
+          body: JSON.stringify({
+            context: client.context,
+            videoId,
+            contentCheckOk: true,
+            racyCheckOk: true,
+          }),
         },
-        body: JSON.stringify({
-          context: client.context,
-          videoId,
-          contentCheckOk: true,
-          racyCheckOk: true,
-        }),
-      });
+        youtubePlayerViewerFetchTimeoutMs,
+      );
       if (!response.ok) {
         continue;
       }
-      const count = youtubeViewerCountFromJSON(await response.json());
+      const count = youtubePlayerViewerCountFromJSON(await response.json());
       if (count != null) {
         return count;
       }
@@ -1334,9 +1497,25 @@ async function fetchYouTubePlayerViewerCount(videoId: string): Promise<number | 
 }
 
 async function fetchHTMLViewerCount(url: string, keys: string[]): Promise<number | null> {
-  const response = await fetch(url, {headers: {'User-Agent': desktopUserAgent}});
+  const response = await fetchWithTimeout(url, {headers: {'User-Agent': desktopUserAgent}}, youtubeViewerFetchTimeoutMs);
   const html = await response.text();
   return numberFromText(decodeHTMLEntities(html), keys);
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<Response>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`Request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([fetch(url, init), timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function youtubeViewerURL(raw: string): string | null {
@@ -1398,11 +1577,16 @@ function numberFromText(text: string, keys: string[]): number | null {
 }
 
 function youtubeViewerCountFromJSON(value: unknown): number | null {
+  return youtubePlayerViewerCountFromJSON(value)
+    ?? youtubePrimaryViewerCountFromJSON(value)
+    ?? youtubeMobileViewerCountFromJSON(value)
+    ?? numberFromKeys(value, youtubeViewerKeys);
+}
+
+function youtubePlayerViewerCountFromJSON(value: unknown): number | null {
   const object = value as any;
   return toNumber(object?.videoDetails?.concurrentViewers)
-    ?? toNumber(object?.microformat?.playerMicroformatRenderer?.liveBroadcastDetails?.concurrentViewers)
-    ?? youtubePrimaryViewerCountFromJSON(value)
-    ?? numberFromKeys(value, youtubeViewerKeys);
+    ?? toNumber(object?.microformat?.playerMicroformatRenderer?.liveBroadcastDetails?.concurrentViewers);
 }
 
 function youtubeViewerCountFromText(text: string): number | null {
@@ -1412,6 +1596,20 @@ function youtubeViewerCountFromText(text: string): number | null {
     return direct;
   }
   for (const token of ['ytInitialPlayerResponse', 'ytInitialData']) {
+    const assigned = jsonAssignedValueAfterToken(token, decoded);
+    if (assigned) {
+      try {
+        const count = youtubeViewerCountFromJSON(JSON.parse(assigned));
+        if (count != null) {
+          return count;
+        }
+      } catch {
+        const count = youtubeMobileViewerCountFromTextBlob(assigned);
+        if (count != null) {
+          return count;
+        }
+      }
+    }
     const json = jsonObjectStringAfterToken(token, decoded);
     if (!json) {
       continue;
@@ -1423,6 +1621,47 @@ function youtubeViewerCountFromText(text: string): number | null {
       }
     } catch {
       // Try the next embedded object.
+    }
+  }
+  return null;
+}
+
+function youtubeMobileViewerCountFromTextBlob(text: string): number | null {
+  if (!text.includes('"liveIndicatorText"')) {
+    return null;
+  }
+  const match = text.match(
+    /"slimVideoInformationRenderer"\s*:\s*\{[\s\S]{0,6000}?"collapsedSubtitle"\s*:\s*\{\s*"runs"\s*:\s*\[\s*\{\s*"text"\s*:\s*"([0-9][0-9,\s\u00a0]*)"\s*\}\s*,/,
+  ) ?? text.match(
+    /"slimVideoInformationRenderer"\s*:\s*\{[\s\S]{0,6000}?"expandedSubtitle"\s*:\s*\{\s*"runs"\s*:\s*\[\s*\{\s*"text"\s*:\s*"([0-9][0-9,\s\u00a0]*)"\s*\}\s*,/,
+  );
+  return toPlainNumber(match?.[1]);
+}
+
+function youtubeMobileViewerCountFromJSON(value: unknown): number | null {
+  const object = value as any;
+  const liveIndicator = object?.playerOverlays?.playerOverlayRenderer?.liveIndicatorText;
+  const contents = object?.contents?.singleColumnWatchNextResults?.results?.results?.contents;
+  if (!liveIndicator || !Array.isArray(contents)) {
+    return null;
+  }
+  for (const item of contents) {
+    const sectionContents = item?.slimVideoMetadataSectionRenderer?.contents;
+    if (!Array.isArray(sectionContents)) {
+      continue;
+    }
+    for (const sectionItem of sectionContents) {
+      const info = sectionItem?.slimVideoInformationRenderer;
+      const subtitles = [info?.collapsedSubtitle, info?.expandedSubtitle];
+      for (const subtitle of subtitles) {
+        const runs = subtitle?.runs;
+        if (Array.isArray(runs) && runs.length > 1) {
+          const count = toPlainNumber(runs[0]?.text);
+          if (count != null) {
+            return count;
+          }
+        }
+      }
     }
   }
   return null;
@@ -1451,6 +1690,41 @@ function youtubeVideoViewCountRendererCount(renderer: any): number | null {
   return toNumber(renderer.originalViewCount);
 }
 
+function jsonAssignedValueAfterToken(token: string, text: string): string | null {
+  const marker = `var ${token} =`;
+  const markerIndex = text.indexOf(marker);
+  if (markerIndex < 0) {
+    return null;
+  }
+  let index = markerIndex + marker.length;
+  while (/\s/.test(text[index] ?? '')) {
+    index += 1;
+  }
+  const quote = text[index];
+  if (quote === '"' || quote === "'") {
+    let escaping = false;
+    let raw = '';
+    for (index += 1; index < text.length; index += 1) {
+      const character = text[index];
+      if (escaping) {
+        raw += `\\${character}`;
+        escaping = false;
+      } else if (character === '\\') {
+        escaping = true;
+      } else if (character === quote) {
+        return decodeJavaScriptStringLiteral(raw);
+      } else {
+        raw += character;
+      }
+    }
+    return null;
+  }
+  if (text[index] === '{') {
+    return jsonObjectStringAt(index, text);
+  }
+  return null;
+}
+
 function jsonObjectStringAfterToken(token: string, text: string): string | null {
   let position = 0;
   while (position < text.length) {
@@ -1462,33 +1736,55 @@ function jsonObjectStringAfterToken(token: string, text: string): string | null 
     if (start < 0) {
       return null;
     }
-    let depth = 0;
-    let inString = false;
-    let escaping = false;
-    for (let index = start; index < text.length; index += 1) {
-      const character = text[index];
-      if (inString) {
-        if (escaping) {
-          escaping = false;
-        } else if (character === '\\') {
-          escaping = true;
-        } else if (character === '"') {
-          inString = false;
-        }
-      } else if (character === '"') {
-        inString = true;
-      } else if (character === '{') {
-        depth += 1;
-      } else if (character === '}') {
-        depth -= 1;
-        if (depth === 0) {
-          return text.slice(start, index + 1);
-        }
-      }
+    const json = jsonObjectStringAt(start, text);
+    if (json) {
+      return json;
     }
     position = tokenIndex + token.length;
   }
   return null;
+}
+
+function jsonObjectStringAt(start: number, text: string): string | null {
+  let depth = 0;
+  let inString = false;
+  let escaping = false;
+  for (let index = start; index < text.length; index += 1) {
+    const character = text[index];
+    if (inString) {
+      if (escaping) {
+        escaping = false;
+      } else if (character === '\\') {
+        escaping = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+    } else if (character === '"') {
+      inString = true;
+    } else if (character === '{') {
+      depth += 1;
+    } else if (character === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, index + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function decodeJavaScriptStringLiteral(text: string): string {
+  return text
+    .replace(/\\x([0-9a-fA-F]{2})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\n/g, '\\n')
+    .replace(/\\r/g, '\\r')
+    .replace(/\\t/g, '\\t')
+    .replace(/\\([^"\\/bfnrtu])/g, '$1')
+    .replace(/\\\//g, '/')
+    .replace(/\\"/g, '"')
+    .replace(/\\'/g, "'")
+    .replace(/\\\\/g, '\\');
 }
 
 function decodeHTMLEntities(text: string): string {
@@ -1512,6 +1808,16 @@ function toNumber(value: unknown): number | null {
     return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : null;
   }
   return null;
+}
+
+function toPlainNumber(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return toNumber(value);
+  }
+  if (typeof value !== 'string' || !/^\s*[0-9][0-9,\s\u00a0]*\s*$/.test(value)) {
+    return null;
+  }
+  return toNumber(value);
 }
 
 function AddStreamModal({
@@ -1616,9 +1922,11 @@ function FocusModal({
   const [commentStatus, setCommentStatus] = useState('');
   const chat = stream ? chatURL(stream) : null;
   const {chromeVisible, showChrome} = useAutoHidingChrome(stream?.id ?? 'closed');
+  const [webViewerCount, setWebViewerCount] = useState<number | null>(null);
 
   useEffect(() => {
     setCommentText('');
+    setWebViewerCount(null);
   }, [stream?.id]);
 
   const sendComment = useCallback(() => {
@@ -1702,9 +2010,11 @@ function FocusModal({
                 muted={muted || volume <= 0}
                 volume={volume}
                 reloadKey={reloadKey}
+                onViewerCount={setWebViewerCount}
               />
               <View style={styles.playerChrome} pointerEvents="box-none">
                 {!chromeVisible && <Pressable style={styles.chromeRevealTouch} onPress={showChrome} />}
+                {settings.showViewerCount && <ViewerCountBadge stream={stream} externalCount={webViewerCount} visible={chromeVisible} />}
                 <View
                   style={[styles.autoHideChrome, !chromeVisible && styles.autoHideChromeHidden]}
                   pointerEvents={chromeVisible ? 'box-none' : 'none'}>
@@ -1722,7 +2032,6 @@ function FocusModal({
                     onInteract={showChrome}
                     mode="focus"
                   />
-                  {settings.showViewerCount && <ViewerCountBadge stream={stream} />}
                 </View>
               </View>
             </View>
@@ -1864,7 +2173,7 @@ function SettingsScreen({
       <Text style={styles.sectionTitle}>再生</Text>
       <SettingSwitch title="音声を有効にして開始" value={settings.playAudio} onValueChange={value => onSettings({playAudio: value})} />
       <SettingSwitch title="拡大時にチャットを表示" value={settings.showChat} onValueChange={value => onSettings({showChat: value})} />
-      <SettingSwitch title="タップ時に同接数を左下に表示" value={settings.showViewerCount} onValueChange={value => onSettings({showViewerCount: value})} />
+      <SettingSwitch title="同接数を左下に表示" value={settings.showViewerCount} onValueChange={value => onSettings({showViewerCount: value})} />
       <SettingSwitch title="レイド先を自動追加" value={settings.autoFollowRaids} onValueChange={value => onSettings({autoFollowRaids: value})} />
       <SettingSwitch title="YouTubeをiframe優先で再生" value={settings.youtubePreferIframe} onValueChange={value => onSettings({youtubePreferIframe: value})} />
       <SettingSwitch title="YouTubeライブを安定バッファで再生" value={settings.youtubeStableBuffer} onValueChange={value => onSettings({youtubeStableBuffer: value})} />
@@ -2232,6 +2541,109 @@ const sourceBridgeScript = `
 function webFallbackScript(blockAds: boolean) {
   return `
   (function(){
+    function toViewerNumber(value){
+      if (value == null) return null;
+      var parsed = Number(String(value).replace(/[^0-9]/g, ''));
+      return isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : null;
+    }
+    function toPlainViewerNumber(value){
+      if (value == null) return null;
+      if (!/^\\s*[0-9][0-9,\\s\\u00a0]*\\s*$/.test(String(value))) return null;
+      return toViewerNumber(value);
+    }
+    function parseJSONLike(value){
+      try {
+        if (typeof value === 'string') return JSON.parse(value);
+        return value || null;
+      } catch(e) {
+        return null;
+      }
+    }
+    function getYouTubeInitialData(){
+      return parseJSONLike(window.ytInitialData);
+    }
+    function getYouTubeInitialPlayer(){
+      return parseJSONLike(window.ytInitialPlayerResponse);
+    }
+    function isYouTubeLivePage(data){
+      try {
+        var player = getYouTubeInitialPlayer();
+        var details = player && player.videoDetails;
+        var liveDetails = player && player.microformat &&
+          player.microformat.playerMicroformatRenderer &&
+          player.microformat.playerMicroformatRenderer.liveBroadcastDetails;
+        var liveIndicator = data && data.playerOverlays &&
+          data.playerOverlays.playerOverlayRenderer &&
+          data.playerOverlays.playerOverlayRenderer.liveIndicatorText;
+        return Boolean(
+          (details && (details.isLive === true || details.isLiveContent === true)) ||
+          (liveDetails && liveDetails.isLiveNow === true) ||
+          liveIndicator
+        );
+      } catch(e) {
+        return false;
+      }
+    }
+    function desktopViewerCountFromInitialData(data){
+      try {
+        var contents = data && data.contents && data.contents.twoColumnWatchNextResults &&
+          data.contents.twoColumnWatchNextResults.results &&
+          data.contents.twoColumnWatchNextResults.results.results &&
+          data.contents.twoColumnWatchNextResults.results.results.contents;
+        if (!Array.isArray(contents)) return null;
+        for (var i = 0; i < contents.length; i += 1) {
+          var renderer = contents[i] && contents[i].videoPrimaryInfoRenderer &&
+            contents[i].videoPrimaryInfoRenderer.viewCount &&
+            contents[i].videoPrimaryInfoRenderer.viewCount.videoViewCountRenderer;
+          if (renderer && renderer.isLive === true) {
+            var count = toViewerNumber(renderer.originalViewCount);
+            if (count != null) return count;
+          }
+        }
+      } catch(e) {}
+      return null;
+    }
+    function mobileViewerCountFromInitialData(data){
+      try {
+        if (!isYouTubeLivePage(data)) return null;
+        var contents = data && data.contents && data.contents.singleColumnWatchNextResults &&
+          data.contents.singleColumnWatchNextResults.results &&
+          data.contents.singleColumnWatchNextResults.results.results &&
+          data.contents.singleColumnWatchNextResults.results.results.contents;
+        if (!Array.isArray(contents)) return null;
+        for (var i = 0; i < contents.length; i += 1) {
+          var section = contents[i] && contents[i].slimVideoMetadataSectionRenderer;
+          var sectionContents = section && section.contents;
+          if (!Array.isArray(sectionContents)) continue;
+          for (var j = 0; j < sectionContents.length; j += 1) {
+            var info = sectionContents[j] && sectionContents[j].slimVideoInformationRenderer;
+            var subtitles = [info && info.collapsedSubtitle, info && info.expandedSubtitle];
+            for (var k = 0; k < subtitles.length; k += 1) {
+              var runs = subtitles[k] && subtitles[k].runs;
+              if (Array.isArray(runs) && runs.length > 1) {
+                var count = toPlainViewerNumber(runs[0] && runs[0].text);
+                if (count != null) return count;
+              }
+            }
+          }
+        }
+      } catch(e) {}
+      return null;
+    }
+    function youtubeViewerCountFromInitialData(){
+      var data = getYouTubeInitialData();
+      var desktopCount = desktopViewerCountFromInitialData(data);
+      if (desktopCount != null) return desktopCount;
+      return mobileViewerCountFromInitialData(data);
+    }
+    function postYouTubeViewerCount(){
+      try {
+        var count = youtubeViewerCountFromInitialData();
+        if (count != null && window.ReactNativeWebView) {
+          window.ReactNativeWebView.postMessage(JSON.stringify({type:'viewerCount', count:count}));
+        }
+      } catch(e) {}
+    }
     function tame(){
       try {
         document.querySelectorAll('video,audio').forEach(function(media){
@@ -2258,7 +2670,12 @@ function webFallbackScript(blockAds: boolean) {
       }
     }
     tame();
-    new MutationObserver(tame).observe(document.documentElement, {childList:true, subtree:true});
+    postYouTubeViewerCount();
+    new MutationObserver(function(){
+      tame();
+      postYouTubeViewerCount();
+    }).observe(document.documentElement, {childList:true, subtree:true});
+    setInterval(postYouTubeViewerCount, 5000);
     window.mvPlay=function(){
       document.querySelectorAll('video,audio').forEach(function(media){try{var p=media.play&&media.play();if(p&&p.catch)p.catch(function(){});}catch(e){}});
     };
@@ -2528,6 +2945,14 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#000',
   },
+  hiddenBridgeWeb: {
+    position: 'absolute',
+    left: -2,
+    top: -2,
+    width: 1,
+    height: 1,
+    opacity: 0,
+  },
   playerChrome: {
     position: 'absolute',
     top: 0,
@@ -2661,11 +3086,13 @@ const styles = StyleSheet.create({
   viewerBadge: {
     position: 'absolute',
     left: 10,
-    bottom: 10,
+    bottom: 56,
+    zIndex: 20,
+    elevation: 20,
     minHeight: 28,
     paddingHorizontal: 8,
     borderRadius: 12,
-    backgroundColor: 'rgba(0,0,0,0.44)',
+    backgroundColor: 'rgba(0,0,0,0.62)',
     borderWidth: 1,
     borderColor: 'rgba(255,255,255,0.12)',
     flexDirection: 'row',

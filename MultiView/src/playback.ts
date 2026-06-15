@@ -260,11 +260,10 @@ async function resolveYouTube(stream: StreamItem, settings: AppSettings): Promis
     };
   }
   return {
-    kind: 'web',
-    url: `https://m.youtube.com/watch?v=${encodeURIComponent(videoId)}`,
-    label: 'YouTube Web',
-    status: 'HLSなし/Webフォールバック',
-    reason: 'YouTubeが直接HLSを返さないためWeb再生に切り替えました。',
+    kind: 'youtube-iframe',
+    videoId,
+    label: 'YouTube iframe',
+    status: 'HLSなし/iframeフォールバック',
   };
 }
 
@@ -458,27 +457,31 @@ async function requestYouTubeDirect(videoId: string): Promise<string | null> {
   let progressiveFallback: string | null = null;
   for (const client of clients) {
     try {
-      const response = await fetch('https://youtubei.googleapis.com/youtubei/v1/player', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': client.userAgent,
-          'X-YouTube-Client-Name': client.headerClientName,
-          'X-YouTube-Client-Version': client.version,
-          'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
-        },
-        body: JSON.stringify({
-          context: client.context,
-          videoId,
-          contentCheckOk: true,
-          racyCheckOk: true,
-          playbackContext: {
-            contentPlaybackContext: {
-              html5Preference: 'HTML5_PREF_WANTS',
-            },
+      const response = await fetchWithTimeout(
+        'https://youtubei.googleapis.com/youtubei/v1/player',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': client.userAgent,
+            'X-YouTube-Client-Name': client.headerClientName,
+            'X-YouTube-Client-Version': client.version,
+            'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
           },
-        }),
-      });
+          body: JSON.stringify({
+            context: client.context,
+            videoId,
+            contentCheckOk: true,
+            racyCheckOk: true,
+            playbackContext: {
+              contentPlaybackContext: {
+                html5Preference: 'HTML5_PREF_WANTS',
+              },
+            },
+          }),
+        },
+        8000,
+      );
       if (!response.ok) {
         continue;
       }
@@ -498,16 +501,14 @@ async function requestYouTubeDirect(videoId: string): Promise<string | null> {
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<Response>((_, reject) => {
     timer = setTimeout(() => {
-      controller.abort();
       reject(new Error(`Request timed out after ${timeoutMs}ms`));
     }, timeoutMs);
   });
   try {
-    return await Promise.race([fetch(url, {...init, signal: controller.signal}), timeout]);
+    return await Promise.race([fetch(url, init), timeout]);
   } finally {
     if (timer) {
       clearTimeout(timer);

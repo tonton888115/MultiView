@@ -10,6 +10,7 @@ export type StreamItem = {
 };
 
 export type AppSettings = {
+  settingsVersion: number;
   showChat: boolean;
   showDanmaku: boolean;
   showEmotes: boolean;

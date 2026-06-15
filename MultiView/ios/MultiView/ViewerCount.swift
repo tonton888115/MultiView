@@ -267,7 +267,17 @@ enum ViewerCountProvider {
         return
       }
       _ = htmlTask(url: fallbackURL, headers: browserHeaders(referer: "https://www.youtube.com/")) { html in
-        completion(youtubeCount(inHTML: html))
+        if let count = youtubeCount(inHTML: html) {
+          completion(count)
+          return
+        }
+        guard let mobileURL = mobileYouTubeWatchURL(videoId: videoId) else {
+          completion(nil)
+          return
+        }
+        _ = htmlTask(url: mobileURL, headers: browserHeaders(referer: "https://m.youtube.com/")) { mobileHTML in
+          completion(youtubeCount(inHTML: mobileHTML))
+        }
       }
     }
     task.resume()
@@ -322,6 +332,17 @@ enum ViewerCountProvider {
       return Int(normalized)
     }
     return nil
+  }
+
+  private static func plainIntValue(_ value: Any?) -> Int? {
+    if value is Int || value is Double {
+      return intValue(value)
+    }
+    guard let string = value as? String,
+          string.range(of: #"^\s*[0-9][0-9,\s\x{00a0}]*\s*$"#, options: .regularExpression) != nil else {
+      return nil
+    }
+    return intValue(string)
   }
 
   private static func parseJSON(_ data: Data?) -> Any? {
@@ -380,6 +401,10 @@ enum ViewerCountProvider {
 
   private static func youtubeWatchURL(videoId: String) -> URL? {
     URL(string: "https://www.youtube.com/watch?v=\(videoId)")
+  }
+
+  private static func mobileYouTubeWatchURL(videoId: String) -> URL? {
+    URL(string: "https://m.youtube.com/watch?v=\(videoId)")
   }
 
   private static func extractNiconicoProgramID(from raw: String) -> String? {
@@ -444,7 +469,7 @@ enum ViewerCountProvider {
         return count
       }
     }
-    return youtubePrimaryViewerCount(in: value) ?? count(in: value, keys: youtubeKeys)
+    return youtubePrimaryViewerCount(in: value) ?? youtubeMobileViewerCount(in: value) ?? count(in: value, keys: youtubeKeys)
   }
 
   private static func youtubeCount(inHTML html: String?) -> Int? {
@@ -459,9 +484,31 @@ enum ViewerCountProvider {
       }
     }
     for token in ["ytInitialPlayerResponse", "ytInitialData"] {
+      if let assigned = jsonAssignedValue(afterToken: token, in: decoded),
+         let object = parseJSON(assigned.data(using: .utf8)),
+         let count = youtubeCount(in: object) {
+        return count
+      } else if let assigned = jsonAssignedValue(afterToken: token, in: decoded),
+                let count = youtubeMobileViewerCount(inTextBlob: assigned) {
+        return count
+      }
       guard let json = jsonObjectString(afterToken: token, in: decoded),
             let object = parseJSON(json.data(using: .utf8)),
             let count = youtubeCount(in: object) else { continue }
+      return count
+    }
+    return nil
+  }
+
+  private static func youtubeMobileViewerCount(inTextBlob text: String) -> Int? {
+    guard text.contains(#""liveIndicatorText""#) else { return nil }
+    let patterns = [
+      #""slimVideoInformationRenderer"\s*:\s*\{[\s\S]{0,6000}?"collapsedSubtitle"\s*:\s*\{\s*"runs"\s*:\s*\[\s*\{\s*"text"\s*:\s*"([0-9][0-9,\s\x{00a0}]*)"\s*\}\s*,"#,
+      #""slimVideoInformationRenderer"\s*:\s*\{[\s\S]{0,6000}?"expandedSubtitle"\s*:\s*\{\s*"runs"\s*:\s*\[\s*\{\s*"text"\s*:\s*"([0-9][0-9,\s\x{00a0}]*)"\s*\}\s*,"#
+    ]
+    for pattern in patterns {
+      guard let value = firstMatch(in: text, pattern: pattern),
+            let count = plainIntValue(value) else { continue }
       return count
     }
     return nil
@@ -488,44 +535,167 @@ enum ViewerCountProvider {
     return nil
   }
 
+  private static func youtubeMobileViewerCount(in value: Any?) -> Int? {
+    guard let root = value as? [String: Any],
+          let overlays = root["playerOverlays"] as? [String: Any],
+          let overlayRenderer = overlays["playerOverlayRenderer"] as? [String: Any],
+          overlayRenderer["liveIndicatorText"] != nil,
+          let contentsRoot = root["contents"] as? [String: Any],
+          let singleColumn = contentsRoot["singleColumnWatchNextResults"] as? [String: Any],
+          let results = singleColumn["results"] as? [String: Any],
+          let nestedResults = results["results"] as? [String: Any],
+          let contents = nestedResults["contents"] as? [[String: Any]] else {
+      return nil
+    }
+    for item in contents {
+      guard let section = item["slimVideoMetadataSectionRenderer"] as? [String: Any],
+            let sectionContents = section["contents"] as? [[String: Any]] else { continue }
+      for sectionItem in sectionContents {
+        guard let info = sectionItem["slimVideoInformationRenderer"] as? [String: Any] else { continue }
+        let subtitles = [info["collapsedSubtitle"], info["expandedSubtitle"]]
+        for subtitleValue in subtitles {
+          guard let subtitle = subtitleValue as? [String: Any],
+                let runs = subtitle["runs"] as? [[String: Any]],
+                runs.count > 1,
+                let count = plainIntValue(runs[0]["text"]) else { continue }
+          return count
+        }
+      }
+    }
+    return nil
+  }
+
   private static func youtubeVideoViewCountRendererCount(_ renderer: [String: Any]) -> Int? {
     guard let isLive = renderer["isLive"] as? Bool, isLive else { return nil }
     return intValue(renderer["originalViewCount"])
+  }
+
+  private static func jsonAssignedValue(afterToken token: String, in text: String) -> String? {
+    guard let markerRange = text.range(of: "var \(token) =") else { return nil }
+    var index = markerRange.upperBound
+    while index < text.endIndex, text[index].isWhitespace {
+      index = text.index(after: index)
+    }
+    guard index < text.endIndex else { return nil }
+    let quote = text[index]
+    if quote == "\"" || quote == "'" {
+      index = text.index(after: index)
+      var raw = ""
+      var escaping = false
+      while index < text.endIndex {
+        let character = text[index]
+        if escaping {
+          raw.append("\\")
+          raw.append(character)
+          escaping = false
+        } else if character == "\\" {
+          escaping = true
+        } else if character == quote {
+          return decodeJavaScriptStringLiteral(raw)
+        } else {
+          raw.append(character)
+        }
+        index = text.index(after: index)
+      }
+      return nil
+    }
+    if text[index] == "{" {
+      return jsonObjectString(startingAt: index, in: text)
+    }
+    return nil
   }
 
   private static func jsonObjectString(afterToken token: String, in text: String) -> String? {
     var searchRange = text.startIndex..<text.endIndex
     while let tokenRange = text.range(of: token, range: searchRange),
           let start = text[tokenRange.upperBound...].firstIndex(of: "{") {
-      var index = start
-      var depth = 0
-      var inString = false
-      var escaping = false
-      while index < text.endIndex {
-        let character = text[index]
-        if inString {
-          if escaping {
-            escaping = false
-          } else if character == "\\" {
-            escaping = true
-          } else if character == "\"" {
-            inString = false
-          }
-        } else if character == "\"" {
-          inString = true
-        } else if character == "{" {
-          depth += 1
-        } else if character == "}" {
-          depth -= 1
-          if depth == 0 {
-            return String(text[start...index])
-          }
-        }
-        index = text.index(after: index)
+      if let json = jsonObjectString(startingAt: start, in: text) {
+        return json
       }
       searchRange = tokenRange.upperBound..<text.endIndex
     }
     return nil
+  }
+
+  private static func jsonObjectString(startingAt start: String.Index, in text: String) -> String? {
+    var index = start
+    var depth = 0
+    var inString = false
+    var escaping = false
+    while index < text.endIndex {
+      let character = text[index]
+      if inString {
+        if escaping {
+          escaping = false
+        } else if character == "\\" {
+          escaping = true
+        } else if character == "\"" {
+          inString = false
+        }
+      } else if character == "\"" {
+        inString = true
+      } else if character == "{" {
+        depth += 1
+      } else if character == "}" {
+        depth -= 1
+        if depth == 0 {
+          return String(text[start...index])
+        }
+      }
+      index = text.index(after: index)
+    }
+    return nil
+  }
+
+  private static func decodeJavaScriptStringLiteral(_ text: String) -> String {
+    var output = ""
+    var index = text.startIndex
+    while index < text.endIndex {
+      let character = text[index]
+      guard character == "\\" else {
+        output.append(character)
+        index = text.index(after: index)
+        continue
+      }
+      let nextIndex = text.index(after: index)
+      guard nextIndex < text.endIndex else {
+        output.append(character)
+        break
+      }
+      let marker = text[nextIndex]
+      if marker == "x" {
+        let start = text.index(after: nextIndex)
+        guard let end = text.index(start, offsetBy: 2, limitedBy: text.endIndex),
+              let code = UInt32(String(text[start..<end]), radix: 16),
+              let scalar = UnicodeScalar(code) else {
+          output.append(marker)
+          index = text.index(after: nextIndex)
+          continue
+        }
+        output.append(Character(scalar))
+        index = end
+      } else if marker == "u" {
+        let start = text.index(after: nextIndex)
+        guard let end = text.index(start, offsetBy: 4, limitedBy: text.endIndex),
+              let code = UInt32(String(text[start..<end]), radix: 16),
+              let scalar = UnicodeScalar(code) else {
+          output.append(marker)
+          index = text.index(after: nextIndex)
+          continue
+        }
+        output.append(Character(scalar))
+        index = end
+      } else {
+        switch marker {
+        case "n": output.append("\\n")
+        case "r": output.append("\\r")
+        case "t": output.append("\\t")
+        default: output.append(marker)
+        }
+        index = text.index(after: nextIndex)
+      }
+    }
+    return output
   }
 
   private static func twitcastingViewerURL(from html: String?) -> URL? {
