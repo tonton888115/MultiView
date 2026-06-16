@@ -1,6 +1,7 @@
 import {desktopUserAgent, mobileUserAgent, resolveLiveYouTubeVideoID, webStreamURL, youtubeVideoId} from './playback';
 import {kickFilterText, kickTokens, makeChatEvent, parseTwitchTags, textTokens, twitchTokens} from './danmaku';
 import {kickHostTarget, reportRaid, twitchRaidTarget} from './raidFollow';
+import {subscribeNiconicoComments} from './niconicoComments';
 import type {AppSettings, ChatEvent, DanmakuToken, PlatformId, StreamItem} from './types';
 
 export type ChatClient = {
@@ -46,9 +47,25 @@ export function startChatClient(stream: StreamItem, settings: AppSettings, emit:
     case 'twitcasting':
       return startTwitCastingChat(stream, emit, status);
     case 'niconico':
-      status('ニコ生弾幕はWebフォールバック中');
-      return emptyClient();
+      return startNiconicoChat(stream, emit, status);
   }
+}
+
+function startNiconicoChat(stream: StreamItem, emit: Emit, status: Status): ChatClient {
+  // 実コメントは隠しセッション WebView の NDGR ストリームから来る(niconicoComments 経由)。
+  status('ニコ生コメント受信中');
+  const unsubscribe = subscribeNiconicoComments(stream.channel, comment => {
+    emit(
+      makeChatEvent(
+        'niconico',
+        `nico:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+        comment.text,
+        textTokens(comment.text),
+        comment.author,
+      ),
+    );
+  });
+  return {stop: unsubscribe};
 }
 
 function emptyClient(): ChatClient {

@@ -57,6 +57,7 @@ import type {AppSettings, PlatformId, PlaybackSource, Source, StreamItem, TabId}
 import {adNetworkBlockerScript, isAdBlockedURL, platformAdBlockExtras} from './src/adblock';
 import {setRaidHandler} from './src/raidFollow';
 import {niconicoOriginURL, niconicoQuality, niconicoSessionScript} from './src/niconico';
+import {pushNiconicoComment} from './src/niconicoComments';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -1299,11 +1300,13 @@ function NiconicoNativePlayer({
       }
       if (payload?.type === 'niconicoStream' && typeof payload.hlsUrl === 'string') {
         setHls({url: payload.hlsUrl, cookieHeader: payload.cookies || undefined});
+      } else if (payload?.type === 'niconicoComment' && typeof payload.text === 'string') {
+        pushNiconicoComment(stream.channel, {text: payload.text});
       } else if (payload?.type === 'niconicoError' || payload?.type === 'niconicoEnded') {
         setFailed(true);
       }
     },
-    [],
+    [stream.channel],
   );
 
   // niconico は RN の直接 fetch/WS を拒否するため、視聴セッションは niconico オリジンを
