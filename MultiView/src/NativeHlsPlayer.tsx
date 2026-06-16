@@ -20,6 +20,7 @@ export type NativeHlsPlayerProps = ViewProps & {
   muted?: boolean;
   volume?: number;
   liveTargetOffsetMs?: number;
+  maxBitrate?: number;
   resizeMode?: 'contain' | 'cover' | 'stretch';
   onPlayerEvent?: (event: NativeSyntheticEvent<NativePlayerEvent>) => void;
 };

@@ -59,6 +59,11 @@ class NativeHlsPlayerManager : SimpleViewManager<NativeHlsPlayerView>() {
     view.setResizeMode(resizeMode)
   }
 
+  @ReactProp(name = "maxBitrate", defaultInt = 0)
+  fun setMaxBitrate(view: NativeHlsPlayerView, maxBitrate: Int) {
+    view.setMaxBitrate(maxBitrate)
+  }
+
   override fun getCommandsMap(): MutableMap<String, Int> =
     MapBuilder.of("play", COMMAND_PLAY, "pause", COMMAND_PAUSE, "reload", COMMAND_RELOAD)
 

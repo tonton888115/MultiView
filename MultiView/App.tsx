@@ -43,6 +43,7 @@ import {compactHandoffCode, decodeHandoff, handoffURL} from './src/handoff';
 import {
   chatURL,
   desktopUserAgent,
+  effectiveQuality,
   makeStream,
   mobileUserAgent,
   resolvePlaybackSource,
@@ -1144,6 +1145,7 @@ function StreamPlayer({
           muted={muted}
           volume={volume}
           liveTargetOffsetMs={source.liveTargetOffsetMs}
+          maxBitrate={effectiveQuality(settings, streamCount) === 'economy' ? 900000 : 0}
           resizeMode="contain"
           onPlayerEvent={event => {
             const payload = event.nativeEvent;

@@ -14,6 +14,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.facebook.react.bridge.Arguments
@@ -24,7 +25,8 @@ import com.facebook.react.uimanager.events.Event
 
 @UnstableApi
 class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
-  private val exoPlayer = ExoPlayer.Builder(context).build()
+  private val trackSelector = DefaultTrackSelector(context)
+  private val exoPlayer = ExoPlayer.Builder(context).setTrackSelector(trackSelector).build()
   private val playerView = PlayerView(context).apply {
     useController = false
     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
@@ -40,6 +42,7 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
   private var muted = false
   private var volume = 1f
   private var liveTargetOffsetMs = 2_000L
+  private var maxBitrate = 0
 
   init {
     setBackgroundColor(android.graphics.Color.BLACK)
@@ -105,6 +108,19 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
     }
     liveTargetOffsetMs = clamped
     prepareIfNeeded(force = sourceUrl != null)
+  }
+
+  // iOS の NetworkQuality.effectivePeakBitRate(エコノミー≈900kbps、3本以上で自動)に相当。
+  // 0 は無制限。HLS の各バリアントから上限以下の最高画質を ExoPlayer が選ぶ。
+  fun setMaxBitrate(next: Int) {
+    if (maxBitrate == next) {
+      return
+    }
+    maxBitrate = next
+    trackSelector.setParameters(
+      trackSelector.buildUponParameters()
+        .setMaxVideoBitrate(if (next > 0) next else Int.MAX_VALUE),
+    )
   }
 
   fun setResizeMode(next: String?) {
