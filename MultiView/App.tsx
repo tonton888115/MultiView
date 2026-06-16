@@ -56,7 +56,7 @@ import {
 import type {AppSettings, PlatformId, PlaybackSource, Source, StreamItem, TabId} from './src/types';
 import {adNetworkBlockerScript, isAdBlockedURL, platformAdBlockExtras} from './src/adblock';
 import {setRaidHandler} from './src/raidFollow';
-import {openNiconicoSession} from './src/niconico';
+import {niconicoOriginURL, niconicoQuality, niconicoSessionScript} from './src/niconico';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -1284,20 +1284,51 @@ function NiconicoNativePlayer({
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
+    // 番組/品質/低遅延/更新 が変わったらセッションをやり直す。
     setHls(null);
     setFailed(false);
-    const session = openNiconicoSession(stream.channel, settings, {
-      onStream: info => setHls({url: info.hlsUrl, cookieHeader: info.cookieHeader}),
-      onError: () => setFailed(true),
-      onEnded: () => setFailed(true),
-    });
-    return () => session.stop();
-    // 視聴セッションは品質/低遅延/番組が変わった時だけ張り直す。
   }, [stream.channel, settings.wifiQuality, settings.niconicoLowLatency, reloadKey]);
+
+  const onSessionMessage = useCallback(
+    (event: WebViewMessageEvent) => {
+      let payload: any;
+      try {
+        payload = JSON.parse(event.nativeEvent.data);
+      } catch {
+        return;
+      }
+      if (payload?.type === 'niconicoStream' && typeof payload.hlsUrl === 'string') {
+        setHls({url: payload.hlsUrl, cookieHeader: payload.cookies || undefined});
+      } else if (payload?.type === 'niconicoError' || payload?.type === 'niconicoEnded') {
+        setFailed(true);
+      }
+    },
+    [],
+  );
+
+  // niconico は RN の直接 fetch/WS を拒否するため、視聴セッションは niconico オリジンを
+  // 読み込んだ隠し WebView 内で実行し、HLS uri を postMessage で受け取る(keepSeatも内部で継続)。
+  const sessionWebView =
+    !failed ? (
+      <WebView
+        key={`niconico-session:${stream.channel}:${reloadKey}`}
+        source={{uri: niconicoOriginURL}}
+        userAgent={desktopUserAgent}
+        javaScriptEnabled
+        domStorageEnabled
+        sharedCookiesEnabled
+        thirdPartyCookiesEnabled
+        setSupportMultipleWindows={false}
+        injectedJavaScript={niconicoSessionScript(stream.channel, niconicoQuality(settings))}
+        onMessage={onSessionMessage}
+        style={styles.hiddenBridgeWeb}
+      />
+    ) : null;
 
   if (hls) {
     return (
       <>
+        {sessionWebView}
         <NativeHlsPlayer
           key={`${hls.url}:${reloadKey}`}
           style={styles.nativePlayer}
@@ -1354,10 +1385,13 @@ function NiconicoNativePlayer({
   }
 
   return (
-    <View style={styles.playerPlaceholder}>
-      <ActivityIndicator color="#7ab7ff" />
-      <Text style={styles.playerStatus}>ニコ生接続中</Text>
-    </View>
+    <>
+      {sessionWebView}
+      <View style={styles.playerPlaceholder}>
+        <ActivityIndicator color="#7ab7ff" />
+        <Text style={styles.playerStatus}>ニコ生接続中</Text>
+      </View>
+    </>
   );
 }
 

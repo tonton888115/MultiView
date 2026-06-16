@@ -1,37 +1,26 @@
-// iOS NiconicoPlayer.swift の視聴セッション(WebSocket)部分を移植。
-// watch ページの data-props から WebSocket URL を取り、startWatching を送って
-// HLS の uri と cookie を受け取る。これにより「ニコ生もネイティブ HLS で映像だけ」
-// (フル Web ページ＝広告/ポップアップだらけ を脱却) を実現する。
+// iOS NiconicoPlayer.swift の WebSocket 視聴セッションを Android(RN) へ移植。
 //
-// NDGR コメント(弾幕)は別途 messageServer.viewUri から取得する(Phase 3B.3)。ここでは
-// 再生用の HLS セッションのみを担当し、失敗時は呼び出し側が Web フォールバックする。
+// ニコ生は React Native の直接 fetch/WebSocket を拒否する(anti-bot/TLS、"Network
+// request failed")。そこで視聴セッションは「niconico オリジンを読み込んだ隠し WebView」
+// の中で実行する: 同一オリジン fetch で watch ページHTMLを取り、data-props から
+// WebSocket URL を得て startWatching → stream で HLS uri + cookie を受け取り、
+// ReactNativeWebView.postMessage で RN へ橋渡しする。HLS は ExoPlayer(NativeHlsPlayer)
+// で再生する(=フルWebページではなく「映像だけ」)。NDGR コメントは viewUri から別途取得。
 
-import {mobileUserAgent} from './playback';
 import type {AppSettings} from './types';
 
-export type NiconicoStreamInfo = {
-  hlsUrl: string;
-  cookieHeader?: string;
-  // NDGR コメント取得用(後続フェーズで使用)
-  viewUri?: string;
-};
+// 隠しセッション WebView を載せる同一オリジンの HTML ページ。
+// text/plain(robots.txt 等)では injectedJavaScript が動かないため HTML を使う。
+export const niconicoOriginURL = 'https://live.nicovideo.jp/';
 
-export type NiconicoCallbacks = {
-  onStream: (info: NiconicoStreamInfo) => void;
-  onStatus?: (message: string) => void;
-  onError: (message: string) => void;
-  onEnded?: () => void;
-};
+export type WatchData = {wsUrl: string; frontendId?: string};
 
-export type NiconicoSession = {stop: () => void};
-
-type WatchData = {wsUrl: string; frontendId?: string};
-
-function niconicoQuality(settings: AppSettings): string {
+export function niconicoQuality(settings: AppSettings): string {
   // iOS: high -> "abr", economy -> "low"
   return settings.wifiQuality === 'economy' ? 'low' : 'abr';
 }
 
+// watch ページHTMLの data-props から WebSocket 情報を取り出す(テスト対象)。
 export function parseNiconicoWatchData(html: string): WatchData | null {
   const propsRaw =
     matchGroup(html, /<script[^>]+id=["']embedded-data["'][^>]+data-props=["']([^"']+)["']/) ??
@@ -47,14 +36,12 @@ export function parseNiconicoWatchData(html: string): WatchData | null {
   } catch {
     return null;
   }
-  // 新形式: pageContents.watchInformation.playerParams.wsEndPoint.url
   const wsEndPoint = props?.pageContents?.watchInformation?.playerParams?.wsEndPoint;
   const newUrl = typeof wsEndPoint?.url === 'string' ? wsEndPoint.url : null;
   if (newUrl) {
     const fid = props?.constants?.requestInfo?.frontendId;
     return {wsUrl: newUrl, frontendId: fid != null ? String(fid) : undefined};
   }
-  // 旧形式: site.relive.webSocketUrl
   const site = props?.site;
   const wsString: string | undefined =
     site?.relive?.webSocketUrl ?? site?.webSocketUrl ?? site?.websocketUrl;
@@ -65,194 +52,57 @@ export function parseNiconicoWatchData(html: string): WatchData | null {
   return null;
 }
 
-export function openNiconicoSession(
-  programId: string,
-  settings: AppSettings,
-  cb: NiconicoCallbacks,
-): NiconicoSession {
-  let stopped = false;
-  let socket: WebSocket | undefined;
-  let keepSeatTimer: ReturnType<typeof setInterval> | undefined;
-  let gotStream = false;
-  let pendingViewUri: string | undefined;
-  const watchURL = `https://live.nicovideo.jp/watch/${encodeURIComponent(programId.trim())}`;
-  const status = (m: string) => cb.onStatus?.(m);
-
-  const cleanup = () => {
-    if (keepSeatTimer) {
-      clearInterval(keepSeatTimer);
-      keepSeatTimer = undefined;
-    }
-    try {
-      socket?.close();
-    } catch {
-      // ignore
-    }
-    socket = undefined;
-  };
-
-  const fail = (message: string) => {
-    if (stopped) {
-      return;
-    }
-    cleanup();
-    cb.onError(message);
-  };
-
-  const send = (payload: unknown) => {
-    try {
-      socket?.send(JSON.stringify(payload));
-    } catch {
-      // ignore transient send failures
-    }
-  };
-
-  const sendStartWatching = () => {
-    send({
-      type: 'startWatching',
-      data: {
-        stream: {
-          quality: niconicoQuality(settings),
-          protocol: 'hls',
-          latency: 'low',
-          requireNewStream: true,
-          accessRightMethod: 'single_cookie',
-          chasePlay: false,
-        },
-        room: {protocol: 'webSocket', commentable: true},
-        reconnect: false,
-      },
-    });
-  };
-
-  const handleText = (text: string) => {
-    let json: any;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      return;
-    }
-    const type = json?.type;
-    if (type === 'ping') {
-      send({type: 'pong'});
-      return;
-    }
-    if (type === 'seat') {
-      const interval = Number(json?.data?.keepIntervalSec);
-      const seconds = Number.isFinite(interval) && interval > 0 ? Math.max(5, interval) : 30;
-      if (keepSeatTimer) {
-        clearInterval(keepSeatTimer);
-      }
-      send({type: 'keepSeat'});
-      keepSeatTimer = setInterval(() => send({type: 'keepSeat'}), seconds * 1000);
-      return;
-    }
-    if (type === 'messageServer') {
-      const viewUri = json?.data?.viewUri;
-      if (typeof viewUri === 'string' && viewUri) {
-        pendingViewUri = viewUri;
-      }
-      return;
-    }
-    if (type === 'stream') {
-      const uri = json?.data?.uri;
-      if (typeof uri === 'string' && uri) {
-        gotStream = true;
-        cb.onStream({
-          hlsUrl: uri,
-          cookieHeader: buildCookieHeader(json?.data?.cookies),
-          viewUri: pendingViewUri,
-        });
-      }
-      return;
-    }
-    if (type === 'disconnect') {
-      cb.onEnded?.();
-      return;
-    }
-    if (type === 'error') {
-      fail(`ニコ生エラー: ${json?.data?.code ?? 'unknown'}`);
-    }
-  };
-
-  const connect = (data: WatchData) => {
-    let url = data.wsUrl;
-    if (data.frontendId && !/[?&]frontend_id=/.test(url)) {
-      url += (url.includes('?') ? '&' : '?') + 'frontend_id=' + encodeURIComponent(data.frontendId);
-    }
-    try {
-      socket = new WebSocket(url, undefined, {
-        headers: {Origin: 'https://live.nicovideo.jp', 'User-Agent': mobileUserAgent},
-      } as any);
-    } catch (error) {
-      fail(`ニコ生WebSocket失敗: ${error instanceof Error ? error.message : String(error)}`);
-      return;
-    }
-    socket.onopen = () => {
-      status('ニコ生接続済み');
-      sendStartWatching();
-    };
-    socket.onmessage = event => handleText(String(event.data ?? ''));
-    socket.onerror = () => status('ニコ生再接続待ち');
-    socket.onclose = () => {
-      if (!stopped && !gotStream) {
-        fail('ニコ生WebSocketが再生前に切断されました');
-      }
-    };
-  };
-
-  (async () => {
-    try {
-      status('ニコ生視聴セッション取得中');
-      const response = await fetch(watchURL, {
-        headers: {
-          'User-Agent': mobileUserAgent,
-          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
-          // identity を明示しないと niconico が brotli を返し、Android(OkHttp)が
-          // 復号できず "Network request failed" になる。
-          'Accept-Encoding': 'identity',
-        },
-      });
-      if (!response.ok) {
-        fail(`ニコ生ページ取得失敗 HTTP ${response.status}`);
-        return;
-      }
-      const html = await response.text();
-      if (stopped) {
-        return;
-      }
-      const data = parseNiconicoWatchData(html);
-      if (!data) {
-        fail('ニコ生WebSocket URLを解決できませんでした');
-        return;
-      }
-      connect(data);
-    } catch (error) {
-      fail(`ニコ生視聴セッション失敗: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  })();
-
-  return {
-    stop: () => {
-      stopped = true;
-      cleanup();
-    },
-  };
-}
-
-function buildCookieHeader(cookies: unknown): string | undefined {
-  if (!Array.isArray(cookies)) {
-    return undefined;
+// 隠し WebView に注入する視聴セッション JS。niconico オリジン上で動くので
+// 同一オリジン fetch / WebSocket が cookie 付き・ブラウザ TLS で通る。
+// RN へは {type:'niconicoStream'|'niconicoView'|'niconicoError'|'niconicoEnded'} を postMessage。
+export function niconicoSessionScript(programId: string, quality: string): string {
+  const lv = JSON.stringify(programId.trim());
+  const q = JSON.stringify(quality);
+  return `(function(){
+  if(window.__mvNico){return;} window.__mvNico=1;
+  var lv=${lv}, quality=${q}, tries=0;
+  function post(o){ try{ window.ReactNativeWebView.postMessage(JSON.stringify(o)); }catch(e){} }
+  function dec(s){ return s.replace(/&quot;/g,'"').replace(/&#34;/g,'"').replace(/&#39;/g,"'").replace(/&apos;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&#x([0-9a-f]+);/gi,function(_,h){return String.fromCharCode(parseInt(h,16));}).replace(/&#(\\d+);/g,function(_,c){return String.fromCharCode(+c);}).replace(/&amp;/g,'&'); }
+  function parseProps(html){
+    var m=html.match(/<script[^>]+id="(?:embedded-data|initial-state)"[^>]+data-props="([^"]+)"/)||html.match(/data-props="([^"]+)"[^>]+id="(?:embedded-data|initial-state)"/);
+    if(!m) return null;
+    try{ return JSON.parse(dec(m[1])); }catch(e){ return null; }
   }
-  const parts = cookies
-    .map(cookie => {
-      const name = cookie?.name;
-      const value = cookie?.value;
-      return typeof name === 'string' && typeof value === 'string' ? `${name}=${value}` : null;
-    })
-    .filter((part): part is string => !!part);
-  return parts.length ? parts.join('; ') : undefined;
+  function wsFrom(p){
+    var pp=p&&p.pageContents&&p.pageContents.watchInformation&&p.pageContents.watchInformation.playerParams;
+    if(pp&&pp.wsEndPoint&&pp.wsEndPoint.url) return {url:pp.wsEndPoint.url, fid:(p.constants&&p.constants.requestInfo&&p.constants.requestInfo.frontendId)};
+    var s=p&&p.site; var u=s&&((s.relive&&s.relive.webSocketUrl)||s.webSocketUrl||s.websocketUrl);
+    if(u) return {url:u, fid:(s.frontendId!=null?s.frontendId:s.frontendID)};
+    return null;
+  }
+  function openWS(ws){
+    var url=ws.url;
+    if(ws.fid!=null && url.indexOf('frontend_id=')<0){ url+=(url.indexOf('?')>=0?'&':'?')+'frontend_id='+encodeURIComponent(ws.fid); }
+    var sock; try{ sock=new WebSocket(url); }catch(e){ post({type:'niconicoError',message:String(e&&e.message||e)}); return; }
+    var keep=null;
+    sock.onopen=function(){ sock.send(JSON.stringify({type:'startWatching',data:{stream:{quality:quality,protocol:'hls',latency:'low',requireNewStream:true,accessRightMethod:'single_cookie',chasePlay:false},room:{protocol:'webSocket',commentable:true},reconnect:false}})); };
+    sock.onmessage=function(ev){
+      var j; try{ j=JSON.parse(ev.data); }catch(e){ return; }
+      if(j.type==='ping'){ sock.send(JSON.stringify({type:'pong'})); return; }
+      if(j.type==='seat'){ var iv=(j.data&&j.data.keepIntervalSec)||30; if(keep)clearInterval(keep); sock.send(JSON.stringify({type:'keepSeat'})); keep=setInterval(function(){ try{sock.send(JSON.stringify({type:'keepSeat'}));}catch(e){} }, Math.max(5,iv)*1000); return; }
+      if(j.type==='messageServer'){ if(j.data&&j.data.viewUri) post({type:'niconicoView',viewUri:j.data.viewUri}); return; }
+      if(j.type==='stream'){ if(j.data&&j.data.uri){ var ck=''; if(Array.isArray(j.data.cookies)){ ck=j.data.cookies.map(function(c){return c.name+'='+c.value;}).join('; '); } post({type:'niconicoStream',hlsUrl:j.data.uri,cookies:ck}); } return; }
+      if(j.type==='error'){ post({type:'niconicoError',message:(j.data&&j.data.code)||'error'}); return; }
+      if(j.type==='disconnect'){ post({type:'niconicoEnded'}); return; }
+    };
+    sock.onerror=function(){ post({type:'niconicoError',message:'ws error'}); };
+    sock.onclose=function(){ post({type:'niconicoEnded'}); };
+  }
+  function attempt(){
+    fetch('/watch/'+lv,{headers:{'Accept':'text/html'},credentials:'include'}).then(function(r){return r.text();}).then(function(html){
+      var ws=wsFrom(parseProps(html));
+      if(!ws){ if(++tries<4){ setTimeout(attempt,1500); } else { post({type:'niconicoError',message:'ws url not found'}); } return; }
+      openWS(ws);
+    }).catch(function(e){ if(++tries<4){ setTimeout(attempt,1500); } else { post({type:'niconicoError',message:String(e&&e.message||e)}); } });
+  }
+  attempt();
+  true;
+})();`;
 }
 
 function matchGroup(text: string, pattern: RegExp): string | null {
@@ -268,7 +118,7 @@ function decodeHTMLEntities(value: string): string {
     .replace(/&apos;/g, "'")
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
-    .replace(/&#x2F;/gi, '/')
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
     .replace(/&amp;/g, '&');
 }
