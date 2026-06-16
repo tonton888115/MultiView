@@ -2,6 +2,7 @@ package com.multiview
 
 import android.content.Context
 import android.net.Uri
+import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.media3.common.C
@@ -43,6 +44,22 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
   private var volume = 1f
   private var liveTargetOffsetMs = 2_000L
   private var maxBitrate = 0
+
+  // React(Fabric)は子ビューのレイアウトを自前で行わないため、host のサイズ変更が
+  // PlayerView/SurfaceView に伝播せず映像が半分に潰れる/位置がずれる。requestLayout の度に
+  // 自分自身を再measure/layout して子へ正しいサイズを伝える(RN カスタムビュー定番の対処)。
+  private val measureAndLayout = Runnable {
+    measure(
+      View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+      View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY),
+    )
+    layout(left, top, right, bottom)
+  }
+
+  override fun requestLayout() {
+    super.requestLayout()
+    post(measureAndLayout)
+  }
 
   init {
     setBackgroundColor(android.graphics.Color.BLACK)
