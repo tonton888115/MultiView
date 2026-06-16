@@ -1033,6 +1033,18 @@ function StreamPlayer({
   const [source, setSource] = useState<PlaybackSource | null>(null);
   const [, setPlayerStatus] = useState('待機中');
   const webRef = useRef<WebView>(null);
+  // ネイティブプレイヤーの error/ended を受けてのデバウンス自動復旧。
+  // iOS の .multiViewPlaybackErrored と同じく 45 秒に 1 回までに制限してループを防ぐ。
+  const [autoReloadTick, setAutoReloadTick] = useState(0);
+  const lastAutoReloadRef = useRef(0);
+  const scheduleAutoReload = useCallback(() => {
+    const now = Date.now();
+    if (now - lastAutoReloadRef.current < 45000) {
+      return;
+    }
+    lastAutoReloadRef.current = now;
+    setTimeout(() => setAutoReloadTick(tick => tick + 1), 1500);
+  }, []);
 
   const handleWebMessage = useCallback(
     (event: WebViewMessageEvent) => {
@@ -1075,7 +1087,7 @@ function StreamPlayer({
     return () => {
       cancelled = true;
     };
-  }, [stream, settings, streamCount, reloadKey]);
+  }, [stream, settings, streamCount, reloadKey, autoReloadTick]);
 
   useEffect(() => {
     if (!onWebCommentBridge) {
@@ -1124,7 +1136,7 @@ function StreamPlayer({
     return (
       <>
         <NativeHlsPlayer
-          key={`${source.url}:${reloadKey}`}
+          key={`${source.url}:${reloadKey}:${autoReloadTick}`}
           style={styles.nativePlayer}
           sourceUrl={source.url}
           headers={source.headers}
@@ -1136,6 +1148,9 @@ function StreamPlayer({
           onPlayerEvent={event => {
             const payload = event.nativeEvent;
             setPlayerStatus(payload.type === 'error' ? `エラー: ${payload.message}` : payload.message);
+            if (payload.type === 'error' || payload.message === 'ended') {
+              scheduleAutoReload();
+            }
           }}
         />
         <DanmakuOverlay stream={stream} settings={settings} />

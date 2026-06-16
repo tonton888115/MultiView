@@ -16,6 +16,11 @@ import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.ReactContext
+import com.facebook.react.bridge.WritableMap
+import com.facebook.react.uimanager.UIManagerHelper
+import com.facebook.react.uimanager.events.Event
 
 @UnstableApi
 class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
@@ -179,14 +184,30 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
     }
   }
 
+  // Fabric(新アーキ)でも旧アーキでも動く EventDispatcher 経由で onPlayerEvent を送る。
+  // 旧来の RCTEventEmitter は bridgeless でエラーになるため使わない。
   private fun emit(type: String, message: String) {
-    // RN 0.82 runs this app in bridgeless mode by default. The legacy
-    // RCTEventEmitter path logs errors there, so JS keeps status from the
-    // resolver and native commands until this view is migrated to Fabric events.
+    val reactContext = context as? ReactContext ?: return
+    val dispatcher = UIManagerHelper.getEventDispatcherForReactTag(reactContext, id) ?: return
+    val surfaceId = UIManagerHelper.getSurfaceId(this)
+    val payload = Arguments.createMap().apply {
+      putString("type", type)
+      putString("message", message)
+    }
+    dispatcher.dispatchEvent(PlayerEvent(surfaceId, id, payload))
   }
 
   private companion object {
     const val DEFAULT_USER_AGENT =
       "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36"
   }
+}
+
+private class PlayerEvent(
+  surfaceId: Int,
+  viewId: Int,
+  private val payload: WritableMap,
+) : Event<PlayerEvent>(surfaceId, viewId) {
+  override fun getEventName(): String = "onPlayerEvent"
+  override fun getEventData(): WritableMap = payload
 }
