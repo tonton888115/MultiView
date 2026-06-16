@@ -58,6 +58,7 @@ import {adNetworkBlockerScript, isAdBlockedURL, platformAdBlockExtras} from './s
 import {setRaidHandler} from './src/raidFollow';
 import {niconicoOriginURL, niconicoQuality, niconicoSessionScript} from './src/niconico';
 import {pushNiconicoComment} from './src/niconicoComments';
+import {startPlaybackService, stopPlaybackService} from './src/playbackService';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -507,6 +508,19 @@ export default function App() {
     });
     return () => setRaidHandler(null);
   }, [addStream, settings.autoFollowRaids]);
+
+  // 背景音声: 配信が1本以上 & 音声ON の間だけ前面サービスを起動しておく。前面にいるうちに
+  // start するので、その後バックグラウンドに入ってもプロセスが生き、音声再生が継続する。
+  useEffect(() => {
+    if (!hydrated) {
+      return;
+    }
+    if (streams.length > 0 && settings.playAudio) {
+      startPlaybackService();
+    } else {
+      stopPlaybackService();
+    }
+  }, [hydrated, streams.length, settings.playAudio]);
 
   const removeStream = useCallback((id: string) => {
     setStreams(current => current.filter(stream => stream.id !== id));
