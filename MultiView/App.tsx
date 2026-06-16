@@ -53,6 +53,7 @@ import {
   youtubeVideoId,
 } from './src/playback';
 import type {AppSettings, PlatformId, PlaybackSource, Source, StreamItem, TabId} from './src/types';
+import {adNetworkBlockerScript, isAdBlockedURL, platformAdBlockExtras} from './src/adblock';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -1167,7 +1168,8 @@ function StreamPlayer({
           allowsInlineMediaPlayback
           mediaPlaybackRequiresUserAction
           setSupportMultipleWindows={false}
-          injectedJavaScript={webFallbackScript(settings.blockWebAds)}
+          injectedJavaScript={webFallbackScript(settings.blockWebAds, stream.platform)}
+          onShouldStartLoadWithRequest={request => !(settings.blockWebAds && isAdBlockedURL(request.url))}
           onMessage={handleWebMessage}
           style={styles.hiddenBridgeWeb}
         />
@@ -1192,7 +1194,8 @@ function StreamPlayer({
           allowsInlineMediaPlayback
           mediaPlaybackRequiresUserAction={false}
           setSupportMultipleWindows={false}
-          injectedJavaScript={webFallbackScript(settings.blockWebAds)}
+          injectedJavaScript={webFallbackScript(settings.blockWebAds, stream.platform)}
+          onShouldStartLoadWithRequest={request => !(settings.blockWebAds && isAdBlockedURL(request.url))}
           onMessage={handleWebMessage}
           style={styles.webPlayer}
         />
@@ -2572,8 +2575,14 @@ const sourceBridgeScript = `
 })();
 `;
 
-function webFallbackScript(blockAds: boolean) {
+function webFallbackScript(blockAds: boolean, platform: PlatformId) {
+  // iOS パリティの広告/ポップアップ対策をまず注入する:
+  //  - blockAds 時: 広告ドメインの iframe/script を DOM から剥がす
+  //  - ニコ生: 快適視聴/プレミアム会員モーダルを隠す
+  //  - Kick/Twitch: 埋め込みプレイヤーの tap を止める
   return `
+  ${blockAds ? adNetworkBlockerScript : ''}
+  ${platformAdBlockExtras(platform)}
   (function(){
     function toViewerNumber(value){
       if (value == null) return null;
