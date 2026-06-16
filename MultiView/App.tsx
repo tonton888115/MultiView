@@ -56,6 +56,7 @@ import {
 import type {AppSettings, PlatformId, PlaybackSource, Source, StreamItem, TabId} from './src/types';
 import {adNetworkBlockerScript, isAdBlockedURL, platformAdBlockExtras} from './src/adblock';
 import {setRaidHandler} from './src/raidFollow';
+import {openNiconicoSession} from './src/niconico';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -1075,6 +1076,10 @@ function StreamPlayer({
   );
 
   useEffect(() => {
+    if (stream.platform === 'niconico') {
+      // ニコ生はネイティブ視聴セッション(NiconicoNativePlayer)が自前で扱う。
+      return;
+    }
     let cancelled = false;
     setSource(null);
     setPlayerStatus('取得中');
@@ -1135,6 +1140,21 @@ function StreamPlayer({
     `;
     webRef.current?.injectJavaScript(command);
   }, [source, paused, muted, volume]);
+
+  if (stream.platform === 'niconico') {
+    return (
+      <NiconicoNativePlayer
+        stream={stream}
+        settings={settings}
+        streamCount={streamCount}
+        paused={paused}
+        muted={muted}
+        volume={volume}
+        reloadKey={reloadKey + autoReloadTick}
+        onViewerCount={onViewerCount}
+      />
+    );
+  }
 
   if (!source) {
     return (
@@ -1237,6 +1257,106 @@ function StreamPlayer({
   return (
     <View style={styles.playerPlaceholder}>
       <Text style={styles.playerStatus}>{source.reason}</Text>
+    </View>
+  );
+}
+
+function NiconicoNativePlayer({
+  stream,
+  settings,
+  streamCount,
+  paused,
+  muted,
+  volume,
+  reloadKey,
+  onViewerCount,
+}: {
+  stream: StreamItem;
+  settings: AppSettings;
+  streamCount: number;
+  paused: boolean;
+  muted: boolean;
+  volume: number;
+  reloadKey: number;
+  onViewerCount?: (count: number) => void;
+}) {
+  const [hls, setHls] = useState<{url: string; cookieHeader?: string} | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setHls(null);
+    setFailed(false);
+    const session = openNiconicoSession(stream.channel, settings, {
+      onStream: info => setHls({url: info.hlsUrl, cookieHeader: info.cookieHeader}),
+      onError: () => setFailed(true),
+      onEnded: () => setFailed(true),
+    });
+    return () => session.stop();
+    // 視聴セッションは品質/低遅延/番組が変わった時だけ張り直す。
+  }, [stream.channel, settings.wifiQuality, settings.niconicoLowLatency, reloadKey]);
+
+  if (hls) {
+    return (
+      <>
+        <NativeHlsPlayer
+          key={`${hls.url}:${reloadKey}`}
+          style={styles.nativePlayer}
+          sourceUrl={hls.url}
+          headers={
+            hls.cookieHeader
+              ? {Cookie: hls.cookieHeader, 'User-Agent': mobileUserAgent}
+              : {'User-Agent': mobileUserAgent}
+          }
+          paused={paused}
+          muted={muted}
+          volume={volume}
+          liveTargetOffsetMs={settings.niconicoLowLatency ? 2000 : 6000}
+          maxBitrate={effectiveQuality(settings, streamCount) === 'economy' ? 900000 : 0}
+          resizeMode="contain"
+        />
+        <DanmakuOverlay stream={stream} settings={settings} />
+      </>
+    );
+  }
+
+  if (failed) {
+    return (
+      <>
+        <WebView
+          key={`niconico-web:${reloadKey}`}
+          source={{uri: webStreamURL(stream)}}
+          userAgent={mobileUserAgent}
+          javaScriptEnabled
+          domStorageEnabled
+          sharedCookiesEnabled
+          thirdPartyCookiesEnabled
+          allowsInlineMediaPlayback
+          mediaPlaybackRequiresUserAction={false}
+          setSupportMultipleWindows={false}
+          injectedJavaScript={webFallbackScript(settings.blockWebAds, 'niconico')}
+          onShouldStartLoadWithRequest={request => !(settings.blockWebAds && isAdBlockedURL(request.url))}
+          onMessage={event => {
+            try {
+              const payload = JSON.parse(event.nativeEvent.data);
+              const count = Number(payload?.count);
+              if (payload?.type === 'viewerCount' && Number.isFinite(count) && count >= 0) {
+                onViewerCount?.(Math.round(count));
+              }
+            } catch {
+              // ignore bridge noise
+            }
+          }}
+          style={styles.webPlayer}
+        />
+        <DanmakuOverlay stream={stream} settings={settings} />
+      </>
+    );
+  }
+
+  return (
+    <View style={styles.playerPlaceholder}>
+      <ActivityIndicator color="#7ab7ff" />
+      <Text style={styles.playerStatus}>ニコ生接続中</Text>
     </View>
   );
 }
