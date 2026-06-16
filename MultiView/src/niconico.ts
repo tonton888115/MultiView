@@ -79,11 +79,18 @@ export function niconicoSessionScript(programId: string, quality: string): strin
   function decU(b){ try{ return td?td.decode(b):decodeURIComponent(escape(String.fromCharCode.apply(null,b))); }catch(e){ return ''; } }
   function pbFields(bytes){ var out=[],p=0; function vi(){ var r=0,s=1,b; while(p<bytes.length){ b=bytes[p++]; r+=(b&0x7f)*s; if((b&0x80)===0) return r; s*=128; } return null; } while(p<bytes.length){ var k=vi(); if(k===null) break; var num=Math.floor(k/8), wt=k&7; if(wt===0){ var v=vi(); if(v===null) break; out.push({n:num,v:v}); } else if(wt===2){ var len=vi(); if(len===null||p+len>bytes.length) break; out.push({n:num,d:bytes.subarray(p,p+len)}); p+=len; } else if(wt===1){ p+=8; } else if(wt===5){ p+=4; } else break; } return out; }
   function sub(fs,n){ for(var i=0;i<fs.length;i++){ if(fs[i].n===n&&fs[i].d) return fs[i].d; } return null; }
+  function str(fs,n){ var d=sub(fs,n); return d?decU(d):''; }
+  function adText(ad){ var f=pbFields(ad); var v2=sub(f,2); if(v2){ var m=str(pbFields(v2),2); return m||'ニコニ広告されました'; } var v0=sub(f,1); if(v0){ var lf=sub(pbFields(v0),1); if(lf){ var lff=pbFields(lf); var m2=str(lff,3); if(m2) return m2; var adv=str(lff,1); if(adv) return adv+' がニコニ広告しました'; } } return 'ニコニ広告されました'; }
   function readProto(url,onMsg,onEnd){ fetch(url).then(function(r){ if(!r.body){ if(onEnd)onEnd(); return; } var rd=r.body.getReader(); var buf=new Uint8Array(0); function pump(){ rd.read().then(function(res){ if(res.done){ if(onEnd)onEnd(); return; } var nb=new Uint8Array(buf.length+res.value.length); nb.set(buf); nb.set(res.value,buf.length); buf=nb; var p=0; while(true){ var q=p,r2=0,s=1,bb,got=false; while(q<buf.length){ bb=buf[q++]; r2+=(bb&0x7f)*s; if((bb&0x80)===0){got=true;break;} s*=128; } if(!got) break; if(q+r2>buf.length) break; onMsg(buf.subarray(q,q+r2)); p=q+r2; } if(p>0) buf=buf.subarray(p); pump(); }).catch(function(){ if(onEnd)onEnd(); }); } pump(); }).catch(function(){ if(onEnd)onEnd(); }); }
   var nicoAt='now', nicoActive={};
   function ndgr(viewUri){ if(window.__mvNdgr) return; window.__mvNdgr=1; nicoView(viewUri); }
   function nicoView(viewUri){ var url=viewUri+(viewUri.indexOf('?')>=0?'&':'?')+'at='+encodeURIComponent(nicoAt); var any=false; readProto(url,function(msg){ any=true; var fs=pbFields(msg); var seg=sub(fs,1); if(seg){ var u=sub(pbFields(seg),3); if(u){ var su=decU(u); if(!nicoActive[su]){ nicoActive[su]=1; nicoSeg(su); } } } var nx=sub(fs,4); if(nx){ var nf=pbFields(nx); for(var i=0;i<nf.length;i++){ if(nf[i].n===1&&nf[i].v!=null) nicoAt=String(nf[i].v); } } },function(){ setTimeout(function(){ nicoView(viewUri); }, any?500:2500); }); }
-  function nicoSeg(uri){ readProto(uri,function(msg){ var fs=pbFields(msg); var m=sub(fs,2); if(!m) return; var mf=pbFields(m); var chat=sub(mf,1)||sub(mf,20); if(chat){ var t=sub(pbFields(chat),1); if(t){ var text=decU(t); if(text) post({type:'niconicoComment',text:text}); } } },function(){ delete nicoActive[uri]; }); }
+  function nicoSeg(uri){ readProto(uri,function(msg){ var fs=pbFields(msg); var m=sub(fs,2); if(!m) return; var mf=pbFields(m);
+    var chat=sub(mf,1)||sub(mf,20); if(chat){ var t=str(pbFields(chat),1); if(t) post({type:'niconicoComment',text:t}); }
+    var gift=sub(mf,8); if(gift){ var gf=pbFields(gift); var sender=str(gf,3)||'誰か'; var item=str(gf,6)||str(gf,1)||'ギフト'; post({type:'niconicoEvent',kind:'gift',text:'🎁 '+sender+' が '+item+' を贈りました'}); }
+    var ad=sub(mf,9); if(ad){ post({type:'niconicoEvent',kind:'nicoad',text:'📢 '+adText(ad)}); }
+    var noti=sub(mf,23); if(noti){ var nm=str(pbFields(noti),2); if(nm) post({type:'niconicoEvent',kind:'notification',text:'🔔 '+nm}); }
+  },function(){ delete nicoActive[uri]; }); }
   function openWS(ws){
     var url=ws.url;
     if(ws.fid!=null && url.indexOf('frontend_id=')<0){ url+=(url.indexOf('?')>=0?'&':'?')+'frontend_id='+encodeURIComponent(ws.fid); }

@@ -1316,11 +1316,26 @@ function NiconicoNativePlayer({
         setHls({url: payload.hlsUrl, cookieHeader: payload.cookies || undefined});
       } else if (payload?.type === 'niconicoComment' && typeof payload.text === 'string') {
         pushNiconicoComment(stream.channel, {text: payload.text});
+      } else if (payload?.type === 'niconicoEvent' && typeof payload.text === 'string') {
+        // ギフト/ニコニ広告/通知。死にトグルだった各設定で表示可否を制御する。
+        const allowed =
+          (payload.kind === 'gift' && settings.showGiftEffects && settings.niconicoShowGift) ||
+          (payload.kind === 'nicoad' && settings.niconicoShowNicoad) ||
+          (payload.kind === 'notification' && settings.niconicoShowNotification);
+        if (allowed) {
+          pushNiconicoComment(stream.channel, {text: payload.text});
+        }
       } else if (payload?.type === 'niconicoError' || payload?.type === 'niconicoEnded') {
         setFailed(true);
       }
     },
-    [stream.channel],
+    [
+      stream.channel,
+      settings.showGiftEffects,
+      settings.niconicoShowGift,
+      settings.niconicoShowNicoad,
+      settings.niconicoShowNotification,
+    ],
   );
 
   // niconico は RN の直接 fetch/WS を拒否するため、視聴セッションは niconico オリジンを
