@@ -1,5 +1,6 @@
 import {desktopUserAgent, mobileUserAgent, resolveLiveYouTubeVideoID, webStreamURL, youtubeVideoId} from './playback';
 import {kickFilterText, kickTokens, makeChatEvent, parseTwitchTags, textTokens, twitchTokens} from './danmaku';
+import {kickHostTarget, reportRaid, twitchRaidTarget} from './raidFollow';
 import type {AppSettings, ChatEvent, DanmakuToken, PlatformId, StreamItem} from './types';
 
 export type ChatClient = {
@@ -85,7 +86,7 @@ function startTwitchChat(stream: StreamItem, emit: Emit, status: Status): ChatCl
       if (text.includes('PING :tmi.twitch.tv')) {
         socket?.send('PONG :tmi.twitch.tv');
       }
-      handleTwitchMessage(text, stream.platform, emit);
+      handleTwitchMessage(text, stream.platform, emit, channel);
     };
     socket.onerror = () => {
       status('Twitchコメント再接続待ち');
@@ -108,7 +109,7 @@ function startTwitchChat(stream: StreamItem, emit: Emit, status: Status): ChatCl
   };
 }
 
-function handleTwitchMessage(text: string, platform: PlatformId, emit: Emit) {
+function handleTwitchMessage(text: string, platform: PlatformId, emit: Emit, channel: string) {
   text.split('\r\n').forEach(rawLine => {
     if (!rawLine) {
       return;
@@ -132,6 +133,12 @@ function handleTwitchMessage(text: string, platform: PlatformId, emit: Emit) {
     }
     const bodyMarker = line.indexOf(' :');
     const message = bodyMarker >= 0 ? line.slice(bodyMarker + 2) : '';
+    if (isUserNotice) {
+      const raidTarget = twitchRaidTarget(tags, message);
+      if (raidTarget) {
+        reportRaid('twitch', raidTarget, channel);
+      }
+    }
     const systemMessage = tags['system-msg'] || tags['msg-id'] || '';
     const displayText = message || systemMessage;
     if (!displayText) {
@@ -180,7 +187,7 @@ function startKickChat(stream: StreamItem, emit: Emit, status: Status): ChatClie
         status('Kickコメント接続済み');
       };
       socket.onmessage = event => {
-        handleKickMessage(String(event.data ?? ''), emit);
+        handleKickMessage(String(event.data ?? ''), emit, channel);
       };
       socket.onclose = () => {
         if (!stopped) {
@@ -234,16 +241,23 @@ async function fetchKickChannelInfo(channel: string): Promise<{chatroomId: strin
   return {chatroomId, channelId: channelId ?? undefined};
 }
 
-function handleKickMessage(text: string, emit: Emit) {
+function handleKickMessage(text: string, emit: Emit, channel: string) {
   const envelope = parseJSON(text);
   const eventName = stringValue(envelope?.event) ?? '';
   if (eventName === 'pusher:ping') {
     return;
   }
+  const payload = typeof envelope?.data === 'string' ? parseJSON(envelope.data) : envelope?.data;
+  if (/host|raid/i.test(eventName)) {
+    const target = kickHostTarget(payload);
+    if (target) {
+      reportRaid('kick', target, channel);
+    }
+    return;
+  }
   if (!eventName.includes('ChatMessage')) {
     return;
   }
-  const payload = typeof envelope?.data === 'string' ? parseJSON(envelope.data) : envelope?.data;
   const content = stringValue(payload?.content) ?? stringValue(payload?.message);
   if (!content) {
     return;

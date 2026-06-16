@@ -55,6 +55,7 @@ import {
 } from './src/playback';
 import type {AppSettings, PlatformId, PlaybackSource, Source, StreamItem, TabId} from './src/types';
 import {adNetworkBlockerScript, isAdBlockedURL, platformAdBlockExtras} from './src/adblock';
+import {setRaidHandler} from './src/raidFollow';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -493,6 +494,17 @@ export default function App() {
     });
     setActiveTab('viewing');
   }, []);
+
+  // レイド/ホスト自動追従。chat.ts が検出した宛先を module-level ハンドラ経由で受け取り、
+  // autoFollowRaids が ON の時だけ streams へ追加して視聴タブへ切り替える(iOS RaidAutoFollow 相当)。
+  useEffect(() => {
+    setRaidHandler((platform, channel) => {
+      if (settings.autoFollowRaids) {
+        addStream(platform, channel);
+      }
+    });
+    return () => setRaidHandler(null);
+  }, [addStream, settings.autoFollowRaids]);
 
   const removeStream = useCallback((id: string) => {
     setStreams(current => current.filter(stream => stream.id !== id));
