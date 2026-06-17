@@ -3,6 +3,7 @@ import {Animated, Easing, Image, StyleSheet, Text, View} from 'react-native';
 import {estimateTokenWidth, textFromTokens, textTokens} from './danmaku';
 import {startChatClient} from './chat';
 import {YouTubeOfficialChatBridge} from './YouTubeOfficialChatBridge';
+import {giftEventFromChatEvent, publishGiftEvent} from './giftEvents';
 import type {AppSettings, ChatEvent, DanmakuToken, StreamItem} from './types';
 
 const danmakuBacklogLimit = 20000;
@@ -216,9 +217,13 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       if (queueRef.current.length > danmakuBacklogLimit) {
         queueRef.current.splice(0, queueRef.current.length - danmakuBacklogLimit);
       }
+      const giftEvent = giftEventFromChatEvent(stream.id, event);
+      if (giftEvent) {
+        publishGiftEvent(stream.id, giftEvent);
+      }
       scheduleDrain();
     },
-    [scheduleDrain],
+    [scheduleDrain, stream.id],
   );
   const ignoreStatus = useCallback(() => undefined, []);
 

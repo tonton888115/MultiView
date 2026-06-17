@@ -20,6 +20,7 @@ import {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {WebView, type WebViewMessageEvent} from 'react-native-webview';
 import {DanmakuOverlay} from './src/DanmakuOverlay';
+import {GiftOverlay} from './src/GiftOverlay';
 import {NativeHlsPlayer} from './src/NativeHlsPlayer';
 import {
   AUTH_STORAGE_KEY,
@@ -58,6 +59,7 @@ import {adNetworkBlockerScript, isAdBlockedURL, platformAdBlockExtras} from './s
 import {setRaidHandler} from './src/raidFollow';
 import {niconicoOriginURL, niconicoQuality, niconicoSessionScript} from './src/niconico';
 import {pushNiconicoComment} from './src/niconicoComments';
+import {publishGiftEvent} from './src/giftEvents';
 import {startPlaybackService, stopPlaybackService} from './src/playbackService';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
@@ -1203,6 +1205,7 @@ function StreamPlayer({
           }}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
+        <GiftOverlay stream={stream} settings={settings} />
       </>
     );
   }
@@ -1239,6 +1242,7 @@ function StreamPlayer({
           style={styles.hiddenBridgeWeb}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
+        <GiftOverlay stream={stream} settings={settings} />
       </>
     );
   }
@@ -1265,6 +1269,7 @@ function StreamPlayer({
           style={styles.webPlayer}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
+        <GiftOverlay stream={stream} settings={settings} />
         {source.kind === 'error' && <PlayerBadge source={source} status={source.reason} warning />}
       </>
     );
@@ -1319,19 +1324,50 @@ function NiconicoNativePlayer({
         pushNiconicoComment(stream.channel, {text: payload.text});
       } else if (payload?.type === 'niconicoEvent' && typeof payload.text === 'string') {
         // ギフト/ニコニ広告/通知。死にトグルだった各設定で表示可否を制御する。
-        const allowed =
-          (payload.kind === 'gift' && settings.showGiftEffects && settings.niconicoShowGift) ||
-          (payload.kind === 'nicoad' && settings.niconicoShowNicoad) ||
-          (payload.kind === 'notification' && settings.niconicoShowNotification);
-        if (allowed) {
+        const giftAllowed = payload.kind === 'gift' && settings.showGiftEffects && settings.niconicoShowGift;
+        const nicoadAllowed = payload.kind === 'nicoad' && settings.niconicoShowNicoad;
+        const notificationAllowed = payload.kind === 'notification' && settings.niconicoShowNotification;
+        if (giftAllowed || nicoadAllowed || notificationAllowed) {
           pushNiconicoComment(stream.channel, {text: payload.text});
+          const createdAt = Date.now();
+          const id = `nico-event:${payload.kind}:${createdAt}:${Math.random().toString(36).slice(2)}`;
+          if (giftAllowed) {
+            publishGiftEvent(stream.id, {
+              id,
+              platform: stream.platform,
+              text: payload.text,
+              headline: 'ギフト',
+              kind: 'gift',
+              createdAt,
+            });
+          } else if (nicoadAllowed) {
+            publishGiftEvent(stream.id, {
+              id,
+              platform: stream.platform,
+              text: payload.text,
+              headline: 'ニコニコ広告',
+              kind: 'nicoad',
+              createdAt,
+            });
+          } else if (notificationAllowed) {
+            publishGiftEvent(stream.id, {
+              id,
+              platform: stream.platform,
+              text: payload.text,
+              headline: 'お知らせ',
+              kind: 'notification',
+              createdAt,
+            });
+          }
         }
       } else if (payload?.type === 'niconicoError' || payload?.type === 'niconicoEnded') {
         setFailed(true);
       }
     },
     [
+      stream.id,
       stream.channel,
+      stream.platform,
       settings.showGiftEffects,
       settings.niconicoShowGift,
       settings.niconicoShowNicoad,
@@ -1380,6 +1416,7 @@ function NiconicoNativePlayer({
           resizeMode="contain"
         />
         <DanmakuOverlay stream={stream} settings={settings} />
+        <GiftOverlay stream={stream} settings={settings} />
       </>
     );
   }
@@ -1414,6 +1451,7 @@ function NiconicoNativePlayer({
           style={styles.webPlayer}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
+        <GiftOverlay stream={stream} settings={settings} />
       </>
     );
   }
