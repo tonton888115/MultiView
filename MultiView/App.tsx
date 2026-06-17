@@ -1235,6 +1235,7 @@ function StreamPlayer({
           injectedJavaScript={webFallbackScript(settings.blockWebAds, stream.platform)}
           onShouldStartLoadWithRequest={request => !(settings.blockWebAds && isAdBlockedURL(request.url))}
           onMessage={handleWebMessage}
+          containerStyle={styles.hiddenBridgeWeb}
           style={styles.hiddenBridgeWeb}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
@@ -1353,6 +1354,7 @@ function NiconicoNativePlayer({
         setSupportMultipleWindows={false}
         injectedJavaScript={niconicoSessionScript(stream.channel, niconicoQuality(settings))}
         onMessage={onSessionMessage}
+        containerStyle={styles.hiddenBridgeWeb}
         style={styles.hiddenBridgeWeb}
       />
     ) : null;
@@ -3204,6 +3206,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#000',
   },
   hiddenBridgeWeb: {
+    flex: 0,
     position: 'absolute',
     left: -2,
     top: -2,

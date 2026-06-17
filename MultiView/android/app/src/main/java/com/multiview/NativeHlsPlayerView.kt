@@ -2,13 +2,15 @@ package com.multiview
 
 import android.content.Context
 import android.net.Uri
-import android.view.View
+import android.view.Gravity
+import android.view.TextureView
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
@@ -17,7 +19,6 @@ import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.ReactContext
 import com.facebook.react.bridge.WritableMap
@@ -28,12 +29,23 @@ import com.facebook.react.uimanager.events.Event
 class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
   private val trackSelector = DefaultTrackSelector(context)
   private val exoPlayer = ExoPlayer.Builder(context).setTrackSelector(trackSelector).build()
-  private val playerView = PlayerView(context).apply {
-    useController = false
-    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-    player = exoPlayer
-    setShutterBackgroundColor(android.graphics.Color.BLACK)
-    layoutParams = LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+  // PlayerView の既定 SurfaceView は RN の動的レイアウトでサイズ追従に失敗し、映像が
+  // 縮んで中央に出る/潰れることがある。通常ビューとして正しくリサイズされる TextureView を
+  // AspectRatioFrameLayout に入れ、アスペクト比は onVideoSizeChanged で設定する。
+  private val contentFrame = AspectRatioFrameLayout(context).apply {
+    setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT)
+    layoutParams = LayoutParams(
+      ViewGroup.LayoutParams.MATCH_PARENT,
+      ViewGroup.LayoutParams.MATCH_PARENT,
+      Gravity.CENTER,
+    )
+  }
+  private val textureView = TextureView(context).apply {
+    layoutParams = FrameLayout.LayoutParams(
+      ViewGroup.LayoutParams.MATCH_PARENT,
+      ViewGroup.LayoutParams.MATCH_PARENT,
+      Gravity.CENTER,
+    )
   }
 
   private var sourceUrl: String? = null
@@ -45,26 +57,19 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
   private var liveTargetOffsetMs = 2_000L
   private var maxBitrate = 0
 
-  // React(Fabric)は子ビューのレイアウトを自前で行わないため、host のサイズ変更が
-  // PlayerView/SurfaceView に伝播せず映像が半分に潰れる/位置がずれる。requestLayout の度に
-  // 自分自身を再measure/layout して子へ正しいサイズを伝える(RN カスタムビュー定番の対処)。
-  private val measureAndLayout = Runnable {
-    measure(
-      View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
-      View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY),
-    )
-    layout(left, top, right, bottom)
-  }
-
-  override fun requestLayout() {
-    super.requestLayout()
-    post(measureAndLayout)
-  }
-
   init {
     setBackgroundColor(android.graphics.Color.BLACK)
-    addView(playerView)
+    contentFrame.addView(textureView)
+    addView(contentFrame)
+    exoPlayer.setVideoTextureView(textureView)
     exoPlayer.addListener(object : Player.Listener {
+      override fun onVideoSizeChanged(videoSize: VideoSize) {
+        val w = videoSize.width
+        val h = videoSize.height
+        val ratio = if (w == 0 || h == 0) 0f else w * videoSize.pixelWidthHeightRatio / h
+        contentFrame.setAspectRatio(ratio)
+      }
+
       override fun onPlaybackStateChanged(playbackState: Int) {
         val status = when (playbackState) {
           Player.STATE_BUFFERING -> "buffering"
@@ -141,7 +146,7 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
   }
 
   fun setResizeMode(next: String?) {
-    playerView.resizeMode = when (next) {
+    contentFrame.resizeMode = when (next) {
       "cover" -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
       "stretch" -> AspectRatioFrameLayout.RESIZE_MODE_FILL
       else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
