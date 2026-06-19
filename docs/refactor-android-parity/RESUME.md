@@ -6,7 +6,9 @@
 ## 1行サマリ
 iOS(完全ネイティブSwift, `ios/MultiView/*.swift`, 約14,300行)を**リファレンス仕様**として、Android(React Native: `App.tsx` + `src/` + Kotlinネイティブモジュール)を**機能パリティ**へ引き上げる大規模リファクタ。iOSとAndroidは別実装。
 
-## いまの状態（2026-06-17 / HEAD=6434435 はローカルのみ・未push、221d3f2 までは push 済み）
+## いまの状態（2026-06-19 / HEAD=b645d86 まで全て push 済み＝Codemagic iOS ビルド実行中）
+- **エコノミー画質 360p 以下に統一(2026-06-19)**: ユーザー「エコノミーでも画質良く通信量すごい」。Android は 2C で既に 640×360 キャップ済み。iOS は **ビットレート上限(900kbps)のみで解像度キャップ無し**(YouTubeは何も未設定)だったため、`NetworkQuality.effectiveMaximumResolution`(640×360 when economy)を追加し全 AVPlayer プレイヤー＋YouTube に `preferredMaximumResolution` を適用(b645d86, push済→iOSビルド)。両PFでエコノミー=≤360p。
+
 - **Phase 0 基盤**: ✅ 完了
 - **Phase 1 クリティカルUX**: ✅ 更新ボタン(↻) / グリッド偶数バグ修正 / 広告ブロック配線
 - **Phase 2 安定化**: ✅ 2A native event bridge(Fabric) / 2B 自動復旧(error,ended→45s reload) / 2C ビットレート上限(自動エコノミー) / 2D 背景音声(前面サービス) / **2C-NetInfo(301a378,a655491): wifi/cellular検出→4Gで`mobileQuality`自動適用＋エコノミーを実効化(≤360pハードキャップ)**。❌ 2E YouTube WebView軽量化
