@@ -1,4 +1,4 @@
-import {AppSettings, PlaybackQuality, PlaybackSource, PlatformId, StreamItem} from './types';
+import {AppSettings, NetworkType, PlaybackQuality, PlaybackSource, PlatformId, StreamItem} from './types';
 
 export const mobileUserAgent =
   'Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36';
@@ -31,11 +31,17 @@ export function makeStream(platform: PlatformId, channel: string): StreamItem {
   };
 }
 
-export function effectiveQuality(settings: AppSettings, streamCount: number): PlaybackQuality {
+export function effectiveQuality(
+  settings: AppSettings,
+  streamCount: number,
+  networkType: NetworkType = 'none',
+): PlaybackQuality {
   if (settings.autoEconomyOnManyStreams && streamCount >= 3) {
     return 'economy';
   }
-  return settings.wifiQuality;
+  // Until Android reports a confirmed Wi-Fi transport, use the conservative
+  // mobile setting so app startup cannot briefly select an unrestricted track.
+  return networkType === 'wifi' ? settings.wifiQuality : settings.mobileQuality;
 }
 
 export function webStreamURL(stream: StreamItem): string {

@@ -2,6 +2,7 @@ import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   ActivityIndicator,
   Alert,
+  AppState,
   Animated,
   Modal,
   SafeAreaView,
@@ -61,6 +62,7 @@ import {niconicoOriginURL, niconicoQuality, niconicoSessionScript} from './src/n
 import {pushNiconicoComment} from './src/niconicoComments';
 import {publishGiftEvent} from './src/giftEvents';
 import {startPlaybackService, stopPlaybackService} from './src/playbackService';
+import {useNetworkType} from './src/network';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -511,17 +513,24 @@ export default function App() {
     return () => setRaidHandler(null);
   }, [addStream, settings.autoFollowRaids]);
 
-  // 背景音声: 配信が1本以上 & 音声ON の間だけ前面サービスを起動しておく。前面にいるうちに
-  // start するので、その後バックグラウンドに入ってもプロセスが生き、音声再生が継続する。
+  // 背景音声: 配信が1本以上 & 音声ON の間だけ前面サービスを起動しておく。
+  // 視聴タブは非表示でもマウントしたままにするため、他タブ移動中もサービスと実再生が一致する。
   useEffect(() => {
     if (!hydrated) {
       return;
     }
-    if (streams.length > 0 && settings.playAudio) {
+    const playbackDesired = streams.length > 0 && settings.playAudio;
+    if (playbackDesired) {
       startPlaybackService();
     } else {
       stopPlaybackService();
     }
+    const subscription = AppState.addEventListener('change', state => {
+      if (state === 'active' && playbackDesired) {
+        startPlaybackService();
+      }
+    });
+    return () => subscription.remove();
   }, [hydrated, streams.length, settings.playAudio]);
 
   const removeStream = useCallback((id: string) => {
@@ -567,7 +576,9 @@ export default function App() {
         {activeTab === 'ranking' && (
           <SourceBrowser sources={orderedSources(rankingSources, settings)} onAdd={addStream} />
         )}
-        {activeTab === 'viewing' && (
+        <View
+          style={[styles.tabPanel, activeTab !== 'viewing' && styles.hiddenViewingPanel]}
+          pointerEvents={activeTab === 'viewing' ? 'auto' : 'none'}>
           <ViewingScreen
             streams={streams}
             settings={settings}
@@ -580,7 +591,7 @@ export default function App() {
             auth={auth}
             onAuth={updateAuth}
           />
-        )}
+        </View>
         {activeTab === 'settings' && (
           <SettingsScreen
             streams={streams}
@@ -965,9 +976,7 @@ function StreamCell({
       .catch(error => {
         if (webCommentRef.current) {
           webCommentRef.current(text);
-          setCommentText('');
-          setCommentStatus('Webチャットへ送信しました');
-          setTimeout(() => setCommentOpen(false), 450);
+          setCommentStatus('Webチャット入力を試行しました（未確認）');
           return;
         }
         setCommentStatus(error instanceof Error ? error.message : String(error));
@@ -977,19 +986,25 @@ function StreamCell({
   return (
     <View style={styles.streamCell} onLayout={event => setCellLayout(event.nativeEvent.layout)}>
       <View style={styles.player} onTouchStart={showChrome}>
-        <StreamPlayer
-          stream={stream}
-          settings={settings}
-          streamCount={streamCount}
-          paused={paused}
-          muted={muted || volume <= 0}
-          volume={volume}
-          reloadKey={reloadKey}
-          onWebCommentBridge={send => {
-            webCommentRef.current = send;
-          }}
-          onViewerCount={setWebViewerCount}
-        />
+        {paused ? (
+          <View style={styles.playerPlaceholder}>
+            <Text style={styles.playerStatus}>フォーカス表示中</Text>
+          </View>
+        ) : (
+          <StreamPlayer
+            stream={stream}
+            settings={settings}
+            streamCount={streamCount}
+            paused={paused}
+            muted={muted || volume <= 0}
+            volume={volume}
+            reloadKey={reloadKey}
+            onWebCommentBridge={send => {
+              webCommentRef.current = send;
+            }}
+            onViewerCount={setWebViewerCount}
+          />
+        )}
         <View style={styles.playerChrome} pointerEvents="box-none">
           {!chromeVisible && <Pressable style={styles.chromeRevealTouch} onPress={showChrome} />}
           {settings.showViewerCount && <ViewerCountBadge stream={stream} externalCount={webViewerCount} visible={chromeVisible} />}
@@ -1064,6 +1079,14 @@ function StreamPlayer({
   const [source, setSource] = useState<PlaybackSource | null>(null);
   const [, setPlayerStatus] = useState('待機中');
   const webRef = useRef<WebView>(null);
+  const streamRef = useRef(stream);
+  const settingsRef = useRef(settings);
+  const streamCountRef = useRef(streamCount);
+  const networkType = useNetworkType();
+  const playbackQuality = effectiveQuality(settings, streamCount, networkType);
+  streamRef.current = stream;
+  settingsRef.current = settings;
+  streamCountRef.current = streamCount;
   // ネイティブプレイヤーの error/ended を受けてのデバウンス自動復旧。
   // iOS の .multiViewPlaybackErrored と同じく 45 秒に 1 回までに制限してループを防ぐ。
   const [autoReloadTick, setAutoReloadTick] = useState(0);
@@ -1093,14 +1116,15 @@ function StreamPlayer({
   );
 
   useEffect(() => {
-    if (stream.platform === 'niconico') {
+    const currentStream = streamRef.current;
+    if (currentStream.platform === 'niconico') {
       // ニコ生はネイティブ視聴セッション(NiconicoNativePlayer)が自前で扱う。
       return;
     }
     let cancelled = false;
     setSource(null);
     setPlayerStatus('取得中');
-    resolvePlaybackSource(stream, settings, streamCount)
+    resolvePlaybackSource(currentStream, settingsRef.current, streamCountRef.current)
       .then(next => {
         if (!cancelled) {
           setSource(next);
@@ -1114,7 +1138,7 @@ function StreamPlayer({
             label: '取得失敗',
             status: 'エラー',
             reason: error instanceof Error ? error.message : String(error),
-            fallbackUrl: webStreamURL(stream),
+            fallbackUrl: webStreamURL(currentStream),
           });
           setPlayerStatus('エラー');
         }
@@ -1122,7 +1146,15 @@ function StreamPlayer({
     return () => {
       cancelled = true;
     };
-  }, [stream, settings, streamCount, reloadKey, autoReloadTick]);
+  }, [
+    stream.id,
+    stream.platform,
+    stream.channel,
+    settings.youtubePreferIframe,
+    settings.youtubeStableBuffer,
+    reloadKey,
+    autoReloadTick,
+  ]);
 
   useEffect(() => {
     if (!onWebCommentBridge) {
@@ -1194,7 +1226,7 @@ function StreamPlayer({
           muted={muted}
           volume={volume}
           liveTargetOffsetMs={source.liveTargetOffsetMs}
-          maxBitrate={effectiveQuality(settings, streamCount) === 'economy' ? 900000 : 0}
+          maxBitrate={playbackQuality === 'economy' ? 900000 : 0}
           resizeMode="contain"
           onPlayerEvent={event => {
             const payload = event.nativeEvent;
@@ -1223,23 +1255,6 @@ function StreamPlayer({
           mediaPlaybackRequiresUserAction={false}
           setSupportMultipleWindows={false}
           style={styles.webPlayer}
-        />
-        <WebView
-          key={`viewer:${source.videoId}:${reloadKey}`}
-          source={{uri: `https://m.youtube.com/watch?v=${encodeURIComponent(source.videoId)}`}}
-          userAgent={mobileUserAgent}
-          javaScriptEnabled
-          domStorageEnabled
-          sharedCookiesEnabled
-          thirdPartyCookiesEnabled
-          allowsInlineMediaPlayback
-          mediaPlaybackRequiresUserAction
-          setSupportMultipleWindows={false}
-          injectedJavaScript={webFallbackScript(settings.blockWebAds, stream.platform)}
-          onShouldStartLoadWithRequest={request => !(settings.blockWebAds && isAdBlockedURL(request.url))}
-          onMessage={handleWebMessage}
-          containerStyle={styles.hiddenBridgeWeb}
-          style={styles.hiddenBridgeWeb}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
         <GiftOverlay stream={stream} settings={settings} />
@@ -1303,15 +1318,42 @@ function NiconicoNativePlayer({
 }) {
   const [hls, setHls] = useState<{url: string; cookieHeader?: string} | null>(null);
   const [failed, setFailed] = useState(false);
+  const [sessionReloadTick, setSessionReloadTick] = useState(0);
+  const networkType = useNetworkType();
+  const playbackQuality = effectiveQuality(settings, streamCount, networkType);
+  const sessionKey = `${stream.channel}:${playbackQuality}:${settings.niconicoLowLatency}:${reloadKey}:${sessionReloadTick}`;
+  const activeSessionKeyRef = useRef(sessionKey);
+  const sessionRetryCountRef = useRef(0);
+  const lastSessionRetryAtRef = useRef(0);
+  activeSessionKeyRef.current = sessionKey;
 
   useEffect(() => {
     // 番組/品質/低遅延/更新 が変わったらセッションをやり直す。
     setHls(null);
     setFailed(false);
-  }, [stream.channel, settings.wifiQuality, settings.niconicoLowLatency, reloadKey]);
+  }, [stream.channel, playbackQuality, settings.niconicoLowLatency, reloadKey, sessionReloadTick]);
+
+  const retryNativeSession = useCallback(() => {
+    const now = Date.now();
+    if (now - lastSessionRetryAtRef.current < 45000) {
+      return;
+    }
+    lastSessionRetryAtRef.current = now;
+    sessionRetryCountRef.current += 1;
+    if (sessionRetryCountRef.current > 3) {
+      setFailed(true);
+      return;
+    }
+    setHls(null);
+    setFailed(false);
+    setSessionReloadTick(tick => tick + 1);
+  }, []);
 
   const onSessionMessage = useCallback(
-    (event: WebViewMessageEvent) => {
+    (event: WebViewMessageEvent, eventSessionKey: string) => {
+      if (eventSessionKey !== activeSessionKeyRef.current) {
+        return;
+      }
       let payload: any;
       try {
         payload = JSON.parse(event.nativeEvent.data);
@@ -1319,6 +1361,7 @@ function NiconicoNativePlayer({
         return;
       }
       if (payload?.type === 'niconicoStream' && typeof payload.hlsUrl === 'string') {
+        sessionRetryCountRef.current = 0;
         setHls({url: payload.hlsUrl, cookieHeader: payload.cookies || undefined});
       } else if (payload?.type === 'niconicoComment' && typeof payload.text === 'string') {
         pushNiconicoComment(stream.channel, {text: payload.text});
@@ -1361,7 +1404,7 @@ function NiconicoNativePlayer({
           }
         }
       } else if (payload?.type === 'niconicoError' || payload?.type === 'niconicoEnded') {
-        setFailed(true);
+        retryNativeSession();
       }
     },
     [
@@ -1372,6 +1415,7 @@ function NiconicoNativePlayer({
       settings.niconicoShowGift,
       settings.niconicoShowNicoad,
       settings.niconicoShowNotification,
+      retryNativeSession,
     ],
   );
 
@@ -1380,7 +1424,7 @@ function NiconicoNativePlayer({
   const sessionWebView =
     !failed ? (
       <WebView
-        key={`niconico-session:${stream.channel}:${reloadKey}`}
+        key={`niconico-session:${sessionKey}`}
         source={{uri: niconicoOriginURL}}
         userAgent={desktopUserAgent}
         javaScriptEnabled
@@ -1388,8 +1432,8 @@ function NiconicoNativePlayer({
         sharedCookiesEnabled
         thirdPartyCookiesEnabled
         setSupportMultipleWindows={false}
-        injectedJavaScript={niconicoSessionScript(stream.channel, niconicoQuality(settings))}
-        onMessage={onSessionMessage}
+        injectedJavaScript={niconicoSessionScript(stream.channel, niconicoQuality(playbackQuality))}
+        onMessage={event => onSessionMessage(event, sessionKey)}
         containerStyle={styles.hiddenBridgeWeb}
         style={styles.hiddenBridgeWeb}
       />
@@ -1412,8 +1456,14 @@ function NiconicoNativePlayer({
           muted={muted}
           volume={volume}
           liveTargetOffsetMs={settings.niconicoLowLatency ? 2000 : 6000}
-          maxBitrate={effectiveQuality(settings, streamCount) === 'economy' ? 900000 : 0}
+          maxBitrate={playbackQuality === 'economy' ? 900000 : 0}
           resizeMode="contain"
+          onPlayerEvent={event => {
+            const payload = event.nativeEvent;
+            if (payload.type === 'error' || payload.message === 'ended') {
+              retryNativeSession();
+            }
+          }}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
         <GiftOverlay stream={stream} settings={settings} />
@@ -2236,8 +2286,7 @@ function FocusModal({
           return;
         }
         injectWebComment(chatRef.current, text);
-        setCommentText('');
-        setCommentStatus('Webチャットへ送信しました');
+        setCommentStatus('Webチャット入力を試行しました（未確認）');
       });
   }, [auth, commentText, onAuth, stream]);
 
@@ -2997,6 +3046,17 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
+  },
+  tabPanel: {
+    flex: 1,
+  },
+  hiddenViewingPanel: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    opacity: 0,
   },
   tabBar: {
     minHeight: 58,

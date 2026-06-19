@@ -59,6 +59,7 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
 
   init {
     setBackgroundColor(android.graphics.Color.BLACK)
+    exoPlayer.setWakeMode(C.WAKE_MODE_NETWORK)
     contentFrame.addView(textureView)
     addView(contentFrame)
     exoPlayer.setVideoTextureView(textureView)
@@ -133,15 +134,27 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
   }
 
   // iOS の NetworkQuality.effectivePeakBitRate(エコノミー≈900kbps、3本以上で自動)に相当。
-  // 0 は無制限。HLS の各バリアントから上限以下の最高画質を ExoPlayer が選ぶ。
+  // エコノミーは 640x360 も上限にして通信量を落とす。制約超過しかない配信でも再生は継続する。
   fun setMaxBitrate(next: Int) {
     if (maxBitrate == next) {
       return
     }
     maxBitrate = next
+    val builder = trackSelector.buildUponParameters()
+      .setExceedVideoConstraintsIfNecessary(true)
+    if (next > 0) {
+      builder
+        .setMaxVideoBitrate(next)
+        .clearVideoSizeConstraints()
+        .setViewportSize(640, 360, true)
+    } else {
+      builder
+        .setMaxVideoBitrate(Int.MAX_VALUE)
+        .clearVideoSizeConstraints()
+        .clearViewportSizeConstraints()
+    }
     trackSelector.setParameters(
-      trackSelector.buildUponParameters()
-        .setMaxVideoBitrate(if (next > 0) next else Int.MAX_VALUE),
+      builder,
     )
   }
 

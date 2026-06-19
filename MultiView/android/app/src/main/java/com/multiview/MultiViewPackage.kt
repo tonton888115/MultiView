@@ -9,7 +9,11 @@ import com.facebook.react.uimanager.ViewManager
 @UnstableApi
 class MultiViewPackage : ReactPackage {
   override fun createNativeModules(reactContext: ReactApplicationContext): MutableList<NativeModule> =
-    mutableListOf(PlaybackServiceModule(reactContext))
+    mutableListOf(
+      PlaybackServiceModule(reactContext),
+      NetworkInfoModule(reactContext),
+      GiftSoundModule(reactContext),
+    )
 
   override fun createViewManagers(reactContext: ReactApplicationContext): MutableList<ViewManager<*, *>> =
     mutableListOf(NativeHlsPlayerManager())

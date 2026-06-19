@@ -7,7 +7,7 @@
 // ReactNativeWebView.postMessage で RN へ橋渡しする。HLS は ExoPlayer(NativeHlsPlayer)
 // で再生する(=フルWebページではなく「映像だけ」)。NDGR コメントは viewUri から別途取得。
 
-import type {AppSettings} from './types';
+import type {PlaybackQuality} from './types';
 
 // 隠しセッション WebView を載せる同一オリジンの HTML ページ。
 // text/plain(robots.txt 等)では injectedJavaScript が動かないため HTML を使う。
@@ -15,9 +15,9 @@ export const niconicoOriginURL = 'https://live.nicovideo.jp/';
 
 export type WatchData = {wsUrl: string; frontendId?: string};
 
-export function niconicoQuality(settings: AppSettings): string {
+export function niconicoQuality(quality: PlaybackQuality): string {
   // iOS: high -> "abr", economy -> "low"
-  return settings.wifiQuality === 'economy' ? 'low' : 'abr';
+  return quality === 'economy' ? 'low' : 'abr';
 }
 
 // watch ページHTMLの data-props から WebSocket 情報を取り出す(テスト対象)。

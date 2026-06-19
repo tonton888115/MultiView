@@ -2,6 +2,7 @@ export type PlatformId = 'kick' | 'twitch' | 'youtube' | 'niconico' | 'twitcasti
 export type TabId = 'following' | 'ranking' | 'viewing' | 'settings';
 export type LayoutMode = 'stacked' | 'grid';
 export type PlaybackQuality = 'high' | 'economy';
+export type NetworkType = 'wifi' | 'cellular' | 'other' | 'none';
 
 export type StreamItem = {
   id: string;
