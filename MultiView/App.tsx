@@ -63,6 +63,7 @@ import {pushNiconicoComment} from './src/niconicoComments';
 import {publishGiftEvent} from './src/giftEvents';
 import {startPlaybackService, stopPlaybackService} from './src/playbackService';
 import {useNetworkType} from './src/network';
+import {parseStreamURL} from './src/streamURL';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -131,44 +132,6 @@ const followingSources: Source[] = [
   {platform: 'twitcasting', label: 'ツイキャス', url: 'https://twitcasting.tv/'},
 ];
 
-const kickNonStreamPaths = new Set([
-  'browse',
-  'categories',
-  'category',
-  'following',
-  'search',
-  'clips',
-  'about',
-  'help',
-  'dashboard',
-  'messages',
-  'settings',
-  'subscriptions',
-  'login',
-  'signup',
-  'auth',
-  'oauth',
-]);
-
-const twitchNonStreamPaths = new Set([
-  'directory',
-  'videos',
-  'login',
-  'signup',
-  'p',
-  'settings',
-  'subscriptions',
-  'wallet',
-  'drops',
-  'u',
-  'downloads',
-  'jobs',
-  'privacy',
-  'terms',
-  'turbo',
-  'store',
-]);
-
 function platformInfo(id: PlatformId) {
   return platforms.find(platform => platform.id === id) ?? platforms[0];
 }
@@ -186,64 +149,6 @@ function orderedPlatforms(order: PlatformId[]) {
 function orderedSources(sources: Source[], settings: AppSettings) {
   const order = orderedPlatforms(settings.platformOrder);
   return order.flatMap(platform => sources.filter(source => source.platform === platform));
-}
-
-function stripWww(host: string): string {
-  return host.replace(/^www\./, '').toLowerCase();
-}
-
-function parseStreamURL(raw: string): {platform: PlatformId; channel: string} | null {
-  try {
-    const url = new URL(raw);
-    const host = stripWww(url.hostname);
-    const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-
-    if (host === 'live-info.soraweb.net') {
-      const linked = url.searchParams.get('link');
-      if (linked) {
-        const parsed = parseStreamURL(linked);
-        if (parsed) {
-          return parsed;
-        }
-      }
-      const site = url.searchParams.get('site');
-      const liveNo = url.searchParams.get('liveNo');
-      if (site === 'nico' && liveNo) {
-        return {platform: 'niconico', channel: liveNo.startsWith('lv') ? liveNo : `lv${liveNo}`};
-      }
-    }
-
-    if (host === 'kick.com' && parts[0] && !kickNonStreamPaths.has(parts[0])) {
-      return {platform: 'kick', channel: parts[0]};
-    }
-    if ((host === 'twitch.tv' || host === 'm.twitch.tv') && parts[0] && !twitchNonStreamPaths.has(parts[0])) {
-      return {platform: 'twitch', channel: parts[0]};
-    }
-    if (host.includes('youtube.com')) {
-      const videoId = url.searchParams.get('v');
-      if (videoId) {
-        return {platform: 'youtube', channel: videoId};
-      }
-      if (['live', 'embed', 'shorts'].includes(parts[0]) && parts[1]) {
-        return {platform: 'youtube', channel: parts[1]};
-      }
-      if (parts[0]?.startsWith('@') || ['channel', 'c', 'user'].includes(parts[0])) {
-        return {platform: 'youtube', channel: parts.join('/')};
-      }
-    }
-    if (host === 'youtu.be' && parts[0]) {
-      return {platform: 'youtube', channel: parts[0]};
-    }
-    if (host.includes('live.nicovideo.jp') && parts[0] === 'watch' && parts[1]) {
-      return {platform: 'niconico', channel: parts.slice(1).join('/')};
-    }
-    if (host === 'twitcasting.tv' && parts[0] && parts[0] !== 'search') {
-      return {platform: 'twitcasting', channel: parts[0]};
-    }
-  } catch {
-    return null;
-  }
-  return null;
 }
 
 function sanitizeSettings(raw: unknown): AppSettings {
@@ -676,7 +581,7 @@ function SourceBrowser({sources, onAdd}: {sources: Source[]; onAdd: (platform: P
   const intercept = useCallback(
     (request: {url?: string; navigationType?: string}) => {
       const url = request.url ?? '';
-      if (url && request.navigationType === 'click' && addParsed(url)) {
+      if (url && addParsed(url)) {
         return false;
       }
       return true;
@@ -870,9 +775,8 @@ function gridSlots(streams: StreamItem[], layoutMode: AppSettings['layoutMode'])
   if (layoutMode !== 'grid') {
     return streams.map((stream, index) => ({stream, index, width: '100%'}));
   }
-  // 2列で詰め、奇数のときだけ最後の1本を全幅にする。
-  // (旧実装は偶数だと末尾2本が全幅化し、2本=実質スタック表示になるバグがあった)
-  const bigCount = streams.length % 2 === 0 ? 0 : 1;
+  // iOS と同じ: 2列で詰め、偶数は末尾2本を全幅で縦積み、奇数は末尾1本を全幅にする。
+  const bigCount = streams.length % 2 === 0 ? 2 : 1;
   const pairedCount = Math.max(0, streams.length - bigCount);
   return streams.map((stream, index) => ({
     stream,
@@ -3492,7 +3396,7 @@ const styles = StyleSheet.create({
   viewerBadge: {
     position: 'absolute',
     left: 10,
-    bottom: 56,
+    bottom: 10,
     zIndex: 20,
     elevation: 20,
     minHeight: 28,
