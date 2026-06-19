@@ -220,6 +220,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: self.settings)
+      // エコノミー時は 360p 以下へ解像度も制限して通信量を節約する。
+      item.preferredMaximumResolution = NetworkQuality.shared.effectiveMaximumResolution(settings: self.settings)
       item.preferredForwardBufferDuration = 4
       // TwitCasting prioritizes smoothness over Kick/Twitch-style live-edge
       // chasing. 1.5s caused visible judder on ordinary HLS streams.

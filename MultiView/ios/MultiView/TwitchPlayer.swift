@@ -332,6 +332,8 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: self.settings)
+      // エコノミー時は 360p 以下へ解像度も制限して通信量を節約する。
+      item.preferredMaximumResolution = NetworkQuality.shared.effectiveMaximumResolution(settings: self.settings)
       // Twitch(fast_bread LL-HLS)。低遅延優先で2秒(再詰め・ユーザー要望/カクつき改善後)。
       item.configuredTimeOffsetFromLive = CMTime(seconds: 1.5, preferredTimescale: 600)
       item.automaticallyPreservesTimeOffsetFromLive = true

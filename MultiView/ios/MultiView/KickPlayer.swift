@@ -403,6 +403,8 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: self.settings)
+      // エコノミー時は 360p 以下へ解像度も制限して通信量を節約する。
+      item.preferredMaximumResolution = NetworkQuality.shared.effectiveMaximumResolution(settings: self.settings)
       // Kick は低遅延HLS(LL-HLS)。ライブ端からのオフセットを 4→2 秒へ詰めて公式アプリとの
       // 遅延差を縮める(automaticallyWaitsToMinimizeStalling=false と整合)。回線が細いと
       // リバッファ寄りになるトレードオフ。通常HLSではこのプロパティは no-op。要実機A/B。

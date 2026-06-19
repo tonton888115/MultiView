@@ -813,6 +813,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     ])
     let item = AVPlayerItem(asset: asset)
     item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+    // エコノミー実効化(従来 YouTube はビットレート/解像度上限が未設定だった)。
+    // エコノミー時はビットレート上限＋解像度 360p 以下で通信量を節約する。
+    item.preferredPeakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: self.settings)
+    item.preferredMaximumResolution = NetworkQuality.shared.effectiveMaximumResolution(settings: self.settings)
     if isLive {
       // LL-HLS配信なら効く(通常HLSはno-op)。ライブエッジ2秒を狙う(再詰め)。
       item.configuredTimeOffsetFromLive = CMTime(seconds: 1.5, preferredTimescale: 600)

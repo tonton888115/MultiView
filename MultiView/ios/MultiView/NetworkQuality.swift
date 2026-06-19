@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import Network
 
@@ -52,5 +53,15 @@ final class NetworkQuality {
     guard settings.autoEconomyOnManyStreams, AppState.shared.streams.count >= 3 else { return base }
     let economy = PlaybackQuality.economy.preferredPeakBitRate
     return base == 0 ? economy : min(base, economy)
+  }
+
+  // エコノミー実効時は解像度上限も 360p(640x360) に制限して通信量を抑える。
+  // ビットレート上限(preferredPeakBitRate)だけだと 480p 等が選ばれてデータ消費が大きいため、
+  // preferredMaximumResolution で解像度自体を 360p 以下に固定する。high/無制限時は .zero。
+  // 「エコノミー実効」条件は effectivePeakBitRate と同じ(回線品質が economy、または自動エコノミー)。
+  func effectiveMaximumResolution(settings: AppSettings) -> CGSize {
+    let economyActive = activeQuality(settings: settings) == .economy
+      || (settings.autoEconomyOnManyStreams && AppState.shared.streams.count >= 3)
+    return economyActive ? CGSize(width: 640, height: 360) : .zero
   }
 }

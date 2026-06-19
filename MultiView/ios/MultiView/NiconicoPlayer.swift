@@ -611,6 +611,8 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       let item = AVPlayerItem(asset: asset)
       item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
       item.preferredPeakBitRate = NetworkQuality.shared.effectivePeakBitRate(settings: self.settings)
+      // エコノミー時は 360p 以下へ解像度も制限して通信量を節約する。
+      item.preferredMaximumResolution = NetworkQuality.shared.effectiveMaximumResolution(settings: self.settings)
       // LL-HLS 配信時のみライブエッジから一定位置を狙う(通常HLSはno-op)。設定「ニコ生 低遅延」
       // ON で 4→1.5 秒に詰める(LL-HLS配信なら遅延が縮む。通常HLSなら効かないのでローダーが別途必要)。
       // 低遅延ONで1.5秒(再詰め)。OFFは従来4s。
