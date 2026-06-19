@@ -12,7 +12,6 @@ class MultiViewPackage : ReactPackage {
     mutableListOf(
       PlaybackServiceModule(reactContext),
       NetworkInfoModule(reactContext),
-      GiftSoundModule(reactContext),
     )
 
   override fun createViewManagers(reactContext: ReactApplicationContext): MutableList<ViewManager<*, *>> =
