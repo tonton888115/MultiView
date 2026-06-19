@@ -1,4 +1,5 @@
 import {parseNiconicoWatchData} from '../niconico';
+import {TWITCASTING_STREAM_PRIORITY, pickTwitcastingHlsUrl} from '../twitcasting';
 
 // data-props は HTML エンティティ化された JSON。テストでは引用符だけ &quot; にする。
 function dataProps(obj: unknown): string {
@@ -25,5 +26,23 @@ describe('niconico watch-data parsing (iOS NiconicoPlayer parity)', () => {
     expect(parseNiconicoWatchData('<html>nope</html>')).toBeNull();
     const props = {site: {name: 'x'}};
     expect(parseNiconicoWatchData(`<div id="embedded-data" data-props="${dataProps(props)}"></div>`)).toBeNull();
+  });
+});
+
+describe('twitcasting HLS stream priority', () => {
+  it.each(TWITCASTING_STREAM_PRIORITY)('returns the %s stream when it is the best available priority', key => {
+    const streams = Object.fromEntries(
+      TWITCASTING_STREAM_PRIORITY.map(priority => [priority, priority === key ? `https://example.com/${priority}.m3u8` : '']),
+    );
+    expect(pickTwitcastingHlsUrl(streams)).toBe(`https://example.com/${key}.m3u8`);
+  });
+
+  it('returns any stream key when no priority key is present', () => {
+    expect(pickTwitcastingHlsUrl({other: 'https://example.com/other.m3u8'})).toBe('https://example.com/other.m3u8');
+  });
+
+  it('returns null for empty or null streams', () => {
+    expect(pickTwitcastingHlsUrl({})).toBeNull();
+    expect(pickTwitcastingHlsUrl(null)).toBeNull();
   });
 });

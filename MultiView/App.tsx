@@ -59,6 +59,7 @@ import type {AppSettings, PlatformId, PlaybackSource, Source, StreamItem, TabId}
 import {adNetworkBlockerScript, isAdBlockedURL, platformAdBlockExtras} from './src/adblock';
 import {setRaidHandler} from './src/raidFollow';
 import {niconicoOriginURL, niconicoQuality, niconicoSessionScript} from './src/niconico';
+import {twitcastingSessionScript} from './src/twitcasting';
 import {pushNiconicoComment} from './src/niconicoComments';
 import {publishGiftEvent} from './src/giftEvents';
 import {startPlaybackService, stopPlaybackService} from './src/playbackService';
@@ -1025,8 +1026,8 @@ function StreamPlayer({
 
   useEffect(() => {
     const currentStream = streamRef.current;
-    if (currentStream.platform === 'niconico') {
-      // ニコ生はネイティブ視聴セッション(NiconicoNativePlayer)が自前で扱う。
+    if (currentStream.platform === 'niconico' || currentStream.platform === 'twitcasting') {
+      // ニコ生/ツイキャスはネイティブ視聴セッションが自前で扱う。
       return;
     }
     let cancelled = false;
@@ -1144,6 +1145,21 @@ function StreamPlayer({
   if (stream.platform === 'niconico') {
     return (
       <NiconicoNativePlayer
+        stream={stream}
+        settings={settings}
+        streamCount={streamCount}
+        paused={paused}
+        muted={muted}
+        volume={volume}
+        reloadKey={reloadKey + autoReloadTick}
+        onViewerCount={onViewerCount}
+      />
+    );
+  }
+
+  if (stream.platform === 'twitcasting') {
+    return (
+      <TwitcastingNativePlayer
         stream={stream}
         settings={settings}
         streamCount={streamCount}
@@ -1463,6 +1479,175 @@ function NiconicoNativePlayer({
       <View style={styles.playerPlaceholder}>
         <ActivityIndicator color="#7ab7ff" />
         <Text style={styles.playerStatus}>ニコ生接続中</Text>
+      </View>
+    </>
+  );
+}
+
+function TwitcastingNativePlayer({
+  stream,
+  settings,
+  streamCount,
+  paused,
+  muted,
+  volume,
+  reloadKey,
+  onViewerCount,
+}: {
+  stream: StreamItem;
+  settings: AppSettings;
+  streamCount: number;
+  paused: boolean;
+  muted: boolean;
+  volume: number;
+  reloadKey: number;
+  onViewerCount?: (count: number) => void;
+}) {
+  const [hls, setHls] = useState<{url: string; cookieHeader: string} | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [sessionReloadTick, setSessionReloadTick] = useState(0);
+  const networkType = useNetworkType();
+  const playbackQuality = effectiveQuality(settings, streamCount, networkType);
+  const channel = stream.channel.trim();
+  const sessionKey = `${channel}:${playbackQuality}:${reloadKey}:${sessionReloadTick}`;
+  const activeSessionKeyRef = useRef(sessionKey);
+  const sessionRetryCountRef = useRef(0);
+  const lastSessionRetryAtRef = useRef(0);
+  activeSessionKeyRef.current = sessionKey;
+
+  useEffect(() => {
+    setHls(null);
+    setFailed(false);
+  }, [channel, playbackQuality, reloadKey, sessionReloadTick]);
+
+  const retryNativeSession = useCallback(() => {
+    const now = Date.now();
+    if (now - lastSessionRetryAtRef.current < 45000) {
+      return;
+    }
+    lastSessionRetryAtRef.current = now;
+    sessionRetryCountRef.current += 1;
+    if (sessionRetryCountRef.current > 3) {
+      setFailed(true);
+      return;
+    }
+    setHls(null);
+    setFailed(false);
+    setSessionReloadTick(tick => tick + 1);
+  }, []);
+
+  const onSessionMessage = useCallback(
+    (event: WebViewMessageEvent, eventSessionKey: string) => {
+      if (eventSessionKey !== activeSessionKeyRef.current) {
+        return;
+      }
+      let payload: any;
+      try {
+        payload = JSON.parse(event.nativeEvent.data);
+      } catch {
+        return;
+      }
+      if (payload?.type === 'twitcastingStream' && typeof payload.hlsUrl === 'string') {
+        sessionRetryCountRef.current = 0;
+        setHls({url: payload.hlsUrl, cookieHeader: String(payload.cookies ?? '')});
+      } else if (payload?.type === 'twitcastingOffline' || payload?.type === 'twitcastingError') {
+        setFailed(true);
+      }
+    },
+    [],
+  );
+
+  // streamserver.php は player=pc_web でも Android mobile UA で通るため、WebView と HLS の UA を揃える。
+  const sessionWebView =
+    !failed ? (
+      <WebView
+        key={`twitcasting-session:${sessionKey}`}
+        source={{uri: `https://twitcasting.tv/${encodeURIComponent(channel)}`}}
+        userAgent={mobileUserAgent}
+        javaScriptEnabled
+        domStorageEnabled
+        sharedCookiesEnabled
+        thirdPartyCookiesEnabled
+        setSupportMultipleWindows={false}
+        injectedJavaScript={twitcastingSessionScript(channel)}
+        onMessage={event => onSessionMessage(event, sessionKey)}
+        containerStyle={styles.hiddenBridgeWeb}
+        style={styles.hiddenBridgeWeb}
+      />
+    ) : null;
+
+  if (hls) {
+    return (
+      <>
+        {sessionWebView}
+        <NativeHlsPlayer
+          key={`${hls.url}:${reloadKey}`}
+          style={styles.nativePlayer}
+          sourceUrl={hls.url}
+          headers={{
+            Cookie: hls.cookieHeader,
+            'User-Agent': mobileUserAgent,
+            Referer: `https://twitcasting.tv/${channel}`,
+          }}
+          paused={paused}
+          muted={muted}
+          volume={volume}
+          maxBitrate={playbackQuality === 'economy' ? 900000 : 0}
+          resizeMode="contain"
+          onPlayerEvent={event => {
+            const payload = event.nativeEvent;
+            if (payload.type === 'error' || payload.message === 'ended') {
+              retryNativeSession();
+            }
+          }}
+        />
+        <DanmakuOverlay stream={stream} settings={settings} />
+        <GiftOverlay stream={stream} settings={settings} />
+      </>
+    );
+  }
+
+  if (failed) {
+    return (
+      <>
+        <WebView
+          key={`twitcasting-web:${reloadKey}`}
+          source={{uri: webStreamURL(stream)}}
+          userAgent={mobileUserAgent}
+          javaScriptEnabled
+          domStorageEnabled
+          sharedCookiesEnabled
+          thirdPartyCookiesEnabled
+          allowsInlineMediaPlayback
+          mediaPlaybackRequiresUserAction={false}
+          setSupportMultipleWindows={false}
+          injectedJavaScript={webFallbackScript(settings.blockWebAds, 'twitcasting')}
+          onShouldStartLoadWithRequest={request => !(settings.blockWebAds && isAdBlockedURL(request.url))}
+          onMessage={event => {
+            try {
+              const payload = JSON.parse(event.nativeEvent.data);
+              const count = Number(payload?.count);
+              if (payload?.type === 'viewerCount' && Number.isFinite(count) && count >= 0) {
+                onViewerCount?.(Math.round(count));
+              }
+            } catch {
+              // ignore bridge noise
+            }
+          }}
+          style={styles.webPlayer}
+        />
+        <DanmakuOverlay stream={stream} settings={settings} />
+        <GiftOverlay stream={stream} settings={settings} />
+      </>
+    );
+  }
+
+  return (
+    <>
+      {sessionWebView}
+      <View style={styles.playerPlaceholder}>
+        <ActivityIndicator color="#7ab7ff" />
+        <Text style={styles.playerStatus}>ツイキャス接続中</Text>
       </View>
     </>
   );

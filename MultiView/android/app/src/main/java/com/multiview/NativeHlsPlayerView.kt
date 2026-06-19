@@ -210,7 +210,21 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
   }
 
   private fun mediaSourceFor(url: String): MediaSource {
-    val requestHeaders = headers.filterKeys { key -> key.lowercase() != "user-agent" }
+    val requestHeaders = headers.filterKeys { key -> key.lowercase() != "user-agent" }.toMutableMap()
+    // セッション WebView が確立した Cookie(httpOnly 含む)を CookieManager から補完する。
+    // document.cookie は httpOnly を読めず、ツイキャス等の HLS セグメントが 401 になるため、
+    // JS から渡る Cookie とネイティブ CookieManager の Cookie をマージして全サブリクエストへ付与する。
+    try {
+      val webCookie = android.webkit.CookieManager.getInstance().getCookie(url)?.takeIf { it.isNotBlank() }
+      if (webCookie != null) {
+        val existing = requestHeaders.entries
+          .firstOrNull { it.key.equals("Cookie", ignoreCase = true) }?.value?.takeIf { it.isNotBlank() }
+        requestHeaders.keys.filter { it.equals("Cookie", ignoreCase = true) }.toList()
+          .forEach { requestHeaders.remove(it) }
+        requestHeaders["Cookie"] = listOfNotNull(existing, webCookie).joinToString("; ")
+      }
+    } catch (_: Throwable) {
+    }
     val dataSourceFactory = DefaultHttpDataSource.Factory()
       .setAllowCrossProtocolRedirects(true)
       .setUserAgent(headers["User-Agent"] ?: DEFAULT_USER_AGENT)
