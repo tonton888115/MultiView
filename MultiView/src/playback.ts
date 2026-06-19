@@ -238,12 +238,15 @@ async function resolveYouTube(stream: StreamItem, settings: AppSettings): Promis
   const raw = cleanChannel(stream.channel);
   const videoId = youtubeVideoId(raw) ?? (await resolveLiveYouTubeVideoID(raw));
   if (!videoId) {
+    // ユーザー要望: YouTube はフル Web ページ(タイトル/広告/チャーム付き)を絶対に映さない。
+    // 映像のみ HLS 抽出が最優先なので、ID 解決に失敗しても Web へ落とさず、クリーンな
+    // プレースホルダ(error/fallbackUrl 無し)を返す。StreamPlayer 側が静かに再解決して
+    // HLS 取得を粘る。
     return {
-      kind: 'web',
-      url: webStreamURL(stream),
-      label: 'YouTube Web',
-      status: '動画ID未解決',
-      reason: '@handle/live から現在のライブ動画IDを解決できませんでした。',
+      kind: 'error',
+      label: 'YouTube',
+      status: '映像取得中',
+      reason: 'ライブ映像を取得中…',
     };
   }
   if (settings.youtubePreferIframe) {

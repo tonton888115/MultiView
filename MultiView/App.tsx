@@ -1091,6 +1091,10 @@ function StreamPlayer({
   // iOS の .multiViewPlaybackErrored と同じく 45 秒に 1 回までに制限してループを防ぐ。
   const [autoReloadTick, setAutoReloadTick] = useState(0);
   const lastAutoReloadRef = useRef(0);
+  // YouTube が native HLS を取れず取得中/iframe に留まったとき、静かに再解決して HLS へ
+  // 昇格させるための内部チック。retry 回数は youtubeRetryRef で上限管理する。
+  const [youtubeUpgradeTick, setYoutubeUpgradeTick] = useState(0);
+  const youtubeRetryRef = useRef(0);
   const scheduleAutoReload = useCallback(() => {
     const now = Date.now();
     if (now - lastAutoReloadRef.current < 45000) {
@@ -1138,7 +1142,8 @@ function StreamPlayer({
             label: '取得失敗',
             status: 'エラー',
             reason: error instanceof Error ? error.message : String(error),
-            fallbackUrl: webStreamURL(currentStream),
+            // YouTube は Web ページへ落とさない(映像のみ優先・ユーザー要望)。他PFは従来どおり。
+            fallbackUrl: currentStream.platform === 'youtube' ? undefined : webStreamURL(currentStream),
           });
           setPlayerStatus('エラー');
         }
@@ -1155,6 +1160,48 @@ function StreamPlayer({
     reloadKey,
     autoReloadTick,
   ]);
+
+  // 配信切替/手動更新で YouTube の再試行カウンタをリセット。
+  useEffect(() => {
+    youtubeRetryRef.current = 0;
+  }, [stream.id, reloadKey]);
+
+  // YouTube は映像のみ HLS 抽出が最優先。ID 解決や HLS 抽出に失敗して取得中/iframe に
+  // 留まったら、画面を Web ページへ落とさず、バックグラウンドで数回だけ静かに再解決し、
+  // native HLS が取れたときだけ差し替える(成功時のみ setSource = ちらつき無し)。
+  useEffect(() => {
+    if (stream.platform !== 'youtube' || !source || source.kind === 'native') {
+      youtubeRetryRef.current = 0;
+      return;
+    }
+    // Web ページへは絶対に落とさず、映像のみ(native HLS)が取れるまで粘る。
+    // 初回数回は素早く(6s)、以降はゆっくり(20s)で再解決し続ける(YouTube への負荷も抑える)。
+    const delay = youtubeRetryRef.current < 3 ? 6000 : 20000;
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      youtubeRetryRef.current += 1;
+      try {
+        const next = await resolvePlaybackSource(streamRef.current, settingsRef.current, streamCountRef.current);
+        if (cancelled) {
+          return;
+        }
+        if (next.kind === 'native') {
+          setSource(next);
+          setPlayerStatus(next.status);
+        } else {
+          setYoutubeUpgradeTick(tick => tick + 1);
+        }
+      } catch {
+        if (!cancelled) {
+          setYoutubeUpgradeTick(tick => tick + 1);
+        }
+      }
+    }, delay);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [source, stream.platform, youtubeUpgradeTick]);
 
   useEffect(() => {
     if (!onWebCommentBridge) {

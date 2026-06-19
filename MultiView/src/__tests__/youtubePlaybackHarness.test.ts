@@ -76,6 +76,22 @@ describe('YouTube playback regression harness', () => {
     expect(playback).not.toContain('        8000,\n      );');
   });
 
+  it('never collapses YouTube to the full web page, even when resolution fully fails', () => {
+    // FAILED METHOD — do not reintroduce: when @handle/live videoId resolution returned null,
+    // resolveYouTube used to return { kind: 'web', label: 'YouTube Web' } which loaded the full
+    // m.youtube.com watch page (title/ads/charm) in a WebView — the exact thing the user rejects.
+    // The contract now: YouTube must NEVER render the full web page. ID未解決はクリーンな
+    // プレースホルダ(再試行)に落とし、StreamPlayer が静かに HLS への昇格を粘る。
+    const playback = readProjectFile('src/playback.ts');
+    const app = readProjectFile('App.tsx');
+    expect(playback).not.toContain("label: 'YouTube Web'");
+    expect(playback).toContain("status: '映像取得中'"); // videoId 未解決のクリーンなプレースホルダ
+    // 解決例外時も YouTube だけは Web フォールバック URL を設定しない。
+    expect(app).toContain("currentStream.platform === 'youtube' ? undefined : webStreamURL(currentStream)");
+    // 取得中/iframe に留まったらバックグラウンドで native HLS へ昇格を粘る。
+    expect(app).toContain('youtubeRetryRef');
+  });
+
   it('requires YouTube chat fixes to exist on both Android JS and iOS Swift paths', () => {
     const chat = readProjectFile('src/chat.ts');
     const overlay = readProjectFile('src/DanmakuOverlay.tsx');
