@@ -1,4 +1,28 @@
-import {extractYouTubeChatSessionFromHTML, youtubeChatEventsFromAction, youtubeChatPollDelayMs} from '../chat';
+import {extractYouTubeChatSessionFromHTML, kickSupportEvent, youtubeChatEventsFromAction, youtubeChatPollDelayMs} from '../chat';
+
+describe('Kick support events', () => {
+  it('converts official subscription and gift payloads into structured gift events', () => {
+    expect(kickSupportEvent('App\\Events\\GiftedSubscriptionsEvent', {
+      id: 'gift-event-1',
+      gifter: {username: 'alice'},
+      gifted_quantity: 5,
+    })).toMatchObject({
+      id: 'gift-event-1',
+      platform: 'kick',
+      author: 'alice',
+      superInfo: 'Kick gift subscription',
+    });
+    expect(kickSupportEvent('ChannelSubscriptionEvent', {
+      id: 'sub-event-1',
+      user: {username: 'bob'},
+    })).toMatchObject({
+      id: 'sub-event-1',
+      author: 'bob',
+      superInfo: 'Kick subscription',
+    });
+    expect(kickSupportEvent('ChatMessageEvent', {username: 'alice'})).toBeNull();
+  });
+});
 
 describe('extractYouTubeChatSessionFromHTML', () => {
   it('falls back to the live_chat HTML when the watch page has no continuation', () => {

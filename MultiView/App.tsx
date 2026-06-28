@@ -36,6 +36,8 @@ import {
   deviceOAuthErrorDisposition,
   hasUsableAuthSession,
   isOAuthRedirectForPending,
+  maintainAuthSessions,
+  mergeAuthMaintenanceSnapshot,
   nextDeviceOAuthPollInterval,
   oauthCompletionErrorDisposition,
   openURL,
@@ -80,6 +82,8 @@ import {startPlaybackService, stopPlaybackService} from './src/playbackService';
 import {useNetworkType} from './src/network';
 import {parseStreamURL} from './src/streamURL';
 import {appSafeAreaEdges, focusedPaneLayout} from './src/layout';
+import {useRecoveringNativeSession} from './src/useRecoveringNativeSession';
+import {shouldRenderNativeSession} from './src/sessionRecovery';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -371,6 +375,49 @@ export default function App() {
       AsyncStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(auth)).catch(() => undefined);
     }
   }, [auth, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated) {
+      return;
+    }
+    let stopped = false;
+    let running = false;
+    const maintain = async () => {
+      if (stopped || running) {
+        return;
+      }
+      running = true;
+      try {
+        const base = authRef.current;
+        await maintainAuthSessions(base, async nextSnapshot => {
+          if (stopped) {
+            return;
+          }
+          const current = authRef.current;
+          const merged = mergeAuthMaintenanceSnapshot(base, current, nextSnapshot);
+          if (merged !== current) {
+            await updateAuth(merged);
+          }
+        });
+      } catch {
+        // Transient provider/network errors are retried on the next foreground/interval pass.
+      } finally {
+        running = false;
+      }
+    };
+    maintain();
+    const interval = setInterval(maintain, 15 * 60_000);
+    const subscription = AppState.addEventListener('change', state => {
+      if (state === 'active') {
+        maintain();
+      }
+    });
+    return () => {
+      stopped = true;
+      clearInterval(interval);
+      subscription.remove();
+    };
+  }, [hydrated, updateAuth]);
 
   useEffect(() => {
     if (!hydrated || !pendingHandoffURLRef.current) {
@@ -1437,37 +1484,27 @@ function NiconicoNativePlayer({
   onViewerCount?: (count: number) => void;
 }) {
   const [hls, setHls] = useState<{url: string; cookieHeader?: string} | null>(null);
-  const [failed, setFailed] = useState(false);
-  const [sessionReloadTick, setSessionReloadTick] = useState(0);
   const networkType = useNetworkType();
   const playbackQuality = effectiveQuality(settings, streamCount, networkType);
+  const recovery = useRecoveringNativeSession(
+    `${stream.channel}:${playbackQuality}:${settings.niconicoLowLatency}:${reloadKey}`,
+  );
+  const {
+    sessionReloadTick,
+    useWebFallback,
+    scheduleReconnect,
+    startSessionWatchdog,
+    markSessionResolved,
+    handlePlayerStatus,
+  } = recovery;
   const sessionKey = `${stream.channel}:${playbackQuality}:${settings.niconicoLowLatency}:${reloadKey}:${sessionReloadTick}`;
   const activeSessionKeyRef = useRef(sessionKey);
-  const sessionRetryCountRef = useRef(0);
-  const lastSessionRetryAtRef = useRef(0);
   activeSessionKeyRef.current = sessionKey;
 
   useEffect(() => {
-    // 番組/品質/低遅延/更新 が変わったらセッションをやり直す。
     setHls(null);
-    setFailed(false);
-  }, [stream.channel, playbackQuality, settings.niconicoLowLatency, reloadKey, sessionReloadTick]);
-
-  const retryNativeSession = useCallback(() => {
-    const now = Date.now();
-    if (now - lastSessionRetryAtRef.current < 45000) {
-      return;
-    }
-    lastSessionRetryAtRef.current = now;
-    sessionRetryCountRef.current += 1;
-    if (sessionRetryCountRef.current > 3) {
-      setFailed(true);
-      return;
-    }
-    setHls(null);
-    setFailed(false);
-    setSessionReloadTick(tick => tick + 1);
-  }, []);
+    startSessionWatchdog();
+  }, [sessionKey, startSessionWatchdog]);
 
   const onSessionMessage = useCallback(
     (event: WebViewMessageEvent, eventSessionKey: string) => {
@@ -1481,19 +1518,27 @@ function NiconicoNativePlayer({
         return;
       }
       if (payload?.type === 'niconicoStream' && typeof payload.hlsUrl === 'string') {
-        sessionRetryCountRef.current = 0;
+        markSessionResolved();
         setHls({url: payload.hlsUrl, cookieHeader: payload.cookies || undefined});
       } else if (payload?.type === 'niconicoComment' && typeof payload.text === 'string') {
-        pushNiconicoComment(stream.channel, {text: payload.text});
+        pushNiconicoComment(stream.channel, {
+          id: typeof payload.id === 'string' ? payload.id : undefined,
+          text: payload.text,
+        });
       } else if (payload?.type === 'niconicoEvent' && typeof payload.text === 'string') {
         // ギフト/ニコニ広告/通知。死にトグルだった各設定で表示可否を制御する。
         const giftAllowed = payload.kind === 'gift' && settings.showGiftEffects && settings.niconicoShowGift;
         const nicoadAllowed = payload.kind === 'nicoad' && settings.niconicoShowNicoad;
         const notificationAllowed = payload.kind === 'notification' && settings.niconicoShowNotification;
         if (giftAllowed || nicoadAllowed || notificationAllowed) {
-          pushNiconicoComment(stream.channel, {text: payload.text});
+          pushNiconicoComment(stream.channel, {
+            id: typeof payload.id === 'string' ? `support:${payload.id}` : undefined,
+            text: payload.text,
+          });
           const createdAt = Date.now();
-          const id = `nico-event:${payload.kind}:${createdAt}:${Math.random().toString(36).slice(2)}`;
+          const id = typeof payload.id === 'string' && payload.id
+            ? `nico-event:${payload.kind}:${payload.id}`
+            : `nico-event:${payload.kind}:${payload.text}:${Math.floor(createdAt / 5000)}`;
           if (giftAllowed) {
             publishGiftEvent(stream.id, {
               id,
@@ -1524,7 +1569,7 @@ function NiconicoNativePlayer({
           }
         }
       } else if (payload?.type === 'niconicoError' || payload?.type === 'niconicoEnded') {
-        retryNativeSession();
+        scheduleReconnect();
       }
     },
     [
@@ -1535,14 +1580,15 @@ function NiconicoNativePlayer({
       settings.niconicoShowGift,
       settings.niconicoShowNicoad,
       settings.niconicoShowNotification,
-      retryNativeSession,
+      markSessionResolved,
+      scheduleReconnect,
     ],
   );
 
   // niconico は RN の直接 fetch/WS を拒否するため、視聴セッションは niconico オリジンを
   // 読み込んだ隠し WebView 内で実行し、HLS uri を postMessage で受け取る(keepSeatも内部で継続)。
   const sessionWebView =
-    !failed ? (
+    !useWebFallback ? (
       <WebView
         key={`niconico-session:${sessionKey}`}
         source={{uri: niconicoOriginURL}}
@@ -1554,17 +1600,20 @@ function NiconicoNativePlayer({
         setSupportMultipleWindows={false}
         injectedJavaScript={niconicoSessionScript(stream.channel, niconicoQuality(playbackQuality))}
         onMessage={event => onSessionMessage(event, sessionKey)}
+        onError={scheduleReconnect}
+        onHttpError={scheduleReconnect}
+        onRenderProcessGone={scheduleReconnect}
         containerStyle={styles.hiddenBridgeWeb}
         style={styles.hiddenBridgeWeb}
       />
     ) : null;
 
-  if (hls) {
+  if (hls && shouldRenderNativeSession(true, useWebFallback)) {
     return (
       <>
         {sessionWebView}
         <NativeHlsPlayer
-          key={`${hls.url}:${reloadKey}`}
+          key={`${hls.url}:${reloadKey}:${sessionReloadTick}`}
           style={styles.nativePlayer}
           sourceUrl={hls.url}
           headers={
@@ -1580,9 +1629,7 @@ function NiconicoNativePlayer({
           resizeMode="contain"
           onPlayerEvent={event => {
             const payload = event.nativeEvent;
-            if (payload.type === 'error' || payload.message === 'ended') {
-              retryNativeSession();
-            }
+            handlePlayerStatus(payload.type, payload.message, paused);
           }}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
@@ -1591,7 +1638,7 @@ function NiconicoNativePlayer({
     );
   }
 
-  if (failed) {
+  if (useWebFallback) {
     return (
       <>
         <WebView
@@ -1657,37 +1704,26 @@ function TwitcastingNativePlayer({
   onViewerCount?: (count: number) => void;
 }) {
   const [hls, setHls] = useState<{url: string; cookieHeader: string} | null>(null);
-  const [failed, setFailed] = useState(false);
-  const [sessionReloadTick, setSessionReloadTick] = useState(0);
   const networkType = useNetworkType();
   const playbackQuality = effectiveQuality(settings, streamCount, networkType);
   const channel = stream.channel.trim();
+  const recovery = useRecoveringNativeSession(`${channel}:${playbackQuality}:${reloadKey}`);
+  const {
+    sessionReloadTick,
+    useWebFallback,
+    scheduleReconnect,
+    startSessionWatchdog,
+    markSessionResolved,
+    handlePlayerStatus,
+  } = recovery;
   const sessionKey = `${channel}:${playbackQuality}:${reloadKey}:${sessionReloadTick}`;
   const activeSessionKeyRef = useRef(sessionKey);
-  const sessionRetryCountRef = useRef(0);
-  const lastSessionRetryAtRef = useRef(0);
   activeSessionKeyRef.current = sessionKey;
 
   useEffect(() => {
     setHls(null);
-    setFailed(false);
-  }, [channel, playbackQuality, reloadKey, sessionReloadTick]);
-
-  const retryNativeSession = useCallback(() => {
-    const now = Date.now();
-    if (now - lastSessionRetryAtRef.current < 45000) {
-      return;
-    }
-    lastSessionRetryAtRef.current = now;
-    sessionRetryCountRef.current += 1;
-    if (sessionRetryCountRef.current > 3) {
-      setFailed(true);
-      return;
-    }
-    setHls(null);
-    setFailed(false);
-    setSessionReloadTick(tick => tick + 1);
-  }, []);
+    startSessionWatchdog();
+  }, [sessionKey, startSessionWatchdog]);
 
   const onSessionMessage = useCallback(
     (event: WebViewMessageEvent, eventSessionKey: string) => {
@@ -1701,18 +1737,18 @@ function TwitcastingNativePlayer({
         return;
       }
       if (payload?.type === 'twitcastingStream' && typeof payload.hlsUrl === 'string') {
-        sessionRetryCountRef.current = 0;
+        markSessionResolved();
         setHls({url: payload.hlsUrl, cookieHeader: String(payload.cookies ?? '')});
       } else if (payload?.type === 'twitcastingOffline' || payload?.type === 'twitcastingError') {
-        setFailed(true);
+        scheduleReconnect();
       }
     },
-    [],
+    [markSessionResolved, scheduleReconnect],
   );
 
   // streamserver.php は player=pc_web でも Android mobile UA で通るため、WebView と HLS の UA を揃える。
   const sessionWebView =
-    !failed ? (
+    !useWebFallback ? (
       <WebView
         key={`twitcasting-session:${sessionKey}`}
         source={{uri: `https://twitcasting.tv/${encodeURIComponent(channel)}`}}
@@ -1724,23 +1760,27 @@ function TwitcastingNativePlayer({
         setSupportMultipleWindows={false}
         injectedJavaScript={twitcastingSessionScript(channel)}
         onMessage={event => onSessionMessage(event, sessionKey)}
+        onError={scheduleReconnect}
+        onHttpError={scheduleReconnect}
+        onRenderProcessGone={scheduleReconnect}
         containerStyle={styles.hiddenBridgeWeb}
         style={styles.hiddenBridgeWeb}
       />
     ) : null;
 
-  if (hls) {
+  if (hls && shouldRenderNativeSession(true, useWebFallback)) {
     return (
       <>
         {sessionWebView}
         <NativeHlsPlayer
-          key={`${hls.url}:${reloadKey}`}
+          key={`${hls.url}:${reloadKey}:${sessionReloadTick}`}
           style={styles.nativePlayer}
           sourceUrl={hls.url}
           headers={{
             Cookie: hls.cookieHeader,
             'User-Agent': mobileUserAgent,
             Referer: `https://twitcasting.tv/${channel}`,
+            Origin: 'https://twitcasting.tv',
           }}
           paused={paused}
           muted={muted}
@@ -1749,9 +1789,7 @@ function TwitcastingNativePlayer({
           resizeMode="contain"
           onPlayerEvent={event => {
             const payload = event.nativeEvent;
-            if (payload.type === 'error' || payload.message === 'ended') {
-              retryNativeSession();
-            }
+            handlePlayerStatus(payload.type, payload.message, paused);
           }}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
@@ -1760,7 +1798,7 @@ function TwitcastingNativePlayer({
     );
   }
 
-  if (failed) {
+  if (useWebFallback) {
     return (
       <>
         <WebView

@@ -47,6 +47,7 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
   private let keychainAccount = "oauth-token"
   private var activeSession: ASWebAuthenticationSession?
   private var authAnchor: ASPresentationAnchor?
+  private var refreshWaiters: [(Result<String, Error>) -> Void] = []
 
   // Custom-scheme redirect URIs the Kick portal rejects; migrate them to the hosted
   // https bridge so existing installs work without the user re-entering anything.
@@ -84,7 +85,8 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
   }
 
   var isSignedIn: Bool {
-    loadToken() != nil
+    guard let token = loadToken() else { return false }
+    return token.isValid || token.refreshToken?.isEmpty == false
   }
 
   func signOut() {
@@ -186,12 +188,27 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
     authAnchor ?? ASPresentationAnchor()
   }
 
-  private func authorizedAccessToken(completion: @escaping (Result<String, Error>) -> Void) {
+  func maintainSession() {
+    guard let token = loadToken(), token.refreshToken?.isEmpty == false,
+          token.expiresAt - Date().timeIntervalSince1970 <= 300 else { return }
+    authorizedAccessToken(minimumValidity: 300) { _ in }
+  }
+
+  private func authorizedAccessToken(
+    minimumValidity: TimeInterval = 60,
+    completion: @escaping (Result<String, Error>) -> Void
+  ) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async {
+        self.authorizedAccessToken(minimumValidity: minimumValidity, completion: completion)
+      }
+      return
+    }
     guard let token = loadToken() else {
       Self.finish(completion, .failure(KickAuthError.notSignedIn))
       return
     }
-    if token.isValid {
+    if token.expiresAt - Date().timeIntervalSince1970 > minimumValidity {
       Self.finish(completion, .success(token.accessToken))
       return
     }
@@ -199,14 +216,37 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
       Self.finish(completion, .failure(KickAuthError.tokenExpired))
       return
     }
+    if !refreshWaiters.isEmpty {
+      refreshWaiters.append(completion)
+      return
+    }
+    refreshWaiters.append(completion)
     refresh(refreshToken: refreshToken) { [weak self] result in
-      switch result {
-      case .failure(let error):
-        self?.saveToken(nil)
-        Self.finish(completion, .failure(error))
-      case .success(let token):
-        self?.saveToken(token)
-        Self.finish(completion, .success(token.accessToken))
+      DispatchQueue.main.async {
+        guard let self else { return }
+        let resolved: Result<String, Error>
+        switch result {
+        case .failure(let error):
+          if let authError = error as? KickAuthError,
+             case .refreshRejected = authError,
+             self.loadToken()?.refreshToken == refreshToken {
+            self.saveToken(nil)
+          }
+          resolved = .failure(error)
+        case .success(let refreshedToken):
+          if self.loadToken()?.refreshToken == refreshToken {
+            self.saveToken(refreshedToken)
+            resolved = .success(refreshedToken.accessToken)
+          } else if let current = self.loadToken(), current.isValid {
+            // A new sign-in completed while the old refresh was in flight.
+            resolved = .success(current.accessToken)
+          } else {
+            resolved = .failure(KickAuthError.tokenExpired)
+          }
+        }
+        let waiters = self.refreshWaiters
+        self.refreshWaiters.removeAll()
+        waiters.forEach { $0(resolved) }
       }
     }
   }
@@ -242,10 +282,20 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
     ]
     let secret = config.clientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
     if !secret.isEmpty { params["client_secret"] = secret }
-    tokenRequest(body: Self.formBody(params), completion: completion)
+    tokenRequest(
+      body: Self.formBody(params),
+      previousRefreshToken: refreshToken,
+      rejectRefreshOnUnauthorized: true,
+      completion: completion
+    )
   }
 
-  private func tokenRequest(body: Data, completion: @escaping (Result<KickOAuthToken, Error>) -> Void) {
+  private func tokenRequest(
+    body: Data,
+    previousRefreshToken: String? = nil,
+    rejectRefreshOnUnauthorized: Bool = false,
+    completion: @escaping (Result<KickOAuthToken, Error>) -> Void
+  ) {
     var request = URLRequest(url: URL(string: "https://id.kick.com/oauth/token")!)
     request.httpMethod = "POST"
     Self.applyBrowserHeaders(&request)
@@ -261,7 +311,12 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
         return
       }
       guard (200..<300).contains(http.statusCode) else {
-        Self.finish(completion, .failure(KickAuthError.oauthRequestFailed(Self.oauthErrorMessage(status: http.statusCode, data: data))))
+        let message = Self.oauthErrorMessage(status: http.statusCode, data: data)
+        if rejectRefreshOnUnauthorized && (http.statusCode == 400 || http.statusCode == 401) {
+          Self.finish(completion, .failure(KickAuthError.refreshRejected(message)))
+        } else {
+          Self.finish(completion, .failure(KickAuthError.oauthRequestFailed(message)))
+        }
         return
       }
       guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -272,7 +327,7 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
       let expiresIn = json["expires_in"] as? Double ?? 3600
       Self.finish(completion, .success(KickOAuthToken(
         accessToken: accessToken,
-        refreshToken: json["refresh_token"] as? String,
+        refreshToken: (json["refresh_token"] as? String) ?? previousRefreshToken,
         expiresAt: Date().timeIntervalSince1970 + max(60, expiresIn - 60),
         scope: json["scope"] as? String
       )))
@@ -432,6 +487,7 @@ enum KickAuthError: LocalizedError {
   case couldNotStartSession
   case notSignedIn
   case tokenExpired
+  case refreshRejected(String)
   case oauthRequestFailed(String)
   case invalidChannel
   case channelLookupFailed
@@ -447,6 +503,7 @@ enum KickAuthError: LocalizedError {
     case .couldNotStartSession: return "Kick認証を開始できません"
     case .notSignedIn: return "Kickにログインしていません"
     case .tokenExpired: return "Kickトークンが期限切れです"
+    case .refreshRejected(let message): return "Kick refresh tokenが無効です: \(message)"
     case .oauthRequestFailed(let message): return "Kick OAuthトークン取得に失敗しました: \(message)"
     case .invalidChannel: return "Kickチャンネルが不正です"
     case .channelLookupFailed: return "KickチャンネルIDを取得できません"

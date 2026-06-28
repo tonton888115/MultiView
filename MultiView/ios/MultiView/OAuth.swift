@@ -73,6 +73,11 @@ final class TwitchAuthManager: NSObject, ASWebAuthenticationPresentationContextP
   private let tokenAccount = "twitch"
   private var activeSession: ASWebAuthenticationSession?
   private var authAnchor: ASPresentationAnchor?
+  private weak var deviceAuthAlert: UIAlertController?
+  private var activeDeviceCode: String?
+  private var devicePollWorkItem: DispatchWorkItem?
+  private var refreshWaiters: [(Result<SimpleOAuthToken, Error>) -> Void] = []
+  private var refreshInFlight = false
 
   var config: TwitchOAuthConfig {
     get {
@@ -93,9 +98,15 @@ final class TwitchAuthManager: NSObject, ASWebAuthenticationPresentationContextP
     }
   }
 
-  var isSignedIn: Bool { OAuthKeychain.load(account: tokenAccount)?.isValid == true }
+  var isSignedIn: Bool {
+    guard let token = OAuthKeychain.load(account: tokenAccount) else { return false }
+    return token.isValid || token.refreshToken?.isEmpty == false
+  }
 
   func signOut() {
+    devicePollWorkItem?.cancel()
+    devicePollWorkItem = nil
+    activeDeviceCode = nil
     OAuthKeychain.save(nil, account: tokenAccount)
   }
 
@@ -109,77 +120,359 @@ final class TwitchAuthManager: NSObject, ASWebAuthenticationPresentationContextP
       Self.finish(completion, .failure(OAuthServiceError.message("Twitch Client IDが未設定です")))
       return
     }
-    let state = UUID().uuidString
-    var components = URLComponents(string: "https://id.twitch.tv/oauth2/authorize")!
-    components.queryItems = [
-      URLQueryItem(name: "client_id", value: config.clientId),
-      URLQueryItem(name: "redirect_uri", value: config.redirectURI),
-      URLQueryItem(name: "response_type", value: "token"),
-      URLQueryItem(name: "scope", value: "user:read:chat user:write:chat"),
-      URLQueryItem(name: "state", value: state)
-    ]
-    guard let url = components.url else {
-      Self.finish(completion, .failure(OAuthServiceError.message("Twitch認証URLを作成できません")))
-      return
-    }
-    authAnchor = presentationAnchor
-    let session = ASWebAuthenticationSession(url: url, callbackURLScheme: "multiview") { [weak self] callbackURL, error in
+    var request = URLRequest(url: URL(string: "https://id.twitch.tv/oauth2/device")!)
+    request.httpMethod = "POST"
+    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    request.httpBody = Self.formBody([
+      "client_id": config.clientId,
+      "scopes": "user:read:chat user:write:chat"
+    ])
+    URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       guard let self else { return }
-      self.activeSession = nil
-      self.authAnchor = nil
       if let error {
         Self.finish(completion, .failure(error))
         return
       }
-      guard let callbackURL,
-            let values = Self.fragmentValues(callbackURL),
-            values["state"] == state,
-            let accessToken = values["access_token"] else {
-        Self.finish(completion, .failure(OAuthServiceError.message("Twitch認証の戻りURLが不正です")))
+      guard let data,
+            let http = response as? HTTPURLResponse,
+            (200..<300).contains(http.statusCode),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let deviceCode = json["device_code"] as? String,
+            let userCode = json["user_code"] as? String,
+            let verification = json["verification_uri"] as? String,
+            let verificationURL = URL(string: verification) else {
+        Self.finish(completion, .failure(OAuthServiceError.message("Twitch Device Codeを取得できません")))
         return
       }
-      self.validate(accessToken: accessToken) { result in
-        switch result {
-        case .failure(let error):
-          Self.finish(completion, .failure(error))
-        case .success(let userID):
-          let expiresIn = Double(values["expires_in"] ?? "") ?? 3600 * 24 * 30
-          OAuthKeychain.save(SimpleOAuthToken(
-            accessToken: accessToken,
-            expiresAt: Date().timeIntervalSince1970 + max(60, expiresIn - 60),
-            userID: userID
-          ), account: self.tokenAccount)
-          Self.finish(completion, .success(()))
-        }
+      let expiresIn = (json["expires_in"] as? NSNumber)?.doubleValue ?? 1800
+      let interval = (json["interval"] as? NSNumber)?.doubleValue ?? 5
+      DispatchQueue.main.async {
+        self.presentDeviceAuthorization(
+          anchor: presentationAnchor,
+          deviceCode: deviceCode,
+          userCode: userCode,
+          verificationURL: verificationURL,
+          expiresAt: Date().timeIntervalSince1970 + expiresIn,
+          interval: max(3, interval),
+          completion: completion
+        )
       }
+    }.resume()
+  }
+
+  private func presentDeviceAuthorization(
+    anchor: ASPresentationAnchor,
+    deviceCode: String,
+    userCode: String,
+    verificationURL: URL,
+    expiresAt: TimeInterval,
+    interval: TimeInterval,
+    completion: @escaping (Result<Void, Error>) -> Void
+  ) {
+    devicePollWorkItem?.cancel()
+    activeDeviceCode = deviceCode
+    UIPasteboard.general.string = userCode
+    let alert = UIAlertController(
+      title: "Twitch認証コード: \(userCode)",
+      message: "認証コードをコピーしました。ブラウザで貼り付けてTwitch連携を許可してください。完了後は自動で反映されます。",
+      preferredStyle: .alert
+    )
+    alert.addAction(UIAlertAction(title: "ブラウザを開く", style: .default) { _ in
+      UIPasteboard.general.string = userCode
+      UIApplication.shared.open(verificationURL)
+    })
+    alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel) { [weak self] _ in
+      guard let self, self.activeDeviceCode == deviceCode else { return }
+      self.devicePollWorkItem?.cancel()
+      self.devicePollWorkItem = nil
+      self.activeDeviceCode = nil
+      Self.finish(completion, .failure(OAuthServiceError.message("Twitch認証をキャンセルしました")))
+    })
+    deviceAuthAlert = alert
+    var presenter = anchor.rootViewController
+    while let presented = presenter?.presentedViewController {
+      presenter = presented
     }
-    session.presentationContextProvider = self
-    session.prefersEphemeralWebBrowserSession = false
-    activeSession = session
-    if !session.start() {
-      activeSession = nil
-      authAnchor = nil
-      Self.finish(completion, .failure(OAuthServiceError.message("Twitch認証を開始できません")))
+    presenter?.present(alert, animated: true)
+    scheduleDevicePoll(
+      deviceCode: deviceCode,
+      expiresAt: expiresAt,
+      interval: interval,
+      completion: completion
+    )
+  }
+
+  private func scheduleDevicePoll(
+    deviceCode: String,
+    expiresAt: TimeInterval,
+    interval: TimeInterval,
+    completion: @escaping (Result<Void, Error>) -> Void
+  ) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async {
+        self.scheduleDevicePoll(
+          deviceCode: deviceCode,
+          expiresAt: expiresAt,
+          interval: interval,
+          completion: completion
+        )
+      }
+      return
+    }
+    guard activeDeviceCode == deviceCode else { return }
+    guard Date().timeIntervalSince1970 < expiresAt else {
+      finishDeviceAuthorization(
+        deviceCode: deviceCode,
+        completion: completion,
+        result: .failure(OAuthServiceError.message("Twitch認証コードの期限が切れました"))
+      )
+      return
+    }
+    let work = DispatchWorkItem { [weak self] in
+      self?.pollDeviceToken(
+        deviceCode: deviceCode,
+        expiresAt: expiresAt,
+        interval: interval,
+        completion: completion
+      )
+    }
+    devicePollWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + max(3, interval), execute: work)
+  }
+
+  private func pollDeviceToken(
+    deviceCode: String,
+    expiresAt: TimeInterval,
+    interval: TimeInterval,
+    completion: @escaping (Result<Void, Error>) -> Void
+  ) {
+    guard activeDeviceCode == deviceCode else { return }
+    var request = URLRequest(url: URL(string: "https://id.twitch.tv/oauth2/token")!)
+    request.httpMethod = "POST"
+    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    request.httpBody = Self.formBody([
+      "client_id": config.clientId,
+      "scopes": "user:read:chat user:write:chat",
+      "device_code": deviceCode,
+      "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+    ])
+    URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+      guard let self, self.activeDeviceCode == deviceCode else { return }
+      if let error {
+        self.scheduleDevicePoll(
+          deviceCode: deviceCode,
+          expiresAt: expiresAt,
+          interval: min(60, max(interval, interval * 2)),
+          completion: completion
+        )
+        _ = error
+        return
+      }
+      let http = response as? HTTPURLResponse
+      let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+      if let accessToken = json["access_token"] as? String,
+         let refreshToken = json["refresh_token"] as? String,
+         let status = http?.statusCode,
+         (200..<300).contains(status) {
+        let expiresIn = (json["expires_in"] as? NSNumber)?.doubleValue ?? 14_400
+        let token = SimpleOAuthToken(
+          accessToken: accessToken,
+          expiresAt: Date().timeIntervalSince1970 + max(60, expiresIn - 60),
+          userID: nil,
+          refreshToken: refreshToken
+        )
+        OAuthKeychain.save(token, account: self.tokenAccount)
+        self.validate(accessToken: accessToken) { result in
+          if case .success(let userID) = result {
+            OAuthKeychain.save(SimpleOAuthToken(
+              accessToken: token.accessToken,
+              expiresAt: token.expiresAt,
+              userID: userID,
+              refreshToken: token.refreshToken
+            ), account: self.tokenAccount)
+          }
+        }
+        self.finishDeviceAuthorization(deviceCode: deviceCode, completion: completion, result: .success(()))
+        return
+      }
+      let message = ((json["message"] as? String) ?? (json["error"] as? String) ?? "").lowercased()
+      if message.contains("authorization_pending") {
+        self.scheduleDevicePoll(deviceCode: deviceCode, expiresAt: expiresAt, interval: interval, completion: completion)
+      } else if message.contains("slow_down") {
+        self.scheduleDevicePoll(deviceCode: deviceCode, expiresAt: expiresAt, interval: interval + 5, completion: completion)
+      } else if http?.statusCode == 429 || (http?.statusCode ?? 0) >= 500 {
+        self.scheduleDevicePoll(deviceCode: deviceCode, expiresAt: expiresAt, interval: min(60, interval * 2), completion: completion)
+      } else {
+        self.finishDeviceAuthorization(
+          deviceCode: deviceCode,
+          completion: completion,
+          result: .failure(OAuthServiceError.message(message.isEmpty ? "Twitch token取得に失敗しました" : message))
+        )
+      }
+    }.resume()
+  }
+
+  private func finishDeviceAuthorization(
+    deviceCode: String,
+    completion: @escaping (Result<Void, Error>) -> Void,
+    result: Result<Void, Error>
+  ) {
+    DispatchQueue.main.async {
+      guard self.activeDeviceCode == deviceCode else { return }
+      self.devicePollWorkItem?.cancel()
+      self.devicePollWorkItem = nil
+      self.activeDeviceCode = nil
+      self.deviceAuthAlert?.dismiss(animated: true)
+      Self.finish(completion, result)
     }
   }
 
+  func maintainSession() {
+    guard let token = OAuthKeychain.load(account: tokenAccount),
+          token.expiresAt - Date().timeIntervalSince1970 <= 300 else { return }
+    withValidToken(minimumValidity: 300) { _ in }
+  }
+
   func sendChat(channel: String, content: String, completion: @escaping (Result<Void, Error>) -> Void) {
-    guard let token = OAuthKeychain.load(account: tokenAccount), token.isValid, let senderID = token.userID else {
-      Self.finish(completion, .failure(OAuthServiceError.message("Twitchにログインしてください")))
-      return
-    }
-    resolveUserID(login: channel, accessToken: token.accessToken) { result in
+    withValidToken { result in
       switch result {
       case .failure(let error):
         Self.finish(completion, .failure(error))
-      case .success(let broadcasterID):
-        self.postMessage(broadcasterID: broadcasterID, senderID: senderID, message: content, accessToken: token.accessToken, completion: completion)
+      case .success(let token):
+        guard let senderID = token.userID else {
+          Self.finish(completion, .failure(OAuthServiceError.message("TwitchユーザーIDを取得できません")))
+          return
+        }
+        self.resolveUserID(login: channel, accessToken: token.accessToken) { result in
+          switch result {
+          case .failure(let error):
+            Self.finish(completion, .failure(error))
+          case .success(let broadcasterID):
+            self.postMessage(broadcasterID: broadcasterID, senderID: senderID, message: content, accessToken: token.accessToken, completion: completion)
+          }
+        }
       }
     }
   }
 
   func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
     authAnchor ?? ASPresentationAnchor()
+  }
+
+  private func withValidToken(
+    minimumValidity: TimeInterval = 60,
+    completion: @escaping (Result<SimpleOAuthToken, Error>) -> Void
+  ) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async {
+        self.withValidToken(minimumValidity: minimumValidity, completion: completion)
+      }
+      return
+    }
+    guard let token = OAuthKeychain.load(account: tokenAccount) else {
+      Self.finish(completion, .failure(OAuthServiceError.message("Twitchにログインしてください")))
+      return
+    }
+    let remaining = token.expiresAt - Date().timeIntervalSince1970
+    if remaining > minimumValidity || (remaining > 0 && token.refreshToken?.isEmpty != false) {
+      ensureUserID(token: token, completion: completion)
+      return
+    }
+    guard token.refreshToken?.isEmpty == false else {
+      Self.finish(completion, .failure(OAuthServiceError.message("Twitchログインの期限が切れました。設定から一度だけ再ログインしてください（以降は自動更新されます）")))
+      return
+    }
+    refreshAccessToken(previous: token) { result in
+      switch result {
+      case .failure(let error):
+        Self.finish(completion, .failure(error))
+      case .success(let refreshed):
+        self.ensureUserID(token: refreshed, completion: completion)
+      }
+    }
+  }
+
+  private func ensureUserID(
+    token: SimpleOAuthToken,
+    completion: @escaping (Result<SimpleOAuthToken, Error>) -> Void
+  ) {
+    if token.userID?.isEmpty == false {
+      Self.finish(completion, .success(token))
+      return
+    }
+    validate(accessToken: token.accessToken) { result in
+      switch result {
+      case .failure(let error):
+        Self.finish(completion, .failure(error))
+      case .success(let userID):
+        let updated = SimpleOAuthToken(
+          accessToken: token.accessToken,
+          expiresAt: token.expiresAt,
+          userID: userID,
+          refreshToken: token.refreshToken
+        )
+        OAuthKeychain.save(updated, account: self.tokenAccount)
+        Self.finish(completion, .success(updated))
+      }
+    }
+  }
+
+  private func refreshAccessToken(
+    previous: SimpleOAuthToken,
+    completion: @escaping (Result<SimpleOAuthToken, Error>) -> Void
+  ) {
+    guard Thread.isMainThread else {
+      DispatchQueue.main.async {
+        self.refreshAccessToken(previous: previous, completion: completion)
+      }
+      return
+    }
+    refreshWaiters.append(completion)
+    guard !refreshInFlight else { return }
+    refreshInFlight = true
+    var request = URLRequest(url: URL(string: "https://id.twitch.tv/oauth2/token")!)
+    request.httpMethod = "POST"
+    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+    request.httpBody = Self.formBody([
+      "client_id": config.clientId,
+      "grant_type": "refresh_token",
+      "refresh_token": previous.refreshToken ?? ""
+    ])
+    URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+      guard let self else { return }
+      let result: Result<SimpleOAuthToken, Error>
+      let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+      if let error {
+        result = .failure(error)
+      } else if let data,
+                (200..<300).contains(status),
+                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let accessToken = json["access_token"] as? String,
+                let refreshToken = json["refresh_token"] as? String {
+        let expiresIn = (json["expires_in"] as? NSNumber)?.doubleValue ?? 14_400
+        result = .success(SimpleOAuthToken(
+          accessToken: accessToken,
+          expiresAt: Date().timeIntervalSince1970 + max(60, expiresIn - 60),
+          userID: previous.userID,
+          refreshToken: refreshToken
+        ))
+      } else {
+        let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let message = (json?["message"] as? String) ?? (json?["error_description"] as? String) ?? "Twitchトークン更新に失敗しました"
+        result = .failure(OAuthServiceError.message(message))
+      }
+      DispatchQueue.main.async {
+        if case .success(let token) = result {
+          OAuthKeychain.save(token, account: self.tokenAccount)
+        } else if status == 400 || status == 401 {
+          OAuthKeychain.save(nil, account: self.tokenAccount)
+        }
+        self.refreshInFlight = false
+        let waiters = self.refreshWaiters
+        self.refreshWaiters.removeAll()
+        waiters.forEach { Self.finish($0, result) }
+      }
+    }.resume()
   }
 
   private func validate(accessToken: String, completion: @escaping (Result<String, Error>) -> Void) {
@@ -260,6 +553,15 @@ final class TwitchAuthManager: NSObject, ASWebAuthenticationPresentationContextP
     return output
   }
 
+  private static func formBody(_ values: [String: String]) -> Data {
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+    return values.map { key, value in
+      let encodedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+      let encodedValue = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+      return "\(encodedKey)=\(encodedValue)"
+    }.joined(separator: "&").data(using: .utf8) ?? Data()
+  }
+
   private static func finish<T>(_ completion: @escaping (Result<T, Error>) -> Void, _ result: Result<T, Error>) {
     DispatchQueue.main.async { completion(result) }
   }
@@ -336,7 +638,9 @@ final class TwitcastingAuthManager: NSObject, ASWebAuthenticationPresentationCon
         Self.finish(completion, .failure(OAuthServiceError.message("ツイキャス認証の戻りURLが不正です")))
         return
       }
-      let expiresIn = Double(values["expires_in"] ?? "") ?? 3600 * 24 * 30
+      // The provider documents 15,552,000 seconds (180 days) for implicit tokens.
+      // TwitCasting does not issue refresh tokens to this public mobile flow.
+      let expiresIn = Double(values["expires_in"] ?? "") ?? 15_552_000
       OAuthKeychain.save(SimpleOAuthToken(
         accessToken: accessToken,
         expiresAt: Date().timeIntervalSince1970 + max(60, expiresIn - 60),
@@ -501,6 +805,13 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
     OAuthKeychain.save(nil, account: tokenAccount)
   }
 
+  func maintainSession() {
+    guard let token = OAuthKeychain.load(account: tokenAccount),
+          token.refreshToken?.isEmpty == false,
+          token.expiresAt - Date().timeIntervalSince1970 <= 300 else { return }
+    withValidAccessToken(minimumValidity: 300) { _ in }
+  }
+
   func signIn(presentationAnchor: ASPresentationAnchor?, completion: @escaping (Result<Void, Error>) -> Void) {
     guard let presentationAnchor else {
       Self.finish(completion, .failure(OAuthServiceError.message("YouTube認証を開始できません")))
@@ -608,12 +919,16 @@ final class YouTubeAuthManager: NSObject, ASWebAuthenticationPresentationContext
   // Returns a usable access token, transparently refreshing via the stored refresh
   // token when the current one has expired. YouTube access tokens last ~1h, which is
   // why the danmaku used to stop (and only a manual re-login fixed it).
-  private func withValidAccessToken(completion: @escaping (Result<String, Error>) -> Void) {
+  private func withValidAccessToken(
+    minimumValidity: TimeInterval = 60,
+    completion: @escaping (Result<String, Error>) -> Void
+  ) {
     guard let token = OAuthKeychain.load(account: tokenAccount) else {
       Self.finish(completion, .failure(OAuthServiceError.message("YouTubeチャット弾幕: YouTubeにログインしてください")))
       return
     }
-    if token.isValid {
+    if token.expiresAt - Date().timeIntervalSince1970 > minimumValidity
+      || (token.isValid && token.refreshToken?.isEmpty != false) {
       Self.finish(completion, .success(token.accessToken))
       return
     }

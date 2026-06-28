@@ -57,6 +57,21 @@ describe('gift event pub/sub', () => {
     unsubscribeThrowing();
     unsubscribeRecording();
   });
+
+  it('replays an event published during overlay mount and dedupes reconnect replays', () => {
+    const streamId = `niconico:pending:${Date.now()}`;
+    const event = {...giftEvent('official-message-id'), platform: 'niconico' as const};
+    const calls: GiftEvent[] = [];
+
+    publishGiftEvent(streamId, event);
+    publishGiftEvent(streamId, event);
+    const unsubscribe = subscribeGiftEvents(streamId, value => calls.push(value));
+
+    expect(calls).toEqual([event]);
+    publishGiftEvent(streamId, event);
+    expect(calls).toEqual([event]);
+    unsubscribe();
+  });
 });
 
 describe('giftEventFromChatEvent', () => {

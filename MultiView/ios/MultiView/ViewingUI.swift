@@ -35,6 +35,7 @@ final class ViewingController: UIViewController {
   private var gridDragOriginalFrames: [String: CGRect] = [:]
   private var gridDragCurrentStreams: [StreamItem] = []
   private var lastAutoReloadAt = Date.distantPast
+  private var pendingAutoReloadWorkItem: DispatchWorkItem?
   // 並び替え・追加・削除でプレイヤーを作り直さず使い回すためのセル再利用プール(stream.id -> cell)。
   private var cellPool: [String: StreamCellView] = [:]
   // 再利用セル/行に付けた高さ制約。reload のたびに貼り直すので、冒頭で必ず外す。
@@ -51,6 +52,7 @@ final class ViewingController: UIViewController {
   }
 
   deinit {
+    pendingAutoReloadWorkItem?.cancel()
     NotificationCenter.default.removeObserver(self)
   }
 
@@ -76,13 +78,19 @@ final class ViewingController: UIViewController {
   }
 
   @objc private func playbackErrored() {
-    // Debounced auto-refresh to clear a recoverable error. Capped at once per 45s
-    // and coalesced so a permanently-failing stream can't trigger a reload loop.
-    guard Date().timeIntervalSince(lastAutoReloadAt) > 45 else { return }
-    lastAutoReloadAt = Date()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-      self?.reloadAndResume()
+    // Coalesce failures, but never drop one inside the 45-second debounce window.
+    // The old guard returned without scheduling anything, leaving a Niconico cell
+    // permanently stopped when its final retry happened during the cooldown.
+    guard pendingAutoReloadWorkItem == nil else { return }
+    let remainingCooldown = max(0, 45 - Date().timeIntervalSince(lastAutoReloadAt))
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.pendingAutoReloadWorkItem = nil
+      self.lastAutoReloadAt = Date()
+      self.reloadAndResume()
     }
+    pendingAutoReloadWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + remainingCooldown + 2, execute: work)
   }
 
   override func viewDidAppear(_ animated: Bool) {

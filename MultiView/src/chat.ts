@@ -59,7 +59,7 @@ function startNiconicoChat(stream: StreamItem, emit: Emit, status: Status): Chat
     emit(
       makeChatEvent(
         'niconico',
-        `nico:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+        comment.id ? `nico:${comment.id}` : `nico:${Date.now()}:${Math.random().toString(36).slice(2)}`,
         comment.text,
         textTokens(comment.text),
         comment.author,
@@ -273,6 +273,11 @@ function handleKickMessage(text: string, emit: Emit, channel: string) {
     }
     return;
   }
+  const supportEvent = kickSupportEvent(eventName, payload);
+  if (supportEvent) {
+    emit(supportEvent);
+    return;
+  }
   if (!eventName.includes('ChatMessage')) {
     return;
   }
@@ -284,6 +289,92 @@ function handleKickMessage(text: string, emit: Emit, channel: string) {
   const author = stringValue(sender?.username) ?? stringValue(sender?.name) ?? stringValue(payload?.username);
   const id = stringValue(payload?.id) ?? `kick:${Date.now()}:${Math.random()}`;
   emit(makeChatEvent('kick', id, kickFilterText(content), kickTokens(content), author ?? undefined));
+}
+
+export function kickSupportEvent(eventName: string, payload: any): ChatEvent | null {
+  const normalized = (eventName.split('\\').pop() ?? eventName).toLowerCase();
+  if (normalized.includes('chatmessage') || payload?.isTest === true) {
+    return null;
+  }
+  const giftNames = new Set([
+    'kick.giftsubscription',
+    'giftsubscription',
+    'giftsubscriptionevent',
+    'giftedsubscriptionevent',
+    'giftedsubscriptionsevent',
+    'luckyuserswhogotgiftsubscriptionsevent',
+  ]);
+  const subscriptionNames = new Set([
+    'channelsubscriptionevent',
+    'subscriptionevent',
+    'kick.subscription',
+    'subscription',
+  ]);
+  const isGift = giftNames.has(normalized);
+  const isSubscription = subscriptionNames.has(normalized);
+  if (!isGift && !isSubscription) {
+    return null;
+  }
+  const user = payload?.user;
+  const gifter = payload?.gifter;
+  const recipientObject = payload?.recipient;
+  const actor = firstStringValue([
+    payload?.username,
+    payload?.login,
+    payload?.name,
+    payload?.gifter_username,
+    typeof payload?.gifter === 'string' ? payload.gifter : undefined,
+    typeof payload?.sender === 'string' ? payload.sender : undefined,
+    user?.username,
+    user?.login,
+    user?.name,
+    gifter?.username,
+    gifter?.login,
+    gifter?.name,
+  ]) ?? (payload?.isAnonymous === true ? '匿名' : undefined);
+  if (!actor) {
+    return null;
+  }
+  const recipient = firstStringValue([
+    payload?.recipient_username,
+    payload?.recipient_login,
+    payload?.recipient_name,
+    recipientObject?.username,
+    recipientObject?.login,
+    recipientObject?.name,
+  ]);
+  const count = firstStringValue([payload?.gifted_quantity, payload?.quantity, payload?.count]);
+  const text = isGift
+    ? count && count !== '0'
+      ? `${actor} が ${count} 件のサブスクをギフト`
+      : recipient
+        ? `${actor} が ${recipient} にサブスクをギフト`
+        : `${actor} がサブスクをギフト`
+    : `${actor} がサブスクしました`;
+  const id = firstStringValue([
+    payload?.id,
+    payload?.event_id,
+    payload?.subscription_id,
+    payload?.created_at,
+  ]) ?? `kick-support:${normalized}:${Date.now()}:${Math.random()}`;
+  return makeChatEvent(
+    'kick',
+    id,
+    text,
+    textTokens(text),
+    actor,
+    isGift ? 'Kick gift subscription' : 'Kick subscription',
+  );
+}
+
+function firstStringValue(values: any[]): string | undefined {
+  for (const value of values) {
+    const text = stringValue(value);
+    if (text) {
+      return text;
+    }
+  }
+  return undefined;
 }
 
 function startYouTubeChat(stream: StreamItem, emit: Emit, status: Status): ChatClient {

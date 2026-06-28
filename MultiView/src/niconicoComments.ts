@@ -3,7 +3,7 @@
 // pushNiconicoComment を呼ぶ。DanmakuOverlay は chat.ts 経由で subscribe して弾幕表示する。
 // raidFollow と同様、プレイヤー階層を跨ぐ通知を props 多層伝播せず module-level で配る。
 
-export type NiconicoComment = {text: string; author?: string};
+export type NiconicoComment = {id?: string; text: string; author?: string};
 type Listener = (comment: NiconicoComment) => void;
 
 const listeners = new Map<string, Set<Listener>>();

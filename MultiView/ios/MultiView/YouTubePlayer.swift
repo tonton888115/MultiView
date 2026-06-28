@@ -43,6 +43,10 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var sponsorSegments: [(start: Double, end: Double)] = []
   private var fallbackWebView: WKWebView?
   private var officialChatWebView: WKWebView?
+  private var playerWebReloadAttempt = 0
+  private var chatWebReloadAttempt = 0
+  private var playerWebReloadWorkItem: DispatchWorkItem?
+  private var chatWebReloadWorkItem: DispatchWorkItem?
   private var isStopped = false
   private var iframeAudioEnabled = false
   private var innerTubeChatSession: YouTubeInnerTubeChatSession?
@@ -527,6 +531,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
 
   func stopPlayback() {
     isStopped = true
+    playerWebReloadWorkItem?.cancel(); playerWebReloadWorkItem = nil
+    chatWebReloadWorkItem?.cancel(); chatWebReloadWorkItem = nil
     resolveTask?.cancel(); resolveTask = nil
     sponsorTask?.cancel(); sponsorTask = nil
     chatPollWorkItem?.cancel(); chatPollWorkItem = nil
@@ -987,18 +993,73 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     guard !isStopped else { return }
     if webView === officialChatWebView {
       showStatus("YouTube公式チャット再接続中")
+      scheduleWebReload(webView, error: error)
       return
     }
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
+    scheduleWebReload(webView, error: error)
   }
 
   func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
     guard !isStopped else { return }
     if webView === officialChatWebView {
       showStatus("YouTube公式チャット再接続中")
+      scheduleWebReload(webView, error: error)
       return
     }
     showStatus("YouTube読み込み失敗: \(error.localizedDescription)")
+    scheduleWebReload(webView, error: error)
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    if webView === officialChatWebView {
+      chatWebReloadAttempt = 0
+      chatWebReloadWorkItem?.cancel()
+      chatWebReloadWorkItem = nil
+    } else if webView === fallbackWebView {
+      playerWebReloadAttempt = 0
+      playerWebReloadWorkItem?.cancel()
+      playerWebReloadWorkItem = nil
+      statusLabel.isHidden = true
+      resumePlayback()
+    }
+  }
+
+  func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+    scheduleWebReload(webView, error: nil)
+  }
+
+  private func scheduleWebReload(_ webView: WKWebView, error: Error?) {
+    guard !isStopped else { return }
+    if let error = error as? URLError, error.code == .cancelled { return }
+    let isChat = webView === officialChatWebView
+    guard isChat || webView === fallbackWebView else { return }
+    if (isChat ? chatWebReloadWorkItem != nil : playerWebReloadWorkItem != nil) { return }
+    let delays: [TimeInterval] = [1, 2, 5, 10, 20, 30]
+    let attempt = isChat ? chatWebReloadAttempt : playerWebReloadAttempt
+    let delay = delays[min(attempt, delays.count - 1)]
+    if isChat {
+      chatWebReloadAttempt += 1
+    } else {
+      playerWebReloadAttempt += 1
+    }
+    let work = DispatchWorkItem { [weak self, weak webView] in
+      guard let self, let webView, !self.isStopped else { return }
+      if isChat {
+        guard webView === self.officialChatWebView else { return }
+        self.chatWebReloadWorkItem = nil
+      } else {
+        guard webView === self.fallbackWebView else { return }
+        self.playerWebReloadWorkItem = nil
+      }
+      webView.reload()
+    }
+    if isChat {
+      chatWebReloadWorkItem = work
+    } else {
+      playerWebReloadWorkItem = work
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
   }
 
   func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {

@@ -85,11 +85,11 @@ export function niconicoSessionScript(programId: string, quality: string): strin
   var nicoAt='now', nicoActive={};
   function ndgr(viewUri){ if(window.__mvNdgr) return; window.__mvNdgr=1; nicoView(viewUri); }
   function nicoView(viewUri){ var url=viewUri+(viewUri.indexOf('?')>=0?'&':'?')+'at='+encodeURIComponent(nicoAt); var any=false; readProto(url,function(msg){ any=true; var fs=pbFields(msg); var seg=sub(fs,1); if(seg){ var u=sub(pbFields(seg),3); if(u){ var su=decU(u); if(!nicoActive[su]){ nicoActive[su]=1; nicoSeg(su); } } } var nx=sub(fs,4); if(nx){ var nf=pbFields(nx); for(var i=0;i<nf.length;i++){ if(nf[i].n===1&&nf[i].v!=null) nicoAt=String(nf[i].v); } } },function(){ setTimeout(function(){ nicoView(viewUri); }, any?500:2500); }); }
-  function nicoSeg(uri){ readProto(uri,function(msg){ var fs=pbFields(msg); var m=sub(fs,2); if(!m) return; var mf=pbFields(m);
-    var chat=sub(mf,1)||sub(mf,20); if(chat){ var t=str(pbFields(chat),1); if(t) post({type:'niconicoComment',text:t}); }
-    var gift=sub(mf,8); if(gift){ var gf=pbFields(gift); var sender=str(gf,3)||'誰か'; var item=str(gf,6)||str(gf,1)||'ギフト'; post({type:'niconicoEvent',kind:'gift',text:'🎁 '+sender+' が '+item+' を贈りました'}); }
-    var ad=sub(mf,9); if(ad){ post({type:'niconicoEvent',kind:'nicoad',text:'📢 '+adText(ad)}); }
-    var noti=sub(mf,23); if(noti){ var nm=str(pbFields(noti),2); if(nm) post({type:'niconicoEvent',kind:'notification',text:'🔔 '+nm}); }
+  function nicoSeg(uri){ var seq=0; readProto(uri,function(msg){ seq++; var fs=pbFields(msg); var meta=sub(fs,1); var metaFields=meta?pbFields(meta):[]; var eventId=str(metaFields,1)||str(metaFields,2)||str(metaFields,3)||('segment:'+uri+':'+seq); var m=sub(fs,2); if(!m) return; var mf=pbFields(m);
+    var chat=sub(mf,1)||sub(mf,20); if(chat){ var t=str(pbFields(chat),1); if(t) post({type:'niconicoComment',id:eventId,text:t}); }
+    var gift=sub(mf,8); if(gift){ var gf=pbFields(gift); var sender=str(gf,3)||'誰か'; var item=str(gf,6)||str(gf,1)||'ギフト'; post({type:'niconicoEvent',id:eventId,kind:'gift',text:'🎁 '+sender+' が '+item+' を贈りました'}); }
+    var ad=sub(mf,9); if(ad){ post({type:'niconicoEvent',id:eventId,kind:'nicoad',text:'📢 '+adText(ad)}); }
+    var noti=sub(mf,23); if(noti){ var nm=str(pbFields(noti),2); if(nm) post({type:'niconicoEvent',id:eventId,kind:'notification',text:'🔔 '+nm}); }
   },function(){ delete nicoActive[uri]; }); }
   function openWS(ws){
     var url=ws.url;

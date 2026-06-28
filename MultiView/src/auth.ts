@@ -69,6 +69,10 @@ const kickRedirect = 'https://tonton888115.github.io/MultiView/kick-oauth.html';
 const twitcastingRedirect = 'multiview://twitcasting-oauth';
 const youtubeRedirect = 'multiview://youtube-oauth';
 const twitchChatScopes = 'user:read:chat user:write:chat';
+const authRefreshLeadMs = 5 * 60_000;
+const twitchValidationIntervalMs = 60 * 60_000;
+const refreshFlights = new Map<OAuthService, Promise<OAuthToken>>();
+let lastTwitchValidationAt = 0;
 
 const browserHeaders = {
   Accept: 'application/json, text/plain, */*',
@@ -142,6 +146,9 @@ export function authStatus(auth: AuthState, service: OAuthService): string {
     return '未ログイン';
   }
   if (token.expiresAt > Date.now()) {
+    if (service === 'twitch' && !token.refreshToken) {
+      return 'ログイン済み（再ログインで自動更新を有効化）';
+    }
     return 'ログイン済み';
   }
   return token.refreshToken ? 'ログイン済み（自動更新）' : '期限切れ';
@@ -309,7 +316,9 @@ export async function completeOAuthRedirect(auth: AuthState, pending: PendingOAu
     }
     return saveToken(auth, 'twitcasting', {
       accessToken,
-      expiresAt: expiryFromNow(values.expires_in, 3600 * 24 * 30),
+      // TwitCasting implicit tokens are valid for 15,552,000 seconds (180 days)
+      // and the provider does not issue refresh tokens to public mobile clients.
+      expiresAt: expiryFromNow(values.expires_in, 15_552_000),
       scope: values.scope,
     });
   }
@@ -345,6 +354,23 @@ export async function requestYouTubeDeviceCode(auth: AuthState): Promise<YouTube
     expiresAt: Date.now() + Number(json.expires_in ?? 900) * 1000,
     intervalSeconds: Math.max(3, Number(json.interval ?? 5)),
   };
+}
+
+export function mergeAuthMaintenanceSnapshot(
+  base: AuthState,
+  current: AuthState,
+  maintained: AuthState,
+): AuthState {
+  let merged = current;
+  (['kick', 'twitch', 'twitcasting', 'youtube'] as OAuthService[]).forEach(service => {
+    const baseValue = JSON.stringify(base[service]);
+    if (JSON.stringify(maintained[service]) === baseValue
+      || JSON.stringify(current[service]) !== baseValue) {
+      return;
+    }
+    merged = {...merged, [service]: maintained[service]};
+  });
+  return merged;
 }
 
 export async function requestTwitchDeviceCode(auth: AuthState): Promise<PendingDeviceOAuth> {
@@ -480,6 +506,60 @@ export async function postStreamComment(
 
 export function openURL(url: string) {
   return Linking.openURL(url);
+}
+
+export async function maintainAuthSessions(
+  auth: AuthState,
+  onAuthUpdated?: (nextAuth: AuthState) => void | Promise<void>,
+): Promise<AuthState> {
+  let current = auth;
+  const twitch = current.twitch.token;
+  if (twitch && Date.now() - lastTwitchValidationAt >= twitchValidationIntervalMs) {
+    lastTwitchValidationAt = Date.now();
+    try {
+      const validation = await validateTwitchSession(twitch.accessToken);
+      const expiresAt = validation.expiresInSeconds == null
+        ? twitch.expiresAt
+        : Date.now() + Math.max(60, validation.expiresInSeconds - 60) * 1000;
+      if (validation.userID !== twitch.userID || expiresAt !== twitch.expiresAt) {
+        current = saveToken(current, 'twitch', {...twitch, userID: validation.userID, expiresAt});
+        await onAuthUpdated?.(current);
+      }
+    } catch (error) {
+      if (isTerminalOAuthFailure(error)) {
+        if (twitch.refreshToken) {
+          try {
+            const refreshed = await authorizedToken(current, 'twitch', onAuthUpdated, Number.POSITIVE_INFINITY);
+            current = refreshed.auth;
+          } catch (refreshError) {
+            if (isTerminalOAuthFailure(refreshError)) {
+              current = signOut(current, 'twitch');
+              await onAuthUpdated?.(current);
+            }
+          }
+        } else {
+          current = signOut(current, 'twitch');
+          await onAuthUpdated?.(current);
+        }
+      }
+    }
+  }
+
+  for (const service of ['kick', 'twitch', 'youtube'] as OAuthService[]) {
+    const token = current[service].token;
+    if (!token?.refreshToken || token.expiresAt > Date.now() + authRefreshLeadMs) {
+      continue;
+    }
+    try {
+      const refreshed = await authorizedToken(current, service, onAuthUpdated, authRefreshLeadMs);
+      current = refreshed.auth;
+    } catch (error) {
+      if (isTerminalOAuthFailure(error)) {
+        current = signOut(current, service);
+      }
+    }
+  }
+  return current;
 }
 
 async function postKick(
@@ -627,46 +707,64 @@ async function authorizedToken(
   auth: AuthState,
   service: OAuthService,
   onAuthUpdated?: (nextAuth: AuthState) => void | Promise<void>,
+  minimumValidityMs = 60_000,
 ): Promise<{auth: AuthState; token: OAuthToken}> {
   const token = auth[service].token;
   if (!token) {
     throw new Error(`${serviceLabel(service)}にログインしてください`);
   }
-  if (token.expiresAt > Date.now()) {
+  if (token.expiresAt > Date.now() + minimumValidityMs) {
     return {auth, token};
   }
   if (!token.refreshToken) {
     throw new Error(`${serviceLabel(service)}ログインの期限が切れました。再ログインしてください`);
   }
   try {
-    if (service === 'kick') {
-      const next = await refreshKickToken(auth.kick.config, token.refreshToken);
-      const nextAuth = saveToken(auth, 'kick', next);
-      await onAuthUpdated?.(nextAuth);
-      return {auth: nextAuth, token: next};
-    }
-    if (service === 'twitch') {
-      const next = await refreshTwitchToken(auth.twitch.config, token);
-      const nextAuth = saveToken(auth, 'twitch', next);
-      await onAuthUpdated?.(nextAuth);
-      return {auth: nextAuth, token: next};
-    }
-    if (service === 'youtube') {
-      const next = await refreshYouTubeToken(auth.youtube.config, token.refreshToken);
-      const nextAuth = saveToken(auth, 'youtube', next);
-      await onAuthUpdated?.(nextAuth);
-      return {auth: nextAuth, token: next};
-    }
+    const next = await refreshTokenSingleFlight(auth, service, token);
+    const nextAuth = saveToken(auth, service, next);
+    await onAuthUpdated?.(nextAuth);
+    return {auth: nextAuth, token: next};
   } catch (error) {
     if (isTerminalOAuthFailure(error)) {
       await onAuthUpdated?.(signOut(auth, service));
     }
     throw error;
   }
-  throw new Error(`${serviceLabel(service)}ログインの期限が切れました。再ログインしてください`);
+}
+
+function refreshTokenSingleFlight(auth: AuthState, service: OAuthService, token: OAuthToken): Promise<OAuthToken> {
+  const active = refreshFlights.get(service);
+  if (active) {
+    return active;
+  }
+  const refreshToken = token.refreshToken;
+  if (!refreshToken) {
+    return Promise.reject(new Error(`${serviceLabel(service)} refresh tokenがありません`));
+  }
+  let flight: Promise<OAuthToken>;
+  if (service === 'kick') {
+    flight = refreshKickToken(auth.kick.config, refreshToken);
+  } else if (service === 'twitch') {
+    flight = refreshTwitchToken(auth.twitch.config, token);
+  } else if (service === 'youtube') {
+    flight = refreshYouTubeToken(auth.youtube.config, refreshToken);
+  } else {
+    flight = Promise.reject(new Error('ツイキャスはrefresh tokenを提供していません'));
+  }
+  refreshFlights.set(service, flight);
+  flight.finally(() => {
+    if (refreshFlights.get(service) === flight) {
+      refreshFlights.delete(service);
+    }
+  }).catch(() => undefined);
+  return flight;
 }
 
 async function validateTwitch(accessToken: string): Promise<string> {
+  return (await validateTwitchSession(accessToken)).userID;
+}
+
+async function validateTwitchSession(accessToken: string): Promise<{userID: string; expiresInSeconds?: number}> {
   const response = await fetch('https://id.twitch.tv/oauth2/validate', {
     headers: {Authorization: `OAuth ${accessToken}`},
   });
@@ -674,7 +772,11 @@ async function validateTwitch(accessToken: string): Promise<string> {
   if (!response.ok || !json.user_id) {
     throw taggedRefreshError(errorDescription(json, 'TwitchユーザーIDを取得できません'), response.status);
   }
-  return json.user_id;
+  const expiresIn = Number(json.expires_in);
+  return {
+    userID: json.user_id,
+    expiresInSeconds: Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : undefined,
+  };
 }
 
 async function exchangeKickCode(config: ServiceAuthConfig, code: string, verifier: string, redirectURI: string): Promise<OAuthToken> {

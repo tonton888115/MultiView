@@ -833,7 +833,11 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         self.socketTask = nil
         if let chatroomID = self.chatroomID {
           DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            self?.connectKickComments(chatroomID: chatroomID)
+            guard let self,
+                  !self.isStopped,
+                  self.fallbackWebView == nil,
+                  self.chatroomID == chatroomID else { return }
+            self.connectKickComments(chatroomID: chatroomID)
           }
         }
       case .success(let message):

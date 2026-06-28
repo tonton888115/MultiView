@@ -883,27 +883,39 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       segmentTasks.removeValue(forKey: uri)
     }
     guard let url = URL(string: uri) else { return }
-    do {
-      for try await message in protobufMessages(from: url) {
-        var handled = false
-        if let text = parseNDGRCommentText(fromChunkedMessage: message) {
-          emitDanmaku(text)
-          handled = true
+    for attempt in 1...4 {
+      do {
+        for try await message in protobufMessages(from: url) {
+          var handled = false
+          if let text = parseNDGRCommentText(fromChunkedMessage: message) {
+            emitDanmaku(text)
+            handled = true
+          }
+          if let event = parseNDGRSupportEvent(fromChunkedMessage: message) {
+            emitSupportEvent(event)
+            handled = true
+          } else if let alert = parseNDGRSupportAlert(fromChunkedMessage: message) {
+            emitSupportAlert(alert)
+            handled = true
+          }
+          if handled {
+            ndgrLastSuccessAt = Date()
+          }
         }
-        if let event = parseNDGRSupportEvent(fromChunkedMessage: message) {
-          emitSupportEvent(event)
-          handled = true
-        } else if let alert = parseNDGRSupportAlert(fromChunkedMessage: message) {
-          emitSupportAlert(alert)
-          handled = true
+        return
+      } catch {
+        if Task.isCancelled || error is CancellationError { return }
+        guard attempt < 4 else {
+          showStatus("ニコ生コメント区間の取得失敗: 再読み込み")
+          DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
+          }
+          return
         }
-        if handled {
-          ndgrLastSuccessAt = Date()
-        }
+        showStatus("ニコ生コメント区間を再取得中 (\(attempt)/3)")
+        let backoff = pow(2.0, Double(attempt - 1))
+        try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
       }
-    } catch {
-      // セグメント単体の失敗は VIEW 側の自動リトライに任せる。
-      // ステータス更新も最小限に (ニコ生再接続中はVIEW側が出す)。
     }
   }
 

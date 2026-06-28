@@ -1,5 +1,5 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {StyleSheet, Text, View} from 'react-native';
+import {NativeModules, StyleSheet, Text, View} from 'react-native';
 import {subscribeGiftEvents, type GiftEvent} from './giftEvents';
 import type {AppSettings, PlatformId, StreamItem} from './types';
 
@@ -76,7 +76,11 @@ export function GiftOverlay({stream, settings}: {stream: StreamItem; settings: A
 }
 
 export function playGiftCue(): void {
-  // TODO(sound): no RN audio dep yet — do NOT add any npm/native dependency.
+  try {
+    NativeModules.GiftSound?.play?.();
+  } catch {
+    // Sound is best-effort; visual delivery must continue.
+  }
 }
 
 const styles = StyleSheet.create({

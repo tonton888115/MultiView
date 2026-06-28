@@ -6,6 +6,8 @@ import {
   deviceOAuthErrorDisposition,
   hasUsableAuthSession,
   isOAuthRedirectForPending,
+  maintainAuthSessions,
+  mergeAuthMaintenanceSnapshot,
   nextDeviceOAuthPollInterval,
   oauthCompletionErrorDisposition,
   pollTwitchDeviceToken,
@@ -43,6 +45,101 @@ function twitchAuth(token?: AuthState['twitch']['token']): AuthState {
 afterEach(() => {
   globalThis.fetch = originalFetch;
   jest.restoreAllMocks();
+});
+
+describe('proactive auth maintenance', () => {
+  it('does not overwrite a login completed while maintenance was in flight', () => {
+    const base = defaultAuthState;
+    const current: AuthState = {
+      ...base,
+      youtube: {
+        ...base.youtube,
+        token: {accessToken: 'new-login', refreshToken: 'new-refresh', expiresAt: Date.now() + 3600_000},
+      },
+    };
+    const maintained: AuthState = {
+      ...base,
+      kick: {
+        ...base.kick,
+        token: {accessToken: 'maintained-kick', refreshToken: 'kick-refresh', expiresAt: Date.now() + 3600_000},
+      },
+    };
+
+    const merged = mergeAuthMaintenanceSnapshot(base, current, maintained);
+
+    expect(merged.kick.token?.accessToken).toBe('maintained-kick');
+    expect(merged.youtube.token?.accessToken).toBe('new-login');
+  });
+
+  it('refreshes an expired Kick session without waiting for a comment send', async () => {
+    const fetchMock = jest.fn().mockResolvedValue(response({
+      access_token: 'kick-access-2',
+      refresh_token: 'kick-refresh-2',
+      expires_in: 3600,
+    }));
+    globalThis.fetch = fetchMock as typeof fetch;
+    const auth: AuthState = {
+      ...defaultAuthState,
+      kick: {
+        config: {...defaultAuthState.kick.config, clientId: 'kick-client'},
+        token: {
+          accessToken: 'kick-expired',
+          refreshToken: 'kick-refresh-1',
+          expiresAt: Date.now() - 1,
+        },
+      },
+    };
+    const onAuthUpdated = jest.fn();
+
+    const next = await maintainAuthSessions(auth, onAuthUpdated);
+
+    expect(next.kick.token).toMatchObject({
+      accessToken: 'kick-access-2',
+      refreshToken: 'kick-refresh-2',
+    });
+    expect(onAuthUpdated).toHaveBeenCalledWith(next);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('coalesces concurrent refreshes so rotating refresh tokens are used once', async () => {
+    let resolveFetch!: (value: Response) => void;
+    const fetchMock = jest.fn().mockImplementation(() => new Promise<Response>(resolve => {
+      resolveFetch = resolve;
+    }));
+    globalThis.fetch = fetchMock as typeof fetch;
+    const auth: AuthState = {
+      ...defaultAuthState,
+      kick: {
+        config: {...defaultAuthState.kick.config, clientId: 'kick-client'},
+        token: {
+          accessToken: 'kick-expired',
+          refreshToken: 'kick-refresh-1',
+          expiresAt: Date.now() - 1,
+        },
+      },
+    };
+
+    const first = maintainAuthSessions(auth);
+    const second = maintainAuthSessions(auth);
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    resolveFetch(response({access_token: 'kick-access-2', refresh_token: 'kick-refresh-2', expires_in: 3600}));
+
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult.kick.token?.refreshToken).toBe('kick-refresh-2');
+    expect(secondResult.kick.token?.refreshToken).toBe('kick-refresh-2');
+  });
+
+  it('uses the provider documented 180-day TwitCasting implicit lifetime fallback', async () => {
+    const before = Date.now();
+    const next = await completeOAuthRedirect(defaultAuthState, {
+      service: 'twitcasting',
+      state: 'state',
+      redirectURI: 'multiview://twitcasting-oauth',
+    }, 'multiview://twitcasting-oauth#access_token=tc-token&state=state');
+
+    expect(next.twitcasting.token?.expiresAt).toBeGreaterThan(before + 170 * 24 * 3600 * 1000);
+  });
 });
 
 describe('auth lifecycle', () => {

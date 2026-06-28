@@ -2,7 +2,7 @@ import UIKit
 import WebKit
 import AVFoundation
 
-final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
+final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate {
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
@@ -18,6 +18,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private var itemFailedObserver: NSObjectProtocol?
   private var liveCatchUpTimer: Timer?
   private var fallbackWebView: WKWebView?
+  private var fallbackReloadAttempt = 0
+  private var fallbackReloadWorkItem: DispatchWorkItem?
   private var playbackGeneration = 0
   private let nativeRetry = NativeRetryLimiter(maxAttempts: 2)
   private var playbackVolume: Float
@@ -115,6 +117,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
 
   func stopPlayback() {
     isStopped = true
+    fallbackReloadWorkItem?.cancel()
+    fallbackReloadWorkItem = nil
     stallWatchdog.stop()
     liveCatchUpTimer?.invalidate()
     liveCatchUpTimer = nil
@@ -365,6 +369,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       web.scrollView.backgroundColor = .black
       web.scrollView.contentInsetAdjustmentBehavior = .never
       web.customUserAgent = Self.userAgent
+      web.navigationDelegate = self
       web.translatesAutoresizingMaskIntoConstraints = false
       self.insertSubview(web, belowSubview: self.danmakuView)
       NSLayoutConstraint.activate([
@@ -377,6 +382,43 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
       self.fallbackWebView = web
       self.statusLabel.isHidden = true
     }
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    guard webView === fallbackWebView else { return }
+    fallbackReloadAttempt = 0
+    fallbackReloadWorkItem?.cancel()
+    fallbackReloadWorkItem = nil
+    statusLabel.isHidden = true
+    applyFallbackVolume()
+  }
+
+  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+    scheduleFallbackReload(webView, error: error)
+  }
+
+  func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+    scheduleFallbackReload(webView, error: error)
+  }
+
+  func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+    scheduleFallbackReload(webView, error: nil)
+  }
+
+  private func scheduleFallbackReload(_ webView: WKWebView, error: Error?) {
+    guard webView === fallbackWebView, !isStopped, fallbackReloadWorkItem == nil else { return }
+    if let error = error as? URLError, error.code == .cancelled { return }
+    let delays: [TimeInterval] = [1, 2, 5, 10, 20, 30]
+    let delay = delays[min(fallbackReloadAttempt, delays.count - 1)]
+    fallbackReloadAttempt += 1
+    showStatus("ツイキャスWeb再接続中 (\(fallbackReloadAttempt))")
+    let work = DispatchWorkItem { [weak self, weak webView] in
+      guard let self, let webView, !self.isStopped, webView === self.fallbackWebView else { return }
+      self.fallbackReloadWorkItem = nil
+      webView.reload()
+    }
+    fallbackReloadWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
   }
 
   private func twitcastingHeaders() -> [String: String] {

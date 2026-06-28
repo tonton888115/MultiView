@@ -9,6 +9,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
   // control we rebuild the players (auto-refresh) instead of only nudging play,
   // because embedded players often stay paused after a takeover.
   private var needsPlaybackReload = false
+  private var authMaintenanceTimer: Timer?
 
   func application(
     _ application: UIApplication,
@@ -27,6 +28,13 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
   func applicationDidBecomeActive(_ application: UIApplication) {
     configureAudioSession()
+    maintainOAuthSessions()
+    authMaintenanceTimer?.invalidate()
+    authMaintenanceTimer = Timer.scheduledTimer(withTimeInterval: 15 * 60, repeats: true) { _ in
+      KickAuthManager.shared.maintainSession()
+      TwitchAuthManager.shared.maintainSession()
+      YouTubeAuthManager.shared.maintainSession()
+    }
     // Pull any fresh web-view logins into the native cookie jar.
     WebLoginCookies.sync()
     if needsPlaybackReload {
@@ -35,6 +43,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     } else {
       resumePlaybackSoon()
     }
+  }
+
+  func applicationWillResignActive(_ application: UIApplication) {
+    authMaintenanceTimer?.invalidate()
+    authMaintenanceTimer = nil
   }
 
   // No audio-session work when leaving the foreground: re-activating while another
@@ -52,6 +65,12 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         try? session.setActive(true, options: [])
       }
     }
+  }
+
+  private func maintainOAuthSessions() {
+    KickAuthManager.shared.maintainSession()
+    TwitchAuthManager.shared.maintainSession()
+    YouTubeAuthManager.shared.maintainSession()
   }
 
   private func installPlaybackObservers() {
@@ -219,6 +238,8 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
   private let showChat: Bool
   private var twitcastingChat: TwitcastingChatClient?
   private var twitcastingStarted = false
+  private var reloadAttempt = 0
+  private var reloadWorkItem: DispatchWorkItem?
 
   init(stream: StreamItem, settings: AppSettings) {
     playAudio = settings.playAudio
@@ -331,6 +352,8 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
 
   func stopPlayback() {
     isStopped = true
+    reloadWorkItem?.cancel()
+    reloadWorkItem = nil
     twitcastingChat?.stop()
     twitcastingChat = nil
     stopLoading()
@@ -346,7 +369,22 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
   }
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    reloadAttempt = 0
+    reloadWorkItem?.cancel()
+    reloadWorkItem = nil
     startTwitcastingChatIfNeeded()
+  }
+
+  func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+    scheduleReload(after: error)
+  }
+
+  func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+    scheduleReload(after: error)
+  }
+
+  func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+    scheduleReload(after: nil)
   }
 
   func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
@@ -364,6 +402,21 @@ final class PlayerWebView: WKWebView, PlaybackResumable, PlaybackStoppable, Audi
     twitcastingChat = TwitcastingChatClient(channel: stream.channel) { [weak self] message, user in
       self?.emitComment(message, user)
     }
+  }
+
+  private func scheduleReload(after error: Error?) {
+    guard !isStopped, reloadWorkItem == nil else { return }
+    if let error = error as? URLError, error.code == .cancelled { return }
+    let delays: [TimeInterval] = [1, 2, 5, 10, 20, 30]
+    let delay = delays[min(reloadAttempt, delays.count - 1)]
+    reloadAttempt += 1
+    let work = DispatchWorkItem { [weak self] in
+      guard let self, !self.isStopped else { return }
+      self.reloadWorkItem = nil
+      self.reloadFromOrigin()
+    }
+    reloadWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
   }
 
   private func emitComment(_ message: String, _ user: String) {
