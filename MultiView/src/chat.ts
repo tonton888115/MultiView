@@ -1,5 +1,6 @@
 import {desktopUserAgent, mobileUserAgent, resolveLiveYouTubeVideoID, webStreamURL, youtubeVideoId} from './playback';
 import {kickFilterText, kickTokens, makeChatEvent, parseTwitchTags, textTokens, twitchTokens} from './danmaku';
+import {isDanmakuEnabled} from './danmakuQueue';
 import {kickHostTarget, reportRaid, twitchRaidTarget} from './raidFollow';
 import {subscribeNiconicoComments} from './niconicoComments';
 import type {AppSettings, ChatEvent, DanmakuToken, PlatformId, StreamItem} from './types';
@@ -34,7 +35,7 @@ const youtubeChatSeenLimit = 20000;
 const youtubeChatSeenKeep = 12000;
 
 export function startChatClient(stream: StreamItem, settings: AppSettings, emit: Emit, status: Status): ChatClient {
-  if (!settings.showChat || !settings.showDanmaku) {
+  if (!isDanmakuEnabled(settings)) {
     return emptyClient();
   }
   switch (stream.platform) {

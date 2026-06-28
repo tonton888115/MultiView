@@ -1,13 +1,12 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {Animated, Easing, Image, StyleSheet, Text, View} from 'react-native';
 import {estimateTokenWidth, textFromTokens, textTokens} from './danmaku';
+import {appendDanmakuEvent, consumeDanmakuEvent, DanmakuEventQueue, isDanmakuEnabled, isRecentDanmakuDuplicate} from './danmakuQueue';
 import {startChatClient} from './chat';
 import {YouTubeOfficialChatBridge} from './YouTubeOfficialChatBridge';
 import {giftEventFromChatEvent, publishGiftEvent} from './giftEvents';
 import type {AppSettings, ChatEvent, DanmakuToken, StreamItem} from './types';
 
-const danmakuBacklogLimit = 20000;
-const duplicateWindowMs = 10000;
 const officialYouTubePrimaryMs = 10000;
 
 type Layout = {
@@ -40,15 +39,17 @@ type LaneReservation = {
 export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings: AppSettings}) {
   const [layout, setLayout] = useState<Layout>({width: 0, height: 0});
   const [visible, setVisible] = useState<VisibleItem[]>([]);
-  const queueRef = useRef<ChatEvent[]>([]);
+  const queueRef = useRef(new DanmakuEventQueue());
   const visibleRef = useRef<VisibleItem[]>([]);
   const laneReservationsRef = useRef<LaneReservation[]>([]);
   const laneCursorRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const recentFingerprintsRef = useRef<Map<string, number>>(new Map());
+  const scheduleDrainRef = useRef<() => void>(() => undefined);
+  const recentEventsRef = useRef<Map<string, number>>(new Map());
   const officialYouTubeActiveUntilRef = useRef(0);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  const showDanmaku = settings.showDanmaku;
 
   const fontSize = useMemo(() => scaledFontSize(settings.danmakuFontSize, layout.width), [layout.width, settings.danmakuFontSize]);
   const lineHeight = fontSize + 8;
@@ -179,15 +180,18 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       let consumed = 0;
       const maxBurst = Math.max(5, laneCount * 5);
       while (queueRef.current.length > 0 && consumed < maxBurst) {
-        const next = queueRef.current[0];
+        const next = queueRef.current.peek();
+        if (!next) {
+          break;
+        }
         if (isSuppressedYouTubeFallback(next, officialYouTubeActiveUntilRef.current)) {
-          queueRef.current.shift();
+          consumeDanmakuEvent(queueRef.current);
           continue;
         }
         if (!emitNow(next)) {
           break;
         }
-        queueRef.current.shift();
+        consumeDanmakuEvent(queueRef.current);
         consumed += 1;
       }
       if (queueRef.current.length > 0) {
@@ -199,50 +203,49 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
     };
     timerRef.current = setTimeout(drain, 16);
   }, [emitNow, laneCount, layout.height, layout.width]);
+  scheduleDrainRef.current = scheduleDrain;
 
   const enqueueEvent = useCallback(
     (event: ChatEvent) => {
       if (isOfficialYouTubeEvent(event)) {
         officialYouTubeActiveUntilRef.current = Date.now() + officialYouTubePrimaryMs;
-        queueRef.current = queueRef.current.filter(
-          queued => !isSuppressedYouTubeFallback(queued, officialYouTubeActiveUntilRef.current),
+        queueRef.current.removeWhere(
+          queued => isSuppressedYouTubeFallback(queued, officialYouTubeActiveUntilRef.current),
         );
       } else if (isSuppressedYouTubeFallback(event, officialYouTubeActiveUntilRef.current)) {
         return;
       }
-      if (isRecentDuplicate(event, recentFingerprintsRef.current)) {
+      if (isRecentDanmakuDuplicate(event, recentEventsRef.current)) {
         return;
       }
-      queueRef.current.push(event);
-      if (queueRef.current.length > danmakuBacklogLimit) {
-        queueRef.current.splice(0, queueRef.current.length - danmakuBacklogLimit);
-      }
+      appendDanmakuEvent(queueRef.current, event);
       const giftEvent = giftEventFromChatEvent(stream.id, event);
       if (giftEvent) {
         publishGiftEvent(stream.id, giftEvent);
       }
-      scheduleDrain();
+      scheduleDrainRef.current();
     },
-    [scheduleDrain, stream.id],
+    [stream.id],
   );
   const ignoreStatus = useCallback(() => undefined, []);
 
   useEffect(() => {
-    if (!settings.showChat || !settings.showDanmaku) {
+    if (!showDanmaku) {
       return;
     }
-    const recentFingerprints = recentFingerprintsRef.current;
+    const queue = queueRef.current;
+    const recentEvents = recentEventsRef.current;
     const client = startChatClient(
       stream,
-      settings,
+      settingsRef.current,
       enqueueEvent,
       ignoreStatus,
     );
     return () => {
       client.stop();
-      queueRef.current = [];
+      queue.clear();
       laneReservationsRef.current = [];
-      recentFingerprints.clear();
+      recentEvents.clear();
       officialYouTubeActiveUntilRef.current = 0;
       if (timerRef.current) {
         clearTimeout(timerRef.current);
@@ -250,9 +253,9 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       }
       updateVisible(() => []);
     };
-  }, [enqueueEvent, ignoreStatus, settings, stream, updateVisible]);
+  }, [enqueueEvent, ignoreStatus, showDanmaku, stream, updateVisible]);
 
-  if (!settings.showChat || !settings.showDanmaku) {
+  if (!isDanmakuEnabled(settings)) {
     return null;
   }
 
@@ -270,6 +273,7 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
             {
               top: item.lane * item.lineHeight + 6,
               minHeight: item.lineHeight,
+              opacity: settings.danmakuOpacity,
               transform: [{translateX: item.x}],
             },
           ]}>
@@ -290,7 +294,7 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
             ) : (
               <Text
                 key={`${item.key}:txt:${index}`}
-                style={[styles.text, {fontSize: item.fontSize, lineHeight: item.lineHeight, color: `rgba(255,255,255,${settings.danmakuOpacity})`}]}>
+                style={[styles.text, {fontSize: item.fontSize, lineHeight: item.lineHeight}]}>
                 {token.text}
               </Text>
             ),
@@ -302,41 +306,6 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       )}
     </View>
   );
-}
-
-function isRecentDuplicate(event: ChatEvent, recent: Map<string, number>): boolean {
-  const now = Date.now();
-  for (const [key, timestamp] of recent) {
-    if (now - timestamp > duplicateWindowMs) {
-      recent.delete(key);
-    }
-  }
-  const key = eventFingerprint(event);
-  if (recent.has(key)) {
-    return true;
-  }
-  recent.set(key, now);
-  return false;
-}
-
-function eventFingerprint(event: ChatEvent): string {
-  if (event.platform !== 'youtube') {
-    return [event.platform, event.id].join('\u001f');
-  }
-  const author = normalizeFingerprintText(event.author ?? '').toLowerCase();
-  const visibleText = normalizeFingerprintText(event.text === 'emoji' ? textFromTokens(event.tokens) : event.text);
-  const superInfo = normalizeFingerprintText(event.superInfo ?? '');
-  if (visibleText && visibleText !== 'emoji') {
-    return [event.platform, author, visibleText, superInfo].join('\u001f');
-  }
-  const tokenKey = event.tokens
-    .map(token => (token.kind === 'image' ? `img:${token.url}:${token.alt ?? ''}` : `txt:${normalizeFingerprintText(token.text)}`))
-    .join('|');
-  return [event.platform, author, visibleText || 'emoji', superInfo, tokenKey].join('\u001f');
-}
-
-function normalizeFingerprintText(value: string): string {
-  return value.replace(/\s+/g, ' ').trim();
 }
 
 function isOfficialYouTubeEvent(event: ChatEvent): boolean {
@@ -362,6 +331,8 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
     left: 0,
+    zIndex: 12,
+    elevation: 12,
     overflow: 'hidden',
   },
   item: {
@@ -380,6 +351,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255, 222, 80, 0.12)',
   },
   text: {
+    color: '#fff',
     fontWeight: '900',
     textShadowColor: 'rgba(0,0,0,0.95)',
     textShadowRadius: 3,

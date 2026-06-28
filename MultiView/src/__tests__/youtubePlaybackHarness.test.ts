@@ -95,6 +95,7 @@ describe('YouTube playback regression harness', () => {
   it('requires YouTube chat fixes to exist on both Android JS and iOS Swift paths', () => {
     const chat = readProjectFile('src/chat.ts');
     const overlay = readProjectFile('src/DanmakuOverlay.tsx');
+    const queue = readProjectFile('src/danmakuQueue.ts');
     const officialBridge = readProjectFile('src/YouTubeOfficialChatBridge.tsx');
     const swift = readProjectFile('ios/MultiView/YouTubePlayer.swift');
 
@@ -102,27 +103,38 @@ describe('YouTube playback regression harness', () => {
     expect(chat).toContain('const youtubeChatMaxPollMs = 1600');
     expect(chat).toContain('export function youtubeChatPollDelayMs');
     expect(chat).toContain("?? 'emoji'");
-    expect(overlay).toContain('const danmakuBacklogLimit = 20000');
     expect(overlay).toContain('YouTubeOfficialChatBridge');
-    expect(overlay).toContain('duplicateWindowMs = 10000');
     expect(overlay).toContain('officialYouTubePrimaryMs = 10000');
     expect(overlay).toContain('laneReservationsRef');
     expect(overlay).toContain('Easing.linear');
     expect(overlay).toContain('isSuppressedYouTubeFallback');
+    expect(overlay).toContain('opacity: settings.danmakuOpacity');
+    expect(overlay).toContain("color: '#fff'");
+    expect(overlay).not.toContain('rgba(255,255,255,${settings.danmakuOpacity})');
+    expect(overlay).toContain('zIndex: 12');
+    expect(overlay).toContain('elevation: 12');
+    expect(overlay).toContain('const showDanmaku = settings.showDanmaku');
+    expect(overlay).not.toContain('if (!settings.showChat || !settings.showDanmaku)');
+    expect(queue).toContain('const duplicateWindowMs = 10000');
+    expect(queue).toContain('return settings.showDanmaku');
+    expect(queue).toContain('class DanmakuEventQueue');
+    expect(queue).toContain('this.head += 1');
+    expect(queue).not.toContain('.shift(');
     expect(officialBridge).toContain('youtubeOfficialChatObserverScript');
     expect(officialBridge).toContain('MutationObserver');
     expect(officialBridge).toContain('yt-live-chat-text-message-renderer');
     expect(officialBridge).toContain('yt-live-chat-paid-sticker-renderer');
+    expect(officialBridge).toContain('yt-live-chat-donation-announcement-renderer');
+    expect(officialBridge).toContain("element.__mvFallbackChatID = 'fallback:'");
+    expect(officialBridge).not.toContain("querySelectorAll('#sticker img, #content img.emoji')");
     expect(officialBridge).not.toContain('yt-live-chat-viewer-engagement-message-renderer');
     expect(officialBridge).not.toContain('yt-live-chat-mode-change-message-renderer');
     expect(officialBridge).not.toContain('yt-live-chat-auto-mod-message-renderer');
 
     expect(swift).toContain('private let youtubeChatMinPollInterval: TimeInterval = 0.7');
     expect(swift).toContain('private let youtubeChatMaxPollInterval: TimeInterval = 1.6');
-    expect(swift).toContain('private let youtubeChatBacklogLimit = 20000');
     expect(swift).toContain('var containsImage: Bool');
     expect(swift).toContain('let imageOnlyFallback = messageTokens.containsImage');
-    expect(swift).toContain('private let youtubeChatDuplicateWindow: TimeInterval = 10');
     expect(swift).toContain('private let youtubeOfficialChatPrimaryWindow: TimeInterval = 10');
     expect(swift).toContain('officialChatActiveUntil');
     expect(swift).toContain('message.id.hasPrefix("yt-dom:")');
@@ -153,6 +165,18 @@ describe('YouTube playback regression harness', () => {
     expect(viewerCount).toContain('originalViewCount');
     expect(viewerCount).not.toContain('watching now');
     expect(viewerCount).not.toContain('人が視聴');
+  });
+
+  it('documents the iOS legacy showChat setting as the native danmaku toggle', () => {
+    const models = readProjectFile('ios/MultiView/Models.swift');
+    const screens = readProjectFile('ios/MultiView/Screens.swift');
+    const swift = readProjectFile('ios/MultiView/YouTubePlayer.swift');
+
+    expect(models).toContain('iOS legacy naming');
+    expect(screens).toContain('cell.textLabel?.text = "弾幕を表示"');
+    expect(screens).toContain('AppState.shared.settings.showChat');
+    expect(swift).toContain('guard settings.showChat else { return }');
+    expect(swift).toContain('guard !isStopped, settings.showChat, pendingChatHead < pendingChatMessages.count else { return }');
   });
 });
 

@@ -42,6 +42,8 @@ enum PlaybackQuality: String, Codable {
 
 struct AppSettings: Codable {
   var settingsVersion = 3
+  // iOS legacy naming: this backs the "弾幕を表示" setting and controls
+  // native danmaku polling/rendering. Android has a separate showDanmaku key.
   var showChat = true
   var showViewerCount = true
   var playAudio = true

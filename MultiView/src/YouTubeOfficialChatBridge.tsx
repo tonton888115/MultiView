@@ -146,6 +146,7 @@ export const youtubeOfficialChatObserverScript = `
   var seenOrder = [];
   var maxSeen = 20000;
   var keepSeen = 12000;
+  var fallbackSequence = 0;
   var rendererSelector = [
     'yt-live-chat-text-message-renderer',
     'yt-live-chat-paid-message-renderer',
@@ -153,7 +154,8 @@ export const youtubeOfficialChatObserverScript = `
     'yt-live-chat-membership-item-renderer',
     'yt-live-chat-sponsorships-gift-purchase-announcement-renderer',
     'yt-live-chat-sponsorships-gift-redemption-announcement-renderer',
-    'yt-live-chat-gift-membership-received-renderer'
+    'yt-live-chat-gift-membership-received-renderer',
+    'yt-live-chat-donation-announcement-renderer'
   ].join(',');
 
   function post(payload) {
@@ -248,7 +250,9 @@ export const youtubeOfficialChatObserverScript = `
 
   function parseRenderer(element) {
     var tokens = [];
-    Array.prototype.forEach.call(element.querySelectorAll('#sticker img, #content img.emoji'), function(img) {
+    // Message emoji are collected in DOM order from #message below. Prepending
+    // #content img.emoji here duplicated every emoji token in normal messages.
+    Array.prototype.forEach.call(element.querySelectorAll('#sticker img'), function(img) {
       var url = imageURL(img);
       if (url) {
         tokens.push({kind: 'image', url: url, alt: img.alt || img.getAttribute('aria-label') || 'sticker'});
@@ -275,7 +279,16 @@ export const youtubeOfficialChatObserverScript = `
       text = 'emoji';
     }
     if (!text && !superInfo) { return null; }
-    var id = element.id || element.getAttribute('data-id') || [author, text, superInfo, tokens.map(function(token) { return token.url || token.text || ''; }).join('|')].join('|');
+    var id = element.id || element.getAttribute('data-id');
+    if (!id) {
+      // Preserve identity for repeated scans of this renderer, while keeping two
+      // distinct same-looking comments as separate official chat events.
+      if (!element.__mvFallbackChatID) {
+        fallbackSequence += 1;
+        element.__mvFallbackChatID = 'fallback:' + Date.now() + ':' + fallbackSequence;
+      }
+      id = element.__mvFallbackChatID;
+    }
     return {type: 'chat', id: id, author: author, text: text, tokens: tokens, superInfo: superInfo || undefined};
   }
 

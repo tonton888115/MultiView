@@ -5,7 +5,6 @@ import {
   AppState,
   Animated,
   Modal,
-  SafeAreaView,
   ScrollView,
   PanResponder,
   Pressable,
@@ -15,9 +14,11 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  useWindowDimensions,
   View,
   Linking,
 } from 'react-native';
+import {SafeAreaView} from 'react-native-safe-area-context';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {WebView, type WebViewMessageEvent} from 'react-native-webview';
 import {DanmakuOverlay} from './src/DanmakuOverlay';
@@ -25,20 +26,33 @@ import {GiftOverlay} from './src/GiftOverlay';
 import {NativeHlsPlayer} from './src/NativeHlsPlayer';
 import {
   AUTH_STORAGE_KEY,
+  PENDING_DEVICE_OAUTH_STORAGE_KEY,
+  PENDING_OAUTH_STORAGE_KEY,
   authStatus,
   completeOAuthRedirect,
+  createOAuthURLSingleFlight,
   createOAuthStart,
   defaultAuthState,
+  deviceOAuthErrorDisposition,
+  hasUsableAuthSession,
+  isOAuthRedirectForPending,
+  nextDeviceOAuthPollInterval,
+  oauthCompletionErrorDisposition,
   openURL,
+  pollTwitchDeviceToken,
   pollYouTubeDeviceToken,
   postStreamComment,
+  requestTwitchDeviceCode,
   requestYouTubeDeviceCode,
   sanitizeAuthState,
+  sanitizePendingDeviceOAuth,
+  sanitizePendingOAuth,
   serviceLabel,
   signOut,
   updateAuthConfig,
   type AuthState,
   type OAuthService,
+  type PendingDeviceOAuth,
   type PendingOAuth,
 } from './src/auth';
 import {compactHandoffCode, decodeHandoff, handoffURL} from './src/handoff';
@@ -65,6 +79,7 @@ import {publishGiftEvent} from './src/giftEvents';
 import {startPlaybackService, stopPlaybackService} from './src/playbackService';
 import {useNetworkType} from './src/network';
 import {parseStreamURL} from './src/streamURL';
+import {appSafeAreaEdges, focusedPaneLayout} from './src/layout';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -221,12 +236,37 @@ export default function App() {
   const [volumes, setVolumes] = useState<Record<string, number>>({});
   const [auth, setAuth] = useState<AuthState>(defaultAuthState);
   const [pendingOAuth, setPendingOAuth] = useState<PendingOAuth | null>(null);
+  const [pendingDeviceOAuth, setPendingDeviceOAuth] = useState<PendingDeviceOAuth | null>(null);
   const [niconicoLoginOpen, setNiconicoLoginOpen] = useState(false);
   const authRef = useRef(auth);
   const pendingOAuthRef = useRef(pendingOAuth);
   const pendingHandoffURLRef = useRef<string | null>(null);
+  const pendingOAuthURLRef = useRef<string | null>(null);
+  const oauthURLSingleFlightRef = useRef(createOAuthURLSingleFlight());
   authRef.current = auth;
   pendingOAuthRef.current = pendingOAuth;
+
+  const updateAuth = useCallback((next: AuthState) => {
+    const sanitized = sanitizeAuthState(next);
+    authRef.current = sanitized;
+    setAuth(sanitized);
+    return AsyncStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(sanitized));
+  }, []);
+
+  const updatePendingOAuth = useCallback((next: PendingOAuth | null) => {
+    pendingOAuthRef.current = next;
+    setPendingOAuth(next);
+    return next
+      ? AsyncStorage.setItem(PENDING_OAUTH_STORAGE_KEY, JSON.stringify(next))
+      : AsyncStorage.removeItem(PENDING_OAUTH_STORAGE_KEY);
+  }, []);
+
+  const updatePendingDeviceOAuth = useCallback((next: PendingDeviceOAuth | null) => {
+    setPendingDeviceOAuth(next);
+    return next
+      ? AsyncStorage.setItem(PENDING_DEVICE_OAUTH_STORAGE_KEY, JSON.stringify(next))
+      : AsyncStorage.removeItem(PENDING_DEVICE_OAUTH_STORAGE_KEY);
+  }, []);
 
   const applyHandoffURL = useCallback((url: string) => {
     const decoded = decodeHandoff(url);
@@ -238,34 +278,65 @@ export default function App() {
 
   useEffect(() => {
     let mounted = true;
+    const readItem = (key: string) => AsyncStorage.getItem(key).catch(() => null);
+    const readCurrentOrLegacy = async (key: string, legacyKey: string) => {
+      const current = await readItem(key);
+      return current ?? readItem(legacyKey);
+    };
     Promise.all([
-      AsyncStorage.getItem(STREAMS_KEY).then(value => value ?? AsyncStorage.getItem(LEGACY_STREAMS_KEY)),
-      AsyncStorage.getItem(SETTINGS_KEY).then(value => value ?? AsyncStorage.getItem(LEGACY_SETTINGS_KEY)),
-      AsyncStorage.getItem(VOLUMES_KEY),
-      AsyncStorage.getItem(AUTH_STORAGE_KEY),
+      readCurrentOrLegacy(STREAMS_KEY, LEGACY_STREAMS_KEY),
+      readCurrentOrLegacy(SETTINGS_KEY, LEGACY_SETTINGS_KEY),
+      readItem(VOLUMES_KEY),
+      readItem(AUTH_STORAGE_KEY),
+      readItem(PENDING_OAUTH_STORAGE_KEY),
+      readItem(PENDING_DEVICE_OAUTH_STORAGE_KEY),
     ])
-      .then(([savedStreams, savedSettings, savedVolumes, savedAuth]) => {
+      .then(([savedStreams, savedSettings, savedVolumes, savedAuth, savedPendingOAuth, savedPendingDeviceOAuth]) => {
         if (!mounted) {
           return;
         }
-        if (savedStreams) {
-          const parsed = JSON.parse(savedStreams);
+        let hadInvalidData = false;
+        const restore = (raw: string | null, apply: (value: unknown) => void) => {
+          if (!raw) {
+            return;
+          }
+          try {
+            apply(JSON.parse(raw));
+          } catch {
+            hadInvalidData = true;
+          }
+        };
+        restore(savedStreams, parsed => {
           if (Array.isArray(parsed)) {
             setStreams(
               parsed
-                .filter(stream => stream.platform && stream.channel)
-                .map(stream => makeStream(stream.platform as PlatformId, String(stream.channel))),
+                .filter(stream => stream && typeof stream === 'object' && 'platform' in stream && 'channel' in stream)
+                .map(stream => makeStream((stream as StreamItem).platform as PlatformId, String((stream as StreamItem).channel))),
             );
           }
-        }
-        if (savedSettings) {
-          setSettings(sanitizeSettings(JSON.parse(savedSettings)));
-        }
-        if (savedVolumes) {
-          setVolumes(JSON.parse(savedVolumes));
-        }
-        if (savedAuth) {
-          setAuth(sanitizeAuthState(JSON.parse(savedAuth)));
+        });
+        restore(savedSettings, parsed => setSettings(sanitizeSettings(parsed)));
+        restore(savedVolumes, parsed => {
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            setVolumes(parsed as Record<string, number>);
+          }
+        });
+        restore(savedAuth, parsed => {
+          const restoredAuth = sanitizeAuthState(parsed);
+          authRef.current = restoredAuth;
+          setAuth(restoredAuth);
+        });
+        restore(savedPendingOAuth, parsed => {
+          const restoredPending = sanitizePendingOAuth(parsed);
+          pendingOAuthRef.current = restoredPending;
+          setPendingOAuth(restoredPending);
+        });
+        restore(savedPendingDeviceOAuth, parsed => {
+          const restoredDevice = sanitizePendingDeviceOAuth(parsed);
+          setPendingDeviceOAuth(restoredDevice);
+        });
+        if (hadInvalidData) {
+          Alert.alert('一部データの読み込み失敗', '破損した保存項目だけを初期化し、他の設定と認証情報は保持しました。');
         }
       })
       .catch(() => {
@@ -328,70 +399,149 @@ export default function App() {
         }
         return;
       }
-      const pending = pendingOAuthRef.current;
-      if (!pending || !url.startsWith('multiview://')) {
+      if (!url.startsWith('multiview://')) {
         return;
       }
-      completeOAuthRedirect(authRef.current, pending, url)
-        .then(next => {
-          setAuth(next);
-          setPendingOAuth(null);
+      if (!hydrated) {
+        pendingOAuthURLRef.current = url;
+        return;
+      }
+      const pending = pendingOAuthRef.current;
+      if (!pending || !isOAuthRedirectForPending(pending, url)) {
+        return;
+      }
+      oauthURLSingleFlightRef.current.run(url, async () => {
+        try {
+          const next = await completeOAuthRedirect(authRef.current, pending, url);
+          await updateAuth(next);
+          await updatePendingOAuth(null);
           Alert.alert('ログイン完了', `${serviceLabel(pending.service)}にログインしました。`);
-        })
-        .catch(error => {
-          setPendingOAuth(null);
-          Alert.alert('ログイン失敗', error instanceof Error ? error.message : String(error));
-        });
+        } catch (error) {
+          const terminal = oauthCompletionErrorDisposition(error) === 'terminal';
+          if (terminal) {
+            await updatePendingOAuth(null).catch(() => undefined);
+          }
+          Alert.alert(
+            terminal ? 'ログイン失敗' : 'ログイン通信失敗',
+            `${error instanceof Error ? error.message : String(error)}${terminal ? '' : '\n認証状態は保持しました。ブラウザの「アプリに戻る」をもう一度押してください。'}`,
+          );
+        }
+      }).catch(() => undefined);
     };
     const sub = Linking.addEventListener('url', handleURL);
-    Linking.getInitialURL().then(url => {
-      if (url) {
+    if (hydrated) {
+      if (pendingOAuthURLRef.current) {
+        const url = pendingOAuthURLRef.current;
+        pendingOAuthURLRef.current = null;
         handleURL({url});
       }
-    }).catch(() => undefined);
+      Linking.getInitialURL().then(url => {
+        if (url) {
+          handleURL({url});
+        }
+      }).catch(() => undefined);
+    }
     return () => sub.remove();
-  }, [applyHandoffURL, hydrated]);
+  }, [applyHandoffURL, hydrated, updateAuth, updatePendingOAuth]);
 
-  const updateAuth = useCallback((next: AuthState) => {
-    setAuth(sanitizeAuthState(next));
-  }, []);
+  useEffect(() => {
+    if (!hydrated || !pendingDeviceOAuth) {
+      return;
+    }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let pollIntervalSeconds = pendingDeviceOAuth.intervalSeconds;
+    const schedulePoll = (delaySeconds: number) => {
+      if (!cancelled) {
+        timer = setTimeout(poll, delaySeconds * 1000);
+      }
+    };
+    const poll = async () => {
+      if (cancelled) {
+        return;
+      }
+      if (Date.now() > pendingDeviceOAuth.expiresAt) {
+        await updatePendingDeviceOAuth(null).catch(() => undefined);
+        if (!cancelled) {
+          Alert.alert(`${serviceLabel(pendingDeviceOAuth.service)}ログイン失敗`, '認証コードの期限が切れました。もう一度ログインしてください。');
+        }
+        return;
+      }
+      try {
+        const next = pendingDeviceOAuth.service === 'twitch'
+          ? await pollTwitchDeviceToken(authRef.current, pendingDeviceOAuth)
+          : await pollYouTubeDeviceToken(authRef.current, pendingDeviceOAuth);
+        if (cancelled) {
+          return;
+        }
+        if (next) {
+          await updateAuth(next);
+          await updatePendingDeviceOAuth(null);
+          if (!cancelled) {
+            Alert.alert('ログイン完了', `${serviceLabel(pendingDeviceOAuth.service)}にログインしました。`);
+          }
+          return;
+        }
+        schedulePoll(pollIntervalSeconds);
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        const disposition = deviceOAuthErrorDisposition(error);
+        if (disposition === 'terminal') {
+          await updatePendingDeviceOAuth(null).catch(() => undefined);
+          Alert.alert(`${serviceLabel(pendingDeviceOAuth.service)}ログイン失敗`, error instanceof Error ? error.message : String(error));
+          return;
+        }
+        pollIntervalSeconds = nextDeviceOAuthPollInterval(pollIntervalSeconds, disposition);
+        const persisted = {...pendingDeviceOAuth, intervalSeconds: pollIntervalSeconds};
+        await AsyncStorage.setItem(PENDING_DEVICE_OAUTH_STORAGE_KEY, JSON.stringify(persisted)).catch(() => undefined);
+        schedulePoll(pollIntervalSeconds);
+      }
+    };
+    timer = setTimeout(poll, 0);
+    return () => {
+      cancelled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [hydrated, pendingDeviceOAuth, updateAuth, updatePendingDeviceOAuth]);
 
   const startOAuthLogin = useCallback(async (service: OAuthService) => {
     try {
-      if (service === 'youtube') {
-        const device = await requestYouTubeDeviceCode(authRef.current);
+      if (service === 'youtube' || service === 'twitch') {
+        const code = service === 'twitch'
+          ? await requestTwitchDeviceCode(authRef.current)
+          : await requestYouTubeDeviceCode(authRef.current);
+        const device: PendingDeviceOAuth = {...code, service};
+        await updatePendingDeviceOAuth(device);
         Alert.alert(
-          'YouTubeログイン',
+          `${serviceLabel(service)}ログイン`,
           `外部ブラウザで ${device.verificationUrl} を開き、コード ${device.userCode} を入力してください。完了まで自動で待機します。`,
         );
         openURL(device.verificationUrl).catch(() => undefined);
-        const poll = async () => {
-          if (Date.now() > device.expiresAt) {
-            Alert.alert('YouTubeログイン失敗', '認証コードの期限が切れました。もう一度ログインしてください。');
-            return;
-          }
-          try {
-            const next = await pollYouTubeDeviceToken(authRef.current, device);
-            if (next) {
-              setAuth(next);
-              Alert.alert('ログイン完了', 'YouTubeにログインしました。');
-              return;
-            }
-            setTimeout(poll, device.intervalSeconds * 1000);
-          } catch (error) {
-            Alert.alert('YouTubeログイン失敗', error instanceof Error ? error.message : String(error));
-          }
-        };
-        setTimeout(poll, device.intervalSeconds * 1000);
         return;
       }
       const start = await createOAuthStart(authRef.current, service);
-      setPendingOAuth(start.pending);
+      await updatePendingOAuth(start.pending);
       await openURL(start.url);
     } catch (error) {
       Alert.alert('ログイン開始失敗', error instanceof Error ? error.message : String(error));
     }
+  }, [updatePendingDeviceOAuth, updatePendingOAuth]);
+
+  const resumeDeviceOAuth = useCallback((pending: PendingDeviceOAuth) => {
+    openURL(pending.verificationUrl).catch(error => {
+      Alert.alert('ブラウザ起動失敗', error instanceof Error ? error.message : String(error));
+    });
   }, []);
+
+  const cancelDeviceOAuth = useCallback(() => {
+    updatePendingDeviceOAuth(null).catch(error => {
+      Alert.alert('認証キャンセル失敗', error instanceof Error ? error.message : String(error));
+    });
+  }, [updatePendingDeviceOAuth]);
 
   const addStream = useCallback((platform: PlatformId, rawChannel: string) => {
     const fromURL = parseStreamURL(rawChannel);
@@ -473,7 +623,7 @@ export default function App() {
   }, []);
 
   return (
-    <SafeAreaView style={styles.app}>
+    <SafeAreaView style={styles.app} edges={appSafeAreaEdges}>
       <StatusBar barStyle="light-content" backgroundColor="#05070a" translucent={false} />
       <View style={styles.content}>
         {activeTab === 'following' && (
@@ -523,6 +673,9 @@ export default function App() {
             auth={auth}
             onAuth={updateAuth}
             onLogin={startOAuthLogin}
+            pendingDeviceOAuth={pendingDeviceOAuth}
+            onResumeDeviceOAuth={resumeDeviceOAuth}
+            onCancelDeviceOAuth={cancelDeviceOAuth}
             onNiconicoLogin={() => setNiconicoLoginOpen(true)}
           />
         )}
@@ -871,7 +1024,7 @@ function StreamCell({
       return;
     }
     setCommentStatus('送信中');
-    postStreamComment(auth, stream, text)
+    postStreamComment(auth, stream, text, onAuth)
       .then(nextAuth => {
         onAuth(nextAuth);
         setCommentText('');
@@ -2327,7 +2480,7 @@ function AddStreamModal({
 
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
-      <SafeAreaView style={styles.modal}>
+      <SafeAreaView style={styles.modal} edges={appSafeAreaEdges}>
         <View style={styles.modalHeader}>
           <Text style={styles.modalTitle}>配信を追加</Text>
           <TouchableOpacity onPress={onClose}>
@@ -2392,10 +2545,14 @@ function FocusModal({
   auth: AuthState;
   onAuth: (auth: AuthState) => void;
 }) {
+  const {width: windowWidth, height: windowHeight} = useWindowDimensions();
+  const paneLayout = focusedPaneLayout(windowWidth, windowHeight, settings.showChat);
+  const useWideLayout = paneLayout === 'wide';
   const chatRef = useRef<WebView>(null);
   const [commentText, setCommentText] = useState('');
   const [commentStatus, setCommentStatus] = useState('');
   const chat = stream ? chatURL(stream) : null;
+  const showFocusChatColumn = paneLayout !== 'solo';
   const {chromeVisible, showChrome} = useAutoHidingChrome(stream?.id ?? 'closed');
   const [webViewerCount, setWebViewerCount] = useState<number | null>(null);
 
@@ -2410,7 +2567,7 @@ function FocusModal({
       return;
     }
     setCommentStatus('送信中');
-    postStreamComment(auth, stream, text)
+    postStreamComment(auth, stream, text, onAuth)
       .then(nextAuth => {
         onAuth(nextAuth);
         setCommentText('');
@@ -2436,46 +2593,56 @@ function FocusModal({
 
   return (
     <Modal visible={!!stream} animationType="slide" onRequestClose={onClose}>
-      <SafeAreaView style={styles.modal}>
+      <SafeAreaView style={styles.modal} edges={appSafeAreaEdges}>
         {stream && (
-          <View style={styles.focusSurface}>
-            <View style={styles.focusChatPanel}>
-              {settings.showChat && chat ? (
-                <WebView
-                  ref={chatRef}
-                  source={{uri: chat}}
-                  userAgent={stream.platform === 'youtube' ? desktopUserAgent : mobileUserAgent}
-                  javaScriptEnabled
-                  domStorageEnabled
-                  sharedCookiesEnabled
-                  thirdPartyCookiesEnabled
-                  setSupportMultipleWindows={false}
-                  style={styles.focusChatWeb}
-                />
-              ) : (
-                <View style={styles.focusUnavailable}>
-                  <Text style={styles.focusUnavailableText}>このサービスはチャット入力未対応です</Text>
+          <View style={[styles.focusSurface, useWideLayout && styles.focusSurfaceWide]}>
+            {showFocusChatColumn && (
+              <View style={[styles.focusChatColumn, useWideLayout && styles.focusChatColumnWide]}>
+                <View style={styles.focusChatPanel}>
+                  {chat ? (
+                    <WebView
+                      ref={chatRef}
+                      source={{uri: chat}}
+                      userAgent={stream.platform === 'youtube' ? desktopUserAgent : mobileUserAgent}
+                      javaScriptEnabled
+                      domStorageEnabled
+                      sharedCookiesEnabled
+                      thirdPartyCookiesEnabled
+                      setSupportMultipleWindows={false}
+                      style={styles.focusChatWeb}
+                    />
+                  ) : (
+                    <View style={styles.focusUnavailable}>
+                      <Text style={styles.focusUnavailableText}>このサービスはチャット入力未対応です</Text>
+                    </View>
+                  )}
                 </View>
-              )}
-            </View>
-            <View style={styles.focusComposer}>
-              <TextInput
-                value={commentText}
-                onChangeText={setCommentText}
-                autoCapitalize="none"
-                autoCorrect={false}
-                placeholder="コメント"
-                placeholderTextColor="rgba(255,255,255,0.55)"
-                style={styles.focusInput}
-                returnKeyType="send"
-                onSubmitEditing={sendComment}
-              />
-              <TouchableOpacity style={styles.focusSend} onPress={sendComment}>
-                <Text style={styles.focusSendText}>送信</Text>
-              </TouchableOpacity>
-              {!!commentStatus && <Text style={styles.focusStatus} numberOfLines={1}>{commentStatus}</Text>}
-            </View>
-            <View style={styles.focusPlayer} onTouchStart={showChrome}>
+                <View style={styles.focusComposer}>
+                  <TextInput
+                    value={commentText}
+                    onChangeText={setCommentText}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    placeholder="コメント"
+                    placeholderTextColor="rgba(255,255,255,0.55)"
+                    style={styles.focusInput}
+                    returnKeyType="send"
+                    onSubmitEditing={sendComment}
+                  />
+                  <TouchableOpacity style={styles.focusSend} onPress={sendComment}>
+                    <Text style={styles.focusSendText}>送信</Text>
+                  </TouchableOpacity>
+                  {!!commentStatus && <Text style={styles.focusStatus} numberOfLines={1}>{commentStatus}</Text>}
+                </View>
+              </View>
+            )}
+            <View
+              style={[
+                styles.focusPlayer,
+                showFocusChatColumn ? styles.focusPlayerStacked : styles.focusPlayerSolo,
+                showFocusChatColumn && useWideLayout && styles.focusPlayerWide,
+              ]}
+              onTouchStart={showChrome}>
               <StreamPlayer
                 stream={stream}
                 settings={settings}
@@ -2602,6 +2769,9 @@ function SettingsScreen({
   auth,
   onAuth,
   onLogin,
+  pendingDeviceOAuth,
+  onResumeDeviceOAuth,
+  onCancelDeviceOAuth,
   onNiconicoLogin,
 }: {
   streams: StreamItem[];
@@ -2613,6 +2783,9 @@ function SettingsScreen({
   auth: AuthState;
   onAuth: (auth: AuthState) => void;
   onLogin: (service: OAuthService) => void;
+  pendingDeviceOAuth: PendingDeviceOAuth | null;
+  onResumeDeviceOAuth: (pending: PendingDeviceOAuth) => void;
+  onCancelDeviceOAuth: () => void;
   onNiconicoLogin: () => void;
 }) {
   const [handoff, setHandoff] = useState('');
@@ -2746,9 +2919,25 @@ function SettingsScreen({
 
       <Text style={styles.sectionTitle}>認証・コメント送信</Text>
       <AuthServicePanel service="kick" auth={auth} onAuth={onAuth} onLogin={onLogin} />
-      <AuthServicePanel service="twitch" auth={auth} onAuth={onAuth} onLogin={onLogin} />
+      <AuthServicePanel
+        service="twitch"
+        auth={auth}
+        onAuth={onAuth}
+        onLogin={onLogin}
+        pendingDeviceOAuth={pendingDeviceOAuth?.service === 'twitch' ? pendingDeviceOAuth : null}
+        onResumeDeviceOAuth={onResumeDeviceOAuth}
+        onCancelDeviceOAuth={onCancelDeviceOAuth}
+      />
       <AuthServicePanel service="twitcasting" auth={auth} onAuth={onAuth} onLogin={onLogin} />
-      <AuthServicePanel service="youtube" auth={auth} onAuth={onAuth} onLogin={onLogin} />
+      <AuthServicePanel
+        service="youtube"
+        auth={auth}
+        onAuth={onAuth}
+        onLogin={onLogin}
+        pendingDeviceOAuth={pendingDeviceOAuth?.service === 'youtube' ? pendingDeviceOAuth : null}
+        onResumeDeviceOAuth={onResumeDeviceOAuth}
+        onCancelDeviceOAuth={onCancelDeviceOAuth}
+      />
       <NiconicoLoginPanel onLogin={onNiconicoLogin} />
 
       <Text style={styles.sectionTitle}>引き継ぎ</Text>
@@ -2847,19 +3036,28 @@ function AuthServicePanel({
   auth,
   onAuth,
   onLogin,
+  pendingDeviceOAuth = null,
+  onResumeDeviceOAuth,
+  onCancelDeviceOAuth,
 }: {
   service: OAuthService;
   auth: AuthState;
   onAuth: (auth: AuthState) => void;
   onLogin: (service: OAuthService) => void;
+  pendingDeviceOAuth?: PendingDeviceOAuth | null;
+  onResumeDeviceOAuth?: (pending: PendingDeviceOAuth) => void;
+  onCancelDeviceOAuth?: () => void;
 }) {
   const state = auth[service];
   const label = serviceLabel(service);
+  const sessionUsable = hasUsableAuthSession(auth, service);
   const setConfig = (patch: Partial<typeof state.config>) => onAuth(updateAuthConfig(auth, service, patch));
   const logout = () => onAuth(signOut(auth, service));
   const redirectHelp = service === 'youtube'
-    ? 'YouTubeはbot判定を避けるため埋め込みWebViewではなく外部ブラウザのDevice Code認証を使います。Client IDはDevice/TVまたはInstalled app向けを使ってください。'
-    : 'Redirect URIは開発者ポータルに登録した値と完全一致させてください。';
+    ? 'YouTubeは外部ブラウザのDevice Code認証を使います。Client IDはDevice/TVまたはInstalled app向けを使ってください。'
+    : service === 'twitch'
+      ? 'Twitchは外部ブラウザのDevice Code認証を使い、access tokenを自動更新します。開発者ポータルでPublicクライアントを使ってください。'
+      : 'Redirect URIは開発者ポータルに登録した値と完全一致させてください。';
   return (
     <View style={styles.authPanel}>
       <View style={styles.authHeader}>
@@ -2868,11 +3066,25 @@ function AuthServicePanel({
           <Text style={styles.authStatus}>{authStatus(auth, service)}</Text>
         </View>
         <TouchableOpacity
-          style={[styles.smallButton, state.token && styles.dangerButton]}
-          onPress={() => (state.token ? logout() : onLogin(service))}>
-          <Text style={styles.smallButtonText}>{state.token ? 'ログアウト' : 'ログイン'}</Text>
+          style={[styles.smallButton, (sessionUsable || pendingDeviceOAuth) && styles.dangerButton]}
+          onPress={() => (pendingDeviceOAuth ? onCancelDeviceOAuth?.() : sessionUsable ? logout() : onLogin(service))}>
+          <Text style={styles.smallButtonText}>
+            {pendingDeviceOAuth ? '認証キャンセル' : sessionUsable ? 'ログアウト' : state.token ? '再ログイン' : 'ログイン'}
+          </Text>
         </TouchableOpacity>
       </View>
+      {pendingDeviceOAuth && (
+        <View style={styles.pendingAuthCard}>
+          <Text style={styles.pendingAuthLabel}>外部ブラウザで次のコードを入力してください</Text>
+          <Text selectable style={styles.pendingAuthCode}>{pendingDeviceOAuth.userCode}</Text>
+          <Text selectable style={styles.pendingAuthURL}>{pendingDeviceOAuth.verificationUrl}</Text>
+          <TouchableOpacity
+            style={styles.pendingAuthButton}
+            onPress={() => onResumeDeviceOAuth?.(pendingDeviceOAuth)}>
+            <Text style={styles.smallButtonText}>ブラウザをもう一度開く</Text>
+          </TouchableOpacity>
+        </View>
+      )}
       <TextInput
         value={state.config.clientId}
         onChangeText={value => setConfig({clientId: value})}
@@ -2894,7 +3106,7 @@ function AuthServicePanel({
           style={styles.authInput}
         />
       )}
-      {service !== 'youtube' && (
+      {service !== 'youtube' && service !== 'twitch' && (
         <TextInput
           value={state.config.redirectURI}
           onChangeText={value => setConfig({redirectURI: value})}
@@ -2932,7 +3144,7 @@ function NiconicoLoginPanel({onLogin}: {onLogin: () => void}) {
 function NiconicoLoginModal({visible, onClose}: {visible: boolean; onClose: () => void}) {
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
-      <SafeAreaView style={styles.modal}>
+      <SafeAreaView style={styles.modal} edges={appSafeAreaEdges}>
         <View style={styles.loginHeader}>
           <Text style={styles.loginTitle}>ニコ生ログイン</Text>
           <TouchableOpacity style={styles.smallButton} onPress={onClose}>
@@ -3178,7 +3390,6 @@ const styles = StyleSheet.create({
   app: {
     flex: 1,
     backgroundColor: '#05070a',
-    paddingTop: (StatusBar.currentHeight ?? 0) + 4,
   },
   content: {
     flex: 1,
@@ -3765,9 +3976,21 @@ const styles = StyleSheet.create({
     paddingBottom: 10,
     backgroundColor: '#000',
   },
+  focusSurfaceWide: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  focusChatColumn: {
+    flex: 1,
+    minHeight: 0,
+  },
+  focusChatColumnWide: {
+    height: '100%',
+    marginRight: 10,
+  },
   focusChatPanel: {
     flex: 1,
-    minHeight: 180,
+    minHeight: 100,
     borderRadius: 18,
     overflow: 'hidden',
     backgroundColor: '#090d12',
@@ -3827,10 +4050,21 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   focusPlayer: {
-    width: '100%',
-    aspectRatio: 16 / 9,
     backgroundColor: '#000',
     position: 'relative',
+  },
+  focusPlayerStacked: {
+    width: '100%',
+    aspectRatio: 16 / 9,
+  },
+  focusPlayerSolo: {
+    flex: 1,
+    width: '100%',
+    height: '100%',
+  },
+  focusPlayerWide: {
+    width: '58%',
+    maxHeight: '100%',
   },
   focusCloseButton: {
     position: 'absolute',
@@ -3909,6 +4143,40 @@ const styles = StyleSheet.create({
     color: '#8c98a8',
     fontSize: 12,
     fontWeight: '700',
+  },
+  pendingAuthCard: {
+    marginTop: 8,
+    padding: 10,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: '#2f8cff',
+    backgroundColor: '#101b29',
+  },
+  pendingAuthLabel: {
+    color: '#c8d5e6',
+    fontSize: 12,
+  },
+  pendingAuthCode: {
+    marginTop: 6,
+    color: '#fff',
+    fontSize: 22,
+    fontWeight: '900',
+    letterSpacing: 2,
+  },
+  pendingAuthURL: {
+    marginTop: 4,
+    color: '#8ebeff',
+    fontSize: 12,
+  },
+  pendingAuthButton: {
+    minHeight: 36,
+    marginTop: 8,
+    paddingHorizontal: 12,
+    alignSelf: 'flex-start',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 7,
+    backgroundColor: '#2f8cff',
   },
   authInput: {
     minHeight: 42,
