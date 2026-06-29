@@ -83,7 +83,7 @@ import {useNetworkType} from './src/network';
 import {parseStreamURL} from './src/streamURL';
 import {appSafeAreaEdges, focusedPaneLayout} from './src/layout';
 import {useRecoveringNativeSession} from './src/useRecoveringNativeSession';
-import {shouldRenderNativeSession} from './src/sessionRecovery';
+import {nativeFirstFrameTimeoutMs, shouldFallbackForMissingNativeFrame, shouldRenderNativeSession} from './src/sessionRecovery';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -1704,6 +1704,8 @@ function TwitcastingNativePlayer({
   onViewerCount?: (count: number) => void;
 }) {
   const [hls, setHls] = useState<{url: string; cookieHeader: string} | null>(null);
+  const [nativeFrameReady, setNativeFrameReady] = useState(false);
+  const [missingNativeFrameFallback, setMissingNativeFrameFallback] = useState(false);
   const networkType = useNetworkType();
   const playbackQuality = effectiveQuality(settings, streamCount, networkType);
   const channel = stream.channel.trim();
@@ -1722,8 +1724,27 @@ function TwitcastingNativePlayer({
 
   useEffect(() => {
     setHls(null);
+    setNativeFrameReady(false);
+    setMissingNativeFrameFallback(false);
     startSessionWatchdog();
   }, [sessionKey, startSessionWatchdog]);
+
+  useEffect(() => {
+    setNativeFrameReady(false);
+    setMissingNativeFrameFallback(false);
+  }, [hls?.url]);
+
+  useEffect(() => {
+    if (!hls || useWebFallback || nativeFrameReady || missingNativeFrameFallback) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (shouldFallbackForMissingNativeFrame(nativeFrameReady, nativeFirstFrameTimeoutMs)) {
+        setMissingNativeFrameFallback(true);
+      }
+    }, nativeFirstFrameTimeoutMs);
+    return () => clearTimeout(timer);
+  }, [hls, missingNativeFrameFallback, nativeFrameReady, useWebFallback]);
 
   const onSessionMessage = useCallback(
     (event: WebViewMessageEvent, eventSessionKey: string) => {
@@ -1745,10 +1766,11 @@ function TwitcastingNativePlayer({
     },
     [markSessionResolved, scheduleReconnect],
   );
+  const renderWebFallback = useWebFallback || missingNativeFrameFallback;
 
   // streamserver.php は player=pc_web でも Android mobile UA で通るため、WebView と HLS の UA を揃える。
   const sessionWebView =
-    !useWebFallback ? (
+    !renderWebFallback ? (
       <WebView
         key={`twitcasting-session:${sessionKey}`}
         source={{uri: `https://twitcasting.tv/${encodeURIComponent(channel)}`}}
@@ -1768,7 +1790,7 @@ function TwitcastingNativePlayer({
       />
     ) : null;
 
-  if (hls && shouldRenderNativeSession(true, useWebFallback)) {
+  if (hls && shouldRenderNativeSession(true, renderWebFallback)) {
     return (
       <>
         {sessionWebView}
@@ -1789,6 +1811,12 @@ function TwitcastingNativePlayer({
           resizeMode="contain"
           onPlayerEvent={event => {
             const payload = event.nativeEvent;
+            if (payload.type === 'firstFrame') {
+              setNativeFrameReady(true);
+            }
+            if (payload.type === 'error') {
+              setMissingNativeFrameFallback(true);
+            }
             handlePlayerStatus(payload.type, payload.message, paused);
           }}
         />
@@ -1798,11 +1826,11 @@ function TwitcastingNativePlayer({
     );
   }
 
-  if (useWebFallback) {
+  if (renderWebFallback) {
     return (
       <>
         <WebView
-          key={`twitcasting-web:${reloadKey}`}
+          key={`twitcasting-web:${channel}:${reloadKey}:${sessionReloadTick}`}
           source={{uri: webStreamURL(stream)}}
           userAgent={mobileUserAgent}
           javaScriptEnabled
@@ -3377,6 +3405,55 @@ function webFallbackScript(blockAds: boolean, platform: PlatformId) {
         }
       } catch(e) {}
     }
+    ${
+      platform === 'twitcasting'
+        ? `
+    function focusTwitCastingPlayer(){
+      try {
+        var playerRoot = document.querySelector('.tw-player-page-grid-player') ||
+          document.querySelector('.tw-player-wrapper') ||
+          document.querySelector('.tw-player') ||
+          document.querySelector('video');
+        if (!playerRoot) return;
+        if (document.body) {
+          document.documentElement.style.setProperty('background','#000','important');
+          document.documentElement.style.setProperty('overflow','hidden','important');
+          document.body.style.setProperty('background','#000','important');
+          document.body.style.setProperty('margin','0','important');
+          document.body.style.setProperty('overflow','hidden','important');
+        }
+        playerRoot.style.setProperty('position','fixed','important');
+        playerRoot.style.setProperty('top','0','important');
+        playerRoot.style.setProperty('left','0','important');
+        playerRoot.style.setProperty('right','0','important');
+        playerRoot.style.setProperty('bottom','0','important');
+        playerRoot.style.setProperty('width','100vw','important');
+        playerRoot.style.setProperty('height','100vh','important');
+        playerRoot.style.setProperty('z-index','2147483647','important');
+        playerRoot.style.setProperty('background','#000','important');
+        document.querySelectorAll('.tw-player-wrapper,.tw-player,.tw-player__body').forEach(function(node){
+          node.style.setProperty('width','100%','important');
+          node.style.setProperty('height','100%','important');
+          node.style.setProperty('max-width','none','important');
+          node.style.setProperty('margin','0','important');
+          node.style.setProperty('background','#000','important');
+        });
+        document.querySelectorAll('.tw-player-header,.tw-player-page__app-link,.tw-player-meta,.tw-player-page-grid-meta,.tw-player-page__mobile-tab').forEach(function(node){
+          node.style.setProperty('display','none','important');
+        });
+        document.querySelectorAll('video').forEach(function(media){
+          media.style.setProperty('width','100%','important');
+          media.style.setProperty('height','100%','important');
+          media.style.setProperty('object-fit','contain','important');
+          media.setAttribute('playsinline','');
+          media.setAttribute('webkit-playsinline','');
+          try { var p = media.play && media.play(); if (p && p.catch) p.catch(function(){}); } catch(e) {}
+        });
+      } catch(e) {}
+    }
+    `
+        : ''
+    }
     function tame(){
       try {
         document.querySelectorAll('video,audio').forEach(function(media){
@@ -3384,6 +3461,7 @@ function webFallbackScript(blockAds: boolean, platform: PlatformId) {
           media.setAttribute('webkit-playsinline','');
         });
       } catch(e) {}
+      ${platform === 'twitcasting' ? 'focusTwitCastingPlayer();' : ''}
       ${
         blockAds
           ? `
@@ -3409,6 +3487,7 @@ function webFallbackScript(blockAds: boolean, platform: PlatformId) {
       postYouTubeViewerCount();
     }).observe(document.documentElement, {childList:true, subtree:true});
     setInterval(postYouTubeViewerCount, 5000);
+    ${platform === 'twitcasting' ? 'setInterval(focusTwitCastingPlayer, 2000);' : ''}
     window.mvPlay=function(){
       document.querySelectorAll('video,audio').forEach(function(media){try{var p=media.play&&media.play();if(p&&p.catch)p.catch(function(){});}catch(e){}});
     };

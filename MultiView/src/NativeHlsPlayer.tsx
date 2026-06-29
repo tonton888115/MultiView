@@ -9,7 +9,7 @@ import {
 } from 'react-native';
 
 type NativePlayerEvent = {
-  type: 'status' | 'error';
+  type: 'status' | 'error' | 'firstFrame';
   message: string;
 };
 

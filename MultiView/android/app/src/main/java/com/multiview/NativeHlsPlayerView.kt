@@ -71,6 +71,10 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
         contentFrame.setAspectRatio(ratio)
       }
 
+      override fun onRenderedFirstFrame() {
+        emit("firstFrame", "rendered")
+      }
+
       override fun onPlaybackStateChanged(playbackState: Int) {
         val status = when (playbackState) {
           Player.STATE_BUFFERING -> "buffering"

@@ -1,7 +1,9 @@
 import {
+  nativeFirstFrameTimeoutMs,
   playerStallTimeoutMs,
   sessionConnectTimeoutMs,
   sessionRetryDelayMs,
+  shouldFallbackForMissingNativeFrame,
   shouldRenderNativeSession,
   shouldUseSessionFallback,
 } from '../sessionRecovery';
@@ -57,6 +59,12 @@ describe('native session recovery policy', () => {
     expect(shouldRenderNativeSession(true, false)).toBe(true);
     expect(shouldRenderNativeSession(true, true)).toBe(false);
     expect(shouldRenderNativeSession(false, false)).toBe(false);
+  });
+
+  it('falls back when native playback never renders a first video frame', () => {
+    expect(shouldFallbackForMissingNativeFrame(false, nativeFirstFrameTimeoutMs - 1)).toBe(false);
+    expect(shouldFallbackForMissingNativeFrame(false, nativeFirstFrameTimeoutMs)).toBe(true);
+    expect(shouldFallbackForMissingNativeFrame(true, nativeFirstFrameTimeoutMs * 2)).toBe(false);
   });
 
   it('times out, falls back temporarily, and continues retrying instead of getting stuck', () => {

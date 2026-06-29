@@ -1,5 +1,6 @@
 export const sessionConnectTimeoutMs = 20_000;
 export const playerStallTimeoutMs = 25_000;
+export const nativeFirstFrameTimeoutMs = 12_000;
 
 const retryDelaysMs = [1_000, 2_000, 5_000, 10_000, 20_000, 30_000];
 
@@ -14,4 +15,8 @@ export function shouldUseSessionFallback(attempt: number): boolean {
 
 export function shouldRenderNativeSession(nativeReady: boolean, useWebFallback: boolean): boolean {
   return nativeReady && !useWebFallback;
+}
+
+export function shouldFallbackForMissingNativeFrame(nativeFrameReady: boolean, elapsedMs: number): boolean {
+  return !nativeFrameReady && elapsedMs >= nativeFirstFrameTimeoutMs;
 }
