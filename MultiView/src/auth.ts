@@ -55,6 +55,10 @@ export type OAuthURLSingleFlight = {
 
 export type DeviceOAuthErrorDisposition = 'retry' | 'slow_down' | 'terminal';
 
+export type StoredAuthReadResult =
+  | {ok: true; value: string | null}
+  | {ok: false; error: unknown};
+
 type TaggedOAuthError = Error & {
   deviceOAuthDisposition?: DeviceOAuthErrorDisposition;
   terminalOAuthFailure?: boolean;
@@ -71,7 +75,7 @@ const youtubeRedirect = 'multiview://youtube-oauth';
 const twitchChatScopes = 'user:read:chat user:write:chat';
 const authRefreshLeadMs = 5 * 60_000;
 const twitchValidationIntervalMs = 60 * 60_000;
-const refreshFlights = new Map<OAuthService, Promise<OAuthToken>>();
+const refreshFlights = new Map<string, Promise<OAuthToken>>();
 let lastTwitchValidationAt = 0;
 
 const browserHeaders = {
@@ -373,6 +377,74 @@ export function mergeAuthMaintenanceSnapshot(
   return merged;
 }
 
+/**
+ * Apply only fields changed by one auth operation to the latest in-memory state.
+ * If the same field changed independently after the operation began, the newer
+ * in-memory value wins instead of being reverted by a stale full-state snapshot.
+ */
+export function mergeAuthUpdateSnapshot(
+  base: AuthState,
+  current: AuthState,
+  updated: AuthState,
+  overwriteConflicts: readonly OAuthService[] = [],
+): AuthState {
+  let merged = current;
+  (['kick', 'twitch', 'twitcasting', 'youtube'] as OAuthService[]).forEach(service => {
+    const currentService = merged[service];
+    const overwriteConflict = overwriteConflicts.includes(service);
+    const nextConfig = mergeAuthField(base[service].config, currentService.config, updated[service].config, overwriteConflict);
+    const nextToken = mergeAuthField(base[service].token, currentService.token, updated[service].token, overwriteConflict);
+    if (authFieldEqual(nextConfig, currentService.config) && authFieldEqual(nextToken, currentService.token)) {
+      return;
+    }
+    merged = {
+      ...merged,
+      [service]: {
+        config: nextConfig,
+        token: nextToken,
+      },
+    };
+  });
+  return merged;
+}
+
+export async function readStoredAuthWithRetry(
+  read: () => Promise<string | null>,
+  maxAttempts = 3,
+): Promise<StoredAuthReadResult> {
+  const attempts = Math.max(1, Math.floor(maxAttempts));
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return {ok: true, value: await read()};
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  return {ok: false, error: lastError};
+}
+
+export async function writeStoredAuthWithRetry(
+  write: () => Promise<void>,
+  maxAttempts = 3,
+  retryDelayMs = 50,
+): Promise<void> {
+  const attempts = Math.max(1, Math.floor(maxAttempts));
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      await write();
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < attempts && retryDelayMs > 0) {
+        await new Promise<void>(resolve => setTimeout(() => resolve(), retryDelayMs));
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError ?? '認証情報を保存できません'));
+}
+
 export async function requestTwitchDeviceCode(auth: AuthState): Promise<PendingDeviceOAuth> {
   const clientId = auth.twitch.config.clientId.trim();
   if (!clientId) {
@@ -425,7 +497,7 @@ export async function pollYouTubeDeviceToken(auth: AuthState, code: YouTubeDevic
   }
   return saveToken(auth, 'youtube', {
     accessToken: json.access_token,
-    refreshToken: json.refresh_token,
+    refreshToken: json.refresh_token ?? auth.youtube.token?.refreshToken,
     expiresAt: expiryFromNow(json.expires_in, 3600),
     scope: normalizeScope(json.scope),
   });
@@ -733,7 +805,11 @@ async function authorizedToken(
 }
 
 function refreshTokenSingleFlight(auth: AuthState, service: OAuthService, token: OAuthToken): Promise<OAuthToken> {
-  const active = refreshFlights.get(service);
+  // A login can finish while a refresh made with the previous rotating token
+  // is still in flight. Coalesce only requests whose provider inputs are the
+  // same; otherwise the new session must not inherit the stale refresh result.
+  const key = refreshFlightKey(auth, service, token);
+  const active = refreshFlights.get(key);
   if (active) {
     return active;
   }
@@ -751,13 +827,27 @@ function refreshTokenSingleFlight(auth: AuthState, service: OAuthService, token:
   } else {
     flight = Promise.reject(new Error('ツイキャスはrefresh tokenを提供していません'));
   }
-  refreshFlights.set(service, flight);
+  refreshFlights.set(key, flight);
   flight.finally(() => {
-    if (refreshFlights.get(service) === flight) {
-      refreshFlights.delete(service);
+    if (refreshFlights.get(key) === flight) {
+      refreshFlights.delete(key);
     }
   }).catch(() => undefined);
   return flight;
+}
+
+function refreshFlightKey(auth: AuthState, service: OAuthService, token: OAuthToken): string {
+  const config = auth[service].config;
+  return JSON.stringify({
+    service,
+    refreshToken: token.refreshToken,
+    clientId: config.clientId,
+    clientSecret: config.clientSecret,
+    redirectURI: config.redirectURI,
+    // Twitch copies these fields when its refresh response omits them.
+    userID: service === 'twitch' ? token.userID : undefined,
+    scope: service === 'twitch' ? token.scope : undefined,
+  });
 }
 
 async function validateTwitch(accessToken: string): Promise<string> {
@@ -985,6 +1075,23 @@ function numberValue(value: unknown): number | undefined {
 function finiteNumber(value: unknown): number | undefined {
   const parsed = typeof value === 'number' ? value : typeof value === 'string' && value.trim() ? Number(value) : NaN;
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function mergeAuthField<T>(base: T, current: T, updated: T, overwriteConflict: boolean): T {
+  if (authFieldEqual(updated, base)) {
+    return current;
+  }
+  if (overwriteConflict) {
+    return updated;
+  }
+  if (!authFieldEqual(current, base) && !authFieldEqual(current, updated)) {
+    return current;
+  }
+  return updated;
+}
+
+function authFieldEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function positiveNumber(value: unknown, fallback: number): number {

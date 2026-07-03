@@ -1,6 +1,12 @@
-import {extractYouTubeChatSessionFromHTML, kickSupportEvent, youtubeChatEventsFromAction, youtubeChatPollDelayMs} from '../chat';
+import {extractYouTubeChatSessionFromHTML, kickHeartbeatResponse, kickSupportEvent, youtubeChatEventsFromAction, youtubeChatPollDelayMs} from '../chat';
 
 describe('Kick support events', () => {
+  it('answers the Pusher heartbeat so an idle chat socket is not disconnected', () => {
+    expect(kickHeartbeatResponse('{"event":"pusher:ping","data":{}}'))
+      .toBe('{"event":"pusher:pong","data":{}}');
+    expect(kickHeartbeatResponse('{"event":"App\\\\Events\\\\ChatMessageEvent"}')).toBeNull();
+  });
+
   it('converts official subscription and gift payloads into structured gift events', () => {
     expect(kickSupportEvent('App\\Events\\GiftedSubscriptionsEvent', {
       id: 'gift-event-1',

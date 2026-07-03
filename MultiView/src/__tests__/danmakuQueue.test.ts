@@ -35,6 +35,26 @@ describe('danmaku queue', () => {
     expect(isRecentDanmakuDuplicate(fallback, recent, 1001)).toBe(true);
   });
 
+  it('does not rescan an unexpired high-flow dedupe window for every comment', () => {
+    class CountingMap extends Map<string, number> {
+      iterations = 0;
+
+      *[Symbol.iterator](): IterableIterator<[string, number]> {
+        for (const entry of super[Symbol.iterator]()) {
+          this.iterations += 1;
+          yield entry;
+        }
+      }
+    }
+    const recent = new CountingMap();
+    for (let index = 0; index < 25000; index += 1) {
+      recent.set(`youtube\u001fexisting-${index}`, 20000 + index);
+    }
+
+    expect(isRecentDanmakuDuplicate(makeChatEvent('youtube', 'new', 'new'), recent, 26001)).toBe(false);
+    expect(recent.iterations).toBe(1);
+  });
+
   it('does not silently truncate a high-flow backlog', () => {
     const queue = new DanmakuEventQueue();
     for (let index = 0; index < 25000; index += 1) {

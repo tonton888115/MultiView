@@ -205,7 +205,7 @@ function startKickChat(stream: StreamItem, emit: Emit, status: Status): ChatClie
         status('Kickコメント接続済み');
       };
       socket.onmessage = event => {
-        handleKickMessage(String(event.data ?? ''), emit, channel);
+        handleKickMessage(String(event.data ?? ''), emit, channel, payload => socket?.send(payload));
       };
       socket.onclose = () => {
         if (!stopped) {
@@ -259,12 +259,14 @@ async function fetchKickChannelInfo(channel: string): Promise<{chatroomId: strin
   return {chatroomId, channelId: channelId ?? undefined};
 }
 
-function handleKickMessage(text: string, emit: Emit, channel: string) {
-  const envelope = parseJSON(text);
-  const eventName = stringValue(envelope?.event) ?? '';
-  if (eventName === 'pusher:ping') {
+function handleKickMessage(text: string, emit: Emit, channel: string, send: (payload: string) => void) {
+  const heartbeat = kickHeartbeatResponse(text);
+  if (heartbeat) {
+    send(heartbeat);
     return;
   }
+  const envelope = parseJSON(text);
+  const eventName = stringValue(envelope?.event) ?? '';
   const payload = typeof envelope?.data === 'string' ? parseJSON(envelope.data) : envelope?.data;
   if (/host|raid/i.test(eventName)) {
     const target = kickHostTarget(payload);
@@ -289,6 +291,13 @@ function handleKickMessage(text: string, emit: Emit, channel: string) {
   const author = stringValue(sender?.username) ?? stringValue(sender?.name) ?? stringValue(payload?.username);
   const id = stringValue(payload?.id) ?? `kick:${Date.now()}:${Math.random()}`;
   emit(makeChatEvent('kick', id, kickFilterText(content), kickTokens(content), author ?? undefined));
+}
+
+export function kickHeartbeatResponse(text: string): string | null {
+  const envelope = parseJSON(text);
+  return stringValue(envelope?.event) === 'pusher:ping'
+    ? JSON.stringify({event: 'pusher:pong', data: {}})
+    : null;
 }
 
 export function kickSupportEvent(eventName: string, payload: any): ChatEvent | null {

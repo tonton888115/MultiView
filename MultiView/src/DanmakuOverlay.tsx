@@ -44,6 +44,8 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
   const laneReservationsRef = useRef<LaneReservation[]>([]);
   const laneCursorRef = useRef(0);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const removalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingRemovalsRef = useRef<Set<string>>(new Set());
   const scheduleDrainRef = useRef<() => void>(() => undefined);
   const recentEventsRef = useRef<Map<string, number>>(new Map());
   const officialYouTubeActiveUntilRef = useRef(0);
@@ -53,14 +55,10 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
 
   const fontSize = useMemo(() => scaledFontSize(settings.danmakuFontSize, layout.width), [layout.width, settings.danmakuFontSize]);
   const lineHeight = fontSize + 8;
-  const laneCount = useMemo(() => {
-    if (layout.height <= 0) {
-      return 1;
-    }
-    return settings.danmakuMaxLines > 0
-      ? Math.max(1, settings.danmakuMaxLines)
-      : Math.max(1, Math.floor(layout.height / lineHeight));
-  }, [layout.height, lineHeight, settings.danmakuMaxLines]);
+  const laneCount = useMemo(
+    () => danmakuLaneCount(layout.height, lineHeight, settings.danmakuMaxLines),
+    [layout.height, lineHeight, settings.danmakuMaxLines],
+  );
 
   const updateVisible = useCallback((updater: (current: VisibleItem[]) => VisibleItem[]) => {
     setVisible(current => {
@@ -71,13 +69,42 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
   }, []);
 
   const removeVisible = useCallback((key: string) => {
-    updateVisible(current => current.filter(item => item.key !== key));
+    pendingRemovalsRef.current.add(key);
+    if (removalTimerRef.current) {
+      return;
+    }
+    removalTimerRef.current = setTimeout(() => {
+      removalTimerRef.current = null;
+      const keys = pendingRemovalsRef.current;
+      pendingRemovalsRef.current = new Set();
+      updateVisible(current => current.filter(item => !keys.has(item.key)));
+    }, 16);
   }, [updateVisible]);
 
   useEffect(() => {
+    // Fold/unfold and multi-window can replace the overlay geometry while an old
+    // drain closure and native animations are still active.  Drop only the
+    // already-visible items (the pending queue is retained) and restart draining
+    // with the new dimensions so comments do not keep using off-screen lanes.
+    visibleRef.current.forEach(item => item.x.stopAnimation());
+    if (visibleRef.current.length > 0) {
+      updateVisible(() => []);
+    }
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    if (removalTimerRef.current) {
+      clearTimeout(removalTimerRef.current);
+      removalTimerRef.current = null;
+    }
+    pendingRemovalsRef.current.clear();
     laneReservationsRef.current = [];
     laneCursorRef.current = 0;
-  }, [laneCount, layout.width, layout.height]);
+    if (queueRef.current.length > 0) {
+      scheduleDrainRef.current();
+    }
+  }, [laneCount, layout.width, layout.height, updateVisible]);
 
   const pickLane = useCallback(
     (now: number): number => {
@@ -134,15 +161,15 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
     [laneCount, layout.width],
   );
 
-  const emitNow = useCallback(
-    (event: ChatEvent): boolean => {
+  const prepareNow = useCallback(
+    (event: ChatEvent): VisibleItem | null | false => {
       const currentSettings = settingsRef.current;
       const text = event.text.trim();
       if (!text && !event.superInfo) {
-        return true;
+        return null;
       }
       if (currentSettings.danmakuMaxLength > 0 && text.length > currentSettings.danmakuMaxLength) {
-        return true;
+        return null;
       }
       if (layout.width <= 0 || layout.height <= 0) {
         return false;
@@ -158,17 +185,9 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       reserveLane(lane, now, widthEstimate, duration);
       const key = `${event.id}:${event.createdAt}:${Math.random()}`;
       const x = new Animated.Value(layout.width + 12);
-      const item: VisibleItem = {key, event, tokens, lane, x, fontSize, lineHeight, widthEstimate, startedAt: now, duration};
-      updateVisible(current => [...current, item]);
-      Animated.timing(x, {
-        toValue: -widthEstimate - 12,
-        duration,
-        easing: Easing.linear,
-        useNativeDriver: true,
-      }).start(() => removeVisible(key));
-      return true;
+      return {key, event, tokens, lane, x, fontSize, lineHeight, widthEstimate, startedAt: now, duration};
     },
-    [fontSize, laneCount, layout.height, layout.width, lineHeight, pickLane, removeVisible, reserveLane, updateVisible],
+    [fontSize, laneCount, layout.height, layout.width, lineHeight, pickLane, reserveLane],
   );
 
   const scheduleDrain = useCallback(() => {
@@ -177,32 +196,51 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
     }
     const drain = () => {
       timerRef.current = null;
-      let consumed = 0;
-      const maxBurst = Math.max(5, laneCount * 5);
-      while (queueRef.current.length > 0 && consumed < maxBurst) {
+      const maxConcurrent = Math.max(4, laneCount * 3);
+      const available = Math.max(0, maxConcurrent - visibleRef.current.length);
+      const maxAdditions = Math.min(Math.max(1, laneCount), available);
+      const maxInspected = Math.max(20, laneCount * 4);
+      const additions: VisibleItem[] = [];
+      let inspected = 0;
+      while (queueRef.current.length > 0 && additions.length < maxAdditions && inspected < maxInspected) {
         const next = queueRef.current.peek();
         if (!next) {
           break;
         }
+        inspected += 1;
         if (isSuppressedYouTubeFallback(next, officialYouTubeActiveUntilRef.current)) {
           consumeDanmakuEvent(queueRef.current);
           continue;
         }
-        if (!emitNow(next)) {
+        const prepared = prepareNow(next);
+        if (prepared === false) {
           break;
         }
         consumeDanmakuEvent(queueRef.current);
-        consumed += 1;
+        if (prepared) {
+          additions.push(prepared);
+        }
+      }
+      if (additions.length > 0) {
+        updateVisible(current => [...current, ...additions]);
+        additions.forEach(item => {
+          Animated.timing(item.x, {
+            toValue: -item.widthEstimate - 12,
+            duration: item.duration,
+            easing: Easing.linear,
+            useNativeDriver: true,
+          }).start(() => removeVisible(item.key));
+        });
       }
       if (queueRef.current.length > 0) {
         const waitMs = layout.width <= 0 || layout.height <= 0
           ? 120
-          : 8;
+          : available > 0 ? 16 : 48;
         timerRef.current = setTimeout(drain, waitMs);
       }
     };
     timerRef.current = setTimeout(drain, 16);
-  }, [emitNow, laneCount, layout.height, layout.width]);
+  }, [laneCount, layout.height, layout.width, prepareNow, removeVisible, updateVisible]);
   scheduleDrainRef.current = scheduleDrain;
 
   const enqueueEvent = useCallback(
@@ -251,6 +289,11 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
         clearTimeout(timerRef.current);
         timerRef.current = null;
       }
+      if (removalTimerRef.current) {
+        clearTimeout(removalTimerRef.current);
+        removalTimerRef.current = null;
+      }
+      pendingRemovalsRef.current.clear();
       updateVisible(() => []);
     };
   }, [enqueueEvent, ignoreStatus, showDanmaku, stream, updateVisible]);
@@ -322,6 +365,17 @@ function scaledFontSize(base: number, width: number): number {
   }
   const scale = Math.min(1.8, Math.max(0.55, width / 340));
   return Math.round(base * scale);
+}
+
+export function danmakuLaneCount(height: number, lineHeight: number, maxLines: number): number {
+  if (height <= 0 || lineHeight <= 0) {
+    return 1;
+  }
+  // Items start at y=6, so reserving floor(height / lineHeight) lanes always
+  // clips the final lane.  A configured maximum is a cap, not a request to
+  // create lanes that do not fit a small grid cell or cover display.
+  const available = Math.max(1, Math.floor(Math.max(0, height - 6) / lineHeight));
+  return maxLines > 0 ? Math.min(Math.max(1, maxLines), available) : available;
 }
 
 const styles = StyleSheet.create({

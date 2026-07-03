@@ -15,6 +15,11 @@ class NativeHlsPlayerManager : SimpleViewManager<NativeHlsPlayerView>() {
   override fun createViewInstance(reactContext: ThemedReactContext): NativeHlsPlayerView =
     NativeHlsPlayerView(reactContext)
 
+  override fun onAfterUpdateTransaction(view: NativeHlsPlayerView) {
+    super.onAfterUpdateTransaction(view)
+    view.commitSourceProperties()
+  }
+
   @ReactProp(name = "sourceUrl")
   fun setSourceUrl(view: NativeHlsPlayerView, sourceUrl: String?) {
     view.setSourceUrl(sourceUrl)

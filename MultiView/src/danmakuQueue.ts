@@ -61,9 +61,13 @@ export function isRecentDanmakuDuplicate(
   now = Date.now(),
 ): boolean {
   for (const [key, timestamp] of recent) {
-    if (now - timestamp > duplicateWindowMs) {
-      recent.delete(key);
+    if (now - timestamp <= duplicateWindowMs) {
+      // Map preserves insertion order. Once the oldest retained entry is still
+      // inside the window, every later entry is too; each expired entry is
+      // therefore visited only once over the lifetime of the queue.
+      break;
     }
+    recent.delete(key);
   }
   const key = eventIdentity(event);
   if (recent.has(key)) {

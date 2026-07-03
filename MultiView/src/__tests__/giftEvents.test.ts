@@ -5,6 +5,8 @@ import {
   type GiftEvent,
 } from '../giftEvents';
 import {makeChatEvent} from '../danmaku';
+import {shouldDisplayGiftOverlayEvent} from '../GiftOverlay';
+import type {AppSettings} from '../types';
 
 function giftEvent(id: string, text = 'thanks'): GiftEvent {
   return {
@@ -71,6 +73,22 @@ describe('gift event pub/sub', () => {
     publishGiftEvent(streamId, event);
     expect(calls).toEqual([event]);
     unsubscribe();
+  });
+});
+
+describe('Niconico support overlay settings', () => {
+  const settings = {
+    showGiftEffects: false,
+    niconicoShowGift: true,
+    niconicoShowNicoad: true,
+    niconicoShowNotification: true,
+  } as AppSettings;
+
+  it('does not let the global gift toggle suppress individually enabled Nico notices', () => {
+    const base = {...giftEvent('nico-event'), platform: 'niconico' as const};
+    expect(shouldDisplayGiftOverlayEvent({...base, kind: 'gift'}, settings)).toBe(false);
+    expect(shouldDisplayGiftOverlayEvent({...base, kind: 'nicoad'}, settings)).toBe(true);
+    expect(shouldDisplayGiftOverlayEvent({...base, kind: 'notification'}, settings)).toBe(true);
   });
 });
 

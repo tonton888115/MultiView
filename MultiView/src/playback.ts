@@ -117,7 +117,8 @@ async function resolveKick(stream: StreamItem): Promise<PlaybackSource> {
   const channel = cleanChannel(stream.channel);
   const url = `https://kick.com/api/v2/channels/${encodeURIComponent(channel)}`;
   const headers = kickHeaders(channel);
-  const response = await fetch(url, {headers});
+  // 回線断中に fetch が長時間ぶら下がると自動復旧サイクル全体が止まるため打ち切る。
+  const response = await fetchWithTimeout(url, {headers}, 15000);
   if (!response.ok) {
     throw new Error(`Kick HTTP ${response.status}`);
   }
@@ -195,15 +196,20 @@ async function resolveTwitch(stream: StreamItem): Promise<PlaybackSource> {
       playerType: 'embed',
     },
   };
-  const response = await fetch('https://gql.twitch.tv/gql', {
-    method: 'POST',
-    headers: {
-      'Client-ID': twitchClientID,
-      'Content-Type': 'application/json',
-      'User-Agent': mobileSafariUserAgent,
+  // 回線断中に fetch が長時間ぶら下がると自動復旧サイクル全体が止まるため打ち切る。
+  const response = await fetchWithTimeout(
+    'https://gql.twitch.tv/gql',
+    {
+      method: 'POST',
+      headers: {
+        'Client-ID': twitchClientID,
+        'Content-Type': 'application/json',
+        'User-Agent': mobileSafariUserAgent,
+      },
+      body: JSON.stringify(body),
     },
-    body: JSON.stringify(body),
-  });
+    15000,
+  );
   if (!response.ok) {
     throw new Error(`Twitch GQL HTTP ${response.status}`);
   }

@@ -92,6 +92,19 @@ describe('YouTube playback regression harness', () => {
     expect(app).toContain('youtubeRetryRef');
   });
 
+  it('keeps the native first-frame event used by the missing-video watchdog', () => {
+    const nativePlayer = readProjectFile('android/app/src/main/java/com/multiview/NativeHlsPlayerView.kt');
+    expect(nativePlayer).toContain('override fun onRenderedFirstFrame()');
+    expect(nativePlayer).toContain('emit("firstFrame", "rendered")');
+    expect(nativePlayer).toContain('LifecycleEventListener');
+    expect(nativePlayer).toContain('override fun onHostResume()');
+    expect(nativePlayer).toContain('override fun onSizeChanged(');
+    expect(nativePlayer).toContain('scheduleVideoOutputRebind()');
+    expect(nativePlayer).toContain('!textureView.isAvailable');
+    expect(nativePlayer).toContain('exoPlayer.clearVideoTextureView(textureView)');
+    expect(nativePlayer).toContain('exoPlayer.setVideoTextureView(textureView)');
+  });
+
   it('requires YouTube chat fixes to exist on both Android JS and iOS Swift paths', () => {
     const chat = readProjectFile('src/chat.ts');
     const overlay = readProjectFile('src/DanmakuOverlay.tsx');

@@ -1,6 +1,6 @@
 import React from 'react';
 import TestRenderer, {act} from 'react-test-renderer';
-import {DanmakuOverlay} from '../DanmakuOverlay';
+import {DanmakuOverlay, danmakuLaneCount} from '../DanmakuOverlay';
 import type {AppSettings, StreamItem} from '../types';
 
 const mockStop = jest.fn();
@@ -114,5 +114,65 @@ describe('DanmakuOverlay lifecycle', () => {
 
     await act(async () => renderer.unmount());
     expect(mockStop).toHaveBeenCalledTimes(2);
+  });
+
+  it('clears in-flight comments when Fold geometry changes', async () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(<DanmakuOverlay stream={stream} settings={settings} />);
+    });
+    jest.useFakeTimers();
+    try {
+      const layoutView = renderer.root.findAll(node => typeof node.props.onLayout === 'function')[0];
+      act(() => {
+        layoutView.props.onLayout({nativeEvent: {layout: {width: 750, height: 410}}});
+      });
+      const onEvent = mockStartChatClient.mock.calls[0][2] as (event: {
+        id: string;
+        platform: 'twitch';
+        text: string;
+        tokens: Array<{kind: 'text'; text: string}>;
+        createdAt: number;
+      }) => void;
+      act(() => {
+        onEvent({
+          id: 'before-fold',
+          platform: 'twitch',
+          text: 'before fold',
+          tokens: [{kind: 'text', text: 'before fold'}],
+          createdAt: Date.now(),
+        });
+        jest.advanceTimersByTime(20);
+      });
+      expect(renderer.root.findAll(node => node.props.children === 'before fold')).not.toHaveLength(0);
+
+      act(() => {
+        layoutView.props.onLayout({nativeEvent: {layout: {width: 340, height: 185}}});
+      });
+      expect(renderer.root.findAll(node => node.props.children === 'before fold')).toHaveLength(0);
+    } finally {
+      if (renderer) {
+        act(() => renderer.unmount());
+      }
+      jest.runOnlyPendingTimers();
+      jest.useRealTimers();
+    }
+  });
+});
+
+describe('danmaku lane geometry', () => {
+  it('keeps the final lane inside the measured overlay', () => {
+    expect(danmakuLaneCount(100, 28, 0)).toBe(3);
+    expect(6 + danmakuLaneCount(100, 28, 0) * 28).toBeLessThanOrEqual(100);
+  });
+
+  it('treats the configured line count as a cap on Fold grid cells', () => {
+    expect(danmakuLaneCount(100, 28, 10)).toBe(3);
+    expect(danmakuLaneCount(540, 28, 4)).toBe(4);
+  });
+
+  it('keeps one usable lane until valid layout metrics arrive', () => {
+    expect(danmakuLaneCount(0, 28, 0)).toBe(1);
+    expect(danmakuLaneCount(10, 28, 10)).toBe(1);
   });
 });

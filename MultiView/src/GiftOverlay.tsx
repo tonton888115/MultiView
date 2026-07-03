@@ -16,11 +16,26 @@ const platformAccent: Record<PlatformId, string> = {
 
 type ActiveGift = GiftEvent & {key: string};
 
+export function shouldDisplayGiftOverlayEvent(event: GiftEvent, settings: AppSettings): boolean {
+  if (event.platform !== 'niconico') {
+    return settings.showGiftEffects;
+  }
+  if (event.kind === 'nicoad') {
+    return settings.niconicoShowNicoad;
+  }
+  if (event.kind === 'notification') {
+    return settings.niconicoShowNotification;
+  }
+  return settings.showGiftEffects && settings.niconicoShowGift;
+}
+
 export function GiftOverlay({stream, settings}: {stream: StreamItem; settings: AppSettings}) {
   const [banners, setBanners] = useState<ActiveGift[]>([]);
   const timersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
   const giftSoundEnabledRef = useRef(settings.giftSoundEnabled);
   giftSoundEnabledRef.current = settings.giftSoundEnabled;
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
 
   const clearTimers = useCallback(() => {
     timersRef.current.forEach(timer => clearTimeout(timer));
@@ -30,10 +45,10 @@ export function GiftOverlay({stream, settings}: {stream: StreamItem; settings: A
   useEffect(() => {
     clearTimers();
     setBanners([]);
-    if (!settings.showGiftEffects) {
-      return;
-    }
     const unsubscribe = subscribeGiftEvents(stream.id, event => {
+      if (!shouldDisplayGiftOverlayEvent(event, settingsRef.current)) {
+        return;
+      }
       if (giftSoundEnabledRef.current) {
         playGiftCue();
       }
@@ -49,11 +64,7 @@ export function GiftOverlay({stream, settings}: {stream: StreamItem; settings: A
       unsubscribe();
       clearTimers();
     };
-  }, [clearTimers, settings.showGiftEffects, stream.id]);
-
-  if (!settings.showGiftEffects) {
-    return null;
-  }
+  }, [clearTimers, stream.id]);
 
   return (
     <View pointerEvents="none" style={styles.overlay}>

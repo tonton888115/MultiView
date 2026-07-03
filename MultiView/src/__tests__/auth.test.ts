@@ -8,10 +8,14 @@ import {
   isOAuthRedirectForPending,
   maintainAuthSessions,
   mergeAuthMaintenanceSnapshot,
+  mergeAuthUpdateSnapshot,
   nextDeviceOAuthPollInterval,
   oauthCompletionErrorDisposition,
   pollTwitchDeviceToken,
+  pollYouTubeDeviceToken,
   postStreamComment,
+  readStoredAuthWithRetry,
+  writeStoredAuthWithRetry,
   requestTwitchDeviceCode,
   sanitizeAuthState,
   sanitizePendingDeviceOAuth,
@@ -69,6 +73,102 @@ describe('proactive auth maintenance', () => {
 
     expect(merged.kick.token?.accessToken).toBe('maintained-kick');
     expect(merged.youtube.token?.accessToken).toBe('new-login');
+  });
+
+  it('atomically preserves cross-service refreshes completed from the same base snapshot', () => {
+    const base: AuthState = {
+      ...defaultAuthState,
+      twitch: {
+        config: {...defaultAuthState.twitch.config, clientId: 'twitch-client'},
+        token: {accessToken: 'twitch-old', refreshToken: 'twitch-refresh-old', expiresAt: 1},
+      },
+      youtube: {
+        config: {...defaultAuthState.youtube.config, clientId: 'youtube-client'},
+        token: {accessToken: 'youtube-old', refreshToken: 'youtube-refresh-old', expiresAt: 1},
+      },
+    };
+    const twitchUpdated: AuthState = {
+      ...base,
+      twitch: {
+        ...base.twitch,
+        token: {accessToken: 'twitch-new', refreshToken: 'twitch-refresh-new', expiresAt: 10_000},
+      },
+    };
+    const youtubeUpdated: AuthState = {
+      ...base,
+      youtube: {
+        ...base.youtube,
+        token: {accessToken: 'youtube-new', refreshToken: 'youtube-refresh-new', expiresAt: 10_000},
+      },
+    };
+
+    const afterTwitch = mergeAuthUpdateSnapshot(base, base, twitchUpdated);
+    const afterBoth = mergeAuthUpdateSnapshot(base, afterTwitch, youtubeUpdated);
+
+    expect(afterBoth.twitch.token?.refreshToken).toBe('twitch-refresh-new');
+    expect(afterBoth.youtube.token?.refreshToken).toBe('youtube-refresh-new');
+  });
+
+  it('does not let a stale refresh overwrite a newer login for the same service', () => {
+    const base = twitchAuth({accessToken: 'old', refreshToken: 'old-refresh', expiresAt: 1});
+    const current = twitchAuth({accessToken: 'new-login', refreshToken: 'new-login-refresh', expiresAt: 10_000});
+    const staleRefresh = twitchAuth({accessToken: 'stale-refresh', refreshToken: 'stale-rotated', expiresAt: 10_000});
+
+    const merged = mergeAuthUpdateSnapshot(base, current, staleRefresh);
+
+    expect(merged.twitch.token?.accessToken).toBe('new-login');
+    expect(merged.twitch.token?.refreshToken).toBe('new-login-refresh');
+  });
+
+  it('merges a new login into a recovered disk snapshot without deleting other services', () => {
+    const stored: AuthState = {
+      ...defaultAuthState,
+      twitch: {
+        config: {...defaultAuthState.twitch.config, clientId: 'twitch-client'},
+        token: {accessToken: 'twitch-saved', refreshToken: 'twitch-refresh', expiresAt: 10_000},
+      },
+    };
+    const newKickLogin: AuthState = {
+      ...defaultAuthState,
+      kick: {
+        config: {...defaultAuthState.kick.config, clientId: 'kick-client'},
+        token: {accessToken: 'kick-new', refreshToken: 'kick-refresh', expiresAt: 20_000},
+      },
+    };
+
+    const merged = mergeAuthUpdateSnapshot(defaultAuthState, stored, newKickLogin, ['kick']);
+
+    expect(merged.kick.token?.accessToken).toBe('kick-new');
+    expect(merged.twitch.token?.accessToken).toBe('twitch-saved');
+  });
+
+  it('retries auth storage reads without converting a persistent read error to missing data', async () => {
+    const transientRead = jest.fn()
+      .mockRejectedValueOnce(new Error('database busy'))
+      .mockResolvedValueOnce('{"twitch":{}}');
+    await expect(readStoredAuthWithRetry(transientRead)).resolves.toEqual({
+      ok: true,
+      value: '{"twitch":{}}',
+    });
+    expect(transientRead).toHaveBeenCalledTimes(2);
+
+    const failedRead = jest.fn().mockRejectedValue(new Error('database unavailable'));
+    const failed = await readStoredAuthWithRetry(failedRead, 3);
+    expect(failed.ok).toBe(false);
+    expect(failedRead).toHaveBeenCalledTimes(3);
+  });
+
+  it('retries a transient auth storage write so a rotated refresh token is not lost', async () => {
+    const transientWrite = jest.fn()
+      .mockRejectedValueOnce(new Error('database busy'))
+      .mockRejectedValueOnce(new Error('database busy'))
+      .mockResolvedValue(undefined);
+    await expect(writeStoredAuthWithRetry(transientWrite, 3, 0)).resolves.toBeUndefined();
+    expect(transientWrite).toHaveBeenCalledTimes(3);
+
+    const failedWrite = jest.fn().mockRejectedValue(new Error('database unavailable'));
+    await expect(writeStoredAuthWithRetry(failedWrite, 3, 0)).rejects.toThrow('database unavailable');
+    expect(failedWrite).toHaveBeenCalledTimes(3);
   });
 
   it('refreshes an expired Kick session without waiting for a comment send', async () => {
@@ -130,6 +230,46 @@ describe('proactive auth maintenance', () => {
     expect(secondResult.kick.token?.refreshToken).toBe('kick-refresh-2');
   });
 
+  it('does not join a newer login to an in-flight refresh using an older rotating token', async () => {
+    const resolvers: Array<(value: Response) => void> = [];
+    const fetchMock = jest.fn().mockImplementation(() => new Promise<Response>(resolve => {
+      resolvers.push(resolve);
+    }));
+    globalThis.fetch = fetchMock as typeof fetch;
+    const expiredKick = (accessToken: string, refreshToken: string): AuthState => ({
+      ...defaultAuthState,
+      kick: {
+        config: {...defaultAuthState.kick.config, clientId: 'kick-client'},
+        token: {accessToken, refreshToken, expiresAt: Date.now() - 1},
+      },
+    });
+
+    const oldAuth = expiredKick('old-access', 'old-refresh');
+    const oldRefresh = maintainAuthSessions(oldAuth);
+    await Promise.resolve();
+    const newLoginRefresh = maintainAuthSessions(expiredKick('new-access', 'new-refresh'));
+    await Promise.resolve();
+    const secondOldRefresh = maintainAuthSessions(oldAuth);
+    await Promise.resolve();
+
+    // Both credentials may refresh concurrently, but another caller using the
+    // old inputs must still join the original old-token request.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][1].body).toContain('refresh_token=old-refresh');
+    expect(fetchMock.mock.calls[1][1].body).toContain('refresh_token=new-refresh');
+    resolvers[0](response({access_token: 'old-refreshed', refresh_token: 'old-rotated', expires_in: 3600}));
+    resolvers[1](response({access_token: 'new-refreshed', refresh_token: 'new-rotated', expires_in: 3600}));
+
+    const [oldResult, newResult, secondOldResult] = await Promise.all([
+      oldRefresh,
+      newLoginRefresh,
+      secondOldRefresh,
+    ]);
+    expect(oldResult.kick.token?.refreshToken).toBe('old-rotated');
+    expect(newResult.kick.token?.refreshToken).toBe('new-rotated');
+    expect(secondOldResult.kick.token?.refreshToken).toBe('old-rotated');
+  });
+
   it('uses the provider documented 180-day TwitCasting implicit lifetime fallback', async () => {
     const before = Date.now();
     const next = await completeOAuthRedirect(defaultAuthState, {
@@ -139,6 +279,38 @@ describe('proactive auth maintenance', () => {
     }, 'multiview://twitcasting-oauth#access_token=tc-token&state=state');
 
     expect(next.twitcasting.token?.expiresAt).toBeGreaterThan(before + 170 * 24 * 3600 * 1000);
+  });
+
+  it('preserves the existing YouTube refresh token when device reauthorization omits it', async () => {
+    globalThis.fetch = jest.fn().mockResolvedValue(response({
+      access_token: 'youtube-access-2',
+      expires_in: 3600,
+      scope: 'https://www.googleapis.com/auth/youtube.force-ssl',
+    })) as typeof fetch;
+    const auth: AuthState = {
+      ...defaultAuthState,
+      youtube: {
+        config: {...defaultAuthState.youtube.config, clientId: 'youtube-client'},
+        token: {
+          accessToken: 'youtube-access-1',
+          refreshToken: 'youtube-refresh-1',
+          expiresAt: Date.now() + 60_000,
+        },
+      },
+    };
+
+    const next = await pollYouTubeDeviceToken(auth, {
+      deviceCode: 'device',
+      userCode: 'code',
+      verificationUrl: 'https://www.google.com/device',
+      expiresAt: Date.now() + 60_000,
+      intervalSeconds: 5,
+    });
+
+    expect(next?.youtube.token).toMatchObject({
+      accessToken: 'youtube-access-2',
+      refreshToken: 'youtube-refresh-1',
+    });
   });
 });
 
