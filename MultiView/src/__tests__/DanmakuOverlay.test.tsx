@@ -116,6 +116,66 @@ describe('DanmakuOverlay lifecycle', () => {
     expect(mockStop).toHaveBeenCalledTimes(2);
   });
 
+  it('drops events while the viewing tab is inactive and resumes fresh on return', async () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(
+        <DanmakuOverlay stream={stream} settings={settings} active={false} />,
+      );
+    });
+    // 非表示中でも chat client は維持される(切断/再接続を繰り返さない)。
+    expect(mockStartChatClient).toHaveBeenCalledTimes(1);
+    jest.useFakeTimers();
+    try {
+      const layoutView = renderer.root.findAll(node => typeof node.props.onLayout === 'function')[0];
+      act(() => {
+        layoutView.props.onLayout({nativeEvent: {layout: {width: 750, height: 410}}});
+      });
+      const onEvent = mockStartChatClient.mock.calls[0][2] as (event: {
+        id: string;
+        platform: 'twitch';
+        text: string;
+        tokens: Array<{kind: 'text'; text: string}>;
+        createdAt: number;
+      }) => void;
+      act(() => {
+        onEvent({
+          id: 'hidden',
+          platform: 'twitch',
+          text: 'hidden text',
+          tokens: [{kind: 'text', text: 'hidden text'}],
+          createdAt: Date.now(),
+        });
+        jest.advanceTimersByTime(20);
+      });
+      expect(renderer.root.findAll(node => node.props.children === 'hidden text')).toHaveLength(0);
+
+      act(() => {
+        renderer.update(<DanmakuOverlay stream={stream} settings={settings} active />);
+      });
+      act(() => {
+        onEvent({
+          id: 'resumed',
+          platform: 'twitch',
+          text: 'resumed text',
+          tokens: [{kind: 'text', text: 'resumed text'}],
+          createdAt: Date.now(),
+        });
+        // 既存テストと同じ 20ms: drain(16ms) 後かつモック環境の即時アニメ完了に伴う
+        // 除去タイマー(+16ms)より前に表示を観測する。
+        jest.advanceTimersByTime(20);
+      });
+      // 復帰後は新規イベントから描画を再開し、非表示中のイベントは復活しない。
+      expect(renderer.root.findAll(node => node.props.children === 'resumed text')).not.toHaveLength(0);
+      expect(renderer.root.findAll(node => node.props.children === 'hidden text')).toHaveLength(0);
+      expect(mockStop).not.toHaveBeenCalled();
+    } finally {
+      act(() => renderer.unmount());
+      jest.runOnlyPendingTimers();
+      jest.useRealTimers();
+    }
+  });
+
   it('clears in-flight comments when Fold geometry changes', async () => {
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {

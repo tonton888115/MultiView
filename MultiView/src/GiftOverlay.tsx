@@ -29,13 +29,25 @@ export function shouldDisplayGiftOverlayEvent(event: GiftEvent, settings: AppSet
   return settings.showGiftEffects && settings.niconicoShowGift;
 }
 
-export function GiftOverlay({stream, settings}: {stream: StreamItem; settings: AppSettings}) {
+// React.memo: 親プレイヤーの再レンダー毎に再構築しない(props は実変更時のみ変わる)。
+export const GiftOverlay = React.memo(function GiftOverlay({
+  stream,
+  settings,
+  active = true,
+}: {
+  stream: StreamItem;
+  settings: AppSettings;
+  active?: boolean;
+}) {
   const [banners, setBanners] = useState<ActiveGift[]>([]);
   const timersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
   const giftSoundEnabledRef = useRef(settings.giftSoundEnabled);
   giftSoundEnabledRef.current = settings.giftSoundEnabled;
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  // 視聴タブが背面の間は新規ギフト演出(表示と通知音)を捨てる。購読自体は保つ。
+  const activeRef = useRef(active);
+  activeRef.current = active;
 
   const clearTimers = useCallback(() => {
     timersRef.current.forEach(timer => clearTimeout(timer));
@@ -43,9 +55,20 @@ export function GiftOverlay({stream, settings}: {stream: StreamItem; settings: A
   }, []);
 
   useEffect(() => {
+    if (!active) {
+      // 背面へ回ったら表示中のバナーとタイマーも畳んで再レンダーを止める。
+      clearTimers();
+      setBanners(current => (current.length > 0 ? [] : current));
+    }
+  }, [active, clearTimers]);
+
+  useEffect(() => {
     clearTimers();
     setBanners([]);
     const unsubscribe = subscribeGiftEvents(stream.id, event => {
+      if (!activeRef.current) {
+        return;
+      }
       if (!shouldDisplayGiftOverlayEvent(event, settingsRef.current)) {
         return;
       }
@@ -84,7 +107,7 @@ export function GiftOverlay({stream, settings}: {stream: StreamItem; settings: A
       })}
     </View>
   );
-}
+});
 
 export function playGiftCue(): void {
   try {

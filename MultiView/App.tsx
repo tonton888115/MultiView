@@ -5,7 +5,9 @@ import {
   AppState,
   Animated,
   Image,
+  LayoutAnimation,
   Modal,
+  Platform,
   ScrollView,
   PanResponder,
   Pressable,
@@ -16,6 +18,7 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
+  UIManager,
   useWindowDimensions,
   View,
   Linking,
@@ -75,7 +78,8 @@ import {
   youtubeIframeHTML,
 } from './src/playback';
 import type {AppSettings, PlatformId, PlaybackSource, Source, StreamItem, TabId} from './src/types';
-import {isAdBlockedURL} from './src/adblock';
+import {adNetworkBlockerScript, isAdBlockedURL} from './src/adblock';
+import {clearAllWebData, clearCookiesForDomain} from './src/NativeWebData';
 import {fetchViewerCount} from './src/viewerCount';
 import {injectWebComment, sourceBridgeScript, webFallbackScript} from './src/webInject';
 import {setRaidHandler} from './src/raidFollow';
@@ -90,6 +94,13 @@ import {appSafeAreaEdges, focusedPaneLayout} from './src/layout';
 import {useRecoveringNativeSession} from './src/useRecoveringNativeSession';
 import {autoReloadDelayMs, nativeFirstFrameTimeoutMs, nativeSourceRecoveryDelayForAttempt, shouldFallbackForMissingNativeFrame, shouldRecoverNativeSource, shouldReloadCellOnViewActivation, shouldReloadOnViewActivation, shouldRenderNativeSession, shouldRestartSessionOnAppState, youtubeUpgradeDelayForAttempt} from './src/sessionRecovery';
 import type {PlayerHealth} from './src/sessionRecovery';
+
+// Android の LayoutAnimation は既定で無効。並び替え時にセルがスライドする視覚
+// フィードバック(iOSのUITableView並び替えに相当)へ必要で、RN公式ドキュメント通り
+// モジュールスコープで一度だけ有効化する(新アーキテクチャでは存在しないため guard)。
+if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
+  UIManager.setLayoutAnimationEnabledExperimental(true);
+}
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -754,10 +765,10 @@ export default function App() {
       <StatusBar barStyle="light-content" backgroundColor="#05070a" translucent={false} />
       <View style={styles.content}>
         {activeTab === 'following' && (
-          <SourceBrowser sources={orderedSources(followingSources, settings)} onAdd={addStream} />
+          <SourceBrowser sources={orderedSources(followingSources, settings)} blockWebAds={settings.blockWebAds} onAdd={addStream} />
         )}
         {activeTab === 'ranking' && (
-          <SourceBrowser sources={orderedSources(rankingSources, settings)} onAdd={addStream} />
+          <SourceBrowser sources={orderedSources(rankingSources, settings)} blockWebAds={settings.blockWebAds} onAdd={addStream} />
         )}
         <View
           style={[styles.tabPanel, activeTab !== 'viewing' && styles.hiddenViewingPanel]}
@@ -806,18 +817,27 @@ export default function App() {
       <NiconicoLoginModal visible={niconicoLoginOpen} onClose={() => setNiconicoLoginOpen(false)} />
 
       <View style={styles.tabBar}>
-        <TabButton active={activeTab === 'following'} label="フォロー" onPress={() => setActiveTab('following')} />
-        <TabButton active={activeTab === 'ranking'} label="ランキング" onPress={() => setActiveTab('ranking')} />
-        <TabButton active={activeTab === 'viewing'} label="視聴" onPress={() => setActiveTab('viewing')} />
-        <TabButton active={activeTab === 'settings'} label="設定" onPress={() => setActiveTab('settings')} />
+        <TabButton active={activeTab === 'following'} icon="◉" label="フォロー" onPress={() => setActiveTab('following')} />
+        <TabButton active={activeTab === 'ranking'} icon="▤" label="ランキング" onPress={() => setActiveTab('ranking')} />
+        <TabButton active={activeTab === 'viewing'} icon="⊞" label="視聴" onPress={() => setActiveTab('viewing')} />
+        <TabButton active={activeTab === 'settings'} icon="⚙︎" label="設定" onPress={() => setActiveTab('settings')} />
       </View>
     </SafeAreaView>
   );
 }
 
-function TabButton({active, label, onPress}: {active: boolean; label: string; onPress: () => void}) {
+// iOS MainTabController のタブ(SF Symbols + tint)に寄せる。Android では SF Symbols が
+// 使えないため、既定フォントで確実にモノクロ描画され color でティントできる記号を使う
+// (絵文字化する字は不可 — 設定の歯車は VS15 でテキスト表示を強制)。
+function TabButton({active, icon, label, onPress}: {active: boolean; icon: string; label: string; onPress: () => void}) {
   return (
-    <TouchableOpacity style={[styles.tabButton, active && styles.tabButtonActive]} onPress={onPress}>
+    <TouchableOpacity
+      style={styles.tabButton}
+      onPress={onPress}
+      accessibilityRole="tab"
+      accessibilityState={{selected: active}}>
+      <View style={[styles.tabIndicator, active && styles.tabIndicatorActive]} />
+      <Text style={[styles.tabIcon, active && styles.tabIconActive]}>{icon}</Text>
       <Text style={[styles.tabText, active && styles.tabTextActive]}>{label}</Text>
     </TouchableOpacity>
   );
@@ -833,7 +853,15 @@ function Pill({active, color, label, onPress}: {active: boolean; color?: string;
   );
 }
 
-function SourceBrowser({sources, onAdd}: {sources: Source[]; onAdd: (platform: PlatformId, channel: string) => void}) {
+function SourceBrowser({
+  sources,
+  blockWebAds,
+  onAdd,
+}: {
+  sources: Source[];
+  blockWebAds: boolean;
+  onAdd: (platform: PlatformId, channel: string) => void;
+}) {
   const [selected, setSelected] = useState(0);
   const source = sources[selected] ?? sources[0];
 
@@ -858,12 +886,23 @@ function SourceBrowser({sources, onAdd}: {sources: Source[]; onAdd: (platform: P
   const intercept = useCallback(
     (request: {url?: string; navigationType?: string}) => {
       const url = request.url ?? '';
+      // iOS はフォロー/ランキングの WebView にも WebAdBlocker を入れる。RN では
+      // navigation 単位の遮断をここで、DOM 単位の剥離を注入スクリプトで行う。
+      if (blockWebAds && isAdBlockedURL(url)) {
+        return false;
+      }
       if (url && addParsed(url)) {
         return false;
       }
       return true;
     },
-    [addParsed],
+    [addParsed, blockWebAds],
+  );
+
+  // 6KB 超のスクリプト文字列をレンダー毎に連結しない。
+  const injectedJavaScript = useMemo(
+    () => (blockWebAds ? `${adNetworkBlockerScript}\n${sourceBridgeScript}` : sourceBridgeScript),
+    [blockWebAds],
   );
 
   const handleMessage = useCallback(
@@ -896,7 +935,7 @@ function SourceBrowser({sources, onAdd}: {sources: Source[]; onAdd: (platform: P
           sharedCookiesEnabled
           thirdPartyCookiesEnabled
           setSupportMultipleWindows={false}
-          injectedJavaScript={sourceBridgeScript}
+          injectedJavaScript={injectedJavaScript}
           onMessage={handleMessage}
           onShouldStartLoadWithRequest={intercept}
         />
@@ -1176,8 +1215,8 @@ function ViewingScreen({
                   index={index}
                   count={streams.length}
                   columns={columns}
-                  onFocus={() => setFocused(stream)}
-                  onReload={() => reloadStream(stream.id)}
+                  onFocus={setFocused}
+                  onReload={reloadStream}
                   onMove={onMove}
                   onRemove={onRemove}
                   onVolume={onVolume}
@@ -1262,7 +1301,9 @@ function gridSlots(streams: StreamItem[], layoutMode: AppSettings['layoutMode'])
   }));
 }
 
-function StreamCell({
+// React.memo: 1セルの状態変化(音量ドラッグ等)で全セルのプレイヤー階層が再レンダー
+// されるのを防ぐ。ハンドラ props は親側で useCallback 済みの安定参照を渡す前提。
+const StreamCell = React.memo(function StreamCell({
   viewingActive,
   stream,
   settings,
@@ -1293,8 +1334,8 @@ function StreamCell({
   index: number;
   count: number;
   columns: number;
-  onFocus: () => void;
-  onReload: () => void;
+  onFocus: (stream: StreamItem) => void;
+  onReload: (id: string) => void;
   onMove: (index: number, target: number) => void;
   onRemove: (id: string) => void;
   onVolume: (stream: StreamItem, volume: number) => void;
@@ -1307,6 +1348,8 @@ function StreamCell({
   const [commentStatus, setCommentStatus] = useState('');
   const [cellLayout, setCellLayout] = useState({width: 0, height: 0});
   const [webViewerCount, setWebViewerCount] = useState<number | null>(null);
+  // 並び替えドラッグ中のセルだけ持ち上げスタイルを当てる(iOSのドラッグ影に相当)。
+  const [reordering, setReordering] = useState(false);
   const dragOriginRef = useRef(index);
   const dragCurrentRef = useRef(index);
   const webCommentRef = useRef<((text: string) => void) | null>(null);
@@ -1344,6 +1387,11 @@ function StreamCell({
       const colDelta = columns > 1 ? Math.round(dx / colWidth) : 0;
       const target = Math.max(0, Math.min(count - 1, dragOriginRef.current + rowDelta * columns + colDelta));
       if (target !== dragCurrentRef.current) {
+        // 即時スワップだと入れ替わりが視認できない。state 変更前に LayoutAnimation を
+        // 仕込み、周囲のセルがスライドして場所を空ける動きにする。
+        LayoutAnimation.configureNext(
+          LayoutAnimation.create(200, LayoutAnimation.Types.easeInEaseOut, LayoutAnimation.Properties.opacity),
+        );
         onMove(dragCurrentRef.current, target);
         dragCurrentRef.current = target;
       }
@@ -1359,10 +1407,15 @@ function StreamCell({
           showChrome();
           dragOriginRef.current = index;
           dragCurrentRef.current = index;
+          setReordering(true);
         },
         onPanResponderMove: (_, gesture) => updateDragTarget(gesture.dx, gesture.dy),
         onPanResponderRelease: (_, gesture) => {
           updateDragTarget(gesture.dx, gesture.dy);
+          setReordering(false);
+        },
+        onPanResponderTerminate: () => {
+          setReordering(false);
         },
       }),
     [index, showChrome, updateDragTarget],
@@ -1412,8 +1465,17 @@ function StreamCell({
       });
   }, [auth, commentText, onAuth, scheduleCommentClose, stream]);
 
+  // React.memo の効果を保つため、セル固有ハンドラはここで安定化して子に渡す。
+  const handleFocus = useCallback(() => onFocus(stream), [onFocus, stream]);
+  const handleReload = useCallback(() => onReload(stream.id), [onReload, stream.id]);
+  const handleRemove = useCallback(() => onRemove(stream.id), [onRemove, stream.id]);
+  const handleCellLayout = useCallback(
+    (event: {nativeEvent: {layout: {width: number; height: number}}}) => setCellLayout(event.nativeEvent.layout),
+    [],
+  );
+
   return (
-    <View style={styles.streamCell} onLayout={event => setCellLayout(event.nativeEvent.layout)}>
+    <View style={[styles.streamCell, reordering && styles.streamCellReordering]} onLayout={handleCellLayout}>
       <View style={styles.player} onTouchStart={showChrome}>
         {paused ? (
           <View style={styles.playerPlaceholder}>
@@ -1436,22 +1498,29 @@ function StreamCell({
         )}
         <View style={styles.playerChrome} pointerEvents="box-none">
           {!chromeVisible && <Pressable style={styles.chromeRevealTouch} onPress={showChrome} />}
-          {settings.showViewerCount && <ViewerCountBadge stream={stream} externalCount={webViewerCount} visible={chromeVisible} />}
+          {settings.showViewerCount && (
+            <ViewerCountBadge stream={stream} externalCount={webViewerCount} visible={chromeVisible} active={viewingActive !== false} />
+          )}
           <View
             style={[styles.autoHideChrome, !chromeVisible && styles.autoHideChromeHidden]}
             pointerEvents={chromeVisible ? 'box-none' : 'none'}>
             <View style={styles.cellTopControls} pointerEvents="box-none">
-              <TouchableOpacity style={styles.overlayButton} onPress={() => setCommentOpen(current => !current)}>
-                <Text style={styles.overlayIcon}>□</Text>
+              {/* 「□」は意味が伝わらない。コメント欄トグルは文字ラベルにし、絵文字の
+                  吹き出し(カラービットマップ化してtint不能)は使わない。 */}
+              <TouchableOpacity
+                accessibilityLabel="コメント入力"
+                style={[styles.overlayButton, commentOpen && styles.overlayButtonActive]}
+                onPress={() => setCommentOpen(current => !current)}>
+                <Text style={[styles.overlayLabel, commentOpen && styles.overlayIconActive]}>コメ</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.overlayButton} onPress={onFocus}>
-                <Text style={styles.overlayIcon}>↗</Text>
+              <TouchableOpacity accessibilityLabel="拡大表示" style={styles.overlayButton} onPress={handleFocus}>
+                <Text style={styles.overlayIcon}>⤢</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.overlayButton} onPress={onReload}>
+              <TouchableOpacity accessibilityLabel="再読み込み" style={styles.overlayButton} onPress={handleReload}>
                 <Text style={styles.overlayIcon}>↻</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.overlayButton} onPress={() => onRemove(stream.id)}>
-                <Text style={styles.overlayIcon}>×</Text>
+              <TouchableOpacity accessibilityLabel="削除" style={styles.overlayButton} onPress={handleRemove}>
+                <Text style={styles.overlayIcon}>✕</Text>
               </TouchableOpacity>
             </View>
             <VolumeOverlay stream={stream} volume={volume} color={info.color} onVolume={onVolume} onInteract={showChrome} />
@@ -1482,9 +1551,11 @@ function StreamCell({
       </View>
     </View>
   );
-}
+});
 
-function StreamPlayer({
+// React.memo: source 解決やネイティブイベントで頻繁に再レンダーする階層の起点。
+// props(ハンドラ含む)は呼び出し側で安定化済み。
+const StreamPlayer = React.memo(function StreamPlayer({
   viewingActive = true,
   stream,
   settings,
@@ -1589,6 +1660,30 @@ function StreamPlayer({
       }
     },
     [onViewerCount],
+  );
+
+  // ~6KB の注入スクリプト文字列をレンダー毎に再構築しない。入力が変わった時だけ作る。
+  const blockWebAds = settings.blockWebAds;
+  const fallbackInjectionScript = useMemo(
+    () => webFallbackScript(blockWebAds, stream.platform),
+    [blockWebAds, stream.platform],
+  );
+  const handleShouldStartLoad = useCallback(
+    (request: {url?: string}) => !(blockWebAds && isAdBlockedURL(request.url)),
+    [blockWebAds],
+  );
+  const handleNativePlayerEvent = useCallback(
+    (event: {nativeEvent: {type: string; message: string}}) => {
+      const payload = event.nativeEvent;
+      // 'idle' は致命的エラー後の停止状態。error イベントが失われても復旧に繋ぐ。
+      if (payload.type === 'error' || payload.message === 'ended' || payload.message === 'idle') {
+        playerHealthRef.current = 'broken';
+        scheduleAutoReload();
+      } else if (payload.message === 'playing' || payload.message === 'ready') {
+        playerHealthRef.current = 'healthy';
+      }
+    },
+    [scheduleAutoReload],
   );
 
   useEffect(() => {
@@ -1743,6 +1838,7 @@ function StreamPlayer({
   if (stream.platform === 'niconico') {
     return (
       <NiconicoNativePlayer
+        viewingActive={viewingActive}
         stream={stream}
         settings={settings}
         streamCount={streamCount}
@@ -1759,6 +1855,7 @@ function StreamPlayer({
   if (stream.platform === 'twitcasting') {
     return (
       <TwitcastingNativePlayer
+        viewingActive={viewingActive}
         stream={stream}
         settings={settings}
         streamCount={streamCount}
@@ -1794,19 +1891,10 @@ function StreamPlayer({
           liveTargetOffsetMs={source.liveTargetOffsetMs}
           maxBitrate={playbackQuality === 'economy' ? 900000 : 0}
           resizeMode="contain"
-          onPlayerEvent={event => {
-            const payload = event.nativeEvent;
-            // 'idle' は致命的エラー後の停止状態。error イベントが失われても復旧に繋ぐ。
-            if (payload.type === 'error' || payload.message === 'ended' || payload.message === 'idle') {
-              playerHealthRef.current = 'broken';
-              scheduleAutoReload();
-            } else if (payload.message === 'playing' || payload.message === 'ready') {
-              playerHealthRef.current = 'healthy';
-            }
-          }}
+          onPlayerEvent={handleNativePlayerEvent}
         />
-        <DanmakuOverlay stream={stream} settings={settings} />
-        <GiftOverlay stream={stream} settings={settings} />
+        <DanmakuOverlay stream={stream} settings={settings} active={viewingActive} />
+        <GiftOverlay stream={stream} settings={settings} active={viewingActive} />
       </>
     );
   }
@@ -1825,8 +1913,8 @@ function StreamPlayer({
           setSupportMultipleWindows={false}
           style={styles.webPlayer}
         />
-        <DanmakuOverlay stream={stream} settings={settings} />
-        <GiftOverlay stream={stream} settings={settings} />
+        <DanmakuOverlay stream={stream} settings={settings} active={viewingActive} />
+        <GiftOverlay stream={stream} settings={settings} active={viewingActive} />
       </>
     );
   }
@@ -1847,13 +1935,13 @@ function StreamPlayer({
           allowsInlineMediaPlayback
           mediaPlaybackRequiresUserAction={false}
           setSupportMultipleWindows={false}
-          injectedJavaScript={webFallbackScript(settings.blockWebAds, stream.platform)}
-          onShouldStartLoadWithRequest={request => !(settings.blockWebAds && isAdBlockedURL(request.url))}
+          injectedJavaScript={fallbackInjectionScript}
+          onShouldStartLoadWithRequest={handleShouldStartLoad}
           onMessage={handleWebMessage}
           style={styles.webPlayer}
         />
-        <DanmakuOverlay stream={stream} settings={settings} />
-        <GiftOverlay stream={stream} settings={settings} />
+        <DanmakuOverlay stream={stream} settings={settings} active={viewingActive} />
+        <GiftOverlay stream={stream} settings={settings} active={viewingActive} />
         {source.kind === 'error' && <PlayerBadge source={source} status={source.reason} warning />}
       </>
     );
@@ -1864,9 +1952,10 @@ function StreamPlayer({
       <Text style={styles.playerStatus}>{source.reason}</Text>
     </View>
   );
-}
+});
 
-function NiconicoNativePlayer({
+const NiconicoNativePlayer = React.memo(function NiconicoNativePlayer({
+  viewingActive = true,
   stream,
   settings,
   streamCount,
@@ -1877,6 +1966,7 @@ function NiconicoNativePlayer({
   onCommentBridge,
   onViewerCount,
 }: {
+  viewingActive?: boolean;
   stream: StreamItem;
   settings: AppSettings;
   streamCount: number;
@@ -2123,6 +2213,49 @@ function NiconicoNativePlayer({
     ],
   );
 
+  // 注入スクリプト文字列とインラインハンドラのレンダー毎再生成を止める(memo対応)。
+  const sessionInjectionScript = useMemo(
+    () => niconicoSessionScript(stream.channel, niconicoQuality(playbackQuality)),
+    [playbackQuality, stream.channel],
+  );
+  const handleSessionMessage = useCallback(
+    (event: WebViewMessageEvent) => onSessionMessage(event, sessionKey),
+    [onSessionMessage, sessionKey],
+  );
+  const blockWebAds = settings.blockWebAds;
+  const fallbackInjectionScript = useMemo(() => webFallbackScript(blockWebAds, 'niconico'), [blockWebAds]);
+  const handleShouldStartLoad = useCallback(
+    (request: {url?: string}) => !(blockWebAds && isAdBlockedURL(request.url)),
+    [blockWebAds],
+  );
+  const handleFallbackMessage = useCallback(
+    (event: WebViewMessageEvent) => {
+      try {
+        const payload = JSON.parse(event.nativeEvent.data);
+        const count = Number(payload?.count);
+        if (payload?.type === 'viewerCount' && Number.isFinite(count) && count >= 0) {
+          onViewerCount?.(Math.round(count));
+        }
+      } catch {
+        // ignore bridge noise
+      }
+    },
+    [onViewerCount],
+  );
+  const handleNativePlayerEvent = useCallback(
+    (event: {nativeEvent: {type: string; message: string}}) => {
+      const payload = event.nativeEvent;
+      if (payload.type === 'firstFrame') {
+        setNativeFrameReady(true);
+      }
+      if (payload.type === 'error' || payload.message === 'ended') {
+        setHls(null);
+      }
+      handlePlayerStatus(payload.type, payload.message, paused);
+    },
+    [handlePlayerStatus, paused],
+  );
+
   // niconico は RN の直接 fetch/WS を拒否するため、視聴セッションは niconico オリジンを
   // 読み込んだ隠し WebView 内で実行し、HLS uri を postMessage で受け取る(keepSeatも内部で継続)。
   const sessionWebView =
@@ -2137,8 +2270,8 @@ function NiconicoNativePlayer({
         sharedCookiesEnabled
         thirdPartyCookiesEnabled
         setSupportMultipleWindows={false}
-        injectedJavaScript={niconicoSessionScript(stream.channel, niconicoQuality(playbackQuality))}
-        onMessage={event => onSessionMessage(event, sessionKey)}
+        injectedJavaScript={sessionInjectionScript}
+        onMessage={handleSessionMessage}
         onError={scheduleReconnect}
         onHttpError={scheduleReconnect}
         onRenderProcessGone={scheduleReconnect}
@@ -2176,19 +2309,10 @@ function NiconicoNativePlayer({
           liveTargetOffsetMs={settings.niconicoLowLatency ? 2000 : 6000}
           maxBitrate={playbackQuality === 'economy' ? 900000 : 0}
           resizeMode="contain"
-          onPlayerEvent={event => {
-            const payload = event.nativeEvent;
-            if (payload.type === 'firstFrame') {
-              setNativeFrameReady(true);
-            }
-            if (payload.type === 'error' || payload.message === 'ended') {
-              setHls(null);
-            }
-            handlePlayerStatus(payload.type, payload.message, paused);
-          }}
+          onPlayerEvent={handleNativePlayerEvent}
         />
-        <DanmakuOverlay stream={stream} settings={settings} />
-        <GiftOverlay stream={stream} settings={settings} />
+        <DanmakuOverlay stream={stream} settings={settings} active={viewingActive} />
+        <GiftOverlay stream={stream} settings={settings} active={viewingActive} />
       </>
     );
   }
@@ -2208,23 +2332,13 @@ function NiconicoNativePlayer({
           allowsInlineMediaPlayback
           mediaPlaybackRequiresUserAction={false}
           setSupportMultipleWindows={false}
-          injectedJavaScript={webFallbackScript(settings.blockWebAds, 'niconico')}
-          onShouldStartLoadWithRequest={request => !(settings.blockWebAds && isAdBlockedURL(request.url))}
-          onMessage={event => {
-            try {
-              const payload = JSON.parse(event.nativeEvent.data);
-              const count = Number(payload?.count);
-              if (payload?.type === 'viewerCount' && Number.isFinite(count) && count >= 0) {
-                onViewerCount?.(Math.round(count));
-              }
-            } catch {
-              // ignore bridge noise
-            }
-          }}
+          injectedJavaScript={fallbackInjectionScript}
+          onShouldStartLoadWithRequest={handleShouldStartLoad}
+          onMessage={handleFallbackMessage}
           style={styles.webPlayer}
         />
-        <DanmakuOverlay stream={stream} settings={settings} />
-        <GiftOverlay stream={stream} settings={settings} />
+        <DanmakuOverlay stream={stream} settings={settings} active={viewingActive} />
+        <GiftOverlay stream={stream} settings={settings} active={viewingActive} />
       </>
     );
   }
@@ -2238,9 +2352,10 @@ function NiconicoNativePlayer({
       </View>
     </>
   );
-}
+});
 
-function TwitcastingNativePlayer({
+const TwitcastingNativePlayer = React.memo(function TwitcastingNativePlayer({
+  viewingActive = true,
   stream,
   settings,
   streamCount,
@@ -2250,6 +2365,7 @@ function TwitcastingNativePlayer({
   reloadKey,
   onViewerCount,
 }: {
+  viewingActive?: boolean;
   stream: StreamItem;
   settings: AppSettings;
   streamCount: number;
@@ -2343,6 +2459,46 @@ function TwitcastingNativePlayer({
   );
   const renderWebFallback = useWebFallback || missingNativeFrameFallback;
 
+  // 注入スクリプト文字列とインラインハンドラのレンダー毎再生成を止める(memo対応)。
+  const sessionInjectionScript = useMemo(() => twitcastingSessionScript(channel), [channel]);
+  const handleSessionMessage = useCallback(
+    (event: WebViewMessageEvent) => onSessionMessage(event, sessionKey),
+    [onSessionMessage, sessionKey],
+  );
+  const blockWebAds = settings.blockWebAds;
+  const fallbackInjectionScript = useMemo(() => webFallbackScript(blockWebAds, 'twitcasting'), [blockWebAds]);
+  const handleShouldStartLoad = useCallback(
+    (request: {url?: string}) => !(blockWebAds && isAdBlockedURL(request.url)),
+    [blockWebAds],
+  );
+  const handleFallbackMessage = useCallback(
+    (event: WebViewMessageEvent) => {
+      try {
+        const payload = JSON.parse(event.nativeEvent.data);
+        const count = Number(payload?.count);
+        if (payload?.type === 'viewerCount' && Number.isFinite(count) && count >= 0) {
+          onViewerCount?.(Math.round(count));
+        }
+      } catch {
+        // ignore bridge noise
+      }
+    },
+    [onViewerCount],
+  );
+  const handleNativePlayerEvent = useCallback(
+    (event: {nativeEvent: {type: string; message: string}}) => {
+      const payload = event.nativeEvent;
+      if (payload.type === 'firstFrame') {
+        setNativeFrameReady(true);
+      }
+      if (payload.type === 'error') {
+        setMissingNativeFrameFallback(true);
+      }
+      handlePlayerStatus(payload.type, payload.message, paused);
+    },
+    [handlePlayerStatus, paused],
+  );
+
   // streamserver.php は player=pc_web でも Android mobile UA で通るため、WebView と HLS の UA を揃える。
   const sessionWebView =
     !missingNativeFrameFallback ? (
@@ -2355,8 +2511,8 @@ function TwitcastingNativePlayer({
         sharedCookiesEnabled
         thirdPartyCookiesEnabled
         setSupportMultipleWindows={false}
-        injectedJavaScript={twitcastingSessionScript(channel)}
-        onMessage={event => onSessionMessage(event, sessionKey)}
+        injectedJavaScript={sessionInjectionScript}
+        onMessage={handleSessionMessage}
         onError={scheduleReconnect}
         onHttpError={scheduleReconnect}
         onRenderProcessGone={scheduleReconnect}
@@ -2384,19 +2540,10 @@ function TwitcastingNativePlayer({
           volume={volume}
           maxBitrate={playbackQuality === 'economy' ? 900000 : 0}
           resizeMode="contain"
-          onPlayerEvent={event => {
-            const payload = event.nativeEvent;
-            if (payload.type === 'firstFrame') {
-              setNativeFrameReady(true);
-            }
-            if (payload.type === 'error') {
-              setMissingNativeFrameFallback(true);
-            }
-            handlePlayerStatus(payload.type, payload.message, paused);
-          }}
+          onPlayerEvent={handleNativePlayerEvent}
         />
-        <DanmakuOverlay stream={stream} settings={settings} />
-        <GiftOverlay stream={stream} settings={settings} />
+        <DanmakuOverlay stream={stream} settings={settings} active={viewingActive} />
+        <GiftOverlay stream={stream} settings={settings} active={viewingActive} />
       </>
     );
   }
@@ -2416,23 +2563,13 @@ function TwitcastingNativePlayer({
           allowsInlineMediaPlayback
           mediaPlaybackRequiresUserAction={false}
           setSupportMultipleWindows={false}
-          injectedJavaScript={webFallbackScript(settings.blockWebAds, 'twitcasting')}
-          onShouldStartLoadWithRequest={request => !(settings.blockWebAds && isAdBlockedURL(request.url))}
-          onMessage={event => {
-            try {
-              const payload = JSON.parse(event.nativeEvent.data);
-              const count = Number(payload?.count);
-              if (payload?.type === 'viewerCount' && Number.isFinite(count) && count >= 0) {
-                onViewerCount?.(Math.round(count));
-              }
-            } catch {
-              // ignore bridge noise
-            }
-          }}
+          injectedJavaScript={fallbackInjectionScript}
+          onShouldStartLoadWithRequest={handleShouldStartLoad}
+          onMessage={handleFallbackMessage}
           style={styles.webPlayer}
         />
-        <DanmakuOverlay stream={stream} settings={settings} />
-        <GiftOverlay stream={stream} settings={settings} />
+        <DanmakuOverlay stream={stream} settings={settings} active={viewingActive} />
+        <GiftOverlay stream={stream} settings={settings} active={viewingActive} />
       </>
     );
   }
@@ -2446,9 +2583,9 @@ function TwitcastingNativePlayer({
       </View>
     </>
   );
-}
+});
 
-function PlayerBadge({source, status, warning}: {source: PlaybackSource; status: string; warning?: boolean}) {
+const PlayerBadge = React.memo(function PlayerBadge({source, status, warning}: {source: PlaybackSource; status: string; warning?: boolean}) {
   return (
     <View style={[styles.playerBadge, warning && styles.playerBadgeWarning]}>
       <Text style={styles.playerBadgeText} numberOfLines={1}>
@@ -2456,9 +2593,11 @@ function PlayerBadge({source, status, warning}: {source: PlaybackSource; status:
       </Text>
     </View>
   );
-}
+});
 
-function VolumeOverlay({
+// React.memo: 音量ドラッグ中の再レンダーをこのオーバーレイ内に閉じ込める。
+// PanResponder は内部の useMemo/ref で管理しており memo 化の影響を受けない。
+const VolumeOverlay = React.memo(function VolumeOverlay({
   stream,
   volume,
   color,
@@ -2568,16 +2707,18 @@ function VolumeOverlay({
       <Text style={styles.volumeIcon}>♪</Text>
     </View>
   );
-}
+});
 
-function ViewerCountBadge({
+const ViewerCountBadge = React.memo(function ViewerCountBadge({
   stream,
   externalCount,
   visible,
+  active = true,
 }: {
   stream: StreamItem;
   externalCount?: number | null;
   visible: boolean;
+  active?: boolean;
 }) {
   const [count, setCount] = useState<number | null>(null);
   const opacity = useRef(new Animated.Value(0)).current;
@@ -2630,6 +2771,11 @@ function ViewerCountBadge({
   useEffect(() => () => clearHideTimer(), [clearHideTimer]);
 
   useEffect(() => {
+    if (!active) {
+      // 視聴タブが背面の間は 30 秒ポーリングを止める。active 復帰でこの effect が
+      // 再実行され、即時 refresh + インターバル再開になる。
+      return;
+    }
     let cancelled = false;
     const refresh = () => {
       if (inFlightRef.current) {
@@ -2656,7 +2802,7 @@ function ViewerCountBadge({
       cancelled = true;
       clearInterval(timer);
     };
-  }, [reveal, stream]);
+  }, [active, reveal, stream]);
 
   if (count == null || count < 0) {
     return null;
@@ -2668,7 +2814,7 @@ function ViewerCountBadge({
       <Text style={styles.viewerBadgeText}>{count}人</Text>
     </Animated.View>
   );
-}
+});
 
 function AddStreamModal({
   visible,
@@ -2917,7 +3063,7 @@ function FocusModal({
                     <Text style={styles.overlayIcon}>↻</Text>
                   </TouchableOpacity>
                   <TouchableOpacity style={[styles.overlayButton, styles.focusRemoveButton]} onPress={removeFocused}>
-                    <Text style={styles.overlayIcon}>×</Text>
+                    <Text style={styles.overlayIcon}>✕</Text>
                   </TouchableOpacity>
                   <VolumeOverlay
                     stream={stream}
@@ -2963,6 +3109,54 @@ function SettingsScreen({
   onNiconicoLogin: () => void;
 }) {
   const order = orderedPlatforms(settings.platformOrder);
+
+  // iOS Screens.swift confirmClearWebData と同じ確認→削除→完了通知のフロー。
+  // OAuth 連携(AsyncStorage 保存)は消さない — WebView 側の Cookie/閲覧データのみ。
+  const confirmClearWebData = useCallback(() => {
+    Alert.alert(
+      'Webログイン情報と履歴を削除',
+      'Kick、ニコ生、YouTube、Twitch、ツイキャスのWebView Cookie・閲覧データを削除します。OAuth連携のログイン状態は残します。',
+      [
+        {text: 'キャンセル', style: 'cancel'},
+        {
+          text: '削除',
+          style: 'destructive',
+          onPress: () => {
+            void clearAllWebData().then(ok => {
+              Alert.alert(
+                ok ? '削除しました' : '削除できませんでした',
+                ok
+                  ? 'WebViewのCookieと閲覧データを削除しました。'
+                  : 'ネイティブモジュールを利用できません。アプリを最新バイナリへ更新してください。',
+              );
+            });
+          },
+        },
+      ],
+    );
+  }, []);
+
+  // iOS Screens.swift handleNiconicoRow のログアウトに対応。Android はニコ生の
+  // ログイン状態を state 管理していない(Cookie が唯一の実体)ため、削除完了の通知のみ。
+  const confirmNiconicoLogout = useCallback(() => {
+    Alert.alert('ニコ生からログアウト', '保存されたログイン情報(Cookie)を削除します。', [
+      {text: 'キャンセル', style: 'cancel'},
+      {
+        text: 'ログアウト',
+        style: 'destructive',
+        onPress: () => {
+          void clearCookiesForDomain('nicovideo.jp').then(ok => {
+            Alert.alert(
+              ok ? 'ログアウトしました' : 'ログアウトできませんでした',
+              ok
+                ? 'ニコ生のログインCookieを削除しました。プレイヤーは次回読み込みから未ログイン状態になります。'
+                : 'ネイティブモジュールを利用できません。アプリを最新バイナリへ更新してください。',
+            );
+          });
+        },
+      },
+    ]);
+  }, []);
 
   return (
     <ScrollView style={styles.settings} contentContainerStyle={styles.settingsContent}>
@@ -3062,6 +3256,9 @@ function SettingsScreen({
 
       <Text style={styles.sectionTitle}>Web</Text>
       <SettingSwitch title="Web広告ブロック" value={settings.blockWebAds} onValueChange={value => onSettings({blockWebAds: value})} />
+      <TouchableOpacity style={styles.settingRow} onPress={confirmClearWebData}>
+        <Text style={styles.dangerRowText}>Webログイン情報と履歴を削除</Text>
+      </TouchableOpacity>
 
       <Text style={styles.sectionTitle}>認証・コメント送信</Text>
       <AuthServicePanel service="kick" auth={auth} onAuth={onAuth} onLogin={onLogin} />
@@ -3084,7 +3281,7 @@ function SettingsScreen({
         onResumeDeviceOAuth={onResumeDeviceOAuth}
         onCancelDeviceOAuth={onCancelDeviceOAuth}
       />
-      <NiconicoLoginPanel onLogin={onNiconicoLogin} />
+      <NiconicoLoginPanel onLogin={onNiconicoLogin} onLogout={confirmNiconicoLogout} />
 
       <TouchableOpacity
         style={styles.clearButton}
@@ -3258,7 +3455,7 @@ function AuthServicePanel({
   );
 }
 
-function NiconicoLoginPanel({onLogin}: {onLogin: () => void}) {
+function NiconicoLoginPanel({onLogin, onLogout}: {onLogin: () => void; onLogout: () => void}) {
   return (
     <View style={styles.authPanel}>
       <View style={styles.authHeader}>
@@ -3266,9 +3463,14 @@ function NiconicoLoginPanel({onLogin}: {onLogin: () => void}) {
           <Text style={styles.authTitle}>ニコ生</Text>
           <Text style={styles.authStatus}>WebログインCookieを利用</Text>
         </View>
-        <TouchableOpacity style={styles.smallButton} onPress={onLogin}>
-          <Text style={styles.smallButtonText}>ログイン</Text>
-        </TouchableOpacity>
+        <View style={styles.authHeaderButtons}>
+          <TouchableOpacity style={styles.smallButton} onPress={onLogin}>
+            <Text style={styles.smallButtonText}>ログイン</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.smallButton, styles.dangerButton]} onPress={onLogout}>
+            <Text style={styles.smallButtonText}>ログアウト</Text>
+          </TouchableOpacity>
+        </View>
       </View>
       <Text style={styles.settingNote}>
         ニコ生は公開OAuthがないため、iOSと同じくアプリ内WebViewでログインしてCookieをプレイヤーとコメント送信に共有します。
@@ -3341,32 +3543,52 @@ const styles = StyleSheet.create({
     left: 0,
     opacity: 0,
   },
+  // iOS の translucent tab bar + hairline に寄せる。アクティブはアクセント色の
+  // ティント + 上端インジケータで示し、背景ピルは使わない。
   tabBar: {
-    minHeight: 58,
+    minHeight: 60,
     paddingHorizontal: 8,
-    paddingTop: 7,
-    borderTopWidth: 1,
-    borderTopColor: '#18202b',
-    backgroundColor: '#090d12',
+    paddingTop: 3,
+    paddingBottom: 6,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: 'rgba(255,255,255,0.16)',
+    backgroundColor: 'rgba(9,13,18,0.92)',
     flexDirection: 'row',
   },
   tabButton: {
     flex: 1,
-    height: 42,
+    minHeight: 51,
     alignItems: 'center',
     justifyContent: 'center',
     borderRadius: 7,
   },
-  tabButtonActive: {
-    backgroundColor: '#162231',
+  tabIndicator: {
+    width: 28,
+    height: 3,
+    marginBottom: 3,
+    borderRadius: 1.5,
+    backgroundColor: 'transparent',
+  },
+  tabIndicatorActive: {
+    backgroundColor: '#67a8ff',
+  },
+  tabIcon: {
+    color: '#8a93a6',
+    fontSize: 18,
+    lineHeight: 21,
+  },
+  tabIconActive: {
+    color: '#67a8ff',
   },
   tabText: {
-    color: '#8c98a8',
-    fontSize: 13,
+    color: '#8a93a6',
+    fontSize: 11,
     fontWeight: '600',
+    marginTop: 1,
   },
   tabTextActive: {
-    color: '#f7f9fc',
+    color: '#67a8ff',
+    fontWeight: '700',
   },
   screen: {
     flex: 1,
@@ -3547,6 +3769,13 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,255,255,0.18)',
     backgroundColor: '#000',
   },
+  // 並び替えドラッグ中のセル: 半透明 + アクセント枠 + 僅かな縮小で「持ち上げ中」を示す。
+  streamCellReordering: {
+    opacity: 0.75,
+    borderWidth: 1.5,
+    borderColor: '#67a8ff',
+    transform: [{scale: 0.97}],
+  },
   platformDot: {
     width: 9,
     height: 9,
@@ -3615,11 +3844,25 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  // コメントバー展開中のトグルはアクセント背景で「開いている」ことを示す。
+  overlayButtonActive: {
+    backgroundColor: 'rgba(47,140,255,0.85)',
+  },
   overlayIcon: {
+    color: 'rgba(255,255,255,0.92)',
+    fontSize: 17,
+    fontWeight: '700',
+    lineHeight: 20,
+  },
+  // 「コメ」のような 2 文字ラベル用。記号アイコンと同じ濃さ/重さで揃える。
+  overlayLabel: {
+    color: 'rgba(255,255,255,0.92)',
+    fontSize: 11,
+    fontWeight: '700',
+    lineHeight: 14,
+  },
+  overlayIconActive: {
     color: '#fff',
-    fontSize: 20,
-    fontWeight: '800',
-    lineHeight: 22,
   },
   playerPlaceholder: {
     flex: 1,
@@ -4025,6 +4268,13 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 17,
   },
+  // iOS の赤文字テーブル行(破壊的操作)に対応する設定行テキスト。
+  dangerRowText: {
+    flex: 1,
+    color: '#ff8fa0',
+    fontSize: 15,
+    fontWeight: '700',
+  },
   authPanel: {
     paddingVertical: 12,
     borderBottomWidth: 1,
@@ -4035,6 +4285,10 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+  },
+  authHeaderButtons: {
+    flexDirection: 'row',
+    alignItems: 'center',
   },
   authTitle: {
     color: '#edf3fb',

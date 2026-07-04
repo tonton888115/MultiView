@@ -37,7 +37,17 @@ type LaneReservation = {
   endX: number;
 };
 
-export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings: AppSettings}) {
+// React.memo: 親(StreamPlayer等)の再レンダー毎にオーバーレイ全体を再構築しない。
+// props は stream/settings(実変更時のみ identity が変わる)と active のみ。
+export const DanmakuOverlay = React.memo(function DanmakuOverlay({
+  stream,
+  settings,
+  active = true,
+}: {
+  stream: StreamItem;
+  settings: AppSettings;
+  active?: boolean;
+}) {
   const [layout, setLayout] = useState<Layout>({width: 0, height: 0});
   const [visible, setVisible] = useState<VisibleItem[]>([]);
   const queueRef = useRef(new DanmakuEventQueue());
@@ -52,6 +62,10 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
   const officialYouTubeActiveUntilRef = useRef(0);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  // 視聴タブが背面(opacity 0)の間の新規イベントは ref 経由で即捨てる。state だと
+  // enqueueEvent の identity が変わり chat client が再接続されてしまう。
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const showDanmaku = settings.showDanmaku;
 
   const fontSize = useMemo(() => scaledFontSize(settings.danmakuFontSize, layout.width), [layout.width, settings.danmakuFontSize]);
@@ -106,6 +120,30 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       scheduleDrainRef.current();
     }
   }, [laneCount, layout.width, layout.height, updateVisible]);
+
+  useEffect(() => {
+    if (active) {
+      return;
+    }
+    // 視聴タブが他タブの下に隠れている間はアニメーション/ドレインを完全停止する。
+    // chat client は止めない(接続維持がプロダクト仕様)。復帰時は新規イベントから
+    // 再開するため、キューと表示中アイテムはここで捨てる。
+    queueRef.current.clear();
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    if (removalTimerRef.current) {
+      clearTimeout(removalTimerRef.current);
+      removalTimerRef.current = null;
+    }
+    pendingRemovalsRef.current.clear();
+    laneReservationsRef.current = [];
+    visibleRef.current.forEach(item => item.x.stopAnimation());
+    if (visibleRef.current.length > 0) {
+      updateVisible(() => []);
+    }
+  }, [active, updateVisible]);
 
   const pickLane = useCallback(
     (now: number): number => {
@@ -246,6 +284,10 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
 
   const enqueueEvent = useCallback(
     (event: ChatEvent) => {
+      if (!activeRef.current) {
+        // 非表示中のイベントは蓄積せず捨てる(復帰時に古い弾幕が雪崩れないように)。
+        return;
+      }
       if (isOfficialYouTubeEvent(event)) {
         officialYouTubeActiveUntilRef.current = Date.now() + officialYouTubePrimaryMs;
         queueRef.current.removeWhere(
@@ -352,7 +394,7 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
       )}
     </View>
   );
-}
+});
 
 function isOfficialYouTubeEvent(event: ChatEvent): boolean {
   return event.platform === 'youtube' && event.id.startsWith('yt-dom:');
