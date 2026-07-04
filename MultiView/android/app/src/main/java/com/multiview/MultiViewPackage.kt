@@ -13,8 +13,12 @@ class MultiViewPackage : ReactPackage {
       PlaybackServiceModule(reactContext),
       NetworkInfoModule(reactContext),
       GiftSoundModule(reactContext),
+      HandoffQrModule(reactContext),
     )
 
   override fun createViewManagers(reactContext: ReactApplicationContext): MutableList<ViewManager<*, *>> =
-    mutableListOf(NativeHlsPlayerManager())
+    mutableListOf(
+      NativeHlsPlayerManager(),
+      AnimatedImageManager(),
+    )
 }

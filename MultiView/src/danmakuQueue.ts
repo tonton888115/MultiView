@@ -1,6 +1,10 @@
 import type {AppSettings, ChatEvent} from './types';
 
 const duplicateWindowMs = 10000;
+// 高流量バーストでもコメントは基本落とさない設計(下の append 参照)。ただし消費側が
+// 長時間止まった場合に未消費バックログが無制限に増えて OOM になるのを防ぐため、通常の
+// バースト(数万件)では決して当たらない十分高い天井だけ設ける。超過時は最古から捨てる。
+const maxQueuedEvents = 50000;
 
 export type RecentDanmakuEvents = Map<string, number>;
 
@@ -18,6 +22,11 @@ export class DanmakuEventQueue {
 
   append(event: ChatEvent): void {
     this.items.push(event);
+    if (this.items.length - this.head > maxQueuedEvents) {
+      // 最新優先で表示するため、あふれた最古のバックログを切り捨てる。
+      this.items = this.items.slice(this.items.length - maxQueuedEvents);
+      this.head = 0;
+    }
   }
 
   consume(): ChatEvent | undefined {

@@ -18,7 +18,10 @@ describe('YouTube playback regression harness', () => {
     'src/types.ts',
     'ios/MultiView/BrowserUserAgent.swift',
     'ios/MultiView/YouTubePlayer.swift',
+    'src/AnimatedEmoteImage.tsx',
     'src/YouTubeOfficialChatBridge.tsx',
+    'android/app/src/main/java/com/multiview/AnimatedImageView.kt',
+    'android/app/src/main/java/com/multiview/MultiViewPackage.kt',
     'android/app/src/main/java/com/multiview/NativeHlsPlayerView.kt',
   ];
 
@@ -109,7 +112,10 @@ describe('YouTube playback regression harness', () => {
     const chat = readProjectFile('src/chat.ts');
     const overlay = readProjectFile('src/DanmakuOverlay.tsx');
     const queue = readProjectFile('src/danmakuQueue.ts');
+    const animatedEmote = readProjectFile('src/AnimatedEmoteImage.tsx');
     const officialBridge = readProjectFile('src/YouTubeOfficialChatBridge.tsx');
+    const androidAnimatedImage = readProjectFile('android/app/src/main/java/com/multiview/AnimatedImageView.kt');
+    const androidPackage = readProjectFile('android/app/src/main/java/com/multiview/MultiViewPackage.kt');
     const swift = readProjectFile('ios/MultiView/YouTubePlayer.swift');
 
     expect(chat).toContain('const youtubeChatMinPollMs = 700');
@@ -117,6 +123,7 @@ describe('YouTube playback regression harness', () => {
     expect(chat).toContain('export function youtubeChatPollDelayMs');
     expect(chat).toContain("?? 'emoji'");
     expect(overlay).toContain('YouTubeOfficialChatBridge');
+    expect(overlay).toContain('AnimatedEmoteImage');
     expect(overlay).toContain('officialYouTubePrimaryMs = 10000');
     expect(overlay).toContain('laneReservationsRef');
     expect(overlay).toContain('Easing.linear');
@@ -133,6 +140,10 @@ describe('YouTube playback regression harness', () => {
     expect(queue).toContain('class DanmakuEventQueue');
     expect(queue).toContain('this.head += 1');
     expect(queue).not.toContain('.shift(');
+    expect(animatedEmote).toContain("requireNativeComponent<NativeAnimatedImageProps>('MVAnimatedImage')");
+    expect(androidAnimatedImage).toContain('setAutoPlayAnimations(true)');
+    expect(androidAnimatedImage).toContain('Fresco.newDraweeControllerBuilder()');
+    expect(androidPackage).toContain('AnimatedImageManager()');
     expect(officialBridge).toContain('youtubeOfficialChatObserverScript');
     expect(officialBridge).toContain('MutationObserver');
     expect(officialBridge).toContain('yt-live-chat-text-message-renderer');

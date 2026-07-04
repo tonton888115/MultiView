@@ -408,6 +408,10 @@ function startYouTubeChat(stream: StreamItem, emit: Emit, status: Status): ChatC
         }
         try {
           const page = await fetchYouTubeChatPage(session, continuation);
+          if (stopped) {
+            // 停止後に届いた応答を、破棄済みの overlay キュー/gift registry へ戻さない。
+            return;
+          }
           continuation = page.continuation ?? continuation;
           page.events.forEach(event => {
             if (!seen.has(event.id)) {
@@ -422,6 +426,9 @@ function startYouTubeChat(stream: StreamItem, emit: Emit, status: Status): ChatC
           }
           timer = setTimeout(poll, page.timeoutMs);
         } catch {
+          if (stopped) {
+            return;
+          }
           status('YouTubeコメント再接続中');
           timer = setTimeout(run, youtubeChatReconnectMs);
         }

@@ -4,10 +4,12 @@ import {
   Alert,
   AppState,
   Animated,
+  Image,
   Modal,
   ScrollView,
   PanResponder,
   Pressable,
+  Share,
   StatusBar,
   StyleSheet,
   Switch,
@@ -61,6 +63,7 @@ import {
   type PendingOAuth,
 } from './src/auth';
 import {compactHandoffCode, decodeHandoff, handoffURL} from './src/handoff';
+import {encodeHandoffQrPngBase64, isHandoffQrAvailable, scanHandoffQr} from './src/NativeHandoffQr';
 import {
   chatURL,
   desktopUserAgent,
@@ -102,6 +105,8 @@ type AuthCommit = (
 ) => Promise<AuthState>;
 
 type NiconicoCommentSender = (text: string) => Promise<void>;
+type HandoffImportMode = 'replace' | 'append';
+type HandoffImporter = (streams: StreamItem[], settings: Partial<AppSettings>, mode: HandoffImportMode) => void;
 
 const platformIds: PlatformId[] = ['kick', 'twitch', 'youtube', 'niconico', 'twitcasting'];
 const youtubeViewerKeys = ['concurrentViewers', 'concurrent_viewers'];
@@ -292,10 +297,13 @@ export default function App() {
         if (merged === current) {
           return current;
         }
-        authRef.current = merged;
-        setAuth(merged);
+        // 永続化に成功してから UI/メモリへ公開する。書き込み失敗時は throw させ、
+        // UI だけログイン/更新済みになって再起動で巻き戻る不整合(refresh token
+        // ローテーション後のセッション喪失)を防ぐ。
         const serialized = JSON.stringify(merged);
         await writeStoredAuthWithRetry(() => AsyncStorage.setItem(AUTH_STORAGE_KEY, serialized));
+        authRef.current = merged;
+        setAuth(merged);
         return merged;
       });
     authWriteChainRef.current = operation.then(() => undefined);
@@ -720,6 +728,21 @@ export default function App() {
     setSettings(current => sanitizeSettings({...current, ...patch}));
   }, []);
 
+  const importHandoff = useCallback<HandoffImporter>((nextStreams, nextSettings, mode) => {
+    if (mode === 'append') {
+      // iOS Handoff「追加する」: 既存タブを保ち、未追加のものだけ足す。
+      // レイアウト等の設定は「置き換える」時のみ反映する(iOS準拠)。
+      setStreams(current => {
+        const existing = new Set(current.map(stream => stream.id));
+        return [...current, ...nextStreams.filter(stream => !existing.has(stream.id))];
+      });
+    } else {
+      setStreams(nextStreams);
+      setSettings(current => sanitizeSettings({...current, ...nextSettings}));
+    }
+    setActiveTab('viewing');
+  }, []);
+
   const setStreamVolume = useCallback((stream: StreamItem, volume: number) => {
     setVolumes(current => ({...current, [stream.id]: Math.max(0, Math.min(1, volume))}));
   }, []);
@@ -747,20 +770,15 @@ export default function App() {
             onMove={moveStreamTo}
             onVolume={setStreamVolume}
             onSettings={updateSettings}
+            onImport={importHandoff}
             auth={auth}
             onAuth={updateAuth}
           />
         </View>
         {activeTab === 'settings' && (
           <SettingsScreen
-            streams={streams}
             settings={settings}
             onSettings={updateSettings}
-            onImport={(nextStreams, nextSettings) => {
-              setStreams(nextStreams);
-              setSettings(sanitizeSettings({...settings, ...nextSettings}));
-              setActiveTab('viewing');
-            }}
             onMovePlatform={(index, delta) => {
               const order = orderedPlatforms(settings.platformOrder);
               const target = index + delta;
@@ -900,6 +918,190 @@ function SourceBrowser({sources, onAdd}: {sources: Source[]; onAdd: (platform: P
   );
 }
 
+function HandoffModal({
+  visible,
+  streams,
+  settings,
+  onClose,
+  onImport,
+}: {
+  visible: boolean;
+  streams: StreamItem[];
+  settings: AppSettings;
+  onClose: () => void;
+  onImport: HandoffImporter;
+}) {
+  const [mode, setMode] = useState<'send' | 'receive'>('send');
+  const [handoff, setHandoff] = useState('');
+  const [handoffQrPng, setHandoffQrPng] = useState<string | null>(null);
+  const compactCode = useMemo(() => compactHandoffCode(streams, settings.layoutMode), [settings.layoutMode, streams]);
+  // QRの中身はURL形式にする。iOSのHandoffPayload.decodeはURL形式も受理し、
+  // OS標準カメラで読んだ場合もディープリンクとしてこのアプリが開く(最大互換)。
+  const handoffUrl = useMemo(() => handoffURL(streams, settings.layoutMode), [settings.layoutMode, streams]);
+  const exportText = useMemo(
+    () =>
+      JSON.stringify(
+        {
+          version: 2,
+          streams,
+          settings,
+          compactCode,
+          url: handoffUrl,
+        },
+        null,
+        2,
+      ),
+    [compactCode, handoffUrl, settings, streams],
+  );
+
+  useEffect(() => {
+    if (visible) {
+      setMode('send');
+    }
+  }, [visible]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!visible || !streams.length) {
+      setHandoffQrPng(null);
+      return;
+    }
+    encodeHandoffQrPngBase64(handoffUrl, 512).then(png => {
+      if (!cancelled) {
+        setHandoffQrPng(png);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [handoffUrl, streams.length, visible]);
+
+  // iOS HandoffController.handleReceived と同じ受け取りフロー:
+  // 解読 → タブ数を提示 → 置き換える(設定も反映) / 追加する(タブのみ) / キャンセル。
+  const receiveHandoff = (raw: string): boolean => {
+    let decoded: ReturnType<typeof decodeHandoff>;
+    try {
+      decoded = decodeHandoff(raw);
+    } catch {
+      Alert.alert('受け取れませんでした', 'コード/QRを認識できませんでした。JSON、iOS引き継ぎコード、multiview:// URL のいずれかを確認してください。');
+      return false;
+    }
+    const nextStreams = decoded.streams.map(stream => makeStream(stream.platform, stream.channel));
+    if (!nextStreams.length) {
+      Alert.alert('タブが空です', '受け取れる視聴タブがありませんでした。');
+      return false;
+    }
+    Alert.alert(`${nextStreams.length} タブを受け取りました`, 'この端末の視聴タブをどうしますか?', [
+      {
+        text: '置き換える',
+        style: 'destructive',
+        onPress: () => {
+          onImport(nextStreams, decoded.settings, 'replace');
+          setHandoff('');
+          onClose();
+        },
+      },
+      {
+        text: '追加する',
+        onPress: () => {
+          onImport(nextStreams, {}, 'append');
+          setHandoff('');
+          onClose();
+        },
+      },
+      {text: 'キャンセル', style: 'cancel'},
+    ]);
+    return true;
+  };
+
+  const importPayload = () => {
+    receiveHandoff(handoff);
+  };
+
+  const scanHandoff = async () => {
+    const scanned = await scanHandoffQr();
+    if (scanned) {
+      receiveHandoff(scanned);
+    }
+  };
+
+  const shareHandoff = async () => {
+    try {
+      await Share.share({message: handoffUrl});
+    } catch {
+      // 共有シートのキャンセルは無視する。
+    }
+  };
+
+  return (
+    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
+      <SafeAreaView style={styles.modal} edges={appSafeAreaEdges}>
+        <View style={styles.modalHeader}>
+          <Text style={styles.modalTitle}>引き継ぎ</Text>
+          <TouchableOpacity onPress={onClose}>
+            <Text style={styles.closeText}>閉じる</Text>
+          </TouchableOpacity>
+        </View>
+        <View style={styles.handoffModeTabs}>
+          <TouchableOpacity
+            style={[styles.handoffModeButton, mode === 'send' && styles.handoffModeButtonActive]}
+            onPress={() => setMode('send')}>
+            <Text style={[styles.handoffModeText, mode === 'send' && styles.handoffModeTextActive]}>送る</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.handoffModeButton, mode === 'receive' && styles.handoffModeButtonActive]}
+            onPress={() => setMode('receive')}>
+            <Text style={[styles.handoffModeText, mode === 'receive' && styles.handoffModeTextActive]}>受け取る</Text>
+          </TouchableOpacity>
+        </View>
+        {mode === 'send' ? (
+          <ScrollView style={styles.handoffBody} contentContainerStyle={styles.handoffContent}>
+            {streams.length > 0 && handoffQrPng ? (
+              <>
+                <Text style={styles.settingNote}>
+                  この端末で開いている {streams.length} タブのQRです。もう一方の端末で「受け取る」から読み取ってください。
+                </Text>
+                <Image
+                  source={{uri: `data:image/png;base64,${handoffQrPng}`}}
+                  style={styles.handoffQr}
+                  resizeMode="contain"
+                />
+                <TouchableOpacity style={styles.fullButton} onPress={shareHandoff}>
+                  <Text style={styles.fullButtonText}>共有 / コピー</Text>
+                </TouchableOpacity>
+                <Text style={styles.settingNote}>iOS互換の短いコードとURLも含めて出力します。</Text>
+                <TextInput value={exportText} editable={false} multiline style={[styles.textArea, styles.readOnly]} />
+              </>
+            ) : (
+              <Text style={styles.settingNote}>開いているタブがありません。</Text>
+            )}
+          </ScrollView>
+        ) : (
+          <ScrollView style={styles.handoffBody} contentContainerStyle={styles.handoffContent}>
+            <Text style={styles.settingNote}>もう一方の端末の「送る」QRを読み取るか、コピーしたコードを貼り付けて受け取ります。</Text>
+            {isHandoffQrAvailable() && (
+              <TouchableOpacity style={styles.fullButton} onPress={scanHandoff}>
+                <Text style={styles.fullButtonText}>QRをスキャン</Text>
+              </TouchableOpacity>
+            )}
+            <TextInput
+              value={handoff}
+              onChangeText={setHandoff}
+              multiline
+              placeholder="ここに引き継ぎJSON / コード / URLを貼り付け"
+              placeholderTextColor="#7d8794"
+              style={styles.textArea}
+            />
+            <TouchableOpacity style={styles.fullButton} onPress={importPayload}>
+              <Text style={styles.fullButtonText}>引き継ぎデータを読み込む</Text>
+            </TouchableOpacity>
+          </ScrollView>
+        )}
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
 function ViewingScreen({
   active,
   streams,
@@ -910,6 +1112,7 @@ function ViewingScreen({
   onMove,
   onVolume,
   onSettings,
+  onImport,
   auth,
   onAuth,
 }: {
@@ -922,10 +1125,12 @@ function ViewingScreen({
   onMove: (index: number, target: number) => void;
   onVolume: (stream: StreamItem, volume: number) => void;
   onSettings: (patch: Partial<AppSettings>) => void;
+  onImport: HandoffImporter;
   auth: AuthState;
   onAuth: AuthCommit;
 }) {
   const [adding, setAdding] = useState(false);
+  const [handoffOpen, setHandoffOpen] = useState(false);
   const [focused, setFocused] = useState<StreamItem | null>(null);
   // reloadKey をインクリメントするとプレイヤー(native/iframe/web)が再マウントされ
   // ソース解決もやり直す。更新ボタン(全体/セル別)の実体。
@@ -997,16 +1202,26 @@ function ViewingScreen({
           </TouchableOpacity>
         </View>
         <View style={styles.viewBottomSpacer} />
-        {streams.length > 0 && (
-          <TouchableOpacity style={styles.bottomIconButton} onPress={reloadAll}>
-            <Text style={styles.bottomIconText}>↻</Text>
-          </TouchableOpacity>
-        )}
+        <TouchableOpacity accessibilityLabel="引き継ぎ" style={styles.bottomIconButton} onPress={() => setHandoffOpen(true)}>
+          <Text style={[styles.bottomIconText, styles.bottomIconLabel]}>QR</Text>
+        </TouchableOpacity>
         <TouchableOpacity style={styles.bottomIconButton} onPress={() => setAdding(true)}>
           <Text style={styles.bottomIconText}>＋</Text>
         </TouchableOpacity>
+        {streams.length > 0 && (
+          <TouchableOpacity accessibilityLabel="更新" style={styles.bottomIconButton} onPress={reloadAll}>
+            <Text style={styles.bottomIconText}>↻</Text>
+          </TouchableOpacity>
+        )}
       </View>
 
+      <HandoffModal
+        visible={handoffOpen}
+        streams={streams}
+        settings={settings}
+        onClose={() => setHandoffOpen(false)}
+        onImport={onImport}
+      />
       <AddStreamModal
         visible={adding}
         settings={settings}
@@ -3184,10 +3399,8 @@ function injectWebComment(webView: WebView | null, text: string) {
 }
 
 function SettingsScreen({
-  streams,
   settings,
   onSettings,
-  onImport,
   onMovePlatform,
   onClear,
   auth,
@@ -3198,10 +3411,8 @@ function SettingsScreen({
   onCancelDeviceOAuth,
   onNiconicoLogin,
 }: {
-  streams: StreamItem[];
   settings: AppSettings;
   onSettings: (patch: Partial<AppSettings>) => void;
-  onImport: (streams: StreamItem[], settings: Partial<AppSettings>) => void;
   onMovePlatform: (index: number, delta: number) => void;
   onClear: () => void;
   auth: AuthState;
@@ -3212,35 +3423,7 @@ function SettingsScreen({
   onCancelDeviceOAuth: () => void;
   onNiconicoLogin: () => void;
 }) {
-  const [handoff, setHandoff] = useState('');
   const order = orderedPlatforms(settings.platformOrder);
-  const compactCode = useMemo(() => compactHandoffCode(streams, settings.layoutMode), [settings.layoutMode, streams]);
-  const exportText = useMemo(
-    () =>
-      JSON.stringify(
-        {
-          version: 2,
-          streams,
-          settings,
-          compactCode,
-          url: handoffURL(streams, settings.layoutMode),
-        },
-        null,
-        2,
-      ),
-    [compactCode, settings, streams],
-  );
-
-  const importPayload = () => {
-    try {
-      const decoded = decodeHandoff(handoff);
-      const nextStreams = decoded.streams.map(stream => makeStream(stream.platform, stream.channel));
-      onImport(nextStreams, decoded.settings);
-      setHandoff('');
-    } catch {
-      Alert.alert('読み込み失敗', 'JSON、iOS引き継ぎコード、multiview:// URL のいずれかを貼り付けてください。');
-    }
-  };
 
   return (
     <ScrollView style={styles.settings} contentContainerStyle={styles.settingsContent}>
@@ -3364,20 +3547,6 @@ function SettingsScreen({
       />
       <NiconicoLoginPanel onLogin={onNiconicoLogin} />
 
-      <Text style={styles.sectionTitle}>引き継ぎ</Text>
-      <Text style={styles.settingNote}>iOS互換の短いコードとURLも含めて出力します。</Text>
-      <TextInput value={exportText} editable={false} multiline style={[styles.textArea, styles.readOnly]} />
-      <TextInput
-        value={handoff}
-        onChangeText={setHandoff}
-        multiline
-        placeholder="ここに引き継ぎJSON / コード / URLを貼り付け"
-        placeholderTextColor="#7d8794"
-        style={styles.textArea}
-      />
-      <TouchableOpacity style={styles.fullButton} onPress={importPayload}>
-        <Text style={styles.fullButtonText}>引き継ぎデータを読み込む</Text>
-      </TouchableOpacity>
       <TouchableOpacity
         style={styles.clearButton}
         onPress={() => {
@@ -3999,6 +4168,7 @@ const styles = StyleSheet.create({
   bottomIconButton: {
     width: 40,
     height: 36,
+    marginLeft: 8,
     borderRadius: 8,
     backgroundColor: '#1a2532',
     alignItems: 'center',
@@ -4009,6 +4179,45 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: '800',
     lineHeight: 26,
+  },
+  bottomIconLabel: {
+    fontSize: 14,
+    lineHeight: 18,
+  },
+  handoffModeTabs: {
+    height: 46,
+    marginHorizontal: 16,
+    marginTop: 14,
+    padding: 3,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#263241',
+    backgroundColor: '#101720',
+    flexDirection: 'row',
+  },
+  handoffModeButton: {
+    flex: 1,
+    borderRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  handoffModeButtonActive: {
+    backgroundColor: '#2f8cff',
+  },
+  handoffModeText: {
+    color: '#9aa7b7',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  handoffModeTextActive: {
+    color: '#fff',
+  },
+  handoffBody: {
+    flex: 1,
+  },
+  handoffContent: {
+    paddingTop: 16,
+    paddingBottom: 24,
   },
   viewToolbar: {
     minHeight: 44,
@@ -4747,6 +4956,14 @@ const styles = StyleSheet.create({
   },
   readOnly: {
     color: '#a9b5c6',
+  },
+  handoffQr: {
+    width: 240,
+    height: 240,
+    alignSelf: 'center',
+    marginTop: 12,
+    borderRadius: 12,
+    backgroundColor: '#ffffff',
   },
   clearButton: {
     minHeight: 44,

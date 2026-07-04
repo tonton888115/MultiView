@@ -628,6 +628,9 @@ export async function maintainAuthSessions(
     } catch (error) {
       if (isTerminalOAuthFailure(error)) {
         current = signOut(current, service);
+        // 上の twitch ブロックと同じく、サインアウトを永続化コールバックへ通知する。
+        // これが無いと無効トークンが保存領域に残り、次回起動で復活してしまう。
+        await onAuthUpdated?.(current);
       }
     }
   }

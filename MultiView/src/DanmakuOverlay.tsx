@@ -1,5 +1,6 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
-import {Animated, Easing, Image, StyleSheet, Text, View} from 'react-native';
+import {Animated, Easing, StyleSheet, Text, View} from 'react-native';
+import {AnimatedEmoteImage} from './AnimatedEmoteImage';
 import {estimateTokenWidth, textFromTokens, textTokens} from './danmaku';
 import {appendDanmakuEvent, consumeDanmakuEvent, DanmakuEventQueue, isDanmakuEnabled, isRecentDanmakuDuplicate} from './danmakuQueue';
 import {startChatClient} from './chat';
@@ -294,6 +295,9 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
         removalTimerRef.current = null;
       }
       pendingRemovalsRef.current.clear();
+      // アンマウント後に native animation の完了 callback が遅れて発火し、破棄済みの
+      // キューや state を触るのを防ぐため、進行中アニメーションを止めてから空にする。
+      visibleRef.current.forEach(item => item.x.stopAnimation());
       updateVisible(() => []);
     };
   }, [enqueueEvent, ignoreStatus, showDanmaku, stream, updateVisible]);
@@ -322,10 +326,9 @@ export function DanmakuOverlay({stream, settings}: {stream: StreamItem; settings
           ]}>
           {item.tokens.map((token, index) =>
             token.kind === 'image' ? (
-              <Image
+              <AnimatedEmoteImage
                 key={`${item.key}:img:${index}`}
-                source={{uri: token.url}}
-                resizeMode="contain"
+                url={token.url}
                 style={[
                   styles.emote,
                   {

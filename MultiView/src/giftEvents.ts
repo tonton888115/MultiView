@@ -59,9 +59,16 @@ export function publishGiftEvent(streamId: string, event: GiftEvent): void {
     streamSeen = new Map();
     seen.set(key, streamSeen);
   }
-  streamSeen.forEach((timestamp, id) => {
-    if (timestamp < now - seenLifetimeMs) {
-      streamSeen?.delete(id);
+  // 全stream の期限切れIDを掃除し、空になった(=もう使われていない配信の)Mapは登録解除する。
+  // stream は通常数個なので全走査は軽く、モジュール寿命でのMap蓄積を防ぐ。
+  seen.forEach((map, otherKey) => {
+    map.forEach((timestamp, id) => {
+      if (timestamp < now - seenLifetimeMs) {
+        map.delete(id);
+      }
+    });
+    if (map.size === 0 && otherKey !== key) {
+      seen.delete(otherKey);
     }
   });
   if (streamSeen.has(event.id)) {

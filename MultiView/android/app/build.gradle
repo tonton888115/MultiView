@@ -82,8 +82,8 @@ android {
         applicationId "com.multiview"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 18
-        versionName "1.18"
+        versionCode 19
+        versionName "1.19"
     }
     signingConfigs {
         debug {
@@ -116,6 +116,9 @@ dependencies {
     implementation("com.facebook.fresco:animated-gif:3.6.0")
     implementation("com.facebook.fresco:animated-webp:3.6.0")
     implementation("com.facebook.fresco:webpsupport:3.6.0")
+    // Handoff QR(iOS Handoff.swift パリティ): 生成=zxing core / 読み取り=CaptureActivity
+    implementation("com.google.zxing:core:3.5.3")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 
     if (hermesEnabled.toBoolean()) {
         implementation("com.facebook.react:hermes-android")

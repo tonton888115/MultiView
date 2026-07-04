@@ -20,8 +20,15 @@ class PlaybackService : Service() {
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    // OS がプロセスを終了した後に intent=null で再生成された場合、再生実体(各セルの
+    // ExoPlayer/WebView と React root)は存在しない。通知だけ残るのを避けて自身を止める。
+    if (intent == null) {
+      stopSelf(startId)
+      return START_NOT_STICKY
+    }
     startForegroundNotification()
-    return START_STICKY
+    // このサービスは再生状態を所有しないので、粘着再起動はしない(JS 側が前面復帰時に再start)。
+    return START_NOT_STICKY
   }
 
   private fun startForegroundNotification() {

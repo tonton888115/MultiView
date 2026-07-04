@@ -14,16 +14,23 @@ const youtubeAndroidVersion = '20.19.35';
 const twitchClientID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
 const twitchAccessTokenHash = '0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712';
 
-export function cleanChannel(raw: string): string {
-  return raw.trim().replace(/^@+/, '@');
+export function cleanChannel(raw: string, platform?: PlatformId): string {
+  const trimmed = raw.trim();
+  // YouTube は @handle 解決に先頭@が要る。Kick/TwitCasting/Twitch の API/チャットURL は
+  // @ を受け付けず404/オフライン扱いになるため、YouTube 以外は先頭@を除去する。
+  // platform 未指定時は従来どおり @ を1つに畳む(既にクリーンな値には無害)。
+  if (platform && platform !== 'youtube') {
+    return trimmed.replace(/^@+/, '');
+  }
+  return trimmed.replace(/^@+/, '@');
 }
 
 export function streamKey(platform: PlatformId, channel: string): string {
-  return `${platform}:${cleanChannel(channel).toLowerCase()}`;
+  return `${platform}:${cleanChannel(channel, platform).toLowerCase()}`;
 }
 
 export function makeStream(platform: PlatformId, channel: string): StreamItem {
-  const clean = cleanChannel(channel);
+  const clean = cleanChannel(channel, platform);
   return {
     id: streamKey(platform, clean),
     platform,
