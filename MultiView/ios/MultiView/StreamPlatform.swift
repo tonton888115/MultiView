@@ -38,9 +38,4 @@ enum StreamPlatform: String, CaseIterable, Codable {
     default: return "チャンネル名"
     }
   }
-
-  var usesIndividualPlayer: Bool {
-    // All platforms now have a dedicated per-cell native player.
-    true
-  }
 }

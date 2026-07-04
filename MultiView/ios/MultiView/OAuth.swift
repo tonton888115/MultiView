@@ -67,12 +67,10 @@ struct TwitchOAuthConfig: Codable {
   var redirectURI = "https://tonton888115.github.io/MultiView/twitch-oauth.html"
 }
 
-final class TwitchAuthManager: NSObject, ASWebAuthenticationPresentationContextProviding {
+final class TwitchAuthManager: NSObject {
   static let shared = TwitchAuthManager()
   private let configKey = "twitch.oauth.config.v1"
   private let tokenAccount = "twitch"
-  private var activeSession: ASWebAuthenticationSession?
-  private var authAnchor: ASPresentationAnchor?
   private weak var deviceAuthAlert: UIAlertController?
   private var activeDeviceCode: String?
   private var devicePollWorkItem: DispatchWorkItem?
@@ -355,10 +353,6 @@ final class TwitchAuthManager: NSObject, ASWebAuthenticationPresentationContextP
     }
   }
 
-  func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-    authAnchor ?? ASPresentationAnchor()
-  }
-
   private func withValidToken(
     minimumValidity: TimeInterval = 60,
     completion: @escaping (Result<SimpleOAuthToken, Error>) -> Void
@@ -544,13 +538,6 @@ final class TwitchAuthManager: NSObject, ASWebAuthenticationPresentationContextP
       }
       Self.finish(completion, .success(()))
     }.resume()
-  }
-
-  private static func fragmentValues(_ url: URL) -> [String: String]? {
-    guard let fragment = url.fragment else { return nil }
-    var output: [String: String] = [:]
-    URLComponents(string: "x://callback?\(fragment)")?.queryItems?.forEach { output[$0.name] = $0.value }
-    return output
   }
 
   private static func formBody(_ values: [String: String]) -> Data {

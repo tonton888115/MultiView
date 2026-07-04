@@ -1,10 +1,49 @@
 import UIKit
 
+// 同接取得は HTML→JSON と複数リクエストを連鎖することがある。従来は先頭タスクしか
+// 保持しておらず、cancel() しても連鎖の後続が走り続けていた。全タスクをこの袋に
+// 登録して、cancel() で連鎖ごと止める。
+final class ViewerCountRequest {
+  private let lock = NSLock()
+  private var tasks: [URLSessionDataTask] = []
+  private var cancelled = false
+
+  func register(_ task: URLSessionDataTask?) {
+    guard let task else { return }
+    lock.lock()
+    if cancelled {
+      lock.unlock()
+      task.cancel()
+      return
+    }
+    tasks.append(task)
+    lock.unlock()
+  }
+
+  func cancel() {
+    lock.lock()
+    cancelled = true
+    let pending = tasks
+    tasks.removeAll()
+    lock.unlock()
+    pending.forEach { $0.cancel() }
+  }
+}
+
 final class ViewerCountOverlay: UIVisualEffectView {
   private let stream: StreamItem
   private let label = UILabel()
   private var timer: Timer?
-  private var task: URLSessionDataTask?
+  private var task: ViewerCountRequest?
+
+  // オートハイドのコントロール群と一緒に隠れている間は 30 秒ごとのネットワーク更新を
+  // スキップして電力/通信を節約する。再表示されたら即時リフレッシュする。
+  var isVisibleHint = true {
+    didSet {
+      guard isVisibleHint, !oldValue else { return }
+      refresh()
+    }
+  }
 
   init(stream: StreamItem) {
     self.stream = stream
@@ -48,7 +87,8 @@ final class ViewerCountOverlay: UIVisualEffectView {
 
     refresh()
     timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-      self?.refresh()
+      guard let self, self.isVisibleHint else { return }
+      self.refresh()
     }
   }
 
@@ -96,19 +136,21 @@ final class ViewerCountOverlay: UIVisualEffectView {
 }
 
 enum ViewerCountProvider {
-  static func fetch(stream: StreamItem, completion: @escaping (Int?) -> Void) -> URLSessionDataTask? {
+  static func fetch(stream: StreamItem, completion: @escaping (Int?) -> Void) -> ViewerCountRequest {
+    let chain = ViewerCountRequest()
     switch stream.platform {
     case .kick:
-      return fetchKick(channel: stream.channel, completion: completion)
+      chain.register(fetchKick(channel: stream.channel, completion: completion))
     case .twitch:
-      return fetchTwitch(channel: stream.channel, completion: completion)
+      chain.register(fetchTwitch(channel: stream.channel, completion: completion))
     case .twitcasting:
-      return fetchTwitcasting(channel: stream.channel, completion: completion)
+      fetchTwitcasting(channel: stream.channel, chain: chain, completion: completion)
     case .youtube:
-      return fetchYouTube(channel: stream.channel, completion: completion)
+      fetchYouTube(channel: stream.channel, chain: chain, completion: completion)
     case .niconico:
-      return fetchNiconico(programId: stream.channel, completion: completion)
+      chain.register(fetchNiconico(programId: stream.channel, completion: completion))
     }
+    return chain
   }
 
   private static func fetchKick(channel rawChannel: String, completion: @escaping (Int?) -> Void) -> URLSessionDataTask? {
@@ -132,7 +174,7 @@ enum ViewerCountProvider {
     }
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
-    request.setValue("kimne78kx3ncx6brgo4mv6wki5h1ko", forHTTPHeaderField: "Client-ID")
+    request.setValue(TwitchGQL.clientID, forHTTPHeaderField: "Client-ID")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
     request.httpBody = try? JSONSerialization.data(withJSONObject: [
@@ -154,34 +196,35 @@ enum ViewerCountProvider {
     return task
   }
 
-  private static func fetchTwitcasting(channel rawChannel: String, completion: @escaping (Int?) -> Void) -> URLSessionDataTask? {
+  private static func fetchTwitcasting(channel rawChannel: String, chain: ViewerCountRequest, completion: @escaping (Int?) -> Void) {
     let channel = normalizedChannel(rawChannel)
     guard let escaped = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
           let url = URL(string: "https://twitcasting.tv/\(escaped)") else {
       completion(nil)
-      return nil
+      return
     }
     var headers = browserHeaders(referer: "https://twitcasting.tv/")
     headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    return htmlTask(url: url, headers: headers) { html in
+    chain.register(htmlTask(url: url, headers: headers) { html in
       guard let viewerURL = twitcastingViewerURL(from: html) else {
         completion(nil)
         return
       }
-      _ = jsonTask(url: viewerURL, headers: browserHeaders(referer: "https://twitcasting.tv/\(channel)")) { object in
+      chain.register(jsonTask(url: viewerURL, headers: browserHeaders(referer: "https://twitcasting.tv/\(channel)")) { object in
         completion(twitcastingViewerCount(from: object))
-      }
-    }
+      })
+    })
   }
 
-  private static func fetchYouTube(channel rawChannel: String, completion: @escaping (Int?) -> Void) -> URLSessionDataTask? {
+  private static func fetchYouTube(channel rawChannel: String, chain: ViewerCountRequest, completion: @escaping (Int?) -> Void) {
     let channel = rawChannel.trimmingCharacters(in: .whitespacesAndNewlines)
     if let videoId = extractYouTubeVideoID(from: channel) {
-      return fetchYouTubePlayer(videoId: videoId, fallbackHTML: nil, fallbackURL: youtubeWatchURL(videoId: videoId), completion: completion)
+      fetchYouTubePlayer(videoId: videoId, fallbackHTML: nil, fallbackURL: youtubeWatchURL(videoId: videoId), chain: chain, completion: completion)
+      return
     }
     guard let liveURL = youtubeLiveURL(from: channel) else {
       completion(nil)
-      return nil
+      return
     }
     var request = URLRequest(url: liveURL)
     browserHeaders(referer: "https://www.youtube.com/").forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
@@ -195,10 +238,10 @@ enum ViewerCountProvider {
         completion(count)
         return
       }
-      _ = fetchYouTubePlayer(videoId: videoId, fallbackHTML: html, fallbackURL: youtubeWatchURL(videoId: videoId), completion: completion)
+      fetchYouTubePlayer(videoId: videoId, fallbackHTML: html, fallbackURL: youtubeWatchURL(videoId: videoId), chain: chain, completion: completion)
     }
+    chain.register(task)
     task.resume()
-    return task
   }
 
   private static func fetchNiconico(programId rawProgramId: String, completion: @escaping (Int?) -> Void) -> URLSessionDataTask? {
@@ -223,11 +266,12 @@ enum ViewerCountProvider {
     videoId: String,
     fallbackHTML: String?,
     fallbackURL: URL?,
+    chain: ViewerCountRequest,
     completion: @escaping (Int?) -> Void
-  ) -> URLSessionDataTask? {
+  ) {
     guard let url = URL(string: "https://youtubei.googleapis.com/youtubei/v1/player") else {
       completion(nil)
-      return nil
+      return
     }
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
@@ -266,7 +310,7 @@ enum ViewerCountProvider {
         completion(nil)
         return
       }
-      _ = htmlTask(url: fallbackURL, headers: browserHeaders(referer: "https://www.youtube.com/")) { html in
+      chain.register(htmlTask(url: fallbackURL, headers: browserHeaders(referer: "https://www.youtube.com/")) { html in
         if let count = youtubeCount(inHTML: html) {
           completion(count)
           return
@@ -275,13 +319,13 @@ enum ViewerCountProvider {
           completion(nil)
           return
         }
-        _ = htmlTask(url: mobileURL, headers: browserHeaders(referer: "https://m.youtube.com/")) { mobileHTML in
+        chain.register(htmlTask(url: mobileURL, headers: browserHeaders(referer: "https://m.youtube.com/")) { mobileHTML in
           completion(youtubeCount(inHTML: mobileHTML))
-        }
-      }
+        })
+      })
     }
+    chain.register(task)
     task.resume()
-    return task
   }
 
   private static func jsonTask(url: URL, headers: [String: String], completion: @escaping (Any?) -> Void) -> URLSessionDataTask {

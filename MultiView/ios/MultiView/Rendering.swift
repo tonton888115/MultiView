@@ -191,33 +191,6 @@ final class NativeDanmakuRenderer {
       }
     }.resume()
   }
-
-  private static func animatedImage(from data: Data) -> UIImage? {
-    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
-    let count = CGImageSourceGetCount(source)
-    guard count > 1 else { return nil }
-
-    var images: [UIImage] = []
-    var duration: TimeInterval = 0
-    for index in 0..<count {
-      guard let cgImage = CGImageSourceCreateImageAtIndex(source, index, nil) else { continue }
-      images.append(UIImage(cgImage: cgImage))
-      duration += frameDuration(at: index, source: source)
-    }
-    guard !images.isEmpty else { return nil }
-    return UIImage.animatedImage(with: images, duration: max(duration, Double(images.count) * 0.08))
-  }
-
-  private static func frameDuration(at index: Int, source: CGImageSource) -> TimeInterval {
-    guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
-          let gif = properties[kCGImagePropertyGIFDictionary] as? [CFString: Any] else {
-      return 0.1
-    }
-    let unclamped = gif[kCGImagePropertyGIFUnclampedDelayTime] as? Double
-    let clamped = gif[kCGImagePropertyGIFDelayTime] as? Double
-    let value = unclamped ?? clamped ?? 0.1
-    return value < 0.02 ? 0.1 : value
-  }
 }
 
 enum NativeGiftEffectStyle: CaseIterable {
@@ -693,79 +666,6 @@ final class NativeOnceGate {
 }
 
 enum NativeEventOverlay {
-  static func show(_ text: String, in root: UIView, tint: UIColor) {
-    let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !message.isEmpty else { return }
-    DispatchQueue.main.async {
-      guard root.bounds.width > 0 else { return }
-      let panel = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
-      panel.layer.cornerRadius = 10
-      panel.clipsToBounds = true
-      panel.alpha = 0
-      panel.translatesAutoresizingMaskIntoConstraints = false
-
-      let accent = UIView()
-      accent.backgroundColor = tint
-      accent.translatesAutoresizingMaskIntoConstraints = false
-      panel.contentView.addSubview(accent)
-
-      let clip = UIView()
-      clip.clipsToBounds = true
-      clip.translatesAutoresizingMaskIntoConstraints = false
-      panel.contentView.addSubview(clip)
-
-      let label = UILabel()
-      label.text = message
-      label.textColor = .white
-      label.font = .systemFont(ofSize: root.bounds.width < 260 ? 11 : 12, weight: .bold)
-      label.numberOfLines = 1
-      label.lineBreakMode = .byClipping
-      clip.addSubview(label)
-
-      root.addSubview(panel)
-      NSLayoutConstraint.activate([
-        panel.topAnchor.constraint(equalTo: root.topAnchor, constant: 10),
-        panel.centerXAnchor.constraint(equalTo: root.centerXAnchor),
-        panel.widthAnchor.constraint(equalTo: root.widthAnchor, multiplier: 0.88),
-        panel.heightAnchor.constraint(equalToConstant: root.bounds.width < 260 ? 30 : 34),
-        accent.leadingAnchor.constraint(equalTo: panel.contentView.leadingAnchor),
-        accent.topAnchor.constraint(equalTo: panel.contentView.topAnchor),
-        accent.bottomAnchor.constraint(equalTo: panel.contentView.bottomAnchor),
-        accent.widthAnchor.constraint(equalToConstant: 3),
-        clip.leadingAnchor.constraint(equalTo: accent.trailingAnchor, constant: 8),
-        clip.trailingAnchor.constraint(equalTo: panel.contentView.trailingAnchor, constant: -10),
-        clip.topAnchor.constraint(equalTo: panel.contentView.topAnchor, constant: 4),
-        clip.bottomAnchor.constraint(equalTo: panel.contentView.bottomAnchor, constant: -4)
-      ])
-
-      root.layoutIfNeeded()
-      clip.layoutIfNeeded()
-      let labelSize = label.sizeThatFits(CGSize(width: CGFloat.greatestFiniteMagnitude, height: clip.bounds.height))
-      let labelWidth = max(labelSize.width, clip.bounds.width)
-      label.frame = CGRect(x: 0, y: 0, width: labelWidth, height: clip.bounds.height)
-      if labelSize.width > clip.bounds.width {
-        label.frame.origin.x = clip.bounds.width
-        UIView.animate(
-          withDuration: min(7.0, max(3.8, Double(labelSize.width / 34.0))),
-          delay: 0.35,
-          options: [.curveLinear],
-          animations: {
-            label.frame.origin.x = -labelSize.width
-          }
-        )
-      }
-
-      UIView.animate(withDuration: 0.18) {
-        panel.alpha = 1
-      }
-      UIView.animate(withDuration: 0.25, delay: 5.2, options: []) {
-        panel.alpha = 0
-      } completion: { _ in
-        panel.removeFromSuperview()
-      }
-    }
-  }
-
   static func showSupport(
     title: String,
     subtitle: String?,

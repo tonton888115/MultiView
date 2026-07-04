@@ -170,7 +170,10 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     twitcastingHeaders().forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
     streamTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       guard let self else { return }
-      self.streamTask = nil
+      // streamTask is read/cleared on the main thread (stopPlayback/recoverFromStall);
+      // hop so the clear cannot race those accesses. Main queue FIFO keeps it ahead
+      // of the retry/fallback/play blocks enqueued below.
+      DispatchQueue.main.async { self.streamTask = nil }
       guard !self.isStopped, generation == self.playbackGeneration else { return }
       // Keep isLoading true until play()/installEmbedFallback runs on the main
       // queue, so a concurrent resumePlayback() can't kick off a second fetch.

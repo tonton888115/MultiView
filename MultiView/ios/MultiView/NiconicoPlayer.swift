@@ -14,9 +14,6 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var segmentTasks: [String: Task<Void, Never>] = [:]
   private var activeSegmentURIs = Set<String>()
   private var keepSeatTimer: Timer?
-  private var endRemovalWorkItem: DispatchWorkItem?
-  private var endCountdownTimer: Timer?
-  private var endCountdownRemaining = 0
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
   private var fallbackWebView: PlayerWebView?
@@ -29,7 +26,6 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var laneCursor = 0
   private var loadAttempts = 0
   private var streamOpenedAt: Date?
-  private var isEnding = false
   private var lastSupportAlert: (text: String, at: Date)?
   private var seenSupportEventIDs = Set<String>()
   // NDGR コメントが最後に成功した時刻。VIEW/SEGMENT 両方のループから更新され、
@@ -145,11 +141,6 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     player.replaceCurrentItem(with: nil)
     keepSeatTimer?.invalidate()
     keepSeatTimer = nil
-    endRemovalWorkItem?.cancel()
-    endRemovalWorkItem = nil
-    endCountdownTimer?.invalidate()
-    endCountdownTimer = nil
-    endCountdownRemaining = 0
     ndgrCommentTask?.cancel()
     ndgrCommentTask = nil
     ndgrReconnectStartedAt = nil
@@ -279,7 +270,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   // (re-syncing cookies) a couple of times before giving up to the web fallback —
   // this removes the "expand once and come back" workaround.
   private func retryOrFallback(_ reason: String) {
-    guard !isStopped, !isEnding, fallbackWebView == nil else { return }
+    guard !isStopped, fallbackWebView == nil else { return }
     verifyProgramEndedFromPage { [weak self] ended in
       guard let self, !self.isStopped, self.fallbackWebView == nil else { return }
       if ended {
@@ -337,7 +328,6 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
           return
         }
         let watch = try self.parseWatchData(from: html)
-        self.scheduleProgramEndIfNeeded(watch.endDate)
         self.connect(webSocketURL: watch.webSocketURL, frontendId: watch.frontendId)
       } catch {
         if Self.isEndedWatchPage(html) {
@@ -416,7 +406,6 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         }
         self.receiveNext()
       case .failure(let error):
-        if self.isEnding { return }
         self.socketTask = nil
         if self.player.currentItem == nil {
           self.retryOrFallback("ニコ生WebSocket切断: \(error.localizedDescription)")
@@ -495,33 +484,13 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
   }
 
-  private func scheduleProgramEndIfNeeded(_ endDate: Date?) {
-    endRemovalWorkItem?.cancel()
-    endRemovalWorkItem = nil
-    // Niconico end timestamps and disconnect payloads can be noisy. Do not
-    // schedule automatic removal; leave the cell under the user's control.
-    _ = endDate
-  }
-
   private func beginEndedCountdown(_ reason: String) {
     DispatchQueue.main.async {
       guard !self.isStopped else { return }
-      self.endRemovalWorkItem?.cancel()
-      self.endRemovalWorkItem = nil
-      self.endCountdownTimer?.invalidate()
-      self.endCountdownTimer = nil
-      self.endCountdownRemaining = 0
       let message = reason
         .replacingOccurrences(of: "ので閉じます", with: "")
         .replacingOccurrences(of: "閉じます", with: "")
       self.showStatus("\(message)\n自動では閉じません")
-    }
-  }
-
-  private func removeEndedProgram(_ reason: String) {
-    DispatchQueue.main.async {
-      guard !self.isStopped else { return }
-      self.showStatus("\(reason)\n自動削除は無効です")
     }
   }
 
@@ -647,7 +616,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   }
 
   private func recoverPlaybackError(_ reason: String) {
-    guard !isStopped, !isEnding else { return }
+    guard !isStopped else { return }
     showStatus("\(reason)\n自動復旧中")
     player.pause()
     player.replaceCurrentItem(with: nil)
@@ -1385,7 +1354,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
   }
 
-  private func parseWatchData(from html: String) throws -> (webSocketURL: URL, frontendId: String?, endDate: Date?) {
+  private func parseWatchData(from html: String) throws -> (webSocketURL: URL, frontendId: String?) {
     guard let encoded = firstMatch(in: html, pattern: #"<script[^>]+id=["']initial-state["'][^>]+data-props=["']([^"']+)["']"#)
       ?? firstMatch(in: html, pattern: #"data-props=["']([^"']+)["'][^>]+id=["']initial-state["']"#)
       ?? firstMatch(in: html, pattern: #"<script[^>]+id=["']embedded-data["'][^>]+data-props=["']([^"']+)["']"#)
@@ -1408,7 +1377,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       let requestInfo = constants?["requestInfo"] as? [String: Any]
       let frontendId = (requestInfo?["frontendId"] as? String)
         ?? (requestInfo?["frontendId"] as? Int).map(String.init)
-      return (url, frontendId, Self.findProgramEndDate(in: props))
+      return (url, frontendId)
     }
     guard let site = props["site"] as? [String: Any] else {
       throw NSError(domain: "NiconicoNativePlayerView", code: 4)
@@ -1423,61 +1392,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     let frontendId = (site["frontendId"] as? String)
       ?? (site["frontendId"] as? Int).map(String.init)
       ?? (site["frontendID"] as? String)
-    return (url, frontendId, Self.findProgramEndDate(in: props))
-  }
-
-  private static func findProgramEndDate(in value: Any) -> Date? {
-    var candidates: [Date] = []
-    collectProgramEndDates(in: value, currentKey: "", into: &candidates)
-    let now = Date()
-    return candidates
-      .filter { $0.timeIntervalSince(now) > -60 }
-      .sorted()
-      .first
-  }
-
-  private static func collectProgramEndDates(in value: Any, currentKey: String, into candidates: inout [Date]) {
-    if let dict = value as? [String: Any] {
-      for (key, nested) in dict {
-        collectProgramEndDates(in: nested, currentKey: key, into: &candidates)
-      }
-      return
-    }
-    if let array = value as? [Any] {
-      array.forEach { collectProgramEndDates(in: $0, currentKey: currentKey, into: &candidates) }
-      return
-    }
-    let key = currentKey.lowercased()
-    guard key.contains("end") || key.contains("expire") || key.contains("close") else { return }
-    if let number = value as? NSNumber {
-      let raw = number.doubleValue
-      let seconds = raw > 10_000_000_000 ? raw / 1000 : raw
-      let date = Date(timeIntervalSince1970: seconds)
-      if date.timeIntervalSince1970 > 1_600_000_000 {
-        candidates.append(date)
-      }
-      return
-    }
-    if let text = value as? String {
-      if let raw = Double(text) {
-        let seconds = raw > 10_000_000_000 ? raw / 1000 : raw
-        let date = Date(timeIntervalSince1970: seconds)
-        if date.timeIntervalSince1970 > 1_600_000_000 {
-          candidates.append(date)
-        }
-        return
-      }
-      let formatter = ISO8601DateFormatter()
-      formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-      if let date = formatter.date(from: text) {
-        candidates.append(date)
-        return
-      }
-      formatter.formatOptions = [.withInternetDateTime]
-      if let date = formatter.date(from: text) {
-        candidates.append(date)
-      }
-    }
+    return (url, frontendId)
   }
 
   private func firstMatch(in text: String, pattern: String) -> String? {

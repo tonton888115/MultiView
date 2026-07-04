@@ -41,7 +41,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   private var streamBlocked = false
   private var laneCursor = 0
 
-  private static let clientID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+  private static let clientID = TwitchGQL.clientID
   private static let accessTokenHash = "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712"
   private static let userAgent = BrowserUserAgent.mobileSafari
   private static var useIvsPlayer: Bool {
@@ -224,7 +224,10 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     request.httpBody = try? JSONSerialization.data(withJSONObject: body)
     tokenTask = URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
       guard let self else { return }
-      self.tokenTask = nil
+      // tokenTask is read/cleared on the main thread (stopPlayback/recoverFromStall);
+      // hop so the clear cannot race those accesses. Main queue FIFO keeps it ahead
+      // of the retry/play blocks enqueued below.
+      DispatchQueue.main.async { self.tokenTask = nil }
       guard !self.isStopped, generation == self.playbackGeneration else { return }
       if let error {
         self.retryNativeLoadOrFallback("Twitchトークン取得失敗: \(error.localizedDescription)", generation: generation)

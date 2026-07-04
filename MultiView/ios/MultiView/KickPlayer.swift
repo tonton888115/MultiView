@@ -276,8 +276,13 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     kickHeaders().forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
     channelTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       guard let self else { return }
-      self.channelTask = nil
-      self.isLoading = false
+      // channelTask/isLoading are read on the main thread (loadNativeStream guard),
+      // so reset them there. The main queue is FIFO, so this still lands before the
+      // retry/fallback/play blocks the branches below enqueue afterwards.
+      DispatchQueue.main.async {
+        self.channelTask = nil
+        self.isLoading = false
+      }
       if let error {
         self.retryKickLoadOrFallback("Kick HLS取得失敗: \(error.localizedDescription)")
         return

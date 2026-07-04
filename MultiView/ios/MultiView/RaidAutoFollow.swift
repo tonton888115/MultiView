@@ -24,59 +24,6 @@ enum RaidAutoFollow {
     return plainMentionTarget(in: text, preferredPlatform: preferredPlatform)
   }
 
-  static func detectTarget(in payload: Any, preferredPlatform: StreamPlatform) -> (StreamPlatform, String)? {
-    if let text = payload as? String {
-      return detectTarget(in: text, preferredPlatform: preferredPlatform)
-    }
-    if let dict = payload as? [String: Any] {
-      if let direct = targetFromDictionary(dict, preferredPlatform: preferredPlatform) {
-        return direct
-      }
-      let joined = dict.compactMap { key, value -> String? in
-        guard key.lowercased().contains("raid") || key.lowercased().contains("host") || key.lowercased().contains("target") else { return nil }
-        return "\(key) \(value)"
-      }.joined(separator: " ")
-      if let direct = detectTarget(in: joined, preferredPlatform: preferredPlatform) {
-        return direct
-      }
-      for value in dict.values {
-        if let nested = detectTarget(in: value, preferredPlatform: preferredPlatform) {
-          return nested
-        }
-      }
-    }
-    if let array = payload as? [Any] {
-      for value in array {
-        if let nested = detectTarget(in: value, preferredPlatform: preferredPlatform) {
-          return nested
-        }
-      }
-    }
-    return nil
-  }
-
-  private static func targetFromDictionary(_ dict: [String: Any], preferredPlatform: StreamPlatform) -> (StreamPlatform, String)? {
-    for (key, value) in dict {
-      let lowerKey = key.lowercased()
-      guard lowerKey.contains("target") || lowerKey == "to" || lowerKey.contains("recipient") || lowerKey.contains("raided") || lowerKey.contains("hosted") else {
-        continue
-      }
-      if let text = value as? String {
-        if let linked = firstStreamURL(in: text) {
-          return linked
-        }
-        let channel = normalize(text, platform: preferredPlatform)
-        if !channel.isEmpty {
-          return (preferredPlatform, channel)
-        }
-      }
-      if let nested = detectTarget(in: value, preferredPlatform: preferredPlatform) {
-        return nested
-      }
-    }
-    return nil
-  }
-
   private static func firstStreamURL(in text: String) -> (StreamPlatform, String)? {
     let pattern = #"https?://[^\s<>"']+"#
     guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }

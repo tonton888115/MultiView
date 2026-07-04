@@ -225,7 +225,7 @@ class BrowserSourceController: UIViewController, WKNavigationDelegate, WKUIDeleg
     })();
     """
     let controller = webView.configuration.userContentController
-    controller.add(self, name: "streamURL")
+    controller.add(WeakScriptMessageHandler(delegate: self), name: "streamURL")
     controller.addUserScript(WKUserScript(source: source, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
   }
 

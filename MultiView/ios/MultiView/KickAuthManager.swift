@@ -480,7 +480,6 @@ final class KickAuthManager: NSObject, ASWebAuthenticationPresentationContextPro
 
 enum KickAuthError: LocalizedError {
   case missingClientId
-  case missingClientSecret
   case invalidRedirectURI
   case invalidAuthorizeURL
   case invalidCallback
@@ -496,7 +495,6 @@ enum KickAuthError: LocalizedError {
   var errorDescription: String? {
     switch self {
     case .missingClientId: return "Kick Client IDが未設定です"
-    case .missingClientSecret: return "Kick Client Secretが未設定です"
     case .invalidRedirectURI: return "Kick Redirect URIが不正です"
     case .invalidAuthorizeURL: return "Kick認証URLを作成できません"
     case .invalidCallback: return "Kick認証の戻りURLが不正です"

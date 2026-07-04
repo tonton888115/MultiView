@@ -201,6 +201,12 @@ final class FocusedStreamView: UIView {
       autoHideControls.append(closeButton)
     }
     autoHider = AutoHidingControls(host: self, controls: autoHideControls)
+    if let viewerCountOverlay {
+      // チップが隠れている間は同接数のネットワーク更新を止める(電力節約)。
+      autoHider?.onVisibilityChange = { [weak viewerCountOverlay] visible in
+        viewerCountOverlay?.isVisibleHint = visible
+      }
+    }
   }
 
   required init?(coder: NSCoder) {

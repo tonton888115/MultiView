@@ -147,9 +147,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   func setPlaybackVolume(_ volume: Float) {
     playbackVolume = min(1, max(0, volume))
     iframeAudioEnabled = true
-    if iframeAudioEnabled {
-      Self.focusAudio(on: self)
-    }
+    Self.focusAudio(on: self)
     applyVolume()
     applyIframeVolume()
   }
@@ -223,7 +221,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     }
     let config = WKWebViewConfiguration()
     config.websiteDataStore = .default()
-    config.userContentController.add(self, name: "youtubeOfficialChat")
+    config.userContentController.add(WeakScriptMessageHandler(delegate: self), name: "youtubeOfficialChat")
     config.userContentController.addUserScript(WKUserScript(source: Self.officialChatObserverScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
     let web = WKWebView(frame: CGRect(x: -2, y: -2, width: 1, height: 1), configuration: config)
     web.customUserAgent = BrowserUserAgent.desktopSafari
@@ -612,7 +610,11 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     resolveTask?.cancel()
     resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       guard let self else { return }
-      self.resolveTask = nil
+      // resolveTask is read/written on the main thread (timeout check below,
+      // stopPlayback); hop to main so the clear cannot race those accesses. The
+      // main queue is FIFO, so this still lands before the retry blocks enqueued
+      // after it.
+      DispatchQueue.main.async { self.resolveTask = nil }
       if let error {
         DispatchQueue.main.async {
           self.noteExtractionFailure("\(client.label): \(error.localizedDescription)")
@@ -877,7 +879,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     config.allowsInlineMediaPlayback = true
     config.mediaTypesRequiringUserActionForPlayback = []
     config.websiteDataStore = .default()
-    config.userContentController.add(self, name: "youtubeAudio")
+    config.userContentController.add(WeakScriptMessageHandler(delegate: self), name: "youtubeAudio")
     WebAdBlocker.install(on: config)
     let web = WKWebView(frame: bounds, configuration: config)
     web.isOpaque = false
@@ -957,7 +959,8 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
     resolveTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       guard let self else { return }
-      self.resolveTask = nil
+      // Keep resolveTask mutations on the main thread (see requestNativePlayer).
+      DispatchQueue.main.async { self.resolveTask = nil }
       if let error {
         self.showStatus("YouTubeライブ解決失敗: \(error.localizedDescription)")
         return

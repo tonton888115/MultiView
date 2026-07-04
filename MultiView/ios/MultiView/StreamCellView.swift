@@ -137,6 +137,12 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
       autoHideControls.append(viewerCountOverlay)
     }
     autoHider = AutoHidingControls(host: self, controls: autoHideControls)
+    if let viewerCountOverlay {
+      // チップが隠れている間は同接数のネットワーク更新を止める(電力節約)。
+      autoHider?.onVisibilityChange = { [weak viewerCountOverlay] visible in
+        viewerCountOverlay?.isVisibleHint = visible
+      }
+    }
     let reorder = UILongPressGestureRecognizer(target: self, action: #selector(handleReorderGesture(_:)))
     reorder.minimumPressDuration = 0.28
     reorder.allowableMovement = 18

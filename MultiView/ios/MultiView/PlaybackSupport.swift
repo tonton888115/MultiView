@@ -214,6 +214,30 @@ enum NativeFallbackRetry {
   }
 }
 
+// Twitch の公開 web クライアント ID(GQL 用)。TwitchPlayer(再生トークン取得)と
+// ViewerCount(同接数取得)の両方で使うため、一箇所で管理する。
+enum TwitchGQL {
+  static let clientID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+}
+
+// WKUserContentController retains its script message handlers strongly, so passing
+// a view/controller itself to `add(_:name:)` creates the classic retain cycle
+// (controller → handler → webView → controller) that keeps the owner alive and
+// prevents deinit from running. This proxy holds the real handler weakly and
+// forwards messages transparently (same handler names, same messages).
+final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+  private weak var delegate: WKScriptMessageHandler?
+
+  init(delegate: WKScriptMessageHandler) {
+    self.delegate = delegate
+    super.init()
+  }
+
+  func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+    delegate?.userContentController(userContentController, didReceive: message)
+  }
+}
+
 extension WKWebView {
   func playAllMedia() {
     evaluateJavaScript("document.querySelectorAll('video,audio').forEach(function(m){try{m.play()}catch(e){}});")
