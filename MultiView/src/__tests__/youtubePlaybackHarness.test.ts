@@ -15,6 +15,9 @@ describe('YouTube playback regression harness', () => {
   const runtimeFiles = [
     'App.tsx',
     'src/playback.ts',
+    'src/viewerCount.ts',
+    'src/webInject.ts',
+    'src/network.ts',
     'src/types.ts',
     'ios/MultiView/BrowserUserAgent.swift',
     'ios/MultiView/YouTubePlayer.swift',
@@ -89,8 +92,9 @@ describe('YouTube playback regression harness', () => {
     const app = readProjectFile('App.tsx');
     expect(playback).not.toContain("label: 'YouTube Web'");
     expect(playback).toContain("status: '映像取得中'"); // videoId 未解決のクリーンなプレースホルダ
-    // 解決例外時も YouTube だけは Web フォールバック URL を設定しない。
-    expect(app).toContain("currentStream.platform === 'youtube' ? undefined : webStreamURL(currentStream)");
+    // 解決例外時も YouTube だけは Web フォールバック URL を設定しない
+    // (resolvePlaybackSource は reject しないため、ガードは playback.ts 側にある)。
+    expect(playback).toContain("stream.platform === 'youtube' ? undefined : webStreamURL(stream)");
     // 取得中/iframe に留まったらバックグラウンドで native HLS へ昇格を粘る。
     expect(app).toContain('youtubeRetryRef');
   });
@@ -174,7 +178,9 @@ describe('YouTube playback regression harness', () => {
   });
 
   it('does not infer YouTube viewer counts from page text snippets', () => {
-    const app = readProjectFile('App.tsx');
+    // Android の同接数ロジックは App.tsx から src/viewerCount.ts (フェッチ/パース) と
+    // src/webInject.ts (WebView 注入スクレイパ) へ移設された。
+    const app = readProjectFile('src/viewerCount.ts') + '\n' + readProjectFile('src/webInject.ts');
     const viewerCount = readProjectFile('ios/MultiView/ViewerCount.swift');
 
     expect(app).toContain('concurrentViewers');

@@ -1,6 +1,5 @@
 import {effectiveQuality} from '../playback';
 import {niconicoQuality} from '../niconico';
-import {isCellular} from '../network';
 import type {AppSettings} from '../types';
 
 function settings(overrides: Partial<AppSettings> = {}): AppSettings {
@@ -60,13 +59,6 @@ describe('network-adaptive playback quality', () => {
 
   it('defaults conservatively when network type is omitted', () => {
     expect(effectiveQuality(settings({wifiQuality: 'high', mobileQuality: 'economy'}), 1)).toBe('economy');
-  });
-
-  it('detects cellular only for the cellular network type', () => {
-    expect(isCellular('cellular')).toBe(true);
-    expect(isCellular('wifi')).toBe(false);
-    expect(isCellular('other')).toBe(false);
-    expect(isCellular('none')).toBe(false);
   });
 
   it('maps effective quality to Niconico session quality', () => {

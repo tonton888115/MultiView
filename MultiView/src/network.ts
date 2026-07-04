@@ -28,8 +28,25 @@ function parseNetworkType(value: unknown): NetworkType | null {
   return value === 'wifi' || value === 'cellular' || value === 'other' || value === 'none' ? value : null;
 }
 
-export function isCellular(type: NetworkType): boolean {
-  return type === 'cellular';
+// タイムアウト付き fetch の共通実装。Promise.race だけの実装はタイムアウト後も
+// 裏の fetch(接続)が生き残り、回線断中に復旧サイクルを詰まらせるため、
+// AbortController で fetch 自体も必ず中断する。
+export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<Response>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`Request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([fetch(url, {...init, signal: controller.signal}), timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function applyType(value: unknown) {

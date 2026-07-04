@@ -1,4 +1,5 @@
 import {AppSettings, NetworkType, PlaybackQuality, PlaybackSource, PlatformId, StreamItem} from './types';
+import {fetchWithTimeout} from './network';
 
 export const mobileUserAgent =
   'Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36';
@@ -115,7 +116,8 @@ export async function resolvePlaybackSource(
       label: '取得失敗',
       status: 'フォールバック待機',
       reason: error instanceof Error ? error.message : String(error),
-      fallbackUrl: webStreamURL(stream),
+      // YouTube は Web ページへ落とさない(映像のみ優先・ユーザー要望)。他PFは従来どおり。
+      fallbackUrl: stream.platform === 'youtube' ? undefined : webStreamURL(stream),
     };
   }
 }
@@ -544,22 +546,6 @@ async function requestYouTubeDirect(videoId: string): Promise<string | null> {
   return progressiveFallback;
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<Response>((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error(`Request timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-  });
-  try {
-    return await Promise.race([fetch(url, init), timeout]);
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  }
-}
-
 export function youtubeClients() {
   const iosUA = `com.google.ios.youtube/${youtubeIOSVersion} (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X; ja_JP)`;
   const androidUA = `com.google.android.youtube/${youtubeAndroidVersion} (Linux; U; Android 15) gzip`;
@@ -664,30 +650,12 @@ iframe{position:absolute;inset:0;width:100%;height:100%;border:0;background:#000
 <div id="err"></div>
 <script src="https://www.youtube.com/iframe_api"></script>
 <script>
-var player=null,READY=false,AUDIO=false,VOL=0,hasPlayedOnce=false,sb=[];
+var player=null,READY=false,AUDIO=false,VOL=0,hasPlayedOnce=false;
 function apply(){
   if(!player||!READY)return;
   try{
     player.playVideo();
     if(AUDIO){player.unMute();player.setVolume(VOL);}else{player.mute();}
-  }catch(e){}
-}
-function loadSB(){
-  try{
-    var cats='%5B%22sponsor%22%2C%22selfpromo%22%2C%22interaction%22%2C%22intro%22%2C%22outro%22%2C%22preview%22%2C%22music_offtopic%22%5D';
-    fetch('https://sponsor.ajay.app/api/skipSegments?videoID=${escaped}&categories='+cats+'&actionTypes=%5B%22skip%22%5D')
-      .then(function(r){return r.ok?r.json():[];})
-      .then(function(list){sb=(list||[]).filter(function(s){return s.actionType==='skip'&&s.segment;}).map(function(s){return {s:s.segment[0],e:s.segment[1]};});})
-      .catch(function(){});
-  }catch(e){}
-}
-function sbTick(){
-  if(!player||!READY||!sb.length)return;
-  try{
-    var t=player.getCurrentTime();
-    for(var i=0;i<sb.length;i++){
-      if(t>=sb[i].s&&t<sb[i].e-0.15){player.seekTo(sb[i].e+0.1,true);break;}
-    }
   }catch(e){}
 }
 function showError(code){
@@ -701,7 +669,7 @@ window.onYouTubeIframeAPIReady=function(){
     host:'https://www.youtube.com',
     playerVars:{autoplay:1,mute:1,playsinline:1,controls:0,rel:0,fs:0,iv_load_policy:3,modestbranding:1,origin:'https://tonton888115.github.io'},
     events:{
-      onReady:function(){READY=true;apply();loadSB();},
+      onReady:function(){READY=true;apply();},
       onStateChange:function(e){
         if(e.data===YT.PlayerState.PLAYING){hasPlayedOnce=true;return;}
         if(!hasPlayedOnce&&(e.data===YT.PlayerState.UNSTARTED||e.data===YT.PlayerState.CUED||e.data===YT.PlayerState.PAUSED)){
@@ -715,7 +683,6 @@ window.onYouTubeIframeAPIReady=function(){
 window.mvPlay=function(){apply();};
 window.mvPause=function(){try{player&&player.pauseVideo();}catch(e){}};
 window.mvSetVolume=function(v){var n=Math.max(0,Math.min(1,+v||0));VOL=Math.round(n*100);AUDIO=VOL>0;apply();};
-setInterval(sbTick,400);
 </script>
 </body>
 </html>`;

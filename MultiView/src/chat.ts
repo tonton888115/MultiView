@@ -1,4 +1,5 @@
 import {desktopUserAgent, mobileUserAgent, resolveLiveYouTubeVideoID, webStreamURL, youtubeVideoId} from './playback';
+import {fetchWithTimeout} from './network';
 import {kickFilterText, kickTokens, makeChatEvent, parseTwitchTags, textTokens, twitchTokens} from './danmaku';
 import {isDanmakuEnabled} from './danmakuQueue';
 import {kickHostTarget, reportRaid, twitchRaidTarget} from './raidFollow';
@@ -1052,24 +1053,6 @@ function parseJSON(text: string): any | null {
     return JSON.parse(text);
   } catch {
     return null;
-  }
-}
-
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  const controller = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<Response>((_, reject) => {
-    timer = setTimeout(() => {
-      controller.abort();
-      reject(new Error(`Request timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-  });
-  try {
-    return await Promise.race([fetch(url, {...init, signal: controller.signal}), timeout]);
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
   }
 }
 

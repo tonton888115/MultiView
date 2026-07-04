@@ -1,8 +1,6 @@
 import React from 'react';
 import {
   requireNativeComponent,
-  UIManager,
-  findNodeHandle,
   type HostComponent,
   type NativeSyntheticEvent,
   type ViewProps,
@@ -31,14 +29,3 @@ const NativeHlsPlayerComponent =
 export const NativeHlsPlayer = React.forwardRef<React.ElementRef<typeof NativeHlsPlayerComponent>, NativeHlsPlayerProps>(
   (props, ref) => <NativeHlsPlayerComponent ref={ref} {...props} />,
 );
-
-export function sendNativePlayerCommand(
-  ref: React.RefObject<React.ElementRef<typeof NativeHlsPlayerComponent> | null>,
-  command: 'play' | 'pause' | 'reload',
-) {
-  const handle = findNodeHandle(ref.current);
-  if (!handle) {
-    return;
-  }
-  UIManager.dispatchViewManagerCommand(handle, command, []);
-}
