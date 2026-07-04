@@ -104,6 +104,9 @@ class HandoffQrModule(private val reactContext: ReactApplicationContext) :
 
   override fun invalidate() {
     reactContext.removeActivityEventListener(this)
+    // 破棄時にスキャン中の Promise を握りつぶすと JS 側の await が永久に解決しない。
+    // キャンセル扱いで reject してから捨てる。
+    pendingScan?.reject("qr_scan_cancelled", "スキャンを中断しました")
     pendingScan = null
     super.invalidate()
   }

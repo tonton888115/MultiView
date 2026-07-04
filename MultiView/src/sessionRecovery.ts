@@ -45,3 +45,41 @@ export function shouldRestartSessionOnAppState(previous: string | null, next: st
 export function shouldReloadOnViewActivation(previouslyActive: boolean, active: boolean): boolean {
   return !previouslyActive && active;
 }
+
+export type PlayerHealth = 'unknown' | 'healthy' | 'broken';
+
+// タブ復帰時、以前は全セルを無条件に再解決・再マウントしていた(健全なネイティブ再生
+// まで黒画面から作り直し)。ネイティブは surface 再バインド(Kotlin側)があるため、
+// 直近イベントが健全なセルはそのまま継続してよい。健全と確認できないもの
+// (イベント未受信/エラー後/Web系ソース)だけを従来どおり再読込する。
+export function shouldReloadCellOnViewActivation(sourceKind: string | null, health: PlayerHealth): boolean {
+  if (sourceKind !== 'native') {
+    return true;
+  }
+  return health !== 'healthy';
+}
+
+// Twitch/Kick の静かな再解決(オフライン配信では成功しない)を固定20秒間隔で無期限に
+// 回さない。失敗が続くほど間隔を倍々で広げ、上限5分で打ち止めにする(成功や配信
+// 切替でattemptは0に戻る)。
+export const nativeSourceRecoveryMaxDelayMs = 300_000;
+
+export function nativeSourceRecoveryDelayForAttempt(attempt: number): number {
+  const normalized = Math.max(0, Math.floor(Number.isFinite(attempt) ? attempt : 0));
+  const delay = nativeSourceRecoveryDelayMs * 2 ** Math.min(normalized, 10);
+  return Math.min(delay, nativeSourceRecoveryMaxDelayMs);
+}
+
+// YouTube の native HLS 昇格再試行: 初回数回は素早く、以降はゆっくり、長期戦は
+// さらに間隔を空ける(YouTubeへの負荷抑制)。iframe優先設定時は昇格自体が無意味
+// なので呼び出し側でループを止めること。
+export function youtubeUpgradeDelayForAttempt(attempt: number): number {
+  const normalized = Math.max(0, Math.floor(Number.isFinite(attempt) ? attempt : 0));
+  if (normalized < 3) {
+    return 6_000;
+  }
+  if (normalized < 8) {
+    return 20_000;
+  }
+  return 60_000;
+}

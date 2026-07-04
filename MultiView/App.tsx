@@ -88,7 +88,8 @@ import {useNetworkType} from './src/network';
 import {parseStreamURL} from './src/streamURL';
 import {appSafeAreaEdges, focusedPaneLayout} from './src/layout';
 import {useRecoveringNativeSession} from './src/useRecoveringNativeSession';
-import {autoReloadDelayMs, nativeFirstFrameTimeoutMs, nativeSourceRecoveryDelayMs, shouldFallbackForMissingNativeFrame, shouldRecoverNativeSource, shouldReloadOnViewActivation, shouldRenderNativeSession, shouldRestartSessionOnAppState} from './src/sessionRecovery';
+import {autoReloadDelayMs, nativeFirstFrameTimeoutMs, nativeSourceRecoveryDelayForAttempt, shouldFallbackForMissingNativeFrame, shouldRecoverNativeSource, shouldReloadCellOnViewActivation, shouldReloadOnViewActivation, shouldRenderNativeSession, shouldRestartSessionOnAppState, youtubeUpgradeDelayForAttempt} from './src/sessionRecovery';
+import type {PlayerHealth} from './src/sessionRecovery';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -427,9 +428,15 @@ export default function App() {
   }, [hydrated, settings]);
 
   useEffect(() => {
-    if (hydrated) {
-      AsyncStorage.setItem(VOLUMES_KEY, JSON.stringify(volumes)).catch(() => undefined);
+    if (!hydrated) {
+      return;
     }
+    // 音量はドラッグ中に連続更新される。move毎にディスクへ書かず、落ち着いてから
+    // 1回だけ永続化する(UI/プレイヤーへの反映はstate経由で即時のまま)。
+    const timer = setTimeout(() => {
+      AsyncStorage.setItem(VOLUMES_KEY, JSON.stringify(volumes)).catch(() => undefined);
+    }, 400);
+    return () => clearTimeout(timer);
   }, [hydrated, volumes]);
 
   useEffect(() => {
@@ -1503,16 +1510,20 @@ function StreamPlayer({
   onViewerCount?: (count: number) => void;
 }) {
   const [source, setSource] = useState<PlaybackSource | null>(null);
-  const [, setPlayerStatus] = useState('待機中');
   const webRef = useRef<WebView>(null);
+  // ネイティブプレイヤーの直近イベントから見た健全性。タブ復帰時に「健全なセルは
+  // 再マウントしない」判定にだけ使うので、stateではなくref(再レンダー不要)。
+  const playerHealthRef = useRef<PlayerHealth>('unknown');
   const streamRef = useRef(stream);
   const settingsRef = useRef(settings);
   const streamCountRef = useRef(streamCount);
+  const sourceRef = useRef<PlaybackSource | null>(null);
   const networkType = useNetworkType();
   const playbackQuality = effectiveQuality(settings, streamCount, networkType);
   streamRef.current = stream;
   settingsRef.current = settings;
   streamCountRef.current = streamCount;
+  sourceRef.current = source;
   // ネイティブプレイヤーの error/ended を受けてのデバウンス自動復旧。
   // iOS の .multiViewPlaybackErrored と同じく 45 秒に 1 回までに制限してループを防ぐ。
   // ただしイベントを「捨てる」と、致命的エラー(STATE_IDLE)後はネイティブ側が二度と
@@ -1528,6 +1539,7 @@ function StreamPlayer({
   // Twitch/Kick がエラー/Webフォールバックに落ちたままにならないよう、静かに再解決
   // して native HLS が取れたときだけ差し替えるための内部チック。
   const [nativeRecoveryTick, setNativeRecoveryTick] = useState(0);
+  const nativeRecoveryAttemptRef = useRef(0);
   const clearAutoReloadTimer = useCallback(() => {
     if (autoReloadTimerRef.current) {
       clearTimeout(autoReloadTimerRef.current);
@@ -1553,10 +1565,14 @@ function StreamPlayer({
     if (shouldReloadOnViewActivation(previouslyActive, viewingActive)) {
       // The viewing panel remains mounted beneath other tabs. Android may
       // detach a TextureView or fail a hidden HLS session while it is opaque.
-      // Re-enter through the same full reload boundary as the manual button.
-      clearAutoReloadTimer();
-      lastAutoReloadRef.current = Date.now();
-      setAutoReloadTick(tick => tick + 1);
+      // ただし直近イベントが健全なネイティブ再生は surface 再バインドで継続する
+      // ため再マウントせず、健全と確認できないセルだけ再読込する(iOSのresumeAll
+      // が継続再生なのと同じ体験に寄せる)。
+      if (shouldReloadCellOnViewActivation(sourceRef.current?.kind ?? null, playerHealthRef.current)) {
+        clearAutoReloadTimer();
+        lastAutoReloadRef.current = Date.now();
+        setAutoReloadTick(tick => tick + 1);
+      }
     }
   }, [clearAutoReloadTimer, viewingActive]);
 
@@ -1583,14 +1599,13 @@ function StreamPlayer({
     }
     let cancelled = false;
     setSource(null);
-    setPlayerStatus('取得中');
+    playerHealthRef.current = 'unknown';
     // resolvePlaybackSource は内部で全例外を error ソースへ畳み込み、reject しない
     // (YouTube を Web ページへ落とさないガードも playback.ts 側にある)。
     resolvePlaybackSource(currentStream, settingsRef.current, streamCountRef.current)
       .then(next => {
         if (!cancelled) {
           setSource(next);
-          setPlayerStatus(next.status);
         }
       });
     return () => {
@@ -1619,9 +1634,16 @@ function StreamPlayer({
       youtubeRetryRef.current = 0;
       return;
     }
+    if (settings.youtubePreferIframe) {
+      // iframe優先設定では resolve が常に iframe を返すため、この昇格再解決は
+      // 絶対に成功しない(=@handleならライブページHTML全取得を無限に繰り返すだけ)。
+      // ループ自体を止める。
+      youtubeRetryRef.current = 0;
+      return;
+    }
     // Web ページへは絶対に落とさず、映像のみ(native HLS)が取れるまで粘る。
-    // 初回数回は素早く(6s)、以降はゆっくり(20s)で再解決し続ける(YouTube への負荷も抑える)。
-    const delay = youtubeRetryRef.current < 3 ? 6000 : 20000;
+    // 初回数回は素早く、以降は間隔を空けて再解決し続ける(YouTube への負荷も抑える)。
+    const delay = youtubeUpgradeDelayForAttempt(youtubeRetryRef.current);
     let cancelled = false;
     const timer = setTimeout(async () => {
       youtubeRetryRef.current += 1;
@@ -1632,7 +1654,6 @@ function StreamPlayer({
         }
         if (next.kind === 'native') {
           setSource(next);
-          setPlayerStatus(next.status);
         } else {
           setYoutubeUpgradeTick(tick => tick + 1);
         }
@@ -1646,16 +1667,19 @@ function StreamPlayer({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [source, stream.platform, youtubeUpgradeTick]);
+  }, [source, stream.platform, settings.youtubePreferIframe, youtubeUpgradeTick]);
 
   // Twitch/Kick は再解決失敗やオフライン判定でエラー/Webフォールバックへ落ちると、
   // 回線復帰後も native HLS へ戻る経路が無かった(iOS は StallWatchdog+再取得ラダー
   // が再接続する)。YouTube と同じく静かに再解決し、native が取れたときだけ差し替える。
   useEffect(() => {
     if (!source || !shouldRecoverNativeSource(stream.platform, source.kind)) {
+      nativeRecoveryAttemptRef.current = 0;
       return;
     }
     let cancelled = false;
+    // オフライン配信を固定間隔で無期限ポーリングしない。失敗が続くほど間隔を
+    // 倍々で広げる(上限5分)。native復帰か配信切替でattemptは0に戻る。
     const timer = setTimeout(async () => {
       try {
         const next = await resolvePlaybackSource(streamRef.current, settingsRef.current, streamCountRef.current);
@@ -1663,17 +1687,19 @@ function StreamPlayer({
           return;
         }
         if (next.kind === 'native') {
+          nativeRecoveryAttemptRef.current = 0;
           setSource(next);
-          setPlayerStatus(next.status);
         } else {
+          nativeRecoveryAttemptRef.current += 1;
           setNativeRecoveryTick(tick => tick + 1);
         }
       } catch {
         if (!cancelled) {
+          nativeRecoveryAttemptRef.current += 1;
           setNativeRecoveryTick(tick => tick + 1);
         }
       }
-    }, nativeSourceRecoveryDelayMs);
+    }, nativeSourceRecoveryDelayForAttempt(nativeRecoveryAttemptRef.current));
     return () => {
       cancelled = true;
       clearTimeout(timer);
@@ -1770,10 +1796,12 @@ function StreamPlayer({
           resizeMode="contain"
           onPlayerEvent={event => {
             const payload = event.nativeEvent;
-            setPlayerStatus(payload.type === 'error' ? `エラー: ${payload.message}` : payload.message);
             // 'idle' は致命的エラー後の停止状態。error イベントが失われても復旧に繋ぐ。
             if (payload.type === 'error' || payload.message === 'ended' || payload.message === 'idle') {
+              playerHealthRef.current = 'broken';
               scheduleAutoReload();
+            } else if (payload.message === 'playing' || payload.message === 'ready') {
+              playerHealthRef.current = 'healthy';
             }
           }}
         />
@@ -2446,6 +2474,50 @@ function VolumeOverlay({
   mode?: 'cell' | 'focus';
 }) {
   const [height, setHeight] = useState(0);
+  // ドラッグ中はこのオーバーレイ内だけで描画し、親(Appルートのvolumes state)への
+  // 反映は間引く。以前はmove毎に全画面再レンダー+AsyncStorage書込が走っていた。
+  // 音量の音への追従は~100ms間隔で体感十分。
+  const [dragVolume, setDragVolume] = useState<number | null>(null);
+  const dragValueRef = useRef<number | null>(null);
+  const lastCommitAtRef = useRef(0);
+  const commitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const commit = useCallback(
+    (value: number) => {
+      lastCommitAtRef.current = Date.now();
+      onVolume(stream, value);
+    },
+    [onVolume, stream],
+  );
+
+  const throttledCommit = useCallback(
+    (value: number) => {
+      const elapsed = Date.now() - lastCommitAtRef.current;
+      if (elapsed >= 100) {
+        commit(value);
+        return;
+      }
+      if (!commitTimerRef.current) {
+        commitTimerRef.current = setTimeout(() => {
+          commitTimerRef.current = null;
+          if (dragValueRef.current !== null) {
+            commit(dragValueRef.current);
+          }
+        }, 100 - elapsed);
+      }
+    },
+    [commit],
+  );
+
+  useEffect(
+    () => () => {
+      if (commitTimerRef.current) {
+        clearTimeout(commitTimerRef.current);
+      }
+    },
+    [],
+  );
+
   const updateFromY = useCallback(
     (locationY: number) => {
       if (height <= 0) {
@@ -2453,10 +2525,23 @@ function VolumeOverlay({
       }
       onInteract?.();
       const next = 1 - Math.max(0, Math.min(height, locationY)) / height;
-      onVolume(stream, next);
+      dragValueRef.current = next;
+      setDragVolume(next);
+      throttledCommit(next);
     },
-    [height, onInteract, onVolume, stream],
+    [height, onInteract, throttledCommit],
   );
+  const endDrag = useCallback(() => {
+    if (commitTimerRef.current) {
+      clearTimeout(commitTimerRef.current);
+      commitTimerRef.current = null;
+    }
+    if (dragValueRef.current !== null) {
+      commit(dragValueRef.current);
+      dragValueRef.current = null;
+    }
+    setDragVolume(null);
+  }, [commit]);
   const responder = useMemo(
     () =>
       PanResponder.create({
@@ -2464,18 +2549,21 @@ function VolumeOverlay({
         onMoveShouldSetPanResponder: () => true,
         onPanResponderGrant: event => updateFromY(event.nativeEvent.locationY),
         onPanResponderMove: event => updateFromY(event.nativeEvent.locationY),
+        onPanResponderRelease: endDrag,
+        onPanResponderTerminate: endDrag,
       }),
-    [updateFromY],
+    [endDrag, updateFromY],
   );
 
+  const displayVolume = dragVolume ?? volume;
   return (
     <View
       style={[styles.volumeOverlay, mode === 'focus' ? styles.focusVolumeOverlay : styles.cellVolumeOverlay]}
       onLayout={event => setHeight(event.nativeEvent.layout.height)}
       {...responder.panHandlers}>
       <View style={styles.volumeTrack}>
-        <View style={[styles.volumeLevel, {height: `${Math.round(volume * 100)}%`, backgroundColor: color}]} />
-        <View style={[styles.volumeThumb, {bottom: `${Math.round(volume * 100)}%`}]} />
+        <View style={[styles.volumeLevel, {height: `${Math.round(displayVolume * 100)}%`, backgroundColor: color}]} />
+        <View style={[styles.volumeThumb, {bottom: `${Math.round(displayVolume * 100)}%`}]} />
       </View>
       <Text style={styles.volumeIcon}>♪</Text>
     </View>

@@ -3,14 +3,18 @@ import {
   autoReloadFireDelayMs,
   autoReloadMinIntervalMs,
   nativeFirstFrameTimeoutMs,
+  nativeSourceRecoveryDelayForAttempt,
+  nativeSourceRecoveryMaxDelayMs,
   playerStallTimeoutMs,
   sessionConnectTimeoutMs,
   sessionRetryDelayMs,
   shouldFallbackForMissingNativeFrame,
   shouldRecoverNativeSource,
+  shouldReloadCellOnViewActivation,
   shouldRenderNativeSession,
   shouldRestartSessionOnAppState,
   shouldUseSessionFallback,
+  youtubeUpgradeDelayForAttempt,
 } from '../sessionRecovery';
 import React, {useEffect} from 'react';
 import TestRenderer, {act} from 'react-test-renderer';
@@ -370,5 +374,50 @@ describe('native session recovery policy', () => {
     expect(latest?.sessionReloadTick).toBe(3);
     act(() => renderer!.unmount());
     expect(jest.getTimerCount()).toBe(0);
+  });
+});
+
+describe('selective reload on view activation', () => {
+  it('keeps healthy native cells mounted', () => {
+    expect(shouldReloadCellOnViewActivation('native', 'healthy')).toBe(false);
+  });
+
+  it('reloads native cells that are broken or unconfirmed', () => {
+    expect(shouldReloadCellOnViewActivation('native', 'broken')).toBe(true);
+    expect(shouldReloadCellOnViewActivation('native', 'unknown')).toBe(true);
+  });
+
+  it('always reloads non-native sources (no health signal)', () => {
+    expect(shouldReloadCellOnViewActivation('web', 'healthy')).toBe(true);
+    expect(shouldReloadCellOnViewActivation('youtube-iframe', 'healthy')).toBe(true);
+    expect(shouldReloadCellOnViewActivation('error', 'unknown')).toBe(true);
+    expect(shouldReloadCellOnViewActivation(null, 'unknown')).toBe(true);
+  });
+});
+
+describe('native source recovery backoff', () => {
+  it('starts at the base delay and doubles per failed attempt', () => {
+    expect(nativeSourceRecoveryDelayForAttempt(0)).toBe(20_000);
+    expect(nativeSourceRecoveryDelayForAttempt(1)).toBe(40_000);
+    expect(nativeSourceRecoveryDelayForAttempt(2)).toBe(80_000);
+    expect(nativeSourceRecoveryDelayForAttempt(3)).toBe(160_000);
+  });
+
+  it('caps at 5 minutes and tolerates garbage input', () => {
+    expect(nativeSourceRecoveryDelayForAttempt(4)).toBe(nativeSourceRecoveryMaxDelayMs);
+    expect(nativeSourceRecoveryDelayForAttempt(100)).toBe(nativeSourceRecoveryMaxDelayMs);
+    expect(nativeSourceRecoveryDelayForAttempt(Number.NaN)).toBe(20_000);
+    expect(nativeSourceRecoveryDelayForAttempt(-5)).toBe(20_000);
+  });
+});
+
+describe('youtube upgrade retry schedule', () => {
+  it('is fast first, then slow, then sparse', () => {
+    expect(youtubeUpgradeDelayForAttempt(0)).toBe(6_000);
+    expect(youtubeUpgradeDelayForAttempt(2)).toBe(6_000);
+    expect(youtubeUpgradeDelayForAttempt(3)).toBe(20_000);
+    expect(youtubeUpgradeDelayForAttempt(7)).toBe(20_000);
+    expect(youtubeUpgradeDelayForAttempt(8)).toBe(60_000);
+    expect(youtubeUpgradeDelayForAttempt(50)).toBe(60_000);
   });
 });
