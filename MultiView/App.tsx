@@ -1886,6 +1886,7 @@ const StreamPlayer = React.memo(function StreamPlayer({
           sourceUrl={source.url}
           headers={source.headers}
           paused={paused}
+          viewingActive={viewingActive}
           muted={muted}
           volume={volume}
           liveTargetOffsetMs={source.liveTargetOffsetMs}
@@ -2304,6 +2305,7 @@ const NiconicoNativePlayer = React.memo(function NiconicoNativePlayer({
             'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6',
           }}
           paused={paused}
+          viewingActive={viewingActive}
           muted={muted}
           volume={volume}
           liveTargetOffsetMs={settings.niconicoLowLatency ? 2000 : 6000}
@@ -2536,6 +2538,7 @@ const TwitcastingNativePlayer = React.memo(function TwitcastingNativePlayer({
             Origin: 'https://twitcasting.tv',
           }}
           paused={paused}
+          viewingActive={viewingActive}
           muted={muted}
           volume={volume}
           maxBitrate={playbackQuality === 'economy' ? 900000 : 0}

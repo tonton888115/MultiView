@@ -15,6 +15,7 @@ export type NativeHlsPlayerProps = ViewProps & {
   sourceUrl?: string | null;
   headers?: Record<string, string>;
   paused?: boolean;
+  viewingActive?: boolean;
   muted?: boolean;
   volume?: number;
   liveTargetOffsetMs?: number;

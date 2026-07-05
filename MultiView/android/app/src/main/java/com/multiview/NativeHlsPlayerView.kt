@@ -88,6 +88,7 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context), LifecycleEve
   private var sourcePropertiesDirty = false
   private var released = false
   private var paused = false
+  private var viewingActive = true
   private var muted = false
   private var volume = 1f
   private var liveTargetOffsetMs = 2_000L
@@ -241,6 +242,17 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context), LifecycleEve
     } else if (exoPlayer.currentMediaItem != null) {
       exoPlayer.play()
       startProgressWatchdog()
+    }
+  }
+
+  fun setViewingActive(next: Boolean) {
+    val becameActive = !viewingActive && next
+    viewingActive = next
+    if (becameActive && !released && exoPlayer.currentMediaItem != null) {
+      scheduleVideoOutputRebind()
+      if (exoPlayer.playbackState == Player.STATE_IDLE) {
+        emit("error", "resume-idle")
+      }
     }
   }
 

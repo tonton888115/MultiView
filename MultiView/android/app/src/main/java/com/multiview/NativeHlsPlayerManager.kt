@@ -44,6 +44,11 @@ class NativeHlsPlayerManager : SimpleViewManager<NativeHlsPlayerView>() {
     view.setPaused(paused)
   }
 
+  @ReactProp(name = "viewingActive", defaultBoolean = true)
+  fun setViewingActive(view: NativeHlsPlayerView, viewingActive: Boolean) {
+    view.setViewingActive(viewingActive)
+  }
+
   @ReactProp(name = "muted", defaultBoolean = false)
   fun setMuted(view: NativeHlsPlayerView, muted: Boolean) {
     view.setMuted(muted)
