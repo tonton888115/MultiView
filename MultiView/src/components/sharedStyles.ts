@@ -1,0 +1,168 @@
+import {StyleSheet} from 'react-native';
+
+// App.tsx と抽出済みコンポーネント/画面の複数ファイルから参照されるスタイル。
+// 値は App.tsx の StyleSheet から移動したもの(変更なし)。
+export const sharedStyles = StyleSheet.create({
+  nativePlayer: {
+    flex: 1,
+    backgroundColor: '#000',
+  },
+  webPlayer: {
+    flex: 1,
+    backgroundColor: '#000',
+  },
+  hiddenBridgeWeb: {
+    flex: 0,
+    position: 'absolute',
+    left: -2,
+    top: -2,
+    width: 1,
+    height: 1,
+    opacity: 0,
+  },
+  playerPlaceholder: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#000',
+  },
+  playerStatus: {
+    color: '#9aa7b7',
+    marginTop: 8,
+    paddingHorizontal: 12,
+    textAlign: 'center',
+    fontSize: 12,
+  },
+  playerChrome: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+  },
+  autoHideChrome: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    opacity: 1,
+  },
+  autoHideChromeHidden: {
+    opacity: 0,
+  },
+  chromeRevealTouch: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+  },
+  overlayButton: {
+    width: 32,
+    height: 32,
+    marginLeft: 8,
+    borderRadius: 16,
+    backgroundColor: 'rgba(0,0,0,0.38)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  overlayIcon: {
+    color: 'rgba(255,255,255,0.92)',
+    fontSize: 17,
+    fontWeight: '700',
+    lineHeight: 20,
+  },
+  screen: {
+    flex: 1,
+  },
+  sourceTabs: {
+    minHeight: 52,
+    maxHeight: 52,
+    borderTopWidth: 1,
+    borderTopColor: '#18202b',
+    backgroundColor: '#090d12',
+  },
+  modal: {
+    flex: 1,
+    backgroundColor: '#05070a',
+  },
+  modalHeader: {
+    minHeight: 56,
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#18202b',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  modalTitle: {
+    color: '#f7f9fc',
+    fontSize: 18,
+    fontWeight: '700',
+    flexShrink: 1,
+  },
+  closeText: {
+    color: '#67a8ff',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  fullButton: {
+    minHeight: 46,
+    marginHorizontal: 16,
+    marginTop: 14,
+    paddingHorizontal: 14,
+    borderRadius: 7,
+    backgroundColor: '#2f8cff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  fullButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  settingNote: {
+    maxWidth: 320,
+    color: '#8c98a8',
+    fontSize: 12,
+    lineHeight: 17,
+  },
+  iconSegment: {
+    width: 96,
+    height: 36,
+    padding: 2,
+    borderRadius: 8,
+    backgroundColor: '#101720',
+    borderWidth: 1,
+    borderColor: '#263241',
+    flexDirection: 'row',
+  },
+  iconSegmentButton: {
+    flex: 1,
+    borderRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  iconSegmentButtonActive: {
+    backgroundColor: '#2f8cff',
+  },
+  iconSegmentText: {
+    color: '#9aa7b7',
+    fontSize: 18,
+    fontWeight: '900',
+    lineHeight: 22,
+  },
+  iconSegmentTextActive: {
+    color: '#fff',
+  },
+  settingRow: {
+    minHeight: 58,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#18202b',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+});

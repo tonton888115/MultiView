@@ -14,6 +14,23 @@ function readProjectFile(relativePath: string): string {
 describe('YouTube playback regression harness', () => {
   const runtimeFiles = [
     'App.tsx',
+    'src/players/StreamPlayer.tsx',
+    'src/players/NiconicoNativePlayer.tsx',
+    'src/players/TwitcastingNativePlayer.tsx',
+    'src/components/TabButton.tsx',
+    'src/components/Pill.tsx',
+    'src/components/PlayerBadge.tsx',
+    'src/components/VolumeOverlay.tsx',
+    'src/components/ViewerCountBadge.tsx',
+    'src/components/settingsRows.tsx',
+    'src/components/sharedStyles.ts',
+    'src/screens/SourceBrowser.tsx',
+    'src/screens/HandoffModal.tsx',
+    'src/screens/AddStreamModal.tsx',
+    'src/screens/FocusModal.tsx',
+    'src/screens/SettingsScreen.tsx',
+    'src/useAutoHidingChrome.ts',
+    'src/platforms.ts',
     'src/playback.ts',
     'src/viewerCount.ts',
     'src/webInject.ts',
@@ -89,14 +106,14 @@ describe('YouTube playback regression harness', () => {
     // The contract now: YouTube must NEVER render the full web page. ID未解決はクリーンな
     // プレースホルダ(再試行)に落とし、StreamPlayer が静かに HLS への昇格を粘る。
     const playback = readProjectFile('src/playback.ts');
-    const app = readProjectFile('App.tsx');
+    const streamPlayer = readProjectFile('src/players/StreamPlayer.tsx');
     expect(playback).not.toContain("label: 'YouTube Web'");
     expect(playback).toContain("status: '映像取得中'"); // videoId 未解決のクリーンなプレースホルダ
     // 解決例外時も YouTube だけは Web フォールバック URL を設定しない
     // (resolvePlaybackSource は reject しないため、ガードは playback.ts 側にある)。
     expect(playback).toContain("stream.platform === 'youtube' ? undefined : webStreamURL(stream)");
     // 取得中/iframe に留まったらバックグラウンドで native HLS へ昇格を粘る。
-    expect(app).toContain('youtubeRetryRef');
+    expect(streamPlayer).toContain('youtubeRetryRef');
   });
 
   it('keeps the native first-frame event used by the missing-video watchdog', () => {

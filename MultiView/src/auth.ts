@@ -29,6 +29,12 @@ export type ServiceAuthState = {
 
 export type AuthState = Record<OAuthService, ServiceAuthState>;
 
+export type AuthCommit = (
+  next: AuthState,
+  base: AuthState,
+  overwriteConflicts?: readonly OAuthService[],
+) => Promise<AuthState>;
+
 export type PendingOAuth = {
   service: Exclude<OAuthService, 'youtube'> | 'youtube';
   state: string;

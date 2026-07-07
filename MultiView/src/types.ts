@@ -96,3 +96,8 @@ export type ChatEvent = {
   highlighted?: boolean;
   createdAt: number;
 };
+
+export type NiconicoCommentSender = (text: string) => Promise<void>;
+
+export type HandoffImportMode = 'replace' | 'append';
+export type HandoffImporter = (streams: StreamItem[], settings: Partial<AppSettings>, mode: HandoffImportMode) => void;
