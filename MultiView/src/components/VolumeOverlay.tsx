@@ -55,10 +55,19 @@ export const VolumeOverlay = React.memo(function VolumeOverlay({
     [commit],
   );
 
+  // アンマウント時: タイマー破棄だけだと最後の100ms間引き分が失われるため、
+  // 未コミットのドラッグ値を先にコミットする。commit は stream/onVolume を
+  // 閉じ込めるので ref 経由で最新版を呼ぶ。
+  const commitRef = useRef(commit);
+  commitRef.current = commit;
   useEffect(
     () => () => {
       if (commitTimerRef.current) {
         clearTimeout(commitTimerRef.current);
+      }
+      if (dragValueRef.current !== null) {
+        commitRef.current(dragValueRef.current);
+        dragValueRef.current = null;
       }
     },
     [],

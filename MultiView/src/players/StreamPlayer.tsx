@@ -142,7 +142,10 @@ export const StreamPlayer = React.memo(function StreamPlayer({
       if (payload.type === 'error' || payload.message === 'ended' || payload.message === 'idle') {
         playerHealthRef.current = 'broken';
         scheduleAutoReload();
-      } else if (payload.message === 'playing' || payload.message === 'ready') {
+      } else if (payload.type === 'firstFrame' || payload.message === 'playing') {
+        // 'ready'(STATE_READY)は映像を一度も描画していなくても発火するため健全の根拠に
+        // しない(READYのまま固まったセルがタブ復帰リロードを免れる)。実描画(firstFrame)
+        // か再生進行(playing。音声のみ配信もここを通る)だけを健全とみなす。
         playerHealthRef.current = 'healthy';
       }
     },
