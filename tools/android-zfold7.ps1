@@ -62,6 +62,10 @@ try {
   $env:ANDROID_HOME = $AndroidHome
   $env:GRADLE_USER_HOME = $GradleHome
   $env:PATH = "$JavaHome\bin;" + $env:PATH
+  # SUBSTドライブ上でもMetroバンドル(release)を実パスCWDで実行させる。
+  # JavaのtoRealPath()はSUBSTを解決しないため、実パスはここから明示的に渡す
+  # (app/build.gradle の react.root が参照)。無いとreleaseバンドルがSHA-1エラーで失敗。
+  $env:MULTIVIEW_REPO_REAL_ROOT = $Root
 
   if ($Command -eq "devices") {
     & $Adb devices -l

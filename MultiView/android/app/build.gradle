@@ -9,7 +9,13 @@ apply plugin: "com.facebook.react"
 react {
     /* Folders */
     //   The root of your project, i.e. where "package.json" lives. Default is '../..'
-    // root = file("../../")
+    //   長パス対策のSUBSTドライブ(X:)からビルドすると、nodeのrealpathは実パス(C:)を
+    //   返すのにMetroの監視ルートはX:のままになり、releaseバンドルが
+    //   「Failed to get the SHA-1 for: ...」で失敗する(RN CLIはCWDからprojectRootを
+    //   再検出するためmetro.config.jsだけでは直せない)。JavaのtoRealPath()はSUBSTを
+    //   解決しないため、SUBSTを作るビルドスクリプト(tools/android-zfold7.ps1等)が
+    //   実パスを環境変数で渡し、Metroを実パスCWDで実行させる。
+    root = System.getenv("MULTIVIEW_REPO_REAL_ROOT") ? file("${System.getenv('MULTIVIEW_REPO_REAL_ROOT')}/MultiView") : file("../../")
     //   The folder where the react-native NPM package is. Default is ../../node_modules/react-native
     // reactNativeDir = file("../../node_modules/react-native")
     //   The folder where the react-native Codegen package is. Default is ../../node_modules/@react-native/codegen
