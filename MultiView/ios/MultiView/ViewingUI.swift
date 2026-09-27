@@ -93,6 +93,7 @@ final class ViewingController: UIViewController {
   }
 
   @objc private func reloadAndResume() {
+    PlaybackDiagnostics.log("全体を作り直して再開")
     reload()
     resumePlaybackAfterReload()
   }
@@ -115,6 +116,7 @@ final class ViewingController: UIViewController {
 
   @objc private func playbackErrored(_ notification: Notification) {
     if let streamID = notification.userInfo?[playbackErroredStreamIDKey] as? String {
+      PlaybackDiagnostics.log("\(streamID): 再生エラー→この配信だけ作り直し予約")
       scheduleStreamRebuild(streamID)
       return
     }
@@ -153,8 +155,12 @@ final class ViewingController: UIViewController {
   private func rebuildStream(_ streamID: String) {
     // 音声割り込み中に作り直すと新しいプレイヤーが自動再生して他アプリと奪い合う。
     // 戻った時(applicationDidBecomeActive)に全体が作り直されるので、ここでは何もしない。
-    guard !PlaybackCoordinator.shared.isSuspended else { return }
+    guard !PlaybackCoordinator.shared.isSuspended else {
+      PlaybackDiagnostics.log("\(streamID): 割り込み中のため作り直しを見送り")
+      return
+    }
     guard AppState.shared.streams.contains(where: { $0.id == streamID }) else { return }
+    PlaybackDiagnostics.log("\(streamID): 作り直し")
     if let focused {
       // 展開中は展開ビューが唯一のプレイヤー。対象がそれなら展開ビューごと作り直す。
       guard focused.id == streamID else { return }
@@ -182,6 +188,7 @@ final class ViewingController: UIViewController {
       return
     }
     let staleIDs = cellPool.filter { $0.value.needsRecoveryOnNetworkRestore }.map { $0.key }
+    PlaybackDiagnostics.log("回線復帰: 作り直し \(staleIDs.count) 件")
     for id in staleIDs {
       guard let cell = cellPool.removeValue(forKey: id) else { continue }
       cell.stopPlayback()
@@ -381,6 +388,10 @@ final class ViewingController: UIViewController {
       self?.present(AddStreamController(), animated: true)
     }
     let reloadButton = iconButton(systemName: "arrow.triangle.2.circlepath", accessibilityLabel: "更新") { [weak self] in
+      // 利用者が明示的に再生を求めた。割り込みによる一時停止状態も解除する(解除しないと
+      // 作り直した後も停止監視・自動復旧が無効のままになる)。
+      PlaybackDiagnostics.log("手動更新")
+      PlaybackCoordinator.shared.endSuspension()
       self?.reload()
       self?.resumePlaybackAfterReload()
     }

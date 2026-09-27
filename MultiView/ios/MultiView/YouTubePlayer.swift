@@ -842,7 +842,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         self.recoverNativeStall("YouTube再生が途切れたため再接続中")
       }
       if stallWatchdog == nil {
-        stallWatchdog = StallWatchdog(player: player) { [weak self] in
+        stallWatchdog = StallWatchdog(player: player, label: "youtube \(stream.channel)") { [weak self] in
           self?.recoverNativeStall("YouTube再生が止まったため再接続中")
         }
       }
@@ -1054,6 +1054,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   }
 
   private func showStatus(_ text: String) {
+    PlaybackDiagnostics.log("\(stream.platform.rawValue) \(stream.channel): \(text.replacingOccurrences(of: "\n", with: " "))")
     DispatchQueue.main.async {
       self.statusLabel.text = text
       self.statusLabel.isHidden = false

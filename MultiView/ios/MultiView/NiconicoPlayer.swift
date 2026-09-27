@@ -34,7 +34,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   // 60 秒成功なしでフル再読み込みへ escalation する閾値判定に使う。
   private var ndgrLastSuccessAt = Date()
   private var ndgrReconnectStartedAt: Date?
-  private lazy var stallWatchdog = StallWatchdog(player: player) { [weak self] in
+  private lazy var stallWatchdog = StallWatchdog(player: player, label: "\(stream.platform.rawValue) \(stream.channel)") { [weak self] in
     self?.recoverPlaybackError("再生が止まったため再接続中")
   }
 
@@ -1653,6 +1653,7 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   }
 
   private func showStatus(_ text: String) {
+    PlaybackDiagnostics.log("\(stream.platform.rawValue) \(stream.channel): \(text.replacingOccurrences(of: "\n", with: " "))")
     DispatchQueue.main.async {
       self.statusLabel.text = text
       self.statusLabel.isHidden = false

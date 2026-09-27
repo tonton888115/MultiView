@@ -114,7 +114,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private var stableMode = false
   private var stallCountResetWork: DispatchWorkItem?
   private var stableModeResetWork: DispatchWorkItem?
-  private lazy var stallWatchdog = StallWatchdog(player: player) { [weak self] in
+  private lazy var stallWatchdog = StallWatchdog(player: player, label: "\(stream.platform.rawValue) \(stream.channel)") { [weak self] in
     self?.recoverFromStall()
   }
   private var isLoading = false
@@ -750,6 +750,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private func startIvsStallWatchdog() {
     if ivsStallWatchdog == nil {
       ivsStallWatchdog = IvsStallWatchdog(
+        label: "\(stream.platform.rawValue) \(stream.channel)",
         isPlaying: { [weak self] in
           guard let self, self.usingIvsPlayback, let ivs = self.ivsPlayer else { return false }
           return ivs.state == .playing
@@ -781,6 +782,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   }
 
   private func showStatus(_ text: String) {
+    PlaybackDiagnostics.log("\(stream.platform.rawValue) \(stream.channel): \(text.replacingOccurrences(of: "\n", with: " "))")
     DispatchQueue.main.async {
       guard !self.streamBlocked else { return }
       self.statusLabel.text = text

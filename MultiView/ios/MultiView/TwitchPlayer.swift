@@ -21,7 +21,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   private var tokenTask: URLSessionDataTask?
   private var chatSocket: URLSessionWebSocketTask?
   private var chatChannel: String?
-  private lazy var stallWatchdog = StallWatchdog(player: player) { [weak self] in
+  private lazy var stallWatchdog = StallWatchdog(player: player, label: "\(stream.platform.rawValue) \(stream.channel)") { [weak self] in
     self?.recoverFromStall()
   }
   private var itemStatusObservation: NSKeyValueObservation?
@@ -605,6 +605,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   private func startIvsStallWatchdog() {
     if ivsStallWatchdog == nil {
       ivsStallWatchdog = IvsStallWatchdog(
+        label: "\(stream.platform.rawValue) \(stream.channel)",
         isPlaying: { [weak self] in
           guard let self, self.usingIvsPlayback, let ivs = self.ivsPlayer else { return false }
           return ivs.state == .playing
@@ -636,6 +637,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 
   private func showStatus(_ text: String) {
+    PlaybackDiagnostics.log("\(stream.platform.rawValue) \(stream.channel): \(text.replacingOccurrences(of: "\n", with: " "))")
     DispatchQueue.main.async {
       guard !self.streamBlocked else { return }
       self.statusLabel.text = text

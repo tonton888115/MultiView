@@ -456,7 +456,7 @@ final class SettingsController: UITableViewController {
   // setup is its own clearly-labelled section (the old layout mixed playback with
   // danmaku and scattered OAuth across confusing rows).
   private enum Sec: Int, CaseIterable {
-    case playback, quality, danmaku, gifts, order, kick, twitch, twitcasting, youtube, niconico, webData, add
+    case playback, quality, danmaku, gifts, order, kick, twitch, twitcasting, youtube, niconico, webData, add, diagnostics
   }
 
   private func switchControl(isOn: Bool, onChange: @escaping (Bool) -> Void) -> UISwitch {
@@ -492,6 +492,7 @@ final class SettingsController: UITableViewController {
     case .niconico: return 2
     case .webData: return 2
     case .add: return 1
+    case .diagnostics: return 1
     }
   }
 
@@ -510,6 +511,7 @@ final class SettingsController: UITableViewController {
     case .niconico: return "ニコ生 連携"
     case .webData: return "Web"
     case .add: return "追加"
+    case .diagnostics: return "診断"
     }
   }
 
@@ -682,6 +684,10 @@ final class SettingsController: UITableViewController {
       cell.textLabel?.text = "配信を手動追加"
       cell.accessoryType = .disclosureIndicator
       cell.selectionStyle = .default
+    case .diagnostics:
+      cell.textLabel?.text = "再生ログ(映像が止まった時の記録)"
+      cell.accessoryType = .disclosureIndicator
+      cell.selectionStyle = .default
     }
     // The table stays in editing mode for drag-reordering, and editing mode shows
     // editingAccessory* instead of accessory* — without this the switches and quality
@@ -737,6 +743,8 @@ final class SettingsController: UITableViewController {
       if indexPath.row == 1 { confirmClearWebData() }
     case .add:
       present(AddStreamController(), animated: true)
+    case .diagnostics:
+      present(UINavigationController(rootViewController: PlaybackLogController()), animated: true)
     default:
       break
     }
@@ -1217,5 +1225,46 @@ final class AddStreamController: UIViewController {
     guard let text = field.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
     AppState.shared.add(platform: selectedPlatform, channel: text)
     dismiss(animated: true)
+  }
+}
+
+// 再生ログ(PlaybackDiagnostics)の表示。映像が止まった時に開いてコピーし、原因の特定に使う。
+final class PlaybackLogController: UIViewController {
+  private let textView = UITextView()
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    title = "再生ログ"
+    view.backgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.04, alpha: 1)
+    textView.isEditable = false
+    textView.backgroundColor = .clear
+    textView.textColor = .white
+    textView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+    textView.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(textView)
+    NSLayoutConstraint.activate([
+      textView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+      textView.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 8),
+      textView.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8),
+      textView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+    ])
+    navigationItem.leftBarButtonItem = UIBarButtonItem(title: "閉じる", style: .plain, target: self, action: #selector(close))
+    navigationItem.rightBarButtonItem = UIBarButtonItem(title: "コピー", style: .done, target: self, action: #selector(copyLog))
+    textView.text = PlaybackDiagnostics.text
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    let end = NSRange(location: max(0, (textView.text as NSString).length - 1), length: 1)
+    textView.scrollRangeToVisible(end)
+  }
+
+  @objc private func close() {
+    dismiss(animated: true)
+  }
+
+  @objc private func copyLog() {
+    UIPasteboard.general.string = PlaybackDiagnostics.text
+    navigationItem.rightBarButtonItem?.title = "コピーしました"
   }
 }

@@ -1,6 +1,7 @@
 import UIKit
 import WebKit
 import AVFoundation
+import CallKit
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -10,6 +11,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
   // because embedded players often stay paused after a takeover.
   private var needsPlaybackReload = false
   private var authMaintenanceTimer: Timer?
+  // 割り込みで全停止した後の解除監視。iOS は割り込み終了に shouldResume を付けないことが
+  // 多く(他アプリの多くが付けない)、二画面表示ではアプリ復帰イベントも来ないため、以前は
+  // 止まったまま自動復旧まで無効になっていた。他の音声・通話が無くなったら自分で再開する。
+  private var suspensionReleaseTimer: Timer?
+  private let callObserver = CXCallObserver()
 
   func application(
     _ application: UIApplication,
@@ -28,6 +34,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
   func applicationDidBecomeActive(_ application: UIApplication) {
     // ユーザーがアプリへ戻った = 音声を取り戻してよい。
+    suspensionReleaseTimer?.invalidate()
+    suspensionReleaseTimer = nil
+    PlaybackDiagnostics.log("アプリ前面へ(作り直し=\(needsPlaybackReload))")
     PlaybackCoordinator.shared.endSuspension()
     configureAudioSession()
     maintainOAuthSessions()
@@ -87,11 +96,23 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
             let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
       switch type {
       case .began:
+        // iOS 14.5〜16 は、アプリがバックグラウンドで一時停止されていた間のセッション無効化を
+        // 復帰後に遅れて「割り込み開始」(reason=appWasSuspended=1)として届ける。他アプリの
+        // 割り込みではないので止めずに再開する(止めると解除されず全画面が止まったままになる)。
+        let reason = notification.userInfo?[AVAudioSessionInterruptionReasonKey] as? UInt
+        if reason == 1 {
+          PlaybackDiagnostics.log("割り込み開始(アプリ一時停止由来)→無視して再開")
+          configureAudioSession()
+          resumePlaybackSoon()
+          return
+        }
+        PlaybackDiagnostics.log("割り込み開始→全停止(reason=\(reason.map { String($0) } ?? "-"))")
         // Another app grabbed the audio session. YIELD: explicitly pause every
         // player (AVPlayer auto-pauses, but WKWebView media may not) and do NOT
         // reactivate the session — that fight was stopping the other app's audio.
         PlaybackCoordinator.shared.pauseAll()
         needsPlaybackReload = true
+        startSuspensionReleaseWatch()
       case .ended:
         // Standard system flow (same as Music): resume only when iOS sets
         // shouldResume. This avoids relying on applicationState, which is
@@ -100,11 +121,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         // the user returns to us via applicationDidBecomeActive.)
         let shouldResume = (notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
           .map { AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) } ?? false
+        PlaybackDiagnostics.log("割り込み終了(shouldResume=\(shouldResume))")
         if shouldResume {
-          PlaybackCoordinator.shared.endSuspension()
-          needsPlaybackReload = false
-          configureAudioSession()
-          reloadAndResumeSoon()
+          resumeAfterInterruption("割り込み終了の通知")
         }
       @unknown default:
         break
@@ -116,6 +135,35 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
       configureAudioSession()
       resumePlaybackSoon()
     }
+  }
+
+  // 割り込み中は2秒ごとに「他アプリの音声も通話も無く、自分が前面」かを確認し、そうなれば
+  // 再開する(割り込み直後の3秒は待つ)。他アプリが再生中の間は奪い返さない。
+  private func startSuspensionReleaseWatch() {
+    suspensionReleaseTimer?.invalidate()
+    let startedAt = Date()
+    suspensionReleaseTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] timer in
+      guard let self, PlaybackCoordinator.shared.isSuspended else {
+        timer.invalidate()
+        self?.suspensionReleaseTimer = nil
+        return
+      }
+      guard Date().timeIntervalSince(startedAt) >= 3,
+            UIApplication.shared.applicationState == .active,
+            !AVAudioSession.sharedInstance().isOtherAudioPlaying,
+            !self.callObserver.calls.contains(where: { !$0.hasEnded }) else { return }
+      self.resumeAfterInterruption("他の音声・通話が終わったため")
+    }
+  }
+
+  private func resumeAfterInterruption(_ reason: String) {
+    suspensionReleaseTimer?.invalidate()
+    suspensionReleaseTimer = nil
+    PlaybackDiagnostics.log("再生再開: \(reason)")
+    PlaybackCoordinator.shared.endSuspension()
+    needsPlaybackReload = false
+    configureAudioSession()
+    reloadAndResumeSoon()
   }
 
   private func resumePlaybackSoon() {

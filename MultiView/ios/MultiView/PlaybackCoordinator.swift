@@ -10,7 +10,9 @@ final class PlaybackCoordinator {
   private(set) var isSuspended = false
 
   func endSuspension() {
+    guard isSuspended else { return }
     isSuspended = false
+    PlaybackDiagnostics.log("一時停止状態を解除")
   }
 
   func register(_ view: PlaybackResumable) {

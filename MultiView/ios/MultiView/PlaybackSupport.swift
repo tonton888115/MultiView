@@ -64,6 +64,43 @@ final class PlaybackBlockingOverlay: UIView {
   }
 }
 
+// 再生・復旧の出来事を端末内に少しだけ記録する(設定→診断→再生ログ で確認/コピー)。
+// iOS は手元で実機デバッグできないため、映像が止まった時に何が起きていたかを後から
+// 特定するためのもの。メモリ上のみ(最大400行)で、メインスレッドから追記する。
+enum PlaybackDiagnostics {
+  private static var lines: [String] = []
+  private static let maxLines = 400
+  private static let formatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "MM/dd HH:mm:ss"
+    return formatter
+  }()
+
+  static func log(_ message: String) {
+    let line = "\(formatter.string(from: Date())) \(message)"
+    if Thread.isMainThread {
+      append(line)
+    } else {
+      DispatchQueue.main.async { append(line) }
+    }
+  }
+
+  private static func append(_ line: String) {
+    lines.append(line)
+    if lines.count > maxLines {
+      lines.removeFirst(lines.count - maxLines)
+    }
+  }
+
+  static var text: String {
+    let info = Bundle.main.infoDictionary
+    let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+    let build = info?["CFBundleVersion"] as? String ?? "?"
+    return (["MultiView \(version) (\(build))"] + lines).joined(separator: "\n")
+  }
+}
+
 // 再生位置が一定時間進まない「フリーズ(ストール)」を監視し、自動で復旧コールバックを呼ぶ。
 // AVPlayer は本物のエラーを出さず固まることがある(回線揺れ/ライブ端枯渇)ので、currentTime の
 // 前進を見て検知する。誤検知で無駄に再読み込みしないよう、無前進12秒+復旧クールダウン20秒と保守的。
@@ -75,6 +112,7 @@ final class PlaybackBlockingOverlay: UIView {
 // それでも進まなければ停止として復旧する。回線断中は再接続しても失敗するだけなので数えない。
 final class StallWatchdog {
   private weak var player: AVPlayer?
+  private let label: String
   private let onStall: () -> Void
   private let stallThreshold: TimeInterval
   private let cooldown: TimeInterval
@@ -82,9 +120,11 @@ final class StallWatchdog {
   private var lastTime: Double = -1
   private var lastProgressAt = Date()
   private var lastRecoveryAt = Date.distantPast
+  private var nudgedThisStall = false
 
-  init(player: AVPlayer, threshold: TimeInterval = 12, cooldown: TimeInterval = 20, onStall: @escaping () -> Void) {
+  init(player: AVPlayer, label: String = "", threshold: TimeInterval = 12, cooldown: TimeInterval = 20, onStall: @escaping () -> Void) {
     self.player = player
+    self.label = label
     self.stallThreshold = threshold
     self.cooldown = cooldown
     self.onStall = onStall
@@ -114,16 +154,22 @@ final class StallWatchdog {
     if now.isFinite, now > lastTime + 0.25 {
       lastTime = now
       lastProgressAt = Date()
+      nudgedThisStall = false
       return
     }
     if player.timeControlStatus == .paused {
       // 止まる意図が無いのに停止している(バッファ枯渇後に自動再開しない)。押し直す。
+      if !nudgedThisStall {
+        nudgedThisStall = true
+        PlaybackDiagnostics.log("\(label): 停止(rate=0)→再生を押し直し")
+      }
       player.play()
     }
     guard Date().timeIntervalSince(lastProgressAt) > stallThreshold,
           Date().timeIntervalSince(lastRecoveryAt) > cooldown else { return }
     lastRecoveryAt = Date()
     lastProgressAt = Date()
+    PlaybackDiagnostics.log("\(label): \(Int(stallThreshold))秒進まず→再接続")
     onStall()
   }
 
@@ -139,6 +185,7 @@ final class StallWatchdog {
 // .playing のまま映像位置が進まなくなる凍結は通知されず、AVPlayer 用の StallWatchdog も
 // IVS 再生中は何も監視していなかった。position の前進を見て同じ基準で検知する。
 final class IvsStallWatchdog {
+  private let label: String
   private let isPlaying: () -> Bool
   private let position: () -> CMTime?
   private let onStall: () -> Void
@@ -147,7 +194,8 @@ final class IvsStallWatchdog {
   private var lastProgressAt = Date()
   private var lastRecoveryAt = Date.distantPast
 
-  init(isPlaying: @escaping () -> Bool, position: @escaping () -> CMTime?, onStall: @escaping () -> Void) {
+  init(label: String = "", isPlaying: @escaping () -> Bool, position: @escaping () -> CMTime?, onStall: @escaping () -> Void) {
+    self.label = label
     self.isPlaying = isPlaying
     self.position = position
     self.onStall = onStall
@@ -187,6 +235,7 @@ final class IvsStallWatchdog {
           Date().timeIntervalSince(lastRecoveryAt) > 20 else { return }
     lastRecoveryAt = Date()
     lastProgressAt = Date()
+    PlaybackDiagnostics.log("\(label): IVS 12秒進まず→再接続")
     onStall()
   }
 }

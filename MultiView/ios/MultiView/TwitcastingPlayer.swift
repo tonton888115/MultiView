@@ -10,7 +10,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private let danmakuView = UIView()
   private let statusLabel = UILabel()
   private var chatClient: TwitcastingChatClient?
-  private lazy var stallWatchdog = StallWatchdog(player: player) { [weak self] in
+  private lazy var stallWatchdog = StallWatchdog(player: player, label: "\(stream.platform.rawValue) \(stream.channel)") { [weak self] in
     self?.recoverFromStall()
   }
   private var streamTask: URLSessionDataTask?
@@ -512,6 +512,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   }
 
   private func showStatus(_ text: String) {
+    PlaybackDiagnostics.log("\(stream.platform.rawValue) \(stream.channel): \(text.replacingOccurrences(of: "\n", with: " "))")
     DispatchQueue.main.async {
       self.statusLabel.text = text
       self.statusLabel.isHidden = false

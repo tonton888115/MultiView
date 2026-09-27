@@ -27,11 +27,16 @@ final class NetworkQuality {
   // 「接続不能→接続可能」への復帰を通知する。回線待ちのプレイヤーはバックオフを待たず
   // その場で再接続できる(以前は同じWi-Fiへの復帰では何も通知されなかった)。
   private func detectReachabilityChange(_ path: NWPath) {
-    let satisfied = path.status == .satisfied
+    // .requiresConnection(オンデマンドVPN等)は実際には通信できることがある。確実に
+    // 繋がらない .unsatisfied だけを回線断とみなす(誤って回線待ちのまま止めない)。
+    let satisfied = path.status != .unsatisfied
     let previous = lastSatisfied
     lastSatisfied = satisfied
     DispatchQueue.main.async {
       self.isReachable = satisfied
+      if let previous, previous != satisfied {
+        PlaybackDiagnostics.log(satisfied ? "回線: 復帰" : "回線: 切断")
+      }
       if previous == false, satisfied {
         NotificationCenter.default.post(name: .multiViewNetworkRestored, object: nil)
       }
