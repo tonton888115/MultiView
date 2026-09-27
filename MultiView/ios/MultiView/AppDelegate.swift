@@ -140,11 +140,22 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
   private let rankingVC = RankingController()
   private let followingVC = FollowingController()
   private let settingsVC = SettingsController()
+  // 視聴タブのビューモード(全画面)中はタブバー・ステータスバーを隠し、ホームインジケータも自動で隠す。
+  private var viewModeActive = false
+
+  override var prefersStatusBarHidden: Bool { viewModeActive }
+  override var childForStatusBarHidden: UIViewController? { nil }
+  override var preferredStatusBarUpdateAnimation: UIStatusBarAnimation { .fade }
+  override var prefersHomeIndicatorAutoHidden: Bool { viewModeActive }
+  override var childForHomeIndicatorAutoHidden: UIViewController? { nil }
 
   override func viewDidLoad() {
     super.viewDidLoad()
     AppState.shared.delegate = self
     delegate = self
+    viewVC.onViewModeChanged = { [weak self] active in
+      self?.applyViewMode(active)
+    }
     configureIPadTabPlacement()
     tabBar.tintColor = .systemBlue
     // On iOS 26 the tab bar is Liquid Glass automatically; overriding its
@@ -182,6 +193,22 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
     rankingVC.reloadOrder()
     followingVC.reloadOrder()
     settingsVC.reload()
+  }
+
+  private func applyViewMode(_ active: Bool) {
+    viewModeActive = active
+    #if compiler(>=6.0)
+    if #available(iOS 18.0, *) {
+      // iOS 18+ は子VCの safe area も正しく更新される公式APIで隠す。
+      setTabBarHidden(active, animated: true)
+    } else {
+      tabBar.isHidden = active
+    }
+    #else
+    tabBar.isHidden = active
+    #endif
+    setNeedsStatusBarAppearanceUpdate()
+    setNeedsUpdateOfHomeIndicatorAutoHidden()
   }
 
   @objc private func raidFollowed() {

@@ -9,15 +9,33 @@ final class NetworkQuality {
   private var currentPath: NWPath?
   private var lastOnCellular: Bool?
   private var lastChangeAt = Date.distantPast
+  private var lastSatisfied: Bool?
+  // メインスレッド専用。回線断中は復旧処理が試行回数を消費せず回線復帰を待つ判断に使う。
+  private(set) var isReachable = true
 
   private init() {
     monitor.pathUpdateHandler = { [weak self] path in
       self?.queue.async {
         self?.currentPath = path
+        self?.detectReachabilityChange(path)
         self?.detectConnectionChange(path)
       }
     }
     monitor.start(queue: queue)
+  }
+
+  // 「接続不能→接続可能」への復帰を通知する。回線待ちのプレイヤーはバックオフを待たず
+  // その場で再接続できる(以前は同じWi-Fiへの復帰では何も通知されなかった)。
+  private func detectReachabilityChange(_ path: NWPath) {
+    let satisfied = path.status == .satisfied
+    let previous = lastSatisfied
+    lastSatisfied = satisfied
+    DispatchQueue.main.async {
+      self.isReachable = satisfied
+      if previous == false, satisfied {
+        NotificationCenter.default.post(name: .multiViewNetworkRestored, object: nil)
+      }
+    }
   }
 
   // Tell the app when the connection flips WiFi<->cellular so it can re-pick the

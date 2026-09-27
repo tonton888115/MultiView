@@ -73,7 +73,7 @@ final class KickLowLatencyLoader: NSObject, AVAssetResourceLoaderDelegate {
   }
 }
 
-final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, IVSPlayer.Delegate, IVSPlaybackHost {
+final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, IVSPlayer.Delegate, IVSPlaybackHost, PlaybackRecoverable {
   private let stream: StreamItem
   let settings: AppSettings
   private let player = AVPlayer()
@@ -98,6 +98,11 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   var usingIvsPlayback = false
   private var forceLegacyPlayback = false
   private let ivsRetry = NativeRetryLimiter(maxAttempts: 2)
+  // 回線断中に再接続を諦めずに待っている(回線復帰で視聴タブがこのセルを作り直す)。
+  private var waitingForNetwork = false
+  // 生存中(IVS再生開始時)にだけ作る。deinit 内の stopPlayback で初めて触れる lazy だと
+  // [weak self] の生成が解放中のオブジェクトに対して行われクラッシュするため。
+  private var ivsStallWatchdog: IvsStallWatchdog?
   // 直近のplayback_url(素HLS再試行用)、再生世代(古いitemのKVO/通知を無視)、
   // ネイティブ再取得リトライ(トークン失効時に新URL取得。上限超過でのみweb UIへ)。
   private var currentHLSURL: URL?
@@ -219,6 +224,8 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     stableModeResetWork?.cancel()
     stableModeResetWork = nil
     ivsRetry.reset()
+    nativeRetry.reset()
+    ivsStallWatchdog?.stop()
     ivsBufferingRecoveryWork?.cancel()
     ivsBufferingRecoveryWork = nil
     teardownIvsPlayback(removeLayer: true)
@@ -245,6 +252,12 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       NotificationCenter.default.removeObserver(itemEndedObserver)
       self.itemEndedObserver = nil
     }
+  }
+
+  var needsRecoveryOnNetworkRestore: Bool {
+    guard !isStopped else { return false }
+    if fallbackWebView != nil { return true }
+    return waitingForNetwork && player.currentItem == nil && ivsPlayer == nil && !isLoading
   }
 
   func setPlaybackVolume(_ volume: Float) {
@@ -529,7 +542,11 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         showRetry: { attempt in
           self.showStatus("Kick再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
         },
-        reload: { self.loadNativeStream() },
+        waitForNetwork: {
+          self.waitingForNetwork = true
+          self.showStatus("回線の復帰を待っています")
+        },
+        reload: { [weak self] in self?.loadNativeStream() },
         fallback: { self.blockOrInstallFallback(reason) }
       )
     }
@@ -551,7 +568,11 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         showRetry: { attempt in
           self.showStatus("Kick再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
         },
-        reload: { self.loadNativeStream() },
+        waitForNetwork: {
+          self.waitingForNetwork = true
+          self.showStatus("回線の復帰を待っています")
+        },
+        reload: { [weak self] in self?.loadNativeStream() },
         fallback: { self.blockOrInstallFallback(reason) }
       )
     }
@@ -715,6 +736,8 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       ivsBufferingRecoveryWork?.cancel()
       ivsBufferingRecoveryWork = nil
       statusLabel.isHidden = true
+      waitingForNetwork = false
+      startIvsStallWatchdog()
     case .ended:
       blockPlayback("Kick SDK再生が終了しました", generation: generation)
     case .idle:
@@ -722,6 +745,23 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     @unknown default:
       break
     }
+  }
+
+  private func startIvsStallWatchdog() {
+    if ivsStallWatchdog == nil {
+      ivsStallWatchdog = IvsStallWatchdog(
+        isPlaying: { [weak self] in
+          guard let self, self.usingIvsPlayback, let ivs = self.ivsPlayer else { return false }
+          return ivs.state == .playing
+        },
+        position: { [weak self] in self?.ivsPlayer?.position },
+        onStall: { [weak self] in
+          guard let self else { return }
+          self.handleIvsFailure("映像が止まったため再接続中", generation: self.playbackGeneration)
+        }
+      )
+    }
+    ivsStallWatchdog?.start()
   }
 
   func player(_ player: IVSPlayer, didFailWithError error: Error) {

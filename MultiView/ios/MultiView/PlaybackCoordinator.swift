@@ -4,6 +4,9 @@ final class PlaybackCoordinator {
   static let shared = PlaybackCoordinator()
   private let views = NSHashTable<AnyObject>.weakObjects()
   private var lastResumeAllAt = Date.distantPast
+  // 他アプリへの音声割り込み等で意図的に全停止している間は true。ストール監視はこの間の
+  // 一時停止を「止まった」と誤認して再生を奪い返さない。
+  private(set) var isSuspended = false
 
   func register(_ view: PlaybackResumable) {
     views.add(view as AnyObject)
@@ -13,6 +16,7 @@ final class PlaybackCoordinator {
     // 同一ランループ内の重複呼び出し(reload/viewDidAppear/各リトライが重なる)を間引く。
     // リトライ間隔(0.2s〜)より十分短い 0.15s なので、意図的な再試行は阻害しない。
     let now = Date()
+    isSuspended = false
     guard now.timeIntervalSince(lastResumeAllAt) > 0.15 else { return }
     lastResumeAllAt = now
     for object in views.allObjects {
@@ -21,6 +25,7 @@ final class PlaybackCoordinator {
   }
 
   func pauseAll() {
+    isSuspended = true
     for object in views.allObjects {
       (object as? PlaybackResumable)?.pausePlayback()
     }

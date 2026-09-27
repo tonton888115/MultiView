@@ -67,6 +67,12 @@ final class PlaybackBlockingOverlay: UIView {
 // 再生位置が一定時間進まない「フリーズ(ストール)」を監視し、自動で復旧コールバックを呼ぶ。
 // AVPlayer は本物のエラーを出さず固まることがある(回線揺れ/ライブ端枯渇)ので、currentTime の
 // 前進を見て検知する。誤検知で無駄に再読み込みしないよう、無前進12秒+復旧クールダウン20秒と保守的。
+//
+// automaticallyWaitsToMinimizeStalling=false のプレイヤーはバッファ枯渇で rate=0(.paused)に
+// 落ちて自力では再開しないことがある。以前は .paused を「ユーザーの一時停止」とみなして監視を
+// 止めていたため、この形の停止は永久に復旧しなかった。意図的な停止(音声割り込み)は
+// PlaybackCoordinator.isSuspended で区別し、それ以外の .paused はまず play() で押し直し、
+// それでも進まなければ停止として復旧する。回線断中は再接続しても失敗するだけなので数えない。
 final class StallWatchdog {
   private weak var player: AVPlayer?
   private let onStall: () -> Void
@@ -100,7 +106,7 @@ final class StallWatchdog {
 
   private func tick() {
     guard let player, let item = player.currentItem else { return }
-    if player.timeControlStatus == .paused {
+    if PlaybackCoordinator.shared.isSuspended || !NetworkQuality.shared.isReachable || Self.reachedEnd(item) {
       lastProgressAt = Date()
       return
     }
@@ -110,8 +116,75 @@ final class StallWatchdog {
       lastProgressAt = Date()
       return
     }
+    if player.timeControlStatus == .paused {
+      // 止まる意図が無いのに停止している(バッファ枯渇後に自動再開しない)。押し直す。
+      player.play()
+    }
     guard Date().timeIntervalSince(lastProgressAt) > stallThreshold,
           Date().timeIntervalSince(lastRecoveryAt) > cooldown else { return }
+    lastRecoveryAt = Date()
+    lastProgressAt = Date()
+    onStall()
+  }
+
+  // VOD が最後まで再生し終えた状態は停止ではない。
+  private static func reachedEnd(_ item: AVPlayerItem) -> Bool {
+    let duration = CMTimeGetSeconds(item.duration)
+    guard duration.isFinite, duration > 0 else { return false }
+    return CMTimeGetSeconds(item.currentTime()) >= duration - 1
+  }
+}
+
+// Amazon IVS プレイヤー用の停止監視。IVS は .buffering/リバッファ/エラーは通知するが、
+// .playing のまま映像位置が進まなくなる凍結は通知されず、AVPlayer 用の StallWatchdog も
+// IVS 再生中は何も監視していなかった。position の前進を見て同じ基準で検知する。
+final class IvsStallWatchdog {
+  private let isPlaying: () -> Bool
+  private let position: () -> CMTime?
+  private let onStall: () -> Void
+  private var timer: Timer?
+  private var lastTime: Double = -1
+  private var lastProgressAt = Date()
+  private var lastRecoveryAt = Date.distantPast
+
+  init(isPlaying: @escaping () -> Bool, position: @escaping () -> CMTime?, onStall: @escaping () -> Void) {
+    self.isPlaying = isPlaying
+    self.position = position
+    self.onStall = onStall
+  }
+
+  deinit {
+    timer?.invalidate()
+  }
+
+  func start() {
+    stop()
+    lastTime = -1
+    lastProgressAt = Date()
+    timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+      self?.tick()
+    }
+  }
+
+  func stop() {
+    timer?.invalidate()
+    timer = nil
+  }
+
+  private func tick() {
+    guard isPlaying(), !PlaybackCoordinator.shared.isSuspended, NetworkQuality.shared.isReachable,
+          let time = position() else {
+      lastProgressAt = Date()
+      return
+    }
+    let now = CMTimeGetSeconds(time)
+    if now.isFinite, now > lastTime + 0.25 {
+      lastTime = now
+      lastProgressAt = Date()
+      return
+    }
+    guard Date().timeIntervalSince(lastProgressAt) > 12,
+          Date().timeIntervalSince(lastRecoveryAt) > 20 else { return }
     lastRecoveryAt = Date()
     lastProgressAt = Date()
     onStall()
@@ -121,13 +194,28 @@ final class StallWatchdog {
 final class NativeRetryLimiter {
   let maxAttempts: Int
   private(set) var attempts = 0
+  private var pendingRetry: DispatchWorkItem?
 
   init(maxAttempts: Int = 2) {
     self.maxAttempts = maxAttempts
   }
 
+  // 成功時(=予約中の再試行はもう不要)にも呼ばれるので、予約も取り消す。
   func reset() {
     attempts = 0
+    cancelPending()
+  }
+
+  func schedule(after delay: TimeInterval, _ work: @escaping () -> Void) {
+    cancelPending()
+    let item = DispatchWorkItem(block: work)
+    pendingRetry = item
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+  }
+
+  func cancelPending() {
+    pendingRetry?.cancel()
+    pendingRetry = nil
   }
 
   func nextAttempt() -> Int? {
@@ -187,6 +275,12 @@ enum NativeAVPlaybackCleanup {
 }
 
 enum NativeFallbackRetry {
+  // 再試行の間隔。以前は即時に2回使い切ってWeb UIへ落ちていたため、瞬間的なCDN/トークンの
+  // 不調でもネイティブ再生を失っていた。
+  static func retryDelay(forAttempt attempt: Int) -> TimeInterval {
+    attempt <= 1 ? 1.5 : 5
+  }
+
   static func retryOrFallback(
     isStopped: Bool,
     fallbackActive: Bool,
@@ -197,17 +291,28 @@ enum NativeFallbackRetry {
     cancelRequest: () -> Void,
     resetLoading: () -> Void,
     showRetry: (Int) -> Void,
-    reload: () -> Void,
+    waitForNetwork: () -> Void,
+    reload: @escaping () -> Void,
     fallback: () -> Void
   ) {
     guard !isStopped, !fallbackActive else { return }
     if let generation, generation != currentGeneration { return }
+    if !NetworkQuality.shared.isReachable {
+      // 回線断中の失敗は回線のせい。試行回数を消費せず(=Web UIへ落とさず)回線復帰を待つ。
+      // 復帰時は視聴タブが .multiViewNetworkRestored でこのセルを作り直す。
+      limiter.cancelPending()
+      teardown()
+      cancelRequest()
+      resetLoading()
+      waitForNetwork()
+      return
+    }
     if let attempt = limiter.nextAttempt() {
       teardown()
       cancelRequest()
       resetLoading()
       showRetry(attempt)
-      reload()
+      limiter.schedule(after: retryDelay(forAttempt: attempt), reload)
       return
     }
     fallback()

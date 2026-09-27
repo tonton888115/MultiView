@@ -36,22 +36,58 @@ final class ViewingController: UIViewController {
   private var gridDragCurrentStreams: [StreamItem] = []
   private var lastAutoReloadAt = Date.distantPast
   private var pendingAutoReloadWorkItem: DispatchWorkItem?
+  // 配信単位の自動作り直し(1配信の障害で他の配信を止めない)。配信IDごとにデバウンスする。
+  private var pendingStreamRebuilds: [String: DispatchWorkItem] = [:]
+  private var lastStreamRebuildAt: [String: Date] = [:]
+  private weak var focusedView: FocusedStreamView?
   // 並び替え・追加・削除でプレイヤーを作り直さず使い回すためのセル再利用プール(stream.id -> cell)。
   private var cellPool: [String: StreamCellView] = [:]
   // 再利用セル/行に付けた高さ制約。reload のたびに貼り直すので、冒頭で必ず外す。
   private var cellLayoutConstraints: [NSLayoutConstraint] = []
+  // ビューモード(全画面): 下部の操作バー・タブバー・ステータスバーを隠して映像だけにする。
+  // タップで「全画面を解除」ボタンだけを一時表示する。起動ごとに通常表示から始める。
+  private(set) var isViewModeActive = false
+  var onViewModeChanged: ((Bool) -> Void)?
+  private var scrollBottomToControls: NSLayoutConstraint?
+  private var scrollBottomToView: NSLayoutConstraint?
+  private var viewModeExitHideWork: DispatchWorkItem?
+  private lazy var viewModeExitButton: UIButton = {
+    var config = UIButton.Configuration.filled()
+    config.title = "全画面を解除"
+    config.image = UIImage(systemName: "arrow.down.right.and.arrow.up.left")
+    config.imagePadding = 6
+    config.cornerStyle = .capsule
+    config.baseBackgroundColor = UIColor.black.withAlphaComponent(0.66)
+    config.baseForegroundColor = .white
+    config.contentInsets = NSDirectionalEdgeInsets(top: 9, leading: 14, bottom: 9, trailing: 16)
+    let button = UIButton(configuration: config)
+    button.accessibilityLabel = "全画面を解除"
+    button.layer.shadowColor = UIColor.black.cgColor
+    button.layer.shadowOpacity = 0.35
+    button.layer.shadowRadius = 8
+    button.layer.shadowOffset = CGSize(width: 0, height: 3)
+    button.translatesAutoresizingMaskIntoConstraints = false
+    button.alpha = 0
+    button.isHidden = true
+    button.addAction(UIAction { [weak self] _ in self?.setViewMode(false) }, for: .touchUpInside)
+    return button
+  }()
 
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.04, alpha: 1)
     configureScroll()
+    configureViewModeExit()
     reload()
     NotificationCenter.default.addObserver(self, selector: #selector(reloadAndResume), name: .multiViewReloadAndResume, object: nil)
     NotificationCenter.default.addObserver(self, selector: #selector(networkQualityChanged), name: .multiViewNetworkQualityChanged, object: nil)
-    NotificationCenter.default.addObserver(self, selector: #selector(playbackErrored), name: .multiViewPlaybackErrored, object: nil)
+    NotificationCenter.default.addObserver(self, selector: #selector(playbackErrored(_:)), name: .multiViewPlaybackErrored, object: nil)
+    NotificationCenter.default.addObserver(self, selector: #selector(networkRestored), name: .multiViewNetworkRestored, object: nil)
   }
 
   deinit {
+    viewModeExitHideWork?.cancel()
+    pendingStreamRebuilds.values.forEach { $0.cancel() }
     pendingAutoReloadWorkItem?.cancel()
     NotificationCenter.default.removeObserver(self)
   }
@@ -77,7 +113,11 @@ final class ViewingController: UIViewController {
     reloadAndResume()
   }
 
-  @objc private func playbackErrored() {
+  @objc private func playbackErrored(_ notification: Notification) {
+    if let streamID = notification.userInfo?[playbackErroredStreamIDKey] as? String {
+      scheduleStreamRebuild(streamID)
+      return
+    }
     // Coalesce failures, but never drop one inside the 45-second debounce window.
     // The old guard returned without scheduling anything, leaving a Niconico cell
     // permanently stopped when its final retry happened during the cooldown.
@@ -91,6 +131,63 @@ final class ViewingController: UIViewController {
     }
     pendingAutoReloadWorkItem = work
     DispatchQueue.main.asyncAfter(deadline: .now() + remainingCooldown + 2, execute: work)
+  }
+
+  // 以前は1配信(ニコ生のコメント障害など)の失敗で全セルを作り直しており、無関係な配信まで
+  // 黒画面からコールドスタートしていた。失敗した配信のセルだけを作り直す。
+  // 同じ配信の連続失敗はこれまでどおり45秒に1回へ間引く(捨てずに繰り延べる)。
+  private func scheduleStreamRebuild(_ streamID: String) {
+    guard pendingStreamRebuilds[streamID] == nil else { return }
+    let last = lastStreamRebuildAt[streamID] ?? .distantPast
+    let remainingCooldown = max(0, 45 - Date().timeIntervalSince(last))
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.pendingStreamRebuilds[streamID] = nil
+      self.lastStreamRebuildAt[streamID] = Date()
+      self.rebuildStream(streamID)
+    }
+    pendingStreamRebuilds[streamID] = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + remainingCooldown + 2, execute: work)
+  }
+
+  private func rebuildStream(_ streamID: String) {
+    guard AppState.shared.streams.contains(where: { $0.id == streamID }) else { return }
+    if let focused {
+      // 展開中は展開ビューが唯一のプレイヤー。対象がそれなら展開ビューごと作り直す。
+      guard focused.id == streamID else { return }
+      reload(rebuildPlayers: true)
+      resumePlaybackAfterReload()
+      return
+    }
+    guard let cell = cellPool.removeValue(forKey: streamID) else { return }
+    cell.stopPlayback()
+    cell.removeFromSuperview()
+    // 残りのセルはプールから再利用される(再生継続)。消したIDだけ新しいプレイヤーになる。
+    reload(rebuildPlayers: false)
+    resumePlaybackAfterReload()
+  }
+
+  // 回線復帰: 回線待ち・Webフォールバック中のセルだけを作り直してネイティブ再生へ戻す。
+  // 再生できているセルには触らず、止まっている可能性のあるものは resumeAll で押し直す。
+  @objc private func networkRestored() {
+    guard isViewLoaded else { return }
+    if focused != nil {
+      if focusedView?.needsRecoveryOnNetworkRestore == true {
+        reload(rebuildPlayers: true)
+      }
+      resumePlaybackAfterReload()
+      return
+    }
+    let staleIDs = cellPool.filter { $0.value.needsRecoveryOnNetworkRestore }.map { $0.key }
+    for id in staleIDs {
+      guard let cell = cellPool.removeValue(forKey: id) else { continue }
+      cell.stopPlayback()
+      cell.removeFromSuperview()
+    }
+    if !staleIDs.isEmpty {
+      reload(rebuildPlayers: false)
+    }
+    resumePlaybackAfterReload()
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -127,6 +224,7 @@ final class ViewingController: UIViewController {
         self?.focused = nil
         self?.reload(rebuildPlayers: true)
       })
+      self.focusedView = focusedView
       stack.addArrangedSubview(focusedView)
       // 展開（1配信フル表示）は操作バーを除いたスクロール領域いっぱいに広げる。
       focusedView.heightAnchor.constraint(
@@ -206,11 +304,14 @@ final class ViewingController: UIViewController {
     view.addSubview(bottomControlsHost)
     scrollView.addSubview(stack)
     configureBottomControls()
+    let bottomToControls = scrollView.bottomAnchor.constraint(equalTo: bottomControlsHost.topAnchor)
+    scrollBottomToControls = bottomToControls
+    scrollBottomToView = scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
     NSLayoutConstraint.activate([
       scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
       scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      scrollView.bottomAnchor.constraint(equalTo: bottomControlsHost.topAnchor),
+      bottomToControls,
       bottomControlsHost.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       bottomControlsHost.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       bottomControlsHost.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
@@ -233,6 +334,7 @@ final class ViewingController: UIViewController {
       self?.handleReorder(cell: cell, event: event)
     })
     cellPool[stream.id] = cell
+    cell.setViewMode(isViewModeActive)
     return cell
   }
 
@@ -279,8 +381,12 @@ final class ViewingController: UIViewController {
       self?.reload()
       self?.resumePlaybackAfterReload()
     }
+    let viewModeButton = iconButton(systemName: "arrow.up.left.and.arrow.down.right", accessibilityLabel: "全画面") { [weak self] in
+      self?.setViewMode(true)
+    }
     bottomControlsRow.addArrangedSubview(layoutControl)
     bottomControlsRow.addArrangedSubview(spacer)
+    bottomControlsRow.addArrangedSubview(viewModeButton)
     bottomControlsRow.addArrangedSubview(handoffButton)
     bottomControlsRow.addArrangedSubview(addButton)
     bottomControlsRow.addArrangedSubview(reloadButton)
@@ -292,6 +398,8 @@ final class ViewingController: UIViewController {
       bottomControlsRow.bottomAnchor.constraint(equalTo: bottomControlsHost.contentView.bottomAnchor, constant: -8),
       layoutControl.widthAnchor.constraint(equalToConstant: 96),
       layoutControl.heightAnchor.constraint(equalToConstant: 34),
+      viewModeButton.widthAnchor.constraint(equalToConstant: 40),
+      viewModeButton.heightAnchor.constraint(equalToConstant: 36),
       handoffButton.widthAnchor.constraint(equalToConstant: 40),
       handoffButton.heightAnchor.constraint(equalToConstant: 36),
       addButton.widthAnchor.constraint(equalToConstant: 38),
@@ -341,7 +449,7 @@ final class ViewingController: UIViewController {
   }
 
   private func handleReorder(cell: StreamCellView, event: StreamReorderEvent) {
-    guard focused == nil, AppState.shared.streams.count > 1 else { return }
+    guard focused == nil, !isViewModeActive, AppState.shared.streams.count > 1 else { return }
     let isStacked = AppState.shared.settings.layoutMode == .stacked
     let location = view.convert(event.windowLocation, from: nil)
     switch event.phase {
@@ -589,6 +697,104 @@ final class ViewingController: UIViewController {
     stack.arrangedSubviews.compactMap { ($0 as? StreamCellView)?.stream }
   }
 
+  // MARK: - ビューモード(全画面)
+
+  func setViewMode(_ active: Bool) {
+    guard isViewLoaded, active != isViewModeActive else { return }
+    isViewModeActive = active
+    bottomControlsHost.isHidden = active
+    // 先に外してから付ける(同時に有効だと制約が衝突する)。
+    if active {
+      scrollBottomToControls?.isActive = false
+      scrollBottomToView?.isActive = true
+    } else {
+      scrollBottomToView?.isActive = false
+      scrollBottomToControls?.isActive = true
+    }
+    updateViewModeScrollInsets()
+    cellPool.values.forEach { $0.setViewMode(active) }
+    onViewModeChanged?(active)
+    if active {
+      showViewModeExitButton()
+    } else {
+      hideViewModeExitButton(animated: false)
+    }
+    UIView.animate(withDuration: 0.25) {
+      self.view.layoutIfNeeded()
+    }
+  }
+
+  override func viewSafeAreaInsetsDidChange() {
+    super.viewSafeAreaInsetsDidChange()
+    updateViewModeScrollInsets()
+  }
+
+  // ビューモードではスクロール領域を画面下端まで広げる。タブバーを隠しても子VCの safe area に
+  // タブバー分が残る iOS があるため自動調整は使わず、端末本来の下端余白(ホームインジケータ)
+  // だけを手動で空ける。
+  private func updateViewModeScrollInsets() {
+    if isViewModeActive {
+      scrollView.contentInsetAdjustmentBehavior = .never
+      let bottom = view.window?.safeAreaInsets.bottom ?? 0
+      scrollView.contentInset = UIEdgeInsets(top: 0, left: 0, bottom: bottom, right: 0)
+      scrollView.verticalScrollIndicatorInsets = scrollView.contentInset
+    } else {
+      scrollView.contentInsetAdjustmentBehavior = .automatic
+      scrollView.contentInset = .zero
+      scrollView.verticalScrollIndicatorInsets = .zero
+    }
+  }
+
+  private func configureViewModeExit() {
+    view.addSubview(viewModeExitButton)
+    NSLayoutConstraint.activate([
+      viewModeExitButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
+      viewModeExitButton.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12)
+    ])
+    // セル/プレイヤー側のタップ処理を妨げないよう、同時認識・タッチ非キャンセルで拾う。
+    let tap = UITapGestureRecognizer(target: self, action: #selector(viewModeTapped))
+    tap.cancelsTouchesInView = false
+    tap.delaysTouchesBegan = false
+    tap.delaysTouchesEnded = false
+    tap.delegate = self
+    view.addGestureRecognizer(tap)
+  }
+
+  @objc private func viewModeTapped() {
+    guard isViewModeActive else { return }
+    showViewModeExitButton()
+  }
+
+  private func showViewModeExitButton() {
+    viewModeExitHideWork?.cancel()
+    view.bringSubviewToFront(viewModeExitButton)
+    viewModeExitButton.isHidden = false
+    UIView.animate(withDuration: 0.16) {
+      self.viewModeExitButton.alpha = 1
+    }
+    let work = DispatchWorkItem { [weak self] in
+      self?.hideViewModeExitButton(animated: true)
+    }
+    viewModeExitHideWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
+  }
+
+  private func hideViewModeExitButton(animated: Bool) {
+    viewModeExitHideWork?.cancel()
+    viewModeExitHideWork = nil
+    guard animated else {
+      viewModeExitButton.alpha = 0
+      viewModeExitButton.isHidden = true
+      return
+    }
+    UIView.animate(withDuration: 0.25, animations: {
+      self.viewModeExitButton.alpha = 0
+    }, completion: { [weak self] _ in
+      guard let self, self.viewModeExitButton.alpha == 0 else { return }
+      self.viewModeExitButton.isHidden = true
+    })
+  }
+
   private func emptyView() -> UIView {
     let label = UILabel()
     label.text = "配信がありません\n＋やランキングから追加してください"
@@ -597,5 +803,17 @@ final class ViewingController: UIViewController {
     label.numberOfLines = 0
     label.heightAnchor.constraint(equalToConstant: 420).isActive = true
     return label
+  }
+}
+
+extension ViewingController: UIGestureRecognizerDelegate {
+  func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+    guard isViewModeActive else { return false }
+    // 解除ボタン自身のタップはボタンの操作に任せる。
+    return touch.view?.isDescendant(of: viewModeExitButton) != true
+  }
+
+  func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+    true
   }
 }

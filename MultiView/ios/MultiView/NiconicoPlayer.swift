@@ -2,7 +2,7 @@ import UIKit
 import WebKit
 import AVFoundation
 
-final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay {
+final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, PlaybackRecoverable {
   private let stream: StreamItem
   private let player = AVPlayer()
   private let playerLayer = AVPlayerLayer()
@@ -25,6 +25,8 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var watchPageURL: URL?
   private var laneCursor = 0
   private var loadAttempts = 0
+  // 回線断中に再接続を諦めずに待っている(回線復帰で視聴タブがこのセルを作り直す)。
+  private var waitingForNetwork = false
   private var streamOpenedAt: Date?
   private var lastSupportAlert: (text: String, at: Date)?
   private var seenSupportEventIDs = Set<String>()
@@ -132,6 +134,11 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
 
   deinit {
     stopPlayback()
+  }
+
+  var needsRecoveryOnNetworkRestore: Bool {
+    guard !isStopped else { return false }
+    return fallbackWebView != nil || waitingForNetwork
   }
 
   func stopPlayback() {
@@ -282,11 +289,22 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   }
 
   private func continueRetryOrFallback(_ reason: String) {
+    if !NetworkQuality.shared.isReachable {
+      // 回線断中の失敗は回線のせい。試行回数を消費せず(=作り直しを連発せず)回線復帰を待つ。
+      waitingForNetwork = true
+      socketTask?.cancel(with: .goingAway, reason: nil)
+      socketTask = nil
+      isLoading = false
+      showStatus("回線の復帰を待っています")
+      return
+    }
     loadAttempts += 1
     guard loadAttempts <= 4 else {
       showStatus("\(reason)\n再読み込みします")
+      let streamID = stream.id
       DispatchQueue.main.async {
-        NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
+        // この配信のセルだけを作り直す(他の配信は止めない)。
+        NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil, userInfo: [playbackErroredStreamIDKey: streamID])
       }
       return
     }
@@ -831,8 +849,10 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         // idle timeout で切り、再接続開始から12秒/3連敗で早めに再読み込みへ上げる。
         if elapsedSinceSuccess > 20 || elapsedSinceReconnect > 12 || consecutiveFailures >= 3 {
           showStatus("ニコ生コメント取得失敗: 再読み込み")
+          let streamID = stream.id
           DispatchQueue.main.async {
-            NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
+            // この配信のセルだけを作り直す(他の配信は止めない)。
+            NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil, userInfo: [playbackErroredStreamIDKey: streamID])
           }
           return
         }
@@ -876,8 +896,10 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         if Task.isCancelled || error is CancellationError { return }
         guard attempt < 4 else {
           showStatus("ニコ生コメント区間の取得失敗: 再読み込み")
+          let streamID = stream.id
           DispatchQueue.main.async {
-            NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
+            // この配信のセルだけを作り直す(他の配信は止めない)。
+            NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil, userInfo: [playbackErroredStreamIDKey: streamID])
           }
           return
         }

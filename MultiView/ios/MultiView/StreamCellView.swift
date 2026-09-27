@@ -26,6 +26,8 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
   private weak var commentPoster: CommentPostable?
   private weak var commentEchoer: CommentEchoDisplay?
   private weak var playbackView: PlaybackStoppable?
+  private weak var recoverable: PlaybackRecoverable?
+  private var reorderGesture: UILongPressGestureRecognizer?
 
   init(stream: StreamItem, onFocus: @escaping () -> Void, onReorder: @escaping (StreamCellView, StreamReorderEvent) -> Void) {
     self.stream = stream
@@ -55,6 +57,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     commentPoster = video as? CommentPostable
     commentEchoer = video as? CommentEchoDisplay
     playbackView = video as? PlaybackStoppable
+    recoverable = video as? PlaybackRecoverable
     video.translatesAutoresizingMaskIntoConstraints = false
     addSubview(video)
 
@@ -150,6 +153,21 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     reorder.delaysTouchesBegan = false
     reorder.delegate = self
     addGestureRecognizer(reorder)
+    reorderGesture = reorder
+  }
+
+  // 回線復帰時に作り直すべき状態(回線待ち・Webフォールバック中)か。
+  var needsRecoveryOnNetworkRestore: Bool {
+    recoverable?.needsRecoveryOnNetworkRestore ?? false
+  }
+
+  // ビューモード(全画面): セルの操作UI・コメント入力・並び替えを無効化して映像だけにする。
+  func setViewMode(_ active: Bool) {
+    autoHider?.isSuppressed = active
+    reorderGesture?.isEnabled = !active
+    if active, !commentBar.isHidden {
+      setCommentBar(visible: false)
+    }
   }
 
   private func configureReorderHandle() {

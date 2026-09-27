@@ -9,6 +9,12 @@ final class FocusedStreamView: UIView {
   private weak var commentPoster: CommentPostable?
   private weak var commentEchoer: CommentEchoDisplay?
   private var viewerCountOverlay: ViewerCountOverlay?
+  private weak var recoverable: PlaybackRecoverable?
+
+  // 回線復帰時に作り直すべき状態(回線待ち・Webフォールバック中)か。
+  var needsRecoveryOnNetworkRestore: Bool {
+    recoverable?.needsRecoveryOnNetworkRestore ?? false
+  }
 
   init(stream: StreamItem, onClose: (() -> Void)?) {
     self.stream = stream
@@ -64,6 +70,7 @@ final class FocusedStreamView: UIView {
     let audio = video as? AudioControllable
     commentPoster = video as? CommentPostable
     commentEchoer = video as? CommentEchoDisplay
+    recoverable = video as? PlaybackRecoverable
     video.translatesAutoresizingMaskIntoConstraints = false
     addSubview(video)
 

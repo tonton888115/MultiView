@@ -7,6 +7,16 @@ final class AutoHidingControls: NSObject, UIGestureRecognizerDelegate {
   // コントロール群の表示/非表示に合わせて呼ばれる(表示=true)。表示中だけ動けばよい
   // 付随処理(同接数の定期取得など)を止めるために使う。
   var onVisibilityChange: ((Bool) -> Void)?
+  // ビューモード中はタップしても出さない(常に隠す)。解除後は次のタップから通常どおり。
+  var isSuppressed = false {
+    didSet {
+      guard isSuppressed != oldValue, isSuppressed else { return }
+      hideWorkItem?.cancel()
+      hideWorkItem = nil
+      controls.forEach { $0.alpha = 0 }
+      onVisibilityChange?(false)
+    }
+  }
 
   init(host: UIView, controls: [UIView]) {
     self.host = host
@@ -26,6 +36,7 @@ final class AutoHidingControls: NSObject, UIGestureRecognizerDelegate {
   }
 
   @objc func showTemporarily() {
+    guard !isSuppressed else { return }
     hideWorkItem?.cancel()
     UIView.animate(withDuration: 0.16) {
       self.controls.forEach { $0.alpha = 1 }

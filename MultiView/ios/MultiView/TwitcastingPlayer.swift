@@ -2,7 +2,7 @@ import UIKit
 import WebKit
 import AVFoundation
 
-final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate {
+final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, PlaybackRecoverable {
   private let stream: StreamItem
   private let settings: AppSettings
   private let player = AVPlayer()
@@ -22,6 +22,8 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private var fallbackReloadWorkItem: DispatchWorkItem?
   private var playbackGeneration = 0
   private let nativeRetry = NativeRetryLimiter(maxAttempts: 2)
+  // 回線断中に再接続を諦めずに待っている(回線復帰で視聴タブがこのセルを作り直す)。
+  private var waitingForNetwork = false
   private var playbackVolume: Float
   private var laneCursor = 0
   private var isLoading = false
@@ -117,6 +119,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
 
   func stopPlayback() {
     isStopped = true
+    nativeRetry.reset()
     fallbackReloadWorkItem?.cancel()
     fallbackReloadWorkItem = nil
     stallWatchdog.stop()
@@ -135,6 +138,12 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
     }
     fallbackWebView?.stopLoadingAndRemove()
     fallbackWebView = nil
+  }
+
+  var needsRecoveryOnNetworkRestore: Bool {
+    guard !isStopped else { return false }
+    if fallbackWebView != nil { return true }
+    return waitingForNetwork && player.currentItem == nil && !isLoading
   }
 
   func setPlaybackVolume(_ volume: Float) {
@@ -325,7 +334,11 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
         showRetry: { attempt in
           self.showStatus("ツイキャス再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
         },
-        reload: { self.loadNativeStream() },
+        waitForNetwork: {
+          self.waitingForNetwork = true
+          self.showStatus("回線の復帰を待っています")
+        },
+        reload: { [weak self] in self?.loadNativeStream() },
         fallback: { self.installEmbedFallback(reason) }
       )
     }

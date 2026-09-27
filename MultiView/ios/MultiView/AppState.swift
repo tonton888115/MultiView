@@ -80,9 +80,14 @@ extension Notification.Name {
   // players at the quality for the new network.
   static let multiViewNetworkQualityChanged = Notification.Name("MultiViewNetworkQualityChanged")
   // Posted by a player when it hits a recoverable error so the viewing tab can
-  // auto-refresh (debounced) to clear it.
+  // auto-refresh (debounced) to clear it. userInfo[playbackErroredStreamIDKey] に
+  // 配信IDを入れると、その配信のセルだけを作り直す(他の配信は止めない)。
   static let multiViewPlaybackErrored = Notification.Name("MultiViewPlaybackErrored")
+  // 回線が「接続不能→接続可能」へ戻った。回線待ち/フォールバック中のセルを即再接続する。
+  static let multiViewNetworkRestored = Notification.Name("MultiViewNetworkRestored")
 }
+
+let playbackErroredStreamIDKey = "streamID"
 
 final class AppState {
   static let shared = AppState()

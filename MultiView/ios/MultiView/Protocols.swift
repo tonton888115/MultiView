@@ -16,6 +16,12 @@ protocol PlaybackStoppable: AnyObject {
   func stopPlayback()
 }
 
+// 回線復帰時に作り直すべき状態(回線待ち・Webフォールバック中など、ネイティブ再生が
+// 失われたまま)かを報告する。視聴タブは該当セルだけを作り直す。
+protocol PlaybackRecoverable: AnyObject {
+  var needsRecoveryOnNetworkRestore: Bool { get }
+}
+
 protocol AudioControllable: AnyObject {
   func setPlaybackVolume(_ volume: Float)
 }

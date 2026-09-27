@@ -7,7 +7,7 @@ import AmazonIVSPlayer
 // usher.ttvnw.net HLS master playlist, and try IVSPlayer first. If IVS cannot
 // handle Twitch's HLS shape, fall back to the proven AVPlayer path, then web.
 // Anonymous IRC supplies danmaku comments.
-final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, IVSPlayer.Delegate, IVSPlaybackHost {
+final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, IVSPlayer.Delegate, IVSPlaybackHost, PlaybackRecoverable {
   private let stream: StreamItem
   let settings: AppSettings
   private let player = AVPlayer()
@@ -34,6 +34,11 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   private var playbackGeneration = 0
   private let nativeRetry = NativeRetryLimiter(maxAttempts: 2)
   private let ivsRetry = NativeRetryLimiter(maxAttempts: 1)
+  // 回線断中に再接続を諦めずに待っている(回線復帰で視聴タブがこのセルを作り直す)。
+  private var waitingForNetwork = false
+  // 生存中(IVS再生開始時)にだけ作る。deinit 内の stopPlayback で初めて触れる lazy だと
+  // [weak self] の生成が解放中のオブジェクトに対して行われクラッシュするため。
+  private var ivsStallWatchdog: IvsStallWatchdog?
   var usingIvsPlayback = false
   private var forceLegacyPlayback = false
   private var isLoading = false
@@ -147,6 +152,9 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     streamBlocked = true
     playbackBlocker.hide()
     stallWatchdog.stop()
+    ivsStallWatchdog?.stop()
+    nativeRetry.reset()
+    ivsRetry.reset()
     liveCatchUpTimer?.invalidate()
     liveCatchUpTimer = nil
     tokenTask?.cancel()
@@ -169,6 +177,12 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       NotificationCenter.default.removeObserver(itemEndedObserver)
       self.itemEndedObserver = nil
     }
+  }
+
+  var needsRecoveryOnNetworkRestore: Bool {
+    guard !isStopped else { return false }
+    if fallbackWebView != nil { return true }
+    return waitingForNetwork && player.currentItem == nil && ivsPlayer == nil && !isLoading
   }
 
   func setPlaybackVolume(_ volume: Float) {
@@ -444,7 +458,11 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
         showRetry: { attempt in
           self.showStatus("Twitch再接続中(\(attempt)/\(self.nativeRetry.maxAttempts))")
         },
-        reload: { self.loadNativeStream() },
+        waitForNetwork: {
+          self.waitingForNetwork = true
+          self.showStatus("回線の復帰を待っています")
+        },
+        reload: { [weak self] in self?.loadNativeStream() },
         fallback: { self.blockOrInstallFallback(reason) }
       )
     }
@@ -573,6 +591,8 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
       ivsBufferingRecoveryWork?.cancel()
       ivsBufferingRecoveryWork = nil
       statusLabel.isHidden = true
+      waitingForNetwork = false
+      startIvsStallWatchdog()
     case .ended:
       blockPlayback("Twitch SDK再生が終了しました", generation: generation)
     case .idle:
@@ -580,6 +600,23 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     @unknown default:
       break
     }
+  }
+
+  private func startIvsStallWatchdog() {
+    if ivsStallWatchdog == nil {
+      ivsStallWatchdog = IvsStallWatchdog(
+        isPlaying: { [weak self] in
+          guard let self, self.usingIvsPlayback, let ivs = self.ivsPlayer else { return false }
+          return ivs.state == .playing
+        },
+        position: { [weak self] in self?.ivsPlayer?.position },
+        onStall: { [weak self] in
+          guard let self else { return }
+          self.handleIvsFailure("映像が止まったため再接続中", generation: self.playbackGeneration)
+        }
+      )
+    }
+    ivsStallWatchdog?.start()
   }
 
   func player(_ player: IVSPlayer, didFailWithError error: Error) {

@@ -26,7 +26,7 @@ private extension Array where Element == NativeDanmakuToken {
   }
 }
 
-final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, WKScriptMessageHandler {
+final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, WKScriptMessageHandler, PlaybackRecoverable {
   private static let instances = NSHashTable<YouTubeNativePlayerView>.weakObjects()
   private let stream: StreamItem
   private let settings: AppSettings
@@ -65,6 +65,16 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   private var officialChatActiveUntil = Date.distantPast
   private var laneCursor = 0
   private var extractionFailures: [String] = []
+  // ネイティブHLSのライブ再生中の停止監視。以前は開始6秒の一回限りの確認しかなく、再生開始後に
+  // 固まる/途切れると iframe へも再取得へも進まず止まったままだった。まずHLSを取り直し
+  // (映像のみ優先)、短時間に続く場合だけ従来の iframe へ落とす。
+  private var nativeVideoID: String?
+  private var nativeStallRecoveries = 0
+  private var lastNativeRecoveryAt = Date.distantPast
+  private var itemFailedObserver: NSObjectProtocol?
+  // 生存中(ライブ再生開始時)にだけ作る。deinit 内の stopPlayback で初めて触れる lazy だと
+  // [weak self] の生成が解放中のオブジェクトに対して行われクラッシュするため。
+  private var stallWatchdog: StallWatchdog?
 
   init(stream: StreamItem, settings: AppSettings) {
     self.stream = stream
@@ -527,8 +537,14 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     DispatchQueue.main.asyncAfter(deadline: .now() + spacing, execute: work)
   }
 
+  var needsRecoveryOnNetworkRestore: Bool {
+    // 回線断で抽出に失敗して iframe に落ちたものを、復帰後に映像のみ(HLS)へ戻す。
+    !isStopped && fallbackWebView != nil
+  }
+
   func stopPlayback() {
     isStopped = true
+    teardownNativeWatch()
     playerWebReloadWorkItem?.cancel(); playerWebReloadWorkItem = nil
     chatWebReloadWorkItem?.cancel(); chatWebReloadWorkItem = nil
     resolveTask?.cancel(); resolveTask = nil
@@ -811,6 +827,29 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       }
     }
     player.replaceCurrentItem(with: item)
+    nativeVideoID = videoId
+    if let itemFailedObserver {
+      NotificationCenter.default.removeObserver(itemFailedObserver)
+      self.itemFailedObserver = nil
+    }
+    if isLive {
+      itemFailedObserver = NotificationCenter.default.addObserver(
+        forName: .AVPlayerItemFailedToPlayToEndTime,
+        object: item,
+        queue: .main
+      ) { [weak self, weak item] _ in
+        guard let self, let item, self.player.currentItem === item else { return }
+        self.recoverNativeStall("YouTube再生が途切れたため再接続中")
+      }
+      if stallWatchdog == nil {
+        stallWatchdog = StallWatchdog(player: player) { [weak self] in
+          self?.recoverNativeStall("YouTube再生が止まったため再接続中")
+        }
+      }
+      stallWatchdog?.start()
+    } else {
+      stallWatchdog?.stop()
+    }
     resumePlayback()
     [0.25, 0.9, 1.8].forEach { delay in
       DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak item] in
@@ -836,6 +875,34 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
     if !isLive {
       fetchSponsorBlock(videoId: videoId)
       installSponsorSkipObserver()
+    }
+  }
+
+  // ライブHLSが再生開始後に止まった/途切れた: HLSを取り直して映像のみのまま復帰する。
+  // 90秒以内に3回目の停止なら不安定とみなし従来どおり iframe へ。
+  private func recoverNativeStall(_ reason: String) {
+    guard !isStopped, fallbackWebView == nil, let videoId = nativeVideoID else { return }
+    let now = Date()
+    nativeStallRecoveries = now.timeIntervalSince(lastNativeRecoveryAt) > 90 ? 1 : nativeStallRecoveries + 1
+    lastNativeRecoveryAt = now
+    teardownNativeWatch()
+    itemStatusObservation = nil
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    guard nativeStallRecoveries <= 2 else {
+      noteExtractionFailure("停止が続くため iframe へ")
+      installAlternativeWebFallback(videoId: videoId)
+      return
+    }
+    showStatus(reason)
+    requestNativePlayer(videoId: videoId)
+  }
+
+  private func teardownNativeWatch() {
+    stallWatchdog?.stop()
+    if let itemFailedObserver {
+      NotificationCenter.default.removeObserver(itemFailedObserver)
+      self.itemFailedObserver = nil
     }
   }
 
@@ -867,6 +934,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
   //    watch ページに遷移せず error メッセージを overlay 表示する。
   private func installAlternativeWebFallback(videoId: String) {
     guard !isStopped, fallbackWebView == nil else { return }
+    teardownNativeWatch()
     if let timeObserver {
       player.removeTimeObserver(timeObserver)
       self.timeObserver = nil
