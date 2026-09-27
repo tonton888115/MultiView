@@ -184,19 +184,30 @@ final class StallWatchdog {
 // Amazon IVS プレイヤー用の停止監視。IVS は .buffering/リバッファ/エラーは通知するが、
 // .playing のまま映像位置が進まなくなる凍結は通知されず、AVPlayer 用の StallWatchdog も
 // IVS 再生中は何も監視していなかった。position の前進を見て同じ基準で検知する。
+// また、システム(イヤホン抜け等)に一時停止されて .ready のまま止まった IVS は誰も再生を
+// 押し直さなかったので、止める意図が無い間は押し直し、それでも進まなければ再接続する。
 final class IvsStallWatchdog {
   private let label: String
   private let isPlaying: () -> Bool
+  private let nudgeIfPaused: () -> Bool
   private let position: () -> CMTime?
   private let onStall: () -> Void
   private var timer: Timer?
   private var lastTime: Double = -1
   private var lastProgressAt = Date()
   private var lastRecoveryAt = Date.distantPast
+  private var nudgedThisStall = false
 
-  init(label: String = "", isPlaying: @escaping () -> Bool, position: @escaping () -> CMTime?, onStall: @escaping () -> Void) {
+  init(
+    label: String = "",
+    isPlaying: @escaping () -> Bool,
+    nudgeIfPaused: @escaping () -> Bool,
+    position: @escaping () -> CMTime?,
+    onStall: @escaping () -> Void
+  ) {
     self.label = label
     self.isPlaying = isPlaying
+    self.nudgeIfPaused = nudgeIfPaused
     self.position = position
     self.onStall = onStall
   }
@@ -220,8 +231,16 @@ final class IvsStallWatchdog {
   }
 
   private func tick() {
-    guard isPlaying(), !PlaybackCoordinator.shared.isSuspended, NetworkQuality.shared.isReachable,
-          let time = position() else {
+    guard !PlaybackCoordinator.shared.isSuspended, NetworkQuality.shared.isReachable else {
+      lastProgressAt = Date()
+      return
+    }
+    let nudged = nudgeIfPaused()
+    if nudged, !nudgedThisStall {
+      nudgedThisStall = true
+      PlaybackDiagnostics.log("\(label): IVS 一時停止のまま→再生を押し直し")
+    }
+    guard nudged || isPlaying(), let time = position() else {
       lastProgressAt = Date()
       return
     }
@@ -229,6 +248,7 @@ final class IvsStallWatchdog {
     if now.isFinite, now > lastTime + 0.25 {
       lastTime = now
       lastProgressAt = Date()
+      nudgedThisStall = false
       return
     }
     guard Date().timeIntervalSince(lastProgressAt) > 12,

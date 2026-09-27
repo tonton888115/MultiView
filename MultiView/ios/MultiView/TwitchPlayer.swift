@@ -610,6 +610,13 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
           guard let self, self.usingIvsPlayback, let ivs = self.ivsPlayer else { return false }
           return ivs.state == .playing
         },
+        nudgeIfPaused: { [weak self] in
+          guard let self, self.usingIvsPlayback, !self.isStopped, !self.streamBlocked,
+                let ivs = self.ivsPlayer, ivs.state == .ready else { return false }
+          self.applyIvsAudio()
+          ivs.play()
+          return true
+        },
         position: { [weak self] in self?.ivsPlayer?.position },
         onStall: { [weak self] in
           guard let self else { return }

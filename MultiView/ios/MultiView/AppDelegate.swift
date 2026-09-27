@@ -88,6 +88,20 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     let center = NotificationCenter.default
     center.addObserver(self, selector: #selector(playbackSignalReceived(_:)), name: AVAudioSession.interruptionNotification, object: nil)
     center.addObserver(self, selector: #selector(playbackSignalReceived(_:)), name: AVAudioSession.routeChangeNotification, object: nil)
+    center.addObserver(self, selector: #selector(mediaServicesWereReset), name: AVAudioSession.mediaServicesWereResetNotification, object: nil)
+  }
+
+  // メディアサービス(音声・動画の再生基盤)がシステム側で再起動されると、全プレイヤーが
+  // 無効になり止まる。セッションを設定し直して作り直す(前面でなければ戻った時に作り直す)。
+  @objc private func mediaServicesWereReset() {
+    PlaybackDiagnostics.log("メディアサービス再起動→作り直し")
+    DispatchQueue.main.async {
+      if UIApplication.shared.applicationState == .active {
+        self.resumeAfterInterruption("メディアサービス再起動")
+      } else {
+        self.needsPlaybackReload = true
+      }
+    }
   }
 
   @objc private func playbackSignalReceived(_ notification: Notification) {
@@ -100,7 +114,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         // 復帰後に遅れて「割り込み開始」(reason=appWasSuspended=1)として届ける。他アプリの
         // 割り込みではないので止めずに再開する(止めると解除されず全画面が止まったままになる)。
         let reason = notification.userInfo?[AVAudioSessionInterruptionReasonKey] as? UInt
-        if reason == 1 {
+        // 旧来の WasSuspended キーで通知される OS もあるので両方見る(1 = appWasSuspended)。
+        let wasSuspended = (notification.userInfo?[AVAudioSessionInterruptionWasSuspendedKey] as? Bool) == true
+        if reason == 1 || wasSuspended {
           PlaybackDiagnostics.log("割り込み開始(アプリ一時停止由来)→無視して再開")
           configureAudioSession()
           resumePlaybackSoon()
