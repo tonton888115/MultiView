@@ -151,6 +151,9 @@ final class ViewingController: UIViewController {
   }
 
   private func rebuildStream(_ streamID: String) {
+    // 音声割り込み中に作り直すと新しいプレイヤーが自動再生して他アプリと奪い合う。
+    // 戻った時(applicationDidBecomeActive)に全体が作り直されるので、ここでは何もしない。
+    guard !PlaybackCoordinator.shared.isSuspended else { return }
     guard AppState.shared.streams.contains(where: { $0.id == streamID }) else { return }
     if let focused {
       // 展開中は展開ビューが唯一のプレイヤー。対象がそれなら展開ビューごと作り直す。
@@ -170,7 +173,7 @@ final class ViewingController: UIViewController {
   // 回線復帰: 回線待ち・Webフォールバック中のセルだけを作り直してネイティブ再生へ戻す。
   // 再生できているセルには触らず、止まっている可能性のあるものは resumeAll で押し直す。
   @objc private func networkRestored() {
-    guard isViewLoaded else { return }
+    guard isViewLoaded, !PlaybackCoordinator.shared.isSuspended else { return }
     if focused != nil {
       if focusedView?.needsRecoveryOnNetworkRestore == true {
         reload(rebuildPlayers: true)

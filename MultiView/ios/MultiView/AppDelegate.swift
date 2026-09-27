@@ -27,6 +27,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
   }
 
   func applicationDidBecomeActive(_ application: UIApplication) {
+    // ユーザーがアプリへ戻った = 音声を取り戻してよい。
+    PlaybackCoordinator.shared.endSuspension()
     configureAudioSession()
     maintainOAuthSessions()
     authMaintenanceTimer?.invalidate()
@@ -99,6 +101,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         let shouldResume = (notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
           .map { AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume) } ?? false
         if shouldResume {
+          PlaybackCoordinator.shared.endSuspension()
           needsPlaybackReload = false
           configureAudioSession()
           reloadAndResumeSoon()
