@@ -8,13 +8,18 @@ import {effectiveQuality, mobileUserAgent, resolvePlaybackSource, youtubeIframeH
 import type {AppSettings, NiconicoCommentSender, PlaybackSource, StreamItem} from '../types';
 import {isAdBlockedURL} from '../adblock';
 import {injectWebComment, webFallbackScript} from '../webInject';
-import {useNetworkType} from '../network';
-import {autoReloadDelayMs, nativeSourceRecoveryDelayForAttempt, shouldRecoverNativeSource, shouldReloadCellOnViewActivation, shouldReloadOnViewActivation, youtubeUpgradeDelayForAttempt} from '../sessionRecovery';
+import {isNetworkKnownOffline, onNetworkRestored, useQualityNetworkType} from '../network';
+import {autoReloadBackoffMs, nativeSourceRecoveryDelayForAttempt, nextAutoReloadAttempt, shouldRecoverNativeSource, shouldReloadCellOnViewActivation, shouldReloadOnViewActivation, youtubeUpgradeDelayForAttempt} from '../sessionRecovery';
 import type {PlayerHealth} from '../sessionRecovery';
 import {PlayerBadge} from '../components/PlayerBadge';
 import {sharedStyles} from '../components/sharedStyles';
 import {NiconicoNativePlayer} from './NiconicoNativePlayer';
 import {TwitcastingNativePlayer} from './TwitcastingNativePlayer';
+
+// ニコ生/ツイキャスはネイティブ視聴セッション(useRecoveringNativeSession)が自前で復旧する。
+function ownsNativeSession(platform: StreamItem['platform']): boolean {
+  return platform === 'niconico' || platform === 'twitcasting';
+}
 
 // React.memo: source 解決やネイティブイベントで頻繁に再レンダーする階層の起点。
 // props(ハンドラ含む)は呼び出し側で安定化済み。
@@ -44,6 +49,8 @@ export const StreamPlayer = React.memo(function StreamPlayer({
   onViewerCount?: (count: number) => void;
 }) {
   const [source, setSource] = useState<PlaybackSource | null>(null);
+  // 自動復旧で同じURLを取り直した場合もネイティブプレイヤーを確実に作り直すための世代。
+  const [playerEpoch, setPlayerEpoch] = useState(0);
   const webRef = useRef<WebView>(null);
   // ネイティブプレイヤーの直近イベントから見た健全性。タブ復帰時に「健全なセルは
   // 再マウントしない」判定にだけ使うので、stateではなくref(再レンダー不要)。
@@ -52,20 +59,26 @@ export const StreamPlayer = React.memo(function StreamPlayer({
   const settingsRef = useRef(settings);
   const streamCountRef = useRef(streamCount);
   const sourceRef = useRef<PlaybackSource | null>(null);
-  const networkType = useNetworkType();
+  // 画質用の回線種別はオフライン中も直前の値を保つ(瞬断で画質が揺れない)。
+  const networkType = useQualityNetworkType();
   const playbackQuality = effectiveQuality(settings, streamCount, networkType);
   streamRef.current = stream;
   settingsRef.current = settings;
   streamCountRef.current = streamCount;
   sourceRef.current = source;
-  // ネイティブプレイヤーの error/ended を受けてのデバウンス自動復旧。
-  // iOS の .multiViewPlaybackErrored と同じく 45 秒に 1 回までに制限してループを防ぐ。
-  // ただしイベントを「捨てる」と、致命的エラー(STATE_IDLE)後はネイティブ側が二度と
-  // イベントを出さないため永久凍結する。窓内のイベントは窓明けへ繰り延べて必ず実行する。
+  // ネイティブプレイヤーの error/ended/idle(停止・ストール含む)を受けての自動復旧。
+  // 初回は即、連続失敗はバックオフ。障害イベントは捨てず、予約済みでなければ必ず実行する
+  // (致命的エラー後のネイティブはイベントを出さないため、捨てると永久凍結する)。
   const [autoReloadTick, setAutoReloadTick] = useState(0);
+  const autoReloadAttemptRef = useRef(0);
   const lastAutoReloadRef = useRef(0);
   const autoReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 回線断中に壊れたセル。再取得は必ず失敗して試行回数だけ消費するので、回線復帰まで待つ。
+  const waitingForNetworkRef = useRef(false);
   const previouslyViewingActiveRef = useRef(viewingActive);
+  // 手動更新/配信切替と自動復旧の解決が並走したとき、古い方の結果で新しいプレイヤーを
+  // 上書きしないための世代。最新の解決だけが setSource できる。
+  const resolveGenerationRef = useRef(0);
   // YouTube が native HLS を取れず取得中/iframe に留まったとき、静かに再解決して HLS へ
   // 昇格させるための内部チック。retry 回数は youtubeRetryRef で上限管理する。
   const [youtubeUpgradeTick, setYoutubeUpgradeTick] = useState(0);
@@ -80,22 +93,55 @@ export const StreamPlayer = React.memo(function StreamPlayer({
       autoReloadTimerRef.current = null;
     }
   }, []);
+  const fireAutoReload = useCallback(() => {
+    clearAutoReloadTimer();
+    waitingForNetworkRef.current = false;
+    lastAutoReloadRef.current = Date.now();
+    setAutoReloadTick(tick => tick + 1);
+  }, [clearAutoReloadTimer]);
   const scheduleAutoReload = useCallback(() => {
-    if (autoReloadTimerRef.current) {
+    if (autoReloadTimerRef.current || waitingForNetworkRef.current) {
       return;
     }
+    if (isNetworkKnownOffline()) {
+      waitingForNetworkRef.current = true;
+      return;
+    }
+    const attempt = nextAutoReloadAttempt(autoReloadAttemptRef.current, Date.now(), lastAutoReloadRef.current);
+    autoReloadAttemptRef.current = attempt + 1;
     autoReloadTimerRef.current = setTimeout(() => {
       autoReloadTimerRef.current = null;
-      lastAutoReloadRef.current = Date.now();
-      setAutoReloadTick(tick => tick + 1);
-    }, autoReloadDelayMs(Date.now(), lastAutoReloadRef.current));
-  }, []);
+      fireAutoReload();
+    }, autoReloadBackoffMs(attempt));
+  }, [fireAutoReload]);
 
   useEffect(() => clearAutoReloadTimer, [clearAutoReloadTimer]);
+
+  // 回線復帰: 壊れている/ネイティブ再生できていないセルはバックオフを待たず即再接続する。
+  useEffect(() => {
+    if (ownsNativeSession(stream.platform)) {
+      return;
+    }
+    return onNetworkRestored(() => {
+      const kind = sourceRef.current?.kind ?? null;
+      if (!waitingForNetworkRef.current && playerHealthRef.current !== 'broken' && kind === 'native') {
+        return;
+      }
+      autoReloadAttemptRef.current = 0;
+      nativeRecoveryAttemptRef.current = 0;
+      youtubeRetryRef.current = 0;
+      fireAutoReload();
+    });
+  }, [fireAutoReload, stream.platform]);
 
   useEffect(() => {
     const previouslyActive = previouslyViewingActiveRef.current;
     previouslyViewingActiveRef.current = viewingActive;
+    if (ownsNativeSession(streamRef.current.platform)) {
+      // ニコ生/ツイキャスは surface 再バインド+自前の復旧で継続できる。タブを戻るたびに
+      // 視聴セッションを作り直す(黒画面+再接続)必要はない。
+      return;
+    }
     if (shouldReloadOnViewActivation(previouslyActive, viewingActive)) {
       // The viewing panel remains mounted beneath other tabs. Android may
       // detach a TextureView or fail a hidden HLS session while it is opaque.
@@ -103,12 +149,10 @@ export const StreamPlayer = React.memo(function StreamPlayer({
       // ため再マウントせず、健全と確認できないセルだけ再読込する(iOSのresumeAll
       // が継続再生なのと同じ体験に寄せる)。
       if (shouldReloadCellOnViewActivation(sourceRef.current?.kind ?? null, playerHealthRef.current)) {
-        clearAutoReloadTimer();
-        lastAutoReloadRef.current = Date.now();
-        setAutoReloadTick(tick => tick + 1);
+        fireAutoReload();
       }
     }
-  }, [clearAutoReloadTimer, viewingActive]);
+  }, [fireAutoReload, viewingActive]);
 
   const handleWebMessage = useCallback(
     (event: WebViewMessageEvent) => {
@@ -152,20 +196,24 @@ export const StreamPlayer = React.memo(function StreamPlayer({
     [scheduleAutoReload],
   );
 
+  // 配信切替/手動更新: 取得中表示に戻して解決し直す。
   useEffect(() => {
     const currentStream = streamRef.current;
-    if (currentStream.platform === 'niconico' || currentStream.platform === 'twitcasting') {
-      // ニコ生/ツイキャスはネイティブ視聴セッションが自前で扱う。
+    if (ownsNativeSession(currentStream.platform)) {
       return;
     }
     let cancelled = false;
+    // 予約済みの自動復旧はこの解決で置き換わる(後から古い解決で差し戻さない)。
+    clearAutoReloadTimer();
+    waitingForNetworkRef.current = false;
+    const generation = ++resolveGenerationRef.current;
     setSource(null);
     playerHealthRef.current = 'unknown';
     // resolvePlaybackSource は内部で全例外を error ソースへ畳み込み、reject しない
     // (YouTube を Web ページへ落とさないガードも playback.ts 側にある)。
     resolvePlaybackSource(currentStream, settingsRef.current, streamCountRef.current)
       .then(next => {
-        if (!cancelled) {
+        if (!cancelled && generation === resolveGenerationRef.current) {
           setSource(next);
         }
       });
@@ -173,14 +221,36 @@ export const StreamPlayer = React.memo(function StreamPlayer({
       cancelled = true;
     };
   }, [
+    clearAutoReloadTimer,
     stream.id,
     stream.platform,
     stream.channel,
     settings.youtubePreferIframe,
     settings.youtubeStableBuffer,
     reloadKey,
-    autoReloadTick,
   ]);
+
+  // 自動復旧: 取得中表示へは戻さず、今の映像(停止フレーム)と弾幕を出したまま裏で解決し直し、
+  // 取れたら差し替える。以前は source=null で弾幕オーバーレイごと外れ、復旧のたびに
+  // コメント接続が切れて貼り直し+スピナー表示になっていた。
+  useEffect(() => {
+    if (autoReloadTick === 0 || ownsNativeSession(streamRef.current.platform)) {
+      return;
+    }
+    let cancelled = false;
+    const generation = ++resolveGenerationRef.current;
+    playerHealthRef.current = 'unknown';
+    resolvePlaybackSource(streamRef.current, settingsRef.current, streamCountRef.current)
+      .then(next => {
+        if (!cancelled && generation === resolveGenerationRef.current) {
+          setSource(next);
+          setPlayerEpoch(epoch => epoch + 1);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [autoReloadTick]);
 
   // 配信切替/手動更新で YouTube の再試行カウンタをリセット。
   useEffect(() => {
@@ -207,6 +277,11 @@ export const StreamPlayer = React.memo(function StreamPlayer({
     const delay = youtubeUpgradeDelayForAttempt(youtubeRetryRef.current);
     let cancelled = false;
     const timer = setTimeout(async () => {
+      if (isNetworkKnownOffline()) {
+        // 回線断中は叩かない(回線復帰時に onNetworkRestored が即再解決する)。
+        setYoutubeUpgradeTick(tick => tick + 1);
+        return;
+      }
       youtubeRetryRef.current += 1;
       try {
         const next = await resolvePlaybackSource(streamRef.current, settingsRef.current, streamCountRef.current);
@@ -242,6 +317,11 @@ export const StreamPlayer = React.memo(function StreamPlayer({
     // オフライン配信を固定間隔で無期限ポーリングしない。失敗が続くほど間隔を
     // 倍々で広げる(上限5分)。native復帰か配信切替でattemptは0に戻る。
     const timer = setTimeout(async () => {
+      if (isNetworkKnownOffline()) {
+        // 回線断中は試行回数を消費しない(回線復帰時に onNetworkRestored が即再解決する)。
+        setNativeRecoveryTick(tick => tick + 1);
+        return;
+      }
       try {
         const next = await resolvePlaybackSource(streamRef.current, settingsRef.current, streamCountRef.current);
         if (cancelled) {
@@ -311,7 +391,7 @@ export const StreamPlayer = React.memo(function StreamPlayer({
         paused={paused}
         muted={muted}
         volume={volume}
-        reloadKey={reloadKey + autoReloadTick}
+        reloadKey={reloadKey}
         onCommentBridge={onNiconicoCommentBridge}
         onViewerCount={onViewerCount}
       />
@@ -328,67 +408,54 @@ export const StreamPlayer = React.memo(function StreamPlayer({
         paused={paused}
         muted={muted}
         volume={volume}
-        reloadKey={reloadKey + autoReloadTick}
+        reloadKey={reloadKey}
         onViewerCount={onViewerCount}
       />
     );
   }
 
+  let content: React.ReactNode;
   if (!source) {
-    return (
+    content = (
       <View style={sharedStyles.playerPlaceholder}>
         <ActivityIndicator color="#7ab7ff" />
         <Text style={sharedStyles.playerStatus}>取得中</Text>
       </View>
     );
-  }
-
-  if (source.kind === 'native') {
-    return (
-      <>
-        <NativeHlsPlayer
-          key={`${source.url}:${reloadKey}:${autoReloadTick}`}
-          style={sharedStyles.nativePlayer}
-          sourceUrl={source.url}
-          headers={source.headers}
-          paused={paused}
-          viewingActive={viewingActive}
-          muted={muted}
-          volume={volume}
-          liveTargetOffsetMs={source.liveTargetOffsetMs}
-          maxBitrate={playbackQuality === 'economy' ? 900000 : 0}
-          resizeMode="contain"
-          onPlayerEvent={handleNativePlayerEvent}
-        />
-        <DanmakuOverlay stream={stream} settings={settings} active={viewingActive} />
-        <GiftOverlay stream={stream} settings={settings} active={viewingActive} />
-      </>
+  } else if (source.kind === 'native') {
+    content = (
+      <NativeHlsPlayer
+        key={`${source.url}:${reloadKey}:${playerEpoch}`}
+        style={sharedStyles.nativePlayer}
+        sourceUrl={source.url}
+        headers={source.headers}
+        paused={paused}
+        viewingActive={viewingActive}
+        muted={muted}
+        volume={volume}
+        liveTargetOffsetMs={source.liveTargetOffsetMs}
+        maxBitrate={playbackQuality === 'economy' ? 900000 : 0}
+        resizeMode="contain"
+        onPlayerEvent={handleNativePlayerEvent}
+      />
     );
-  }
-
-  if (source.kind === 'youtube-iframe') {
-    return (
-      <>
-        <WebView
-          key={`${source.videoId}:${reloadKey}`}
-          ref={webRef}
-          source={{html: youtubeIframeHTML(source.videoId), baseUrl: 'https://tonton888115.github.io/MultiView/'}}
-          javaScriptEnabled
-          domStorageEnabled
-          allowsInlineMediaPlayback
-          mediaPlaybackRequiresUserAction={false}
-          setSupportMultipleWindows={false}
-          style={sharedStyles.webPlayer}
-        />
-        <DanmakuOverlay stream={stream} settings={settings} active={viewingActive} />
-        <GiftOverlay stream={stream} settings={settings} active={viewingActive} />
-      </>
+  } else if (source.kind === 'youtube-iframe') {
+    content = (
+      <WebView
+        key={`${source.videoId}:${reloadKey}`}
+        ref={webRef}
+        source={{html: youtubeIframeHTML(source.videoId), baseUrl: 'https://tonton888115.github.io/MultiView/'}}
+        javaScriptEnabled
+        domStorageEnabled
+        allowsInlineMediaPlayback
+        mediaPlaybackRequiresUserAction={false}
+        setSupportMultipleWindows={false}
+        style={sharedStyles.webPlayer}
+      />
     );
-  }
-
-  if (source.kind === 'web' || (source.kind === 'error' && source.fallbackUrl)) {
+  } else if (source.kind === 'web' || (source.kind === 'error' && source.fallbackUrl)) {
     const url = source.kind === 'web' ? source.url : source.fallbackUrl ?? 'about:blank';
-    return (
+    content = (
       <>
         <WebView
           key={`${url}:${reloadKey}`}
@@ -407,16 +474,24 @@ export const StreamPlayer = React.memo(function StreamPlayer({
           onMessage={handleWebMessage}
           style={sharedStyles.webPlayer}
         />
-        <DanmakuOverlay stream={stream} settings={settings} active={viewingActive} />
-        <GiftOverlay stream={stream} settings={settings} active={viewingActive} />
         {source.kind === 'error' && <PlayerBadge source={source} status={source.reason} warning />}
       </>
     );
+  } else {
+    content = (
+      <View style={sharedStyles.playerPlaceholder}>
+        <Text style={sharedStyles.playerStatus}>{source.reason}</Text>
+      </View>
+    );
   }
 
+  // 弾幕/ギフトは映像ソースの種類(取得中・ネイティブ・Web・エラー)が変わっても外さない。
+  // 復旧のたびにコメント接続を切って貼り直すと、その間のコメントが抜けて不安定に見える。
   return (
-    <View style={sharedStyles.playerPlaceholder}>
-      <Text style={sharedStyles.playerStatus}>{source.reason}</Text>
-    </View>
+    <>
+      {content}
+      <DanmakuOverlay stream={stream} settings={settings} active={viewingActive} />
+      <GiftOverlay stream={stream} settings={settings} active={viewingActive} />
+    </>
   );
 });

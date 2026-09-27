@@ -11,7 +11,7 @@ import {webFallbackScript} from '../webInject';
 import {niconicoOriginURL, niconicoPostCommentScript, niconicoQuality, niconicoSessionScript, niconicoSupportPresentation} from '../niconico';
 import {pushNiconicoComment} from '../niconicoComments';
 import {publishGiftEvent} from '../giftEvents';
-import {useNetworkType} from '../network';
+import {useQualityNetworkType} from '../network';
 import {useRecoveringNativeSession} from '../useRecoveringNativeSession';
 import {nativeFirstFrameTimeoutMs, shouldFallbackForMissingNativeFrame, shouldRenderNativeSession, shouldRestartSessionOnAppState} from '../sessionRecovery';
 import {sharedStyles} from '../components/sharedStyles';
@@ -51,7 +51,9 @@ export const NiconicoNativePlayer = React.memo(function NiconicoNativePlayer({
     reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   }>());
-  const networkType = useNetworkType();
+  // 画質用の回線種別はオフライン中も直前の値を保つ(瞬断でセッションキーが変わり
+  // 視聴セッションを作り直さない。回線復帰は useRecoveringNativeSession が扱う)。
+  const networkType = useQualityNetworkType();
   const playbackQuality = effectiveQuality(settings, streamCount, networkType);
   const recovery = useRecoveringNativeSession(
     `${stream.channel}:${playbackQuality}:${settings.niconicoLowLatency}:${reloadKey}`,

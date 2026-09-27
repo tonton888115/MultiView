@@ -1,11 +1,12 @@
 import {
-  autoReloadDelayMs,
-  autoReloadFireDelayMs,
-  autoReloadMinIntervalMs,
+  autoReloadAttemptResetMs,
+  autoReloadBackoffMs,
   nativeFirstFrameTimeoutMs,
+  nextAutoReloadAttempt,
   nativeSourceRecoveryDelayForAttempt,
   nativeSourceRecoveryMaxDelayMs,
   playerStallTimeoutMs,
+  sessionRestartDedupeMs,
   sessionConnectTimeoutMs,
   sessionRetryDelayMs,
   shouldFallbackForMissingNativeFrame,
@@ -76,15 +77,20 @@ describe('native session recovery policy', () => {
     expect(shouldFallbackForMissingNativeFrame(true, nativeFirstFrameTimeoutMs * 2)).toBe(false);
   });
 
-  it('defers a debounced auto reload instead of dropping it', () => {
-    // 初回(または45秒以上経過後)は最短ディレイで発火する。
-    expect(autoReloadDelayMs(100_000, 0)).toBe(autoReloadFireDelayMs);
-    expect(autoReloadDelayMs(100_000, 100_000 - autoReloadMinIntervalMs)).toBe(autoReloadFireDelayMs);
-    // 45秒窓の内側では「捨てる」のではなく窓明けまで繰り延べる。
-    expect(autoReloadDelayMs(100_000, 90_000)).toBe(autoReloadMinIntervalMs - 10_000);
-    expect(autoReloadDelayMs(100_000, 99_000)).toBe(autoReloadMinIntervalMs - 1_000);
-    // 直後の連続発火でも最低ディレイは確保する。
-    expect(autoReloadDelayMs(100_000, 100_000)).toBe(autoReloadMinIntervalMs);
+  it('recovers the first failure quickly and backs off repeated failures', () => {
+    // 初回は1.5秒で復旧(以前は45秒窓で最大45秒止まったままだった)。
+    expect(autoReloadBackoffMs(0)).toBe(1_500);
+    expect(autoReloadBackoffMs(1)).toBe(4_000);
+    expect(autoReloadBackoffMs(2)).toBe(10_000);
+    // 失敗が続いても上限で頭打ちにし、回数が壊れていても安全側に倒す。
+    expect(autoReloadBackoffMs(50)).toBe(40_000);
+    expect(autoReloadBackoffMs(Number.NaN)).toBe(1_500);
+  });
+
+  it('treats a failure after a long stable period as a first failure again', () => {
+    expect(nextAutoReloadAttempt(3, 200_000, 200_000 - autoReloadAttemptResetMs)).toBe(0);
+    expect(nextAutoReloadAttempt(3, 200_000, 200_000 - autoReloadAttemptResetMs + 1)).toBe(3);
+    expect(nextAutoReloadAttempt(0, 200_000, 0)).toBe(0);
   });
 
   it('recovers Twitch/Kick from non-native sources but leaves YouTube to its own upgrade loop', () => {
@@ -297,12 +303,15 @@ describe('native session recovery policy', () => {
     expect(latest?.sessionReloadTick).toBe(1);
     expect(latest?.useWebFallback).toBe(false);
     act(() => {
+      // 作り直した次のセッションが改めて失敗する(=別の障害)までには時間が経つ。
+      jest.advanceTimersByTime(sessionRestartDedupeMs);
       latest!.markSessionResolved();
       latest!.handlePlayerStatus('error', 'BAD_DECRYPT', false);
     });
     expect(latest?.sessionReloadTick).toBe(2);
     expect(latest?.useWebFallback).toBe(false);
     act(() => {
+      jest.advanceTimersByTime(sessionRestartDedupeMs);
       latest!.markSessionResolved();
       latest!.handlePlayerStatus('error', 'BAD_DECRYPT', false);
     });
@@ -310,6 +319,51 @@ describe('native session recovery policy', () => {
     expect(latest?.useWebFallback).toBe(true);
     expect(latest?.useWebFallback).toBe(true);
     expect(latest?.sessionReloadTick).toBe(3);
+    act(() => renderer!.unmount());
+  });
+
+  it('counts simultaneous failure signals for one incident only once', () => {
+    jest.useFakeTimers();
+    let latest: Recovery | undefined;
+    let renderer: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(RecoveryHarness, {
+        report: value => { latest = value; },
+      }));
+    });
+    act(() => {
+      latest!.markSessionResolved();
+      // ネイティブのストール通知と JS 側の監視が同じ障害で続けて届く。
+      latest!.handlePlayerStatus('error', 'stall', false);
+      latest!.restartSessionNow();
+      latest!.handlePlayerStatus('error', 'stall', false);
+    });
+    expect(latest?.sessionReloadTick).toBe(1);
+    expect(latest?.useWebFallback).toBe(false);
+    act(() => renderer!.unmount());
+  });
+
+  it('keeps a queued reconnect when a duplicate restart is coalesced', () => {
+    jest.useFakeTimers();
+    let latest: Recovery | undefined;
+    let renderer: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(RecoveryHarness, {
+        report: value => { latest = value; },
+      }));
+    });
+    act(() => {
+      latest!.restartSessionNow();
+    });
+    expect(latest?.sessionReloadTick).toBe(1);
+    act(() => {
+      // 作り直した直後のセッションが失敗して再接続を予約し、同じ窓で重複通知が来る。
+      latest!.scheduleReconnect();
+      latest!.restartSessionNow();
+      jest.advanceTimersByTime(sessionRetryDelayMs(2) + 100);
+    });
+    // 重複通知はまとめても、予約済みの再接続は消えずに実行される。
+    expect(latest?.sessionReloadTick).toBe(2);
     act(() => renderer!.unmount());
   });
 

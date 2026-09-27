@@ -13,14 +13,18 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.ui.AspectRatioFrameLayout
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.LifecycleEventListener
@@ -28,6 +32,35 @@ import com.facebook.react.bridge.ReactContext
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.uimanager.UIManagerHelper
 import com.facebook.react.uimanager.events.Event
+import java.io.IOException
+
+// ライブ視聴向けの読み込みエラー方針。通信断(接続失敗/タイムアウト/名前解決失敗)は
+// 既定の3回だと数秒の瞬断でも致命エラー→プレイヤー作り直し(黒画面・再接続)になるため、
+// 間隔を空けながら約40秒まで粘って、その場で再生を再開させる。HTTPステータスエラー
+// (トークン失効/配信終了等)は従来どおり早めに失敗させ、JS側の再取得(新URL)へ回す。
+@UnstableApi
+internal class LiveLoadErrorHandlingPolicy : DefaultLoadErrorHandlingPolicy() {
+  override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
+    if (isConnectivityFailure(loadErrorInfo.exception)) {
+      return minOf(1_000L * loadErrorInfo.errorCount, 5_000L)
+    }
+    if (loadErrorInfo.errorCount > DefaultLoadErrorHandlingPolicy.DEFAULT_MIN_LOADABLE_RETRY_COUNT) {
+      return C.TIME_UNSET
+    }
+    return super.getRetryDelayMsFor(loadErrorInfo)
+  }
+
+  override fun getMinimumLoadableRetryCount(dataType: Int): Int = CONNECTIVITY_RETRY_COUNT
+
+  private fun isConnectivityFailure(exception: IOException): Boolean =
+    exception is HttpDataSource.HttpDataSourceException &&
+      exception !is HttpDataSource.InvalidResponseCodeException &&
+      exception !is HttpDataSource.InvalidContentTypeException
+
+  private companion object {
+    const val CONNECTIVITY_RETRY_COUNT = 10
+  }
+}
 
 internal fun mergeCookieHeaders(explicitHeader: String?, fallbackHeader: String?): String? {
   val cookies = linkedMapOf<String, String>()
@@ -98,6 +131,9 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context), LifecycleEve
   private var lastProgressPositionMs = C.TIME_UNSET
   private var lastProgressAtMs = 0L
   private var lastStallRecoveryAtMs: Long? = null
+  // 停止検知の1段目(その場でライブ端へ戻して読み直す)を試したか。進行が戻ればリセット。
+  private var inPlaceRecoveryTried = false
+  private var presentationNotified = false
   private var videoOutputRebindAttempts = 0
   private val rebindVideoOutput = object : Runnable {
     override fun run() {
@@ -136,9 +172,18 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context), LifecycleEve
         if (lastProgressPositionMs == C.TIME_UNSET || position > lastProgressPositionMs + MIN_PROGRESS_MS) {
           lastProgressPositionMs = position
           lastProgressAtMs = now
-        } else {
+          inPlaceRecoveryTried = false
+        } else if (now - lastProgressAtMs >= STALL_THRESHOLD_MS) {
           val cooldownElapsed = lastStallRecoveryAtMs?.let { now - it >= STALL_RECOVERY_COOLDOWN_MS } ?: true
-          if (now - lastProgressAtMs >= STALL_THRESHOLD_MS && cooldownElapsed) {
+          if (!inPlaceRecoveryTried) {
+            // 1段目: URL・プレイヤーはそのままライブ端へ戻して読み直す(黒画面/再接続なし)。
+            // バッファ枯渇やライブ窓ずれで固まった多くのケースはこれで再開する。
+            inPlaceRecoveryTried = true
+            lastProgressAtMs = now
+            recoverInPlace()
+          } else if (cooldownElapsed) {
+            // 2段目: それでも進まなければ JS へ通知し、URL再取得/セッション作り直しへ。
+            inPlaceRecoveryTried = false
             lastStallRecoveryAtMs = now
             lastProgressAtMs = now
             emit("error", "stall")
@@ -169,7 +214,23 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context), LifecycleEve
       }
 
       override fun onRenderedFirstFrame() {
+        presentationNotified = true
         emit("firstFrame", "rendered")
+      }
+
+      override fun onTracksChanged(tracks: Tracks) {
+        // 音声のみの配信(ツイキャスのラジオ等)は映像を描画しないので onRenderedFirstFrame が
+        // 来ない。JS 側の「初回フレーム待ち」が作り直しを繰り返さないよう、内容が音声だけと
+        // 確定した時点で表示開始として通知する。
+        if (
+          !presentationNotified &&
+          !tracks.isEmpty &&
+          tracks.containsType(C.TRACK_TYPE_AUDIO) &&
+          !tracks.containsType(C.TRACK_TYPE_VIDEO)
+        ) {
+          presentationNotified = true
+          emit("firstFrame", "audio-only")
+        }
       }
 
       override fun onPlaybackStateChanged(playbackState: Int) {
@@ -408,6 +469,7 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context), LifecycleEve
       return
     }
     preparedUrl = url
+    presentationNotified = false
     emit("status", "loading")
     exoPlayer.setMediaSource(mediaSourceFor(url))
     exoPlayer.prepare()
@@ -437,6 +499,18 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context), LifecycleEve
   private fun resetProgressSample(now: Long = SystemClock.elapsedRealtime()) {
     lastProgressPositionMs = C.TIME_UNSET
     lastProgressAtMs = now
+    inPlaceRecoveryTried = false
+  }
+
+  private fun recoverInPlace() {
+    if (released || exoPlayer.currentMediaItem == null) {
+      return
+    }
+    if (exoPlayer.playbackState == Player.STATE_IDLE) {
+      exoPlayer.prepare()
+    }
+    exoPlayer.seekToDefaultPosition()
+    exoPlayer.playWhenReady = !paused
   }
 
   private fun mediaSourceFor(url: String): MediaSource {
@@ -473,12 +547,16 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context), LifecycleEve
       )
       .build()
     val lower = url.lowercase()
+    val loadErrorPolicy = LiveLoadErrorHandlingPolicy()
     return if (lower.contains(".m3u8") || lower.contains("hls")) {
       HlsMediaSource.Factory(dataSourceFactory)
         .setAllowChunklessPreparation(true)
+        .setLoadErrorHandlingPolicy(loadErrorPolicy)
         .createMediaSource(mediaItem)
     } else {
-      ProgressiveMediaSource.Factory(dataSourceFactory).createMediaSource(mediaItem)
+      ProgressiveMediaSource.Factory(dataSourceFactory)
+        .setLoadErrorHandlingPolicy(loadErrorPolicy)
+        .createMediaSource(mediaItem)
     }
   }
 

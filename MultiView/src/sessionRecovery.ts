@@ -1,15 +1,26 @@
 export const sessionConnectTimeoutMs = 20_000;
 export const playerStallTimeoutMs = 25_000;
 export const nativeFirstFrameTimeoutMs = 12_000;
-export const autoReloadMinIntervalMs = 45_000;
-export const autoReloadFireDelayMs = 1_500;
+// 同じ障害に対するネイティブ通知/JSストール監視/初回フレーム待ちの同時発火をまとめる窓。
+export const sessionRestartDedupeMs = 3_000;
 export const nativeSourceRecoveryDelayMs = 20_000;
 
-// 汎用StreamPlayerの自動リロードは45秒に1回へ間引くが、間引いた障害イベントを
-// 捨てると致命的エラー(STATE_IDLE)後は誰も再試行せず永久凍結する。次に発火
-// できる時刻まで遅延して、予約済みでなければ必ず1回は実行する。
-export function autoReloadDelayMs(nowMs: number, lastReloadAtMs: number): number {
-  return Math.max(autoReloadFireDelayMs, lastReloadAtMs + autoReloadMinIntervalMs - nowMs);
+// 汎用StreamPlayer(Kick/Twitch/YouTube)の自動復旧間隔。以前は一律「45秒に1回」で、
+// 一度失敗すると次の復旧まで最大45秒止まったままだった。初回は即(1.5秒)、失敗が
+// 続くほど間隔を広げる。障害イベントは捨てず、予約済みでなければ必ず1回は実行する。
+const autoReloadBackoffScheduleMs = [1_500, 4_000, 10_000, 20_000, 40_000];
+
+export function autoReloadBackoffMs(attempt: number): number {
+  const normalized = Math.max(0, Math.floor(Number.isFinite(attempt) ? attempt : 0));
+  return autoReloadBackoffScheduleMs[Math.min(normalized, autoReloadBackoffScheduleMs.length - 1)];
+}
+
+// 直前の自動復旧からこれだけ経っていれば「しばらく安定していた」とみなし、
+// 次の障害は初回扱い(最短間隔)で復旧する。
+export const autoReloadAttemptResetMs = 90_000;
+
+export function nextAutoReloadAttempt(attempt: number, nowMs: number, lastReloadAtMs: number): number {
+  return nowMs - lastReloadAtMs >= autoReloadAttemptResetMs ? 0 : attempt;
 }
 
 // Twitch/Kick がエラー/Webフォールバックへ落ちたまま回線が復帰しても、native HLS

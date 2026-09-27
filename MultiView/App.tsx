@@ -2,6 +2,7 @@ import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   Alert,
   AppState,
+  BackHandler,
   LayoutAnimation,
   Platform,
   ScrollView,
@@ -56,6 +57,8 @@ import {makeStream} from './src/playback';
 import type {AppSettings, HandoffImporter, NiconicoCommentSender, PlatformId, Source, StreamItem, TabId} from './src/types';
 import {setRaidHandler} from './src/raidFollow';
 import {startPlaybackService, stopPlaybackService} from './src/playbackService';
+import {setImmersiveMode} from './src/systemUi';
+import {useNetworkType} from './src/network';
 import {parseStreamURL} from './src/streamURL';
 import {appSafeAreaEdges} from './src/layout';
 import {orderedPlatforms, platformIds, platformInfo} from './src/platforms';
@@ -179,6 +182,13 @@ export default function App() {
   const [pendingOAuth, setPendingOAuth] = useState<PendingOAuth | null>(null);
   const [pendingDeviceOAuth, setPendingDeviceOAuth] = useState<PendingDeviceOAuth | null>(null);
   const [niconicoLoginOpen, setNiconicoLoginOpen] = useState(false);
+  // ビューモード: 視聴タブを全画面にし、下部タブ/操作バー/システムバーを隠す。
+  // 分割画面などで画面が狭いとき用。起動ごとに通常表示から始める(永続化しない)。
+  const [viewMode, setViewMode] = useState(false);
+  // 回線監視をアプリ全体で常時動かす。プレイヤーが1つも無い瞬間に監視が止まって
+  // 回線種別が「不明」へ戻ると、次に追加した配信が画質を取り違えて作り直しになる。
+  // 起動直後も配信の読み込み(保存データ復元)より先に回線種別が確定する。
+  useNetworkType();
   const authRef = useRef(auth);
   const authWriteChainRef = useRef<Promise<void>>(Promise.resolve());
   const authStorageReadFailedRef = useRef(false);
@@ -626,6 +636,24 @@ export default function App() {
     return () => subscription.remove();
   }, [hydrated, streams.length, settings.playAudio]);
 
+  const viewModeActive = viewMode && activeTab === 'viewing';
+  useEffect(() => {
+    setImmersiveMode(viewModeActive);
+  }, [viewModeActive]);
+  // 画面破棄/開発時リロードで没入表示(バー非表示)が残らないようにする。
+  useEffect(() => () => setImmersiveMode(false), []);
+  useEffect(() => {
+    if (!viewModeActive) {
+      return;
+    }
+    // 戻るキー/ジェスチャーはアプリ終了ではなくビューモード解除にする。
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      setViewMode(false);
+      return true;
+    });
+    return () => subscription.remove();
+  }, [viewModeActive]);
+
   const removeStream = useCallback((id: string) => {
     setStreams(current => current.filter(stream => stream.id !== id));
     setVolumes(current => {
@@ -676,7 +704,7 @@ export default function App() {
 
   return (
     <SafeAreaView style={styles.app} edges={appSafeAreaEdges}>
-      <StatusBar barStyle="light-content" backgroundColor="#05070a" translucent={false} />
+      <StatusBar barStyle="light-content" backgroundColor="#05070a" translucent={false} hidden={viewModeActive} />
       <View style={styles.content}>
         {activeTab === 'following' && (
           <SourceBrowser sources={orderedSources(followingSources, settings)} blockWebAds={settings.blockWebAds} onAdd={addStream} />
@@ -700,6 +728,8 @@ export default function App() {
             onImport={importHandoff}
             auth={auth}
             onAuth={updateAuth}
+            viewMode={viewModeActive}
+            onViewMode={setViewMode}
           />
         </View>
         {activeTab === 'settings' && (
@@ -730,12 +760,14 @@ export default function App() {
       </View>
       <NiconicoLoginModal visible={niconicoLoginOpen} onClose={() => setNiconicoLoginOpen(false)} />
 
-      <View style={styles.tabBar}>
-        <TabButton active={activeTab === 'following'} icon="◉" label="フォロー" onPress={() => setActiveTab('following')} />
-        <TabButton active={activeTab === 'ranking'} icon="▤" label="ランキング" onPress={() => setActiveTab('ranking')} />
-        <TabButton active={activeTab === 'viewing'} icon="⊞" label="視聴" onPress={() => setActiveTab('viewing')} />
-        <TabButton active={activeTab === 'settings'} icon="⚙︎" label="設定" onPress={() => setActiveTab('settings')} />
-      </View>
+      {!viewModeActive && (
+        <View style={styles.tabBar}>
+          <TabButton active={activeTab === 'following'} icon="◉" label="フォロー" onPress={() => setActiveTab('following')} />
+          <TabButton active={activeTab === 'ranking'} icon="▤" label="ランキング" onPress={() => setActiveTab('ranking')} />
+          <TabButton active={activeTab === 'viewing'} icon="⊞" label="視聴" onPress={() => setActiveTab('viewing')} />
+          <TabButton active={activeTab === 'settings'} icon="⚙︎" label="設定" onPress={() => setActiveTab('settings')} />
+        </View>
+      )}
     </SafeAreaView>
   );
 }
@@ -753,6 +785,8 @@ function ViewingScreen({
   onImport,
   auth,
   onAuth,
+  viewMode,
+  onViewMode,
 }: {
   active: boolean;
   streams: StreamItem[];
@@ -766,8 +800,14 @@ function ViewingScreen({
   onImport: HandoffImporter;
   auth: AuthState;
   onAuth: AuthCommit;
+  viewMode: boolean;
+  onViewMode: (enabled: boolean) => void;
 }) {
   const [adding, setAdding] = useState(false);
+  // ビューモード中はセルの操作UIを出さず、画面のどこかに触れたら「全画面を解除」だけを
+  // 一時表示する(入った直後も場所が分かるよう一度表示してから自動で隠れる)。
+  const {chromeVisible: exitVisible, showChrome: showExit} = useAutoHidingChrome(viewMode);
+  const exitViewMode = useCallback(() => onViewMode(false), [onViewMode]);
   const [handoffOpen, setHandoffOpen] = useState(false);
   const [focused, setFocused] = useState<StreamItem | null>(null);
   // reloadKey をインクリメントするとプレイヤー(native/iframe/web)が再マウントされ
@@ -790,7 +830,7 @@ function ViewingScreen({
 
   return (
     <View style={sharedStyles.screen}>
-      <View style={styles.viewBody}>
+      <View style={styles.viewBody} onTouchStart={viewMode ? showExit : undefined}>
         {streams.length === 0 ? (
           <View style={styles.empty}>
             <Text style={styles.emptyTitle}>配信がありません</Text>
@@ -819,39 +859,56 @@ function ViewingScreen({
                   onVolume={onVolume}
                   auth={auth}
                   onAuth={onAuth}
+                  viewMode={viewMode}
                 />
               </View>
             ))}
           </ScrollView>
         )}
-      </View>
-
-      <View style={styles.viewBottomControls}>
-        <View style={sharedStyles.iconSegment}>
-          <TouchableOpacity
-            style={[sharedStyles.iconSegmentButton, settings.layoutMode === 'stacked' && sharedStyles.iconSegmentButtonActive]}
-            onPress={() => onSettings({layoutMode: 'stacked'})}>
-            <Text style={[sharedStyles.iconSegmentText, settings.layoutMode === 'stacked' && sharedStyles.iconSegmentTextActive]}>▥</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[sharedStyles.iconSegmentButton, settings.layoutMode === 'grid' && sharedStyles.iconSegmentButtonActive]}
-            onPress={() => onSettings({layoutMode: 'grid'})}>
-            <Text style={[sharedStyles.iconSegmentText, settings.layoutMode === 'grid' && sharedStyles.iconSegmentTextActive]}>▦</Text>
-          </TouchableOpacity>
-        </View>
-        <View style={styles.viewBottomSpacer} />
-        <TouchableOpacity accessibilityLabel="引き継ぎ" style={styles.bottomIconButton} onPress={() => setHandoffOpen(true)}>
-          <Text style={[styles.bottomIconText, styles.bottomIconLabel]}>QR</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.bottomIconButton} onPress={() => setAdding(true)}>
-          <Text style={styles.bottomIconText}>＋</Text>
-        </TouchableOpacity>
-        {streams.length > 0 && (
-          <TouchableOpacity accessibilityLabel="更新" style={styles.bottomIconButton} onPress={reloadAll}>
-            <Text style={styles.bottomIconText}>↻</Text>
-          </TouchableOpacity>
+        {viewMode && (
+          <View
+            style={[styles.viewModeExitWrap, !exitVisible && styles.viewModeExitHidden]}
+            pointerEvents={exitVisible ? 'box-none' : 'none'}>
+            <TouchableOpacity accessibilityLabel="全画面を解除" style={styles.viewModeExitButton} onPress={exitViewMode}>
+              <Text style={styles.viewModeExitText}>全画面を解除</Text>
+            </TouchableOpacity>
+          </View>
         )}
       </View>
+
+      {!viewMode && (
+        <View style={styles.viewBottomControls}>
+          <View style={sharedStyles.iconSegment}>
+            <TouchableOpacity
+              style={[sharedStyles.iconSegmentButton, settings.layoutMode === 'stacked' && sharedStyles.iconSegmentButtonActive]}
+              onPress={() => onSettings({layoutMode: 'stacked'})}>
+              <Text style={[sharedStyles.iconSegmentText, settings.layoutMode === 'stacked' && sharedStyles.iconSegmentTextActive]}>▥</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[sharedStyles.iconSegmentButton, settings.layoutMode === 'grid' && sharedStyles.iconSegmentButtonActive]}
+              onPress={() => onSettings({layoutMode: 'grid'})}>
+              <Text style={[sharedStyles.iconSegmentText, settings.layoutMode === 'grid' && sharedStyles.iconSegmentTextActive]}>▦</Text>
+            </TouchableOpacity>
+          </View>
+          <View style={styles.viewBottomSpacer} />
+          {streams.length > 0 && (
+            <TouchableOpacity accessibilityLabel="全画面" style={[styles.bottomIconButton, styles.bottomWideButton]} onPress={() => onViewMode(true)}>
+              <Text style={[styles.bottomIconText, styles.bottomIconLabel]}>全画面</Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity accessibilityLabel="引き継ぎ" style={styles.bottomIconButton} onPress={() => setHandoffOpen(true)}>
+            <Text style={[styles.bottomIconText, styles.bottomIconLabel]}>QR</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.bottomIconButton} onPress={() => setAdding(true)}>
+            <Text style={styles.bottomIconText}>＋</Text>
+          </TouchableOpacity>
+          {streams.length > 0 && (
+            <TouchableOpacity accessibilityLabel="更新" style={styles.bottomIconButton} onPress={reloadAll}>
+              <Text style={styles.bottomIconText}>↻</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      )}
 
       <HandoffModal
         visible={handoffOpen}
@@ -919,6 +976,7 @@ const StreamCell = React.memo(function StreamCell({
   onVolume,
   auth,
   onAuth,
+  viewMode,
 }: {
   viewingActive?: boolean;
   stream: StreamItem;
@@ -938,6 +996,7 @@ const StreamCell = React.memo(function StreamCell({
   onVolume: (stream: StreamItem, volume: number) => void;
   auth: AuthState;
   onAuth: AuthCommit;
+  viewMode: boolean;
 }) {
   const info = platformInfo(stream.platform);
   const [commentOpen, setCommentOpen] = useState(false);
@@ -975,6 +1034,12 @@ const StreamCell = React.memo(function StreamCell({
     niconicoCommentRef.current = send;
   }, []);
   const {chromeVisible, showChrome} = useAutoHidingChrome(stream.id);
+  useEffect(() => {
+    if (viewMode) {
+      // ビューモードではセル操作UIを出さないので、開いていたコメント入力も閉じる。
+      setCommentOpen(false);
+    }
+  }, [viewMode]);
   const updateDragTarget = useCallback(
     (dx: number, dy: number) => {
       showChrome();
@@ -1073,7 +1138,7 @@ const StreamCell = React.memo(function StreamCell({
 
   return (
     <View style={[styles.streamCell, reordering && styles.streamCellReordering]} onLayout={handleCellLayout}>
-      <View style={styles.player} onTouchStart={showChrome}>
+      <View style={styles.player} onTouchStart={viewMode ? undefined : showChrome}>
         {paused ? (
           <View style={sharedStyles.playerPlaceholder}>
             <Text style={sharedStyles.playerStatus}>フォーカス表示中</Text>
@@ -1093,58 +1158,60 @@ const StreamCell = React.memo(function StreamCell({
             onViewerCount={setWebViewerCount}
           />
         )}
-        <View style={sharedStyles.playerChrome} pointerEvents="box-none">
-          {!chromeVisible && <Pressable style={sharedStyles.chromeRevealTouch} onPress={showChrome} />}
-          {settings.showViewerCount && (
-            <ViewerCountBadge stream={stream} externalCount={webViewerCount} visible={chromeVisible} active={viewingActive !== false} />
-          )}
-          <View
-            style={[sharedStyles.autoHideChrome, !chromeVisible && sharedStyles.autoHideChromeHidden]}
-            pointerEvents={chromeVisible ? 'box-none' : 'none'}>
-            <View style={styles.cellTopControls} pointerEvents="box-none">
-              {/* 「□」は意味が伝わらない。コメント欄トグルは文字ラベルにし、絵文字の
-                  吹き出し(カラービットマップ化してtint不能)は使わない。 */}
-              <TouchableOpacity
-                accessibilityLabel="コメント入力"
-                style={[sharedStyles.overlayButton, commentOpen && styles.overlayButtonActive]}
-                onPress={() => setCommentOpen(current => !current)}>
-                <Text style={[styles.overlayLabel, commentOpen && styles.overlayIconActive]}>コメ</Text>
-              </TouchableOpacity>
-              <TouchableOpacity accessibilityLabel="拡大表示" style={sharedStyles.overlayButton} onPress={handleFocus}>
-                <Text style={sharedStyles.overlayIcon}>⤢</Text>
-              </TouchableOpacity>
-              <TouchableOpacity accessibilityLabel="再読み込み" style={sharedStyles.overlayButton} onPress={handleReload}>
-                <Text style={sharedStyles.overlayIcon}>↻</Text>
-              </TouchableOpacity>
-              <TouchableOpacity accessibilityLabel="削除" style={sharedStyles.overlayButton} onPress={handleRemove}>
-                <Text style={sharedStyles.overlayIcon}>✕</Text>
-              </TouchableOpacity>
+        {!viewMode && (
+          <View style={sharedStyles.playerChrome} pointerEvents="box-none">
+            {!chromeVisible && <Pressable style={sharedStyles.chromeRevealTouch} onPress={showChrome} />}
+            {settings.showViewerCount && (
+              <ViewerCountBadge stream={stream} externalCount={webViewerCount} visible={chromeVisible} active={viewingActive !== false} />
+            )}
+            <View
+              style={[sharedStyles.autoHideChrome, !chromeVisible && sharedStyles.autoHideChromeHidden]}
+              pointerEvents={chromeVisible ? 'box-none' : 'none'}>
+              <View style={styles.cellTopControls} pointerEvents="box-none">
+                {/* 「□」は意味が伝わらない。コメント欄トグルは文字ラベルにし、絵文字の
+                    吹き出し(カラービットマップ化してtint不能)は使わない。 */}
+                <TouchableOpacity
+                  accessibilityLabel="コメント入力"
+                  style={[sharedStyles.overlayButton, commentOpen && styles.overlayButtonActive]}
+                  onPress={() => setCommentOpen(current => !current)}>
+                  <Text style={[styles.overlayLabel, commentOpen && styles.overlayIconActive]}>コメ</Text>
+                </TouchableOpacity>
+                <TouchableOpacity accessibilityLabel="拡大表示" style={sharedStyles.overlayButton} onPress={handleFocus}>
+                  <Text style={sharedStyles.overlayIcon}>⤢</Text>
+                </TouchableOpacity>
+                <TouchableOpacity accessibilityLabel="再読み込み" style={sharedStyles.overlayButton} onPress={handleReload}>
+                  <Text style={sharedStyles.overlayIcon}>↻</Text>
+                </TouchableOpacity>
+                <TouchableOpacity accessibilityLabel="削除" style={sharedStyles.overlayButton} onPress={handleRemove}>
+                  <Text style={sharedStyles.overlayIcon}>✕</Text>
+                </TouchableOpacity>
+              </View>
+              <VolumeOverlay stream={stream} volume={volume} color={info.color} onVolume={onVolume} onInteract={showChrome} />
+              <View style={styles.reorderHandle} {...reorderResponder.panHandlers}>
+                <Text style={styles.reorderIcon}>≡</Text>
+              </View>
             </View>
-            <VolumeOverlay stream={stream} volume={volume} color={info.color} onVolume={onVolume} onInteract={showChrome} />
-            <View style={styles.reorderHandle} {...reorderResponder.panHandlers}>
-              <Text style={styles.reorderIcon}>≡</Text>
-            </View>
+            {commentOpen && (
+              <View style={styles.commentBar}>
+                <TextInput
+                  value={commentText}
+                  onChangeText={setCommentText}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  placeholder="コメント"
+                  placeholderTextColor="rgba(255,255,255,0.55)"
+                  style={styles.commentInput}
+                  returnKeyType="send"
+                  onSubmitEditing={submitComment}
+                />
+                <TouchableOpacity style={styles.commentSend} onPress={submitComment}>
+                  <Text style={styles.commentSendText}>送信</Text>
+                </TouchableOpacity>
+                {!!commentStatus && <Text style={styles.commentStatus} numberOfLines={1}>{commentStatus}</Text>}
+              </View>
+            )}
           </View>
-          {commentOpen && (
-            <View style={styles.commentBar}>
-              <TextInput
-                value={commentText}
-                onChangeText={setCommentText}
-                autoCapitalize="none"
-                autoCorrect={false}
-                placeholder="コメント"
-                placeholderTextColor="rgba(255,255,255,0.55)"
-                style={styles.commentInput}
-                returnKeyType="send"
-                onSubmitEditing={submitComment}
-              />
-              <TouchableOpacity style={styles.commentSend} onPress={submitComment}>
-                <Text style={styles.commentSendText}>送信</Text>
-              </TouchableOpacity>
-              {!!commentStatus && <Text style={styles.commentStatus} numberOfLines={1}>{commentStatus}</Text>}
-            </View>
-          )}
-        </View>
+        )}
       </View>
     </View>
   );
@@ -1215,6 +1282,32 @@ const styles = StyleSheet.create({
   bottomIconLabel: {
     fontSize: 14,
     lineHeight: 18,
+  },
+  bottomWideButton: {
+    width: 64,
+  },
+  viewModeExitWrap: {
+    position: 'absolute',
+    top: 10,
+    right: 12,
+  },
+  viewModeExitHidden: {
+    opacity: 0,
+  },
+  viewModeExitButton: {
+    minHeight: 40,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(255,255,255,0.28)',
+    backgroundColor: 'rgba(0,0,0,0.66)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  viewModeExitText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '800',
   },
   empty: {
     flex: 1,

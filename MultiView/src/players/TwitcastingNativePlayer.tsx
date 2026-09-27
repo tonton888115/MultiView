@@ -9,7 +9,7 @@ import type {AppSettings, StreamItem} from '../types';
 import {isAdBlockedURL} from '../adblock';
 import {webFallbackScript} from '../webInject';
 import {twitcastingSessionScript} from '../twitcasting';
-import {useNetworkType} from '../network';
+import {useQualityNetworkType} from '../network';
 import {useRecoveringNativeSession} from '../useRecoveringNativeSession';
 import {nativeFirstFrameTimeoutMs, shouldFallbackForMissingNativeFrame, shouldRenderNativeSession, shouldRestartSessionOnAppState} from '../sessionRecovery';
 import {sharedStyles} from '../components/sharedStyles';
@@ -37,8 +37,8 @@ export const TwitcastingNativePlayer = React.memo(function TwitcastingNativePlay
 }) {
   const [hls, setHls] = useState<{url: string; cookieHeader: string} | null>(null);
   const [nativeFrameReady, setNativeFrameReady] = useState(false);
-  const [missingNativeFrameFallback, setMissingNativeFrameFallback] = useState(false);
-  const networkType = useNetworkType();
+  // 画質用の回線種別はオフライン中も直前の値を保つ(瞬断でセッションを作り直さない)。
+  const networkType = useQualityNetworkType();
   const playbackQuality = effectiveQuality(settings, streamCount, networkType);
   const channel = stream.channel.trim();
   const recovery = useRecoveringNativeSession(`${channel}:${playbackQuality}:${reloadKey}`);
@@ -72,17 +72,15 @@ export const TwitcastingNativePlayer = React.memo(function TwitcastingNativePlay
   useEffect(() => {
     setHls(null);
     setNativeFrameReady(false);
-    setMissingNativeFrameFallback(false);
     startSessionWatchdog();
   }, [sessionKey, startSessionWatchdog]);
 
   useEffect(() => {
     setNativeFrameReady(false);
-    setMissingNativeFrameFallback(false);
   }, [hls?.url]);
 
   useEffect(() => {
-    if (!hls || useWebFallback || nativeFrameReady || missingNativeFrameFallback) {
+    if (!hls || useWebFallback || nativeFrameReady) {
       return;
     }
     const timer = setTimeout(() => {
@@ -95,7 +93,7 @@ export const TwitcastingNativePlayer = React.memo(function TwitcastingNativePlay
       }
     }, nativeFirstFrameTimeoutMs);
     return () => clearTimeout(timer);
-  }, [hls, missingNativeFrameFallback, nativeFrameReady, restartSessionNow, useWebFallback]);
+  }, [hls, nativeFrameReady, restartSessionNow, useWebFallback]);
 
   const onSessionMessage = useCallback(
     (event: WebViewMessageEvent, eventSessionKey: string) => {
@@ -117,7 +115,7 @@ export const TwitcastingNativePlayer = React.memo(function TwitcastingNativePlay
     },
     [markSessionResolved, scheduleReconnect],
   );
-  const renderWebFallback = useWebFallback || missingNativeFrameFallback;
+  const renderWebFallback = useWebFallback;
 
   // 注入スクリプト文字列とインラインハンドラのレンダー毎再生成を止める(memo対応)。
   const sessionInjectionScript = useMemo(() => twitcastingSessionScript(channel), [channel]);
@@ -151,35 +149,34 @@ export const TwitcastingNativePlayer = React.memo(function TwitcastingNativePlay
       if (payload.type === 'firstFrame') {
         setNativeFrameReady(true);
       }
-      if (payload.type === 'error') {
-        setMissingNativeFrameFallback(true);
-      }
+      // error は handlePlayerStatus がセッションを作り直す。以前はここで一時Webフォール
+      // バックへ切り替えており、作り直しまでの1描画だけ公式ページ(音声付き)を読み込み
+      // 始めてはすぐ破棄する無駄なちらつきになっていた。
       handlePlayerStatus(payload.type, payload.message, paused);
     },
     [handlePlayerStatus, paused],
   );
 
   // streamserver.php は player=pc_web でも Android mobile UA で通るため、WebView と HLS の UA を揃える。
-  const sessionWebView =
-    !missingNativeFrameFallback ? (
-      <WebView
-        key={`twitcasting-session:${sessionKey}`}
-        source={{uri: `https://twitcasting.tv/${encodeURIComponent(channel)}`}}
-        userAgent={mobileUserAgent}
-        javaScriptEnabled
-        domStorageEnabled
-        sharedCookiesEnabled
-        thirdPartyCookiesEnabled
-        setSupportMultipleWindows={false}
-        injectedJavaScript={sessionInjectionScript}
-        onMessage={handleSessionMessage}
-        onError={scheduleReconnect}
-        onHttpError={scheduleReconnect}
-        onRenderProcessGone={scheduleReconnect}
-        containerStyle={sharedStyles.hiddenBridgeWeb}
-        style={sharedStyles.hiddenBridgeWeb}
-      />
-    ) : null;
+  const sessionWebView = (
+    <WebView
+      key={`twitcasting-session:${sessionKey}`}
+      source={{uri: `https://twitcasting.tv/${encodeURIComponent(channel)}`}}
+      userAgent={mobileUserAgent}
+      javaScriptEnabled
+      domStorageEnabled
+      sharedCookiesEnabled
+      thirdPartyCookiesEnabled
+      setSupportMultipleWindows={false}
+      injectedJavaScript={sessionInjectionScript}
+      onMessage={handleSessionMessage}
+      onError={scheduleReconnect}
+      onHttpError={scheduleReconnect}
+      onRenderProcessGone={scheduleReconnect}
+      containerStyle={sharedStyles.hiddenBridgeWeb}
+      style={sharedStyles.hiddenBridgeWeb}
+    />
+  );
 
   if (hls && shouldRenderNativeSession(true, renderWebFallback)) {
     return (

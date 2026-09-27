@@ -12,7 +12,13 @@ type NativeNetworkInfoModule = {
 
 const pollIntervalMs = 8000;
 const listeners = new Set<(type: NetworkType) => void>();
+const restoreListeners = new Set<() => void>();
 let currentNetworkType: NetworkType = 'none';
+// 初回の問い合わせが返るまでは 'none' でも「未確定」であって「オフライン」ではない。
+let networkTypeKnown = false;
+// 画質判定用: 直近に接続していた回線種別。瞬断('none')のたびに画質=セッションキーが
+// 変わって視聴セッションを作り直さないよう、オフライン中は直前の回線種別を保つ。
+let lastConnectedNetworkType: NetworkType = 'none';
 let nativeSubscription: {remove: () => void} | undefined;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -51,11 +57,29 @@ export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs
 
 function applyType(value: unknown) {
   const next = parseNetworkType(value);
-  if (!next || next === currentNetworkType) {
+  if (!next) {
+    return;
+  }
+  const wasOffline = networkTypeKnown && currentNetworkType === 'none';
+  networkTypeKnown = true;
+  if (next === currentNetworkType) {
     return;
   }
   currentNetworkType = next;
+  if (next !== 'none') {
+    lastConnectedNetworkType = next;
+  }
   listeners.forEach(listener => listener(next));
+  if (wasOffline && next !== 'none') {
+    // 回線復帰: 待機中/失敗中のプレイヤーをバックオフ待ちにせず即再接続させる。
+    restoreListeners.forEach(listener => {
+      try {
+        listener();
+      } catch {
+        // 1つの購読者の失敗で他の復帰処理を止めない。
+      }
+    });
+  }
 }
 
 function pollConnectionType() {
@@ -98,6 +122,46 @@ function stopMonitoring() {
     pollTimer = undefined;
   }
   currentNetworkType = 'none';
+  networkTypeKnown = false;
+}
+
+// 端末がオフラインだと確定している時だけ true(起動直後の未確定状態は false)。
+// 復旧処理はこの間リトライ回数を消費せず、回線復帰(onNetworkRestored)を待つ。
+export function isNetworkKnownOffline(): boolean {
+  return networkTypeKnown && currentNetworkType === 'none';
+}
+
+export function onNetworkRestored(listener: () => void): () => void {
+  restoreListeners.add(listener);
+  return () => {
+    restoreListeners.delete(listener);
+  };
+}
+
+function useNetworkListener<T>(select: () => T): T {
+  const [value, setValue] = useState<T>(select);
+
+  useEffect(() => {
+    const listener = () => setValue(select());
+    listeners.add(listener);
+    startMonitoring();
+    listener();
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) {
+        stopMonitoring();
+      }
+    };
+    // select は呼び出し側で固定の関数を渡す。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return value;
+}
+
+// 画質(エコノミー判定/セッションキー)用の回線種別。オフライン中は直前の回線種別を返す。
+export function useQualityNetworkType(): NetworkType {
+  return useNetworkListener(() => lastConnectedNetworkType);
 }
 
 export function useNetworkType(): NetworkType {

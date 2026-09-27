@@ -15,6 +15,7 @@ class MultiViewPackage : ReactPackage {
       GiftSoundModule(reactContext),
       HandoffQrModule(reactContext),
       WebDataModule(reactContext),
+      SystemUiModule(reactContext),
     )
 
   override fun createViewManagers(reactContext: ReactApplicationContext): MutableList<ViewManager<*, *>> =
