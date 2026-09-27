@@ -9,7 +9,7 @@ import type {AppSettings, NiconicoCommentSender, PlaybackSource, StreamItem} fro
 import {isAdBlockedURL} from '../adblock';
 import {injectWebComment, webFallbackScript} from '../webInject';
 import {isNetworkKnownOffline, onNetworkRestored, useQualityNetworkType} from '../network';
-import {autoReloadBackoffMs, nativeSourceRecoveryDelayForAttempt, nextAutoReloadAttempt, shouldRecoverNativeSource, shouldReloadCellOnViewActivation, shouldReloadOnViewActivation, youtubeUpgradeDelayForAttempt} from '../sessionRecovery';
+import {autoReloadBackoffMs, nativeSourceRecoveryDelayForAttempt, networkRestoreGraceMs, nextAutoReloadAttempt, shouldRecoverNativeSource, shouldReloadCellOnViewActivation, shouldReloadOnViewActivation, youtubeUpgradeDelayForAttempt} from '../sessionRecovery';
 import type {PlayerHealth} from '../sessionRecovery';
 import {PlayerBadge} from '../components/PlayerBadge';
 import {sharedStyles} from '../components/sharedStyles';
@@ -75,6 +75,10 @@ export const StreamPlayer = React.memo(function StreamPlayer({
   const autoReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // 回線断中に壊れたセル。再取得は必ず失敗して試行回数だけ消費するので、回線復帰まで待つ。
   const waitingForNetworkRef = useRef(false);
+  // 直近の障害がエラー無しの停止(stall)か。プレイヤーは生きているので回線復帰後に自力で
+  // 再開する余地がある。
+  const lastFailureWasStallRef = useRef(false);
+  const restoreGraceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previouslyViewingActiveRef = useRef(viewingActive);
   // 手動更新/配信切替と自動復旧の解決が並走したとき、古い方の結果で新しいプレイヤーを
   // 上書きしないための世代。最新の解決だけが setSource できる。
@@ -91,6 +95,10 @@ export const StreamPlayer = React.memo(function StreamPlayer({
     if (autoReloadTimerRef.current) {
       clearTimeout(autoReloadTimerRef.current);
       autoReloadTimerRef.current = null;
+    }
+    if (restoreGraceTimerRef.current) {
+      clearTimeout(restoreGraceTimerRef.current);
+      restoreGraceTimerRef.current = null;
     }
   }, []);
   const fireAutoReload = useCallback(() => {
@@ -130,6 +138,25 @@ export const StreamPlayer = React.memo(function StreamPlayer({
       autoReloadAttemptRef.current = 0;
       nativeRecoveryAttemptRef.current = 0;
       youtubeRetryRef.current = 0;
+      if (kind === 'native' && lastFailureWasStallRef.current) {
+        // まだ生きているプレイヤーに自力再開の猶予を与える(再生が戻れば作り直さない)。
+        // 回線断を検知する前に予約された作り直しがあれば、猶予を優先して取り消す。
+        if (autoReloadTimerRef.current) {
+          clearTimeout(autoReloadTimerRef.current);
+          autoReloadTimerRef.current = null;
+        }
+        if (!restoreGraceTimerRef.current) {
+          restoreGraceTimerRef.current = setTimeout(() => {
+            restoreGraceTimerRef.current = null;
+            if (playerHealthRef.current !== 'healthy') {
+              fireAutoReload();
+            } else {
+              waitingForNetworkRef.current = false;
+            }
+          }, networkRestoreGraceMs);
+        }
+        return;
+      }
       fireAutoReload();
     });
   }, [fireAutoReload, stream.platform]);
@@ -185,15 +212,22 @@ export const StreamPlayer = React.memo(function StreamPlayer({
       // 'idle' は致命的エラー後の停止状態。error イベントが失われても復旧に繋ぐ。
       if (payload.type === 'error' || payload.message === 'ended' || payload.message === 'idle') {
         playerHealthRef.current = 'broken';
+        lastFailureWasStallRef.current = payload.type === 'error' && payload.message === 'stall';
         scheduleAutoReload();
       } else if (payload.type === 'firstFrame' || payload.message === 'playing') {
         // 'ready'(STATE_READY)は映像を一度も描画していなくても発火するため健全の根拠に
         // しない(READYのまま固まったセルがタブ復帰リロードを免れる)。実描画(firstFrame)
         // か再生進行(playing。音声のみ配信もここを通る)だけを健全とみなす。
         playerHealthRef.current = 'healthy';
+        if (lastFailureWasStallRef.current) {
+          // 停止(stall)後にプレイヤーが自力で再開した。予約済みの作り直しは不要。
+          lastFailureWasStallRef.current = false;
+          waitingForNetworkRef.current = false;
+          clearAutoReloadTimer();
+        }
       }
     },
-    [scheduleAutoReload],
+    [clearAutoReloadTimer, scheduleAutoReload],
   );
 
   // 配信切替/手動更新: 取得中表示に戻して解決し直す。

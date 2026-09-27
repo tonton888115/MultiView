@@ -19,6 +19,11 @@ export function autoReloadBackoffMs(attempt: number): number {
 // 次の障害は初回扱い(最短間隔)で復旧する。
 export const autoReloadAttemptResetMs = 90_000;
 
+// 回線復帰時、エラー無しの停止(stall)で止まっていたネイティブプレイヤーはまだ生きており、
+// 自力で再開することが多い(作り直すと数秒黒画面になる)。この猶予内に再生が戻らなければ
+// 作り直す。致命的エラーで止まったもの(IDLE)は猶予なしで作り直す。
+export const networkRestoreGraceMs = 6_000;
+
 export function nextAutoReloadAttempt(attempt: number, nowMs: number, lastReloadAtMs: number): number {
   return nowMs - lastReloadAtMs >= autoReloadAttemptResetMs ? 0 : attempt;
 }

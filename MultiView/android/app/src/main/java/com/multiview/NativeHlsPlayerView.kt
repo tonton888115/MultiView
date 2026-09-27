@@ -133,6 +133,9 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context), LifecycleEve
   private var lastStallRecoveryAtMs: Long? = null
   // 停止検知の1段目(その場でライブ端へ戻して読み直す)を試したか。進行が戻ればリセット。
   private var inPlaceRecoveryTried = false
+  // 1段目のシークで再生位置がライブ端へ飛んだ分を「進行」と数えない(数えると2段目の
+  // URL再取得へ永久に進めず、エラー無しで固まった配信が止まったままになる)。
+  private var rebaselineAfterRecovery = false
   private var presentationNotified = false
   private var videoOutputRebindAttempts = 0
   private val rebindVideoOutput = object : Runnable {
@@ -169,10 +172,19 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context), LifecycleEve
         resetProgressSample(now)
       } else if (exoPlayer.playbackState != Player.STATE_IDLE && exoPlayer.playbackState != Player.STATE_ENDED) {
         val position = exoPlayer.currentPosition
-        if (lastProgressPositionMs == C.TIME_UNSET || position > lastProgressPositionMs + MIN_PROGRESS_MS) {
+        if (rebaselineAfterRecovery) {
+          rebaselineAfterRecovery = false
+          lastProgressPositionMs = position
+        } else if (lastProgressPositionMs == C.TIME_UNSET || position > lastProgressPositionMs + MIN_PROGRESS_MS) {
+          val recoveredInPlace = inPlaceRecoveryTried && lastProgressPositionMs != C.TIME_UNSET
           lastProgressPositionMs = position
           lastProgressAtMs = now
           inPlaceRecoveryTried = false
+          if (recoveredInPlace) {
+            // その場復旧で再生が実際に進み始めた。isPlaying の変化イベントが出ない場合でも
+            // JS に健全を伝え、不要な作り直しをさせない。
+            emit("status", "playing")
+          }
         } else if (now - lastProgressAtMs >= STALL_THRESHOLD_MS) {
           val cooldownElapsed = lastStallRecoveryAtMs?.let { now - it >= STALL_RECOVERY_COOLDOWN_MS } ?: true
           if (!inPlaceRecoveryTried) {
@@ -500,6 +512,7 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context), LifecycleEve
     lastProgressPositionMs = C.TIME_UNSET
     lastProgressAtMs = now
     inPlaceRecoveryTried = false
+    rebaselineAfterRecovery = false
   }
 
   private fun recoverInPlace() {
@@ -509,6 +522,7 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context), LifecycleEve
     if (exoPlayer.playbackState == Player.STATE_IDLE) {
       exoPlayer.prepare()
     }
+    rebaselineAfterRecovery = true
     exoPlayer.seekToDefaultPosition()
     exoPlayer.playWhenReady = !paused
   }
