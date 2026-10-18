@@ -85,7 +85,7 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private let playbackBlocker = PlaybackBlockingOverlay()
   var playbackVolume: Float
   private var channelTask: URLSessionDataTask?
-  private var socketTask: URLSessionWebSocketTask?
+  private var chatClient: KickRealtimeClient?
   private var itemStatusObservation: NSKeyValueObservation?
   private var itemFailedObserver: NSObjectProtocol?
   private var itemEndedObserver: NSObjectProtocol?
@@ -236,8 +236,8 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     channelTask = nil
     player.pause()
     player.replaceCurrentItem(with: nil)
-    socketTask?.cancel(with: .goingAway, reason: nil)
-    socketTask = nil
+    chatClient?.stop()
+    chatClient = nil
     chatroomID = nil
     kickChannelID = nil
     fallbackWebView?.stopPlayback()
@@ -621,8 +621,8 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
       self.teardownPlayback()
       self.fallbackWebView?.pausePlayback()
       self.fallbackWebView?.isUserInteractionEnabled = false
-      self.socketTask?.cancel(with: .goingAway, reason: nil)
-      self.socketTask = nil
+      self.chatClient?.stop()
+      self.chatClient = nil
       self.statusLabel.isHidden = true
       self.playbackBlocker.show(
         title: "Kick配信は終了したか、再生できません",
@@ -711,8 +711,8 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
         web.bottomAnchor.constraint(equalTo: self.bottomAnchor)
       ])
       self.fallbackWebView = web
-      self.socketTask?.cancel(with: .goingAway, reason: nil)
-      self.socketTask = nil
+      self.chatClient?.stop()
+      self.chatClient = nil
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
         web.resumePlayback()
       }
@@ -850,77 +850,25 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
     }
   }
 
+  // 動画の再取得(復旧)でも呼ばれるが、同じチャットルームに接続中なら貼り直さない
+  // (再接続はクライアント側が自前で行う。貼り直すとその間のコメントを落とす)。
   private func connectKickComments(chatroomID: String) {
-    guard (settings.showChat || settings.autoFollowRaids), !isStopped else { return }
-    self.chatroomID = chatroomID
-    socketTask?.cancel(with: .goingAway, reason: nil)
-    guard let url = URL(string: "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=ios-native&version=1.0&flash=false") else { return }
-    let task = URLSession.shared.webSocketTask(with: url)
-    socketTask = task
-    task.resume()
-    // Chat messages arrive on the chatroom channel; host/raid (ChatMove…) and
-    // other channel events arrive on the channel's own Pusher channel, so
-    // subscribe to both.
-    var channels = ["chatrooms.\(chatroomID).v2"]
-    if let channelID = kickChannelID, !channelID.isEmpty {
-      channels.append("channel.\(channelID)")
-    }
-    for channelName in channels {
-      let payload: [String: Any] = [
-        "event": "pusher:subscribe",
-        "data": ["auth": "", "channel": channelName]
-      ]
-      if let data = try? JSONSerialization.data(withJSONObject: payload),
-         let text = String(data: data, encoding: .utf8) {
-        task.send(.string(text)) { _ in }
-      }
-    }
-    receiveKickComment()
-  }
-
-  private func receiveKickComment() {
-    socketTask?.receive { [weak self] result in
-      guard let self, !self.isStopped else { return }
-      switch result {
-      case .failure:
-        self.socketTask?.cancel(with: .goingAway, reason: nil)
-        self.socketTask = nil
-        if let chatroomID = self.chatroomID {
-          DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self,
-                  !self.isStopped,
-                  self.fallbackWebView == nil,
-                  self.chatroomID == chatroomID else { return }
-            self.connectKickComments(chatroomID: chatroomID)
-          }
-        }
-      case .success(let message):
-        if case .string(let text) = message {
-          self.handleKickSocketMessage(text)
-        }
-        self.receiveKickComment()
+    DispatchQueue.main.async {
+      guard (self.settings.showChat || self.settings.autoFollowRaids),
+            !self.isStopped,
+            self.fallbackWebView == nil else { return }
+      if self.chatClient != nil, self.chatroomID == chatroomID { return }
+      self.chatroomID = chatroomID
+      self.chatClient?.stop()
+      self.chatClient = KickRealtimeClient(chatroomID: chatroomID, channelID: self.kickChannelID) { [weak self] event, payload in
+        self?.handleKickEvent(event, payload: payload)
       }
     }
   }
 
-  private func handleKickSocketMessage(_ text: String) {
-    guard let data = text.data(using: .utf8),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let event = json["event"] as? String else { return }
-    if event == "pusher:ping" {
-      socketTask?.send(.string(#"{"event":"pusher:pong","data":{}}"#)) { _ in }
-      return
-    }
-    let payloadData: Data?
-    if let raw = json["data"] as? String {
-      payloadData = raw.data(using: .utf8)
-    } else if let raw = json["data"] as? [String: Any] {
-      payloadData = try? JSONSerialization.data(withJSONObject: raw)
-    } else {
-      payloadData = nil
-    }
-    guard let payloadData,
-          let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else { return }
+  // Pusher / Centrifugo どちらの経路でも公式 envelope の {event, data} は同じ。main で呼ばれる。
+  private func handleKickEvent(_ event: String, payload: [String: Any]) {
+    guard !isStopped else { return }
     // Auto-follow a raid/host ONLY from Kick's explicit host/raid events. Chat text
     // は走査しない (誤検知の元)。Kick はイベント名を時々変えるので、Raid/Host を
     // 含む event class を網羅的に拾うようにしている。
@@ -1202,5 +1150,317 @@ final class KickNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, 
   private static let userAgent = BrowserUserAgent.mobileSafari
   private static var useIvsPlayer: Bool {
     !UserDefaults.standard.bool(forKey: "playback.kick.ivs.disabled")
+  }
+}
+
+// Kick チャットの realtime 接続。2026-10 に Pusher(ws-us2 / 32cbd69e…)は
+// "App key not in this cluster" で即切断されるようになり、公式 Web は web.kick.com の
+// 交渉 API が返す provider(現状 Centrifugo)へ接続している。公式と同じく交渉結果を正とし、
+// pusher が返れば従来の Pusher で接続する。状態は main キューでのみ触る。
+final class KickRealtimeClient {
+  enum App {
+    case centrifugo(URL)
+    case pusher(appKey: String, cluster: String)
+  }
+
+  enum Frame {
+    case ping
+    case reply(id: Int, error: String?, ttl: Double?)
+    case publication(event: String, payload: [String: Any])
+  }
+
+  // 交渉 API 自体が落ちている時の既定値(2026-10 時点の公式応答)。
+  private static let defaultCentrifugoURL = URL(string: "wss://realtime.us-east-1.platform.kick.com/connection/websocket")!
+  private static let apiBase = "https://web.kick.com/api/v1/realtime"
+  // Centrifugo は Origin を検査する(kick.com / 同一ホスト以外は 403)。
+  private static let origin = "https://kick.com"
+
+  private let channels: [String]
+  private let channelID: String?
+  private let onEvent: (String, [String: Any]) -> Void
+  private let clientID = UUID().uuidString.lowercased()
+  private var socket: URLSessionWebSocketTask?
+  private var stopped = false
+  private var nextCommandID = 1
+  private var retryWork: DispatchWorkItem?
+  private var refreshWork: DispatchWorkItem?
+
+  init(chatroomID: String, channelID: String?, onEvent: @escaping (String, [String: Any]) -> Void) {
+    // チャットは chatroom チャンネル、ホスト/レイド等はチャンネル側に来るので両方購読する。
+    var channels = ["chatrooms.\(chatroomID).v2"]
+    if let channelID, !channelID.isEmpty {
+      channels.append("channel.\(channelID)")
+    }
+    self.channels = channels
+    self.channelID = channelID
+    self.onEvent = onEvent
+    DispatchQueue.main.async { [weak self] in self?.start() }
+  }
+
+  func stop() {
+    let work = { [self] in
+      stopped = true
+      retryWork?.cancel()
+      retryWork = nil
+      refreshWork?.cancel()
+      refreshWork = nil
+      socket?.cancel(with: .goingAway, reason: nil)
+      socket = nil
+    }
+    if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
+  }
+
+  private func start() {
+    guard !stopped else { return }
+    negotiate { [weak self] app in
+      guard let self, !self.stopped else { return }
+      switch app {
+      case .pusher(let appKey, let cluster):
+        self.openPusher(appKey: appKey, cluster: cluster)
+      case .centrifugo(let url):
+        Self.fetchToken(clientID: self.clientID) { [weak self] token in
+          guard let self, !self.stopped else { return }
+          guard let token else {
+            self.scheduleRetry(after: 5)
+            return
+          }
+          self.openCentrifugo(url: url, token: token)
+        }
+      }
+    }
+  }
+
+  private func scheduleRetry(after delay: TimeInterval) {
+    guard !stopped else { return }
+    retryWork?.cancel()
+    refreshWork?.cancel()
+    let work = DispatchWorkItem { [weak self] in self?.start() }
+    retryWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+  }
+
+  private func negotiate(_ completion: @escaping (App) -> Void) {
+    guard let channelID, !channelID.isEmpty else {
+      completion(.centrifugo(Self.defaultCentrifugoURL))
+      return
+    }
+    let body: [String: Any] = [
+      "client": ["id": clientID, "type": "web"],
+      "capabilities": ["accepted_providers": [["provider": "pusher"], ["provider": "centrifugo"]]]
+    ]
+    Self.postJSON("/channels/\(channelID)/chat/connection", body: body) { json in
+      completion(Self.realtimeApp(from: json) ?? .centrifugo(Self.defaultCentrifugoURL))
+    }
+  }
+
+  private func openPusher(appKey: String, cluster: String) {
+    guard let url = URL(string: "wss://ws-\(cluster).pusher.com/app/\(appKey)?protocol=7&client=ios-native&version=1.0&flash=false") else {
+      scheduleRetry(after: 5)
+      return
+    }
+    let task = URLSession.shared.webSocketTask(with: url)
+    socket = task
+    task.resume()
+    for channel in channels {
+      sendJSON(["event": "pusher:subscribe", "data": ["auth": "", "channel": channel]])
+    }
+    receive(task, parse: { Self.pusherFrame($0).map { [$0] } ?? [] }) { [weak self] frame in
+      guard let self else { return }
+      switch frame {
+      case .ping:
+        self.sendText(#"{"event":"pusher:pong","data":{}}"#)
+      case .publication(let event, let payload):
+        self.onEvent(event, payload)
+      case .reply:
+        break
+      }
+    }
+  }
+
+  private func openCentrifugo(url: URL, token: String) {
+    var request = URLRequest(url: url)
+    request.setValue(Self.origin, forHTTPHeaderField: "Origin")
+    let task = URLSession.shared.webSocketTask(with: request)
+    socket = task
+    nextCommandID = 1
+    task.resume()
+    sendCommand(["connect": ["token": token, "name": "js"]])
+    receive(task, parse: Self.centrifugoFrames) { [weak self] frame in
+      guard let self else { return }
+      switch frame {
+      case .ping:
+        self.sendText("{}")
+      case .publication(let event, let payload):
+        self.onEvent(event, payload)
+      case .reply(let id, let error, let ttl):
+        if id == 1, error != nil {
+          self.socket?.cancel(with: .goingAway, reason: nil)
+          self.socket = nil
+          self.scheduleRetry(after: 5)
+          return
+        }
+        if id == 1 {
+          for channel in self.channels {
+            self.sendCommand(["subscribe": ["channel": channel]])
+          }
+        }
+        if let ttl {
+          self.scheduleTokenRefresh(ttl: ttl, task: task)
+        }
+      }
+    }
+  }
+
+  // 接続トークンは ~45 分で失効するので、期限前に refresh で貼り替える。
+  // 失敗してもサーバーが失効時に切断 → receive 失敗から再接続するので致命的ではない。
+  private func scheduleTokenRefresh(ttl: Double, task: URLSessionWebSocketTask) {
+    refreshWork?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      Self.fetchToken(clientID: self.clientID) { [weak self] token in
+        guard let self, !self.stopped, self.socket === task, let token else { return }
+        self.sendCommand(["refresh": ["token": token]])
+      }
+    }
+    refreshWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + max(30, ttl - 60), execute: work)
+  }
+
+  // JSON 解析は受信スレッドで済ませ、状態を触る処理だけ main へ戻す。
+  private func receive(_ task: URLSessionWebSocketTask, parse: @escaping (String) -> [Frame], handle: @escaping (Frame) -> Void) {
+    task.receive { [weak self] result in
+      let frames: [Frame]?
+      switch result {
+      case .success(.string(let text)):
+        frames = parse(text)
+      case .success(.data(let data)):
+        frames = String(data: data, encoding: .utf8).map(parse) ?? []
+      case .success:
+        frames = []
+      case .failure:
+        frames = nil
+      }
+      DispatchQueue.main.async {
+        guard let self, !self.stopped, self.socket === task else { return }
+        guard let frames else {
+          self.socket = nil
+          self.scheduleRetry(after: 3)
+          return
+        }
+        frames.forEach(handle)
+        guard self.socket === task else { return }
+        self.receive(task, parse: parse, handle: handle)
+      }
+    }
+  }
+
+  private func sendCommand(_ command: [String: Any]) {
+    var body = command
+    body["id"] = nextCommandID
+    nextCommandID += 1
+    sendJSON(body)
+  }
+
+  private func sendJSON(_ object: [String: Any]) {
+    guard let data = try? JSONSerialization.data(withJSONObject: object),
+          let text = String(data: data, encoding: .utf8) else { return }
+    sendText(text)
+  }
+
+  private func sendText(_ text: String) {
+    socket?.send(.string(text)) { _ in }
+  }
+
+  // 公式 Web の getRealtimeApp と同じ選び方: mode=websocket の connections を先頭から見て、
+  // 必要な credentials が揃った最初のものを使う。
+  static func realtimeApp(from json: [String: Any]?) -> App? {
+    let data = (json?["data"] as? [String: Any]) ?? json
+    guard (data?["mode"] as? String) == "websocket",
+          let connections = data?["connections"] as? [[String: Any]] else { return nil }
+    for connection in connections {
+      let credentials = connection["credentials"] as? [String: Any] ?? [:]
+      switch connection["provider"] as? String {
+      case "centrifugo":
+        if let raw = credentials["url"] as? String, let url = URL(string: raw) {
+          return .centrifugo(url)
+        }
+      case "pusher":
+        if let appKey = credentials["app_key"] as? String, !appKey.isEmpty,
+           let cluster = credentials["cluster"] as? String, !cluster.isEmpty {
+          return .pusher(appKey: appKey, cluster: cluster)
+        }
+      default:
+        break
+      }
+    }
+    return nil
+  }
+
+  // Centrifugo JSON プロトコルは 1 フレームに改行区切りで複数メッセージを載せる。
+  // `{}` はサーバー ping(pong:true なので `{}` を返す必要がある)。
+  static func centrifugoFrames(_ text: String) -> [Frame] {
+    text.split(separator: "\n").compactMap { line -> Frame? in
+      guard let data = String(line).data(using: .utf8),
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+      if json.isEmpty { return .ping }
+      if let id = json["id"] as? Int {
+        let result = (json["connect"] ?? json["refresh"]) as? [String: Any]
+        var errorText: String?
+        if let error = json["error"] as? [String: Any] {
+          errorText = (error["message"] as? String) ?? "code \(error["code"].map { "\($0)" } ?? "?")"
+        }
+        let ttl = (result?["expires"] as? Bool) == true ? (result?["ttl"] as? Double) : nil
+        return .reply(id: id, error: errorText, ttl: ttl)
+      }
+      guard let push = json["push"] as? [String: Any],
+            let pub = push["pub"] as? [String: Any],
+            let envelope = pub["data"] as? [String: Any],
+            let event = envelope["event"] as? String,
+            let payload = payloadObject(envelope["data"]) else { return nil }
+      return .publication(event: event, payload: payload)
+    }
+  }
+
+  static func pusherFrame(_ text: String) -> Frame? {
+    guard let data = text.data(using: .utf8),
+          let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let event = json["event"] as? String else { return nil }
+    if event == "pusher:ping" { return .ping }
+    guard let payload = payloadObject(json["data"]) else { return nil }
+    return .publication(event: event, payload: payload)
+  }
+
+  // envelope の data は JSON 文字列のことがある。
+  private static func payloadObject(_ value: Any?) -> [String: Any]? {
+    if let dict = value as? [String: Any] { return dict }
+    guard let text = value as? String, let data = text.data(using: .utf8) else { return nil }
+    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+  }
+
+  private static func fetchToken(clientID: String, completion: @escaping (String?) -> Void) {
+    postJSON("/auth/connection", body: ["client_id": clientID]) { json in
+      let token = (json?["data"] as? [String: Any])?["token"] as? String
+      completion(token?.isEmpty == false ? token : nil)
+    }
+  }
+
+  // completion は main で呼ぶ。失敗時は nil。
+  private static func postJSON(_ path: String, body: [String: Any], completion: @escaping ([String: Any]?) -> Void) {
+    guard let url = URL(string: apiBase + path),
+          let httpBody = try? JSONSerialization.data(withJSONObject: body) else {
+      DispatchQueue.main.async { completion(nil) }
+      return
+    }
+    var request = URLRequest(url: url, timeoutInterval: 10)
+    request.httpMethod = "POST"
+    request.httpBody = httpBody
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue(origin, forHTTPHeaderField: "Origin")
+    URLSession.shared.dataTask(with: request) { data, response, _ in
+      let ok = (response as? HTTPURLResponse).map { (200..<300).contains($0.statusCode) } ?? false
+      let json = ok ? data.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } : nil
+      DispatchQueue.main.async { completion(json) }
+    }.resume()
   }
 }

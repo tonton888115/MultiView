@@ -38,10 +38,12 @@ final class TwitcastingChatClient {
     }
   }
 
+  // frontendapi の users/{id}/latest-movie は 2026-10 時点で全ユーザー HTTP 400(code 3013)。
+  // 再生と同じ streamserver.php の movie.id を正とし、ダメなら watch ページの data-movie-id。
   private func fetchLatestMovie() {
     guard !stopped, !channel.isEmpty else { return }
-    guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-          let url = URL(string: "https://frontendapi.twitcasting.tv/users/\(encoded)/latest-movie") else { return }
+    guard let encoded = channel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+          let url = URL(string: "https://twitcasting.tv/streamserver.php?target=\(encoded)&mode=client&player=pc_web") else { return }
     var request = URLRequest(url: url)
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")

@@ -3,6 +3,15 @@ import {fetchWithTimeout} from './network';
 import {kickFilterText, kickTokens, makeChatEvent, parseTwitchTags, textTokens, twitchTokens} from './danmaku';
 import {isDanmakuEnabled} from './danmakuQueue';
 import {kickHostTarget, reportRaid, twitchRaidTarget} from './raidFollow';
+import {
+  fetchKickCentrifugoToken,
+  kickPusherURL,
+  kickRealtimeClientId,
+  kickRealtimeDefaultApp,
+  kickRealtimeOrigin,
+  negotiateKickRealtimeApp,
+  parseCentrifugoFrames,
+} from './kickRealtime';
 import {subscribeNiconicoComments} from './niconicoComments';
 import type {AppSettings, ChatEvent, DanmakuToken, PlatformId, StreamItem} from './types';
 
@@ -181,9 +190,111 @@ function startKickChat(stream: StreamItem, emit: Emit, status: Status): ChatClie
   let stopped = false;
   let socket: WebSocket | undefined;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   const channel = cleanChannel(stream.channel);
+  const clientId = kickRealtimeClientId();
+  const onEvent = (eventName: string, payload: any) => handleKickEvent(eventName, payload, emit, channel);
 
-  const connect = async () => {
+  const clearTimers = () => {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = undefined;
+    }
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = undefined;
+    }
+  };
+  const scheduleReconnect = (delayMs: number) => {
+    if (stopped) {
+      return;
+    }
+    clearTimers();
+    retryTimer = setTimeout(connect, delayMs);
+  };
+  const watchClose = (ws: WebSocket) => {
+    ws.onclose = () => {
+      // 古いソケットの遅れた close で二重接続しない。
+      if (socket === ws) {
+        scheduleReconnect(3000);
+      }
+    };
+    ws.onerror = () => {
+      status('Kickコメント再接続待ち');
+    };
+  };
+
+  const openPusher = (app: {appKey: string; cluster: string}, channels: string[]) => {
+    const ws = new WebSocket(kickPusherURL(app));
+    socket = ws;
+    ws.onopen = () => {
+      channels.forEach(channelName => {
+        ws.send(JSON.stringify({event: 'pusher:subscribe', data: {auth: '', channel: channelName}}));
+      });
+      status('Kickコメント接続済み');
+    };
+    ws.onmessage = event => {
+      const text = String(event.data ?? '');
+      const heartbeat = kickHeartbeatResponse(text);
+      if (heartbeat) {
+        ws.send(heartbeat);
+        return;
+      }
+      const envelope = parseJSON(text);
+      const payload = typeof envelope?.data === 'string' ? parseJSON(envelope.data) : envelope?.data;
+      onEvent(stringValue(envelope?.event) ?? '', payload);
+    };
+    watchClose(ws);
+  };
+
+  const openCentrifugo = (url: string, token: string, channels: string[]) => {
+    const ws = new WebSocket(url, null, {headers: {origin: kickRealtimeOrigin}});
+    socket = ws;
+    let nextId = 1;
+    const send = (command: object) => ws.send(JSON.stringify({id: nextId++, ...command}));
+    // 接続トークンは ~45 分で失効するので、期限前に refresh で貼り替える。
+    // 失敗してもサーバーが失効時に切断 → onclose から再接続するので致命的ではない。
+    const scheduleRefresh = (ttlSeconds: number) => {
+      if (refreshTimer) {
+        clearTimeout(refreshTimer);
+      }
+      refreshTimer = setTimeout(() => {
+        fetchKickCentrifugoToken(clientId)
+          .then(fresh => {
+            if (!stopped && socket === ws) {
+              send({refresh: {token: fresh}});
+            }
+          })
+          .catch(() => undefined);
+      }, Math.max(30, ttlSeconds - 60) * 1000);
+    };
+    ws.onopen = () => {
+      send({connect: {token, name: 'js'}});
+    };
+    ws.onmessage = event => {
+      parseCentrifugoFrames(String(event.data ?? '')).forEach(frame => {
+        if (frame.kind === 'ping') {
+          ws.send('{}');
+        } else if (frame.kind === 'publication') {
+          onEvent(frame.event, frame.data);
+        } else if (frame.id === 1 && frame.error) {
+          status(`Kickコメント接続エラー: ${frame.error}`);
+          ws.close();
+        } else {
+          if (frame.id === 1) {
+            channels.forEach(name => send({subscribe: {channel: name}}));
+            status('Kickコメント接続済み');
+          }
+          if (frame.ttl) {
+            scheduleRefresh(frame.ttl);
+          }
+        }
+      });
+    };
+    watchClose(ws);
+  };
+
+  async function connect() {
     if (stopped) {
       return;
     }
@@ -194,42 +305,29 @@ function startKickChat(stream: StreamItem, emit: Emit, status: Status): ChatClie
       if (info.channelId) {
         channels.push(`channel.${info.channelId}`);
       }
+      const app = info.channelId
+        ? await negotiateKickRealtimeApp(info.channelId, clientId).catch(() => kickRealtimeDefaultApp)
+        : kickRealtimeDefaultApp;
+      const token = app.provider === 'centrifugo' ? await fetchKickCentrifugoToken(clientId) : '';
       if (stopped) {
         return;
       }
       status('Kickコメント接続中');
-      socket = new WebSocket('wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=android-native&version=1.0&flash=false');
-      socket.onopen = () => {
-        channels.forEach(channelName => {
-          socket?.send(JSON.stringify({event: 'pusher:subscribe', data: {auth: '', channel: channelName}}));
-        });
-        status('Kickコメント接続済み');
-      };
-      socket.onmessage = event => {
-        handleKickMessage(String(event.data ?? ''), emit, channel, payload => socket?.send(payload));
-      };
-      socket.onclose = () => {
-        if (!stopped) {
-          retryTimer = setTimeout(connect, 3000);
-        }
-      };
-      socket.onerror = () => {
-        status('Kickコメント再接続待ち');
-      };
+      if (app.provider === 'pusher') {
+        openPusher(app, channels);
+      } else {
+        openCentrifugo(app.url, token, channels);
+      }
     } catch (error) {
       status(error instanceof Error ? error.message : String(error));
-      if (!stopped) {
-        retryTimer = setTimeout(connect, 5000);
-      }
+      scheduleReconnect(5000);
     }
-  };
+  }
   connect();
   return {
     stop: () => {
       stopped = true;
-      if (retryTimer) {
-        clearTimeout(retryTimer);
-      }
+      clearTimers();
       socket?.close();
     },
   };
@@ -260,15 +358,8 @@ async function fetchKickChannelInfo(channel: string): Promise<{chatroomId: strin
   return {chatroomId, channelId: channelId ?? undefined};
 }
 
-function handleKickMessage(text: string, emit: Emit, channel: string, send: (payload: string) => void) {
-  const heartbeat = kickHeartbeatResponse(text);
-  if (heartbeat) {
-    send(heartbeat);
-    return;
-  }
-  const envelope = parseJSON(text);
-  const eventName = stringValue(envelope?.event) ?? '';
-  const payload = typeof envelope?.data === 'string' ? parseJSON(envelope.data) : envelope?.data;
+// Pusher / Centrifugo どちらの経路でも公式 envelope の {event, data} は同じ。
+function handleKickEvent(eventName: string, payload: any, emit: Emit, channel: string) {
   if (/host|raid/i.test(eventName)) {
     const target = kickHostTarget(payload);
     if (target) {
@@ -771,16 +862,25 @@ function startTwitCastingChat(stream: StreamItem, emit: Emit, status: Status): C
   };
 }
 
+// frontendapi の users/{id}/latest-movie は 2026-10 時点で全ユーザー HTTP 400(code 3013)。
+// 再生と同じ streamserver.php の movie.id を正とし、ダメなら watch ページの data-movie-id。
 async function fetchTwitCastingMovieId(channel: string): Promise<string> {
-  const response = await fetch(`https://frontendapi.twitcasting.tv/users/${encodeURIComponent(channel)}/latest-movie`, {
-    headers: {
-      Accept: 'application/json',
-      'User-Agent': mobileUserAgent,
-      Referer: `https://twitcasting.tv/${channel}`,
-    },
-  });
-  const json = await response.json();
-  const id = stringValue(json?.movie?.id);
+  const headers = {'User-Agent': mobileUserAgent, Referer: `https://twitcasting.tv/${channel}`};
+  try {
+    const response = await fetchWithTimeout(
+      `https://twitcasting.tv/streamserver.php?target=${encodeURIComponent(channel)}&mode=client&player=pc_web`,
+      {headers: {...headers, Accept: 'application/json'}},
+      10000,
+    );
+    const id = stringValue((await response.json())?.movie?.id);
+    if (id) {
+      return id;
+    }
+  } catch {
+    // watch ページへ
+  }
+  const response = await fetchWithTimeout(`https://twitcasting.tv/${encodeURIComponent(channel)}`, {headers}, 10000);
+  const id = regexGroup(await response.text(), /data-movie-id=["'](\d+)["']/);
   if (!id) {
     throw new Error('ツイキャス配信IDを取得できません');
   }
