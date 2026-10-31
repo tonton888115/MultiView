@@ -1,4 +1,4 @@
-import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import React, {memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -51,6 +51,7 @@ import {
   resolvePlaybackSource,
   resolveLiveYouTubeVideoID,
   webStreamURL,
+  youtubeChatURL,
   youtubeClients,
   youtubeIframeHTML,
   youtubeVideoId,
@@ -63,6 +64,9 @@ import {pushNiconicoComment} from './src/niconicoComments';
 import {publishGiftEvent} from './src/giftEvents';
 import {startPlaybackService, stopPlaybackService} from './src/playbackService';
 import {useNetworkType} from './src/network';
+import {StreamGrid, type ReorderTouchTargets} from './src/StreamGrid';
+import {ReorderHandleBase} from './src/ReorderHandle';
+import {moveItem} from './src/gridLayout';
 
 const STREAMS_KEY = 'multiview.android.streams.v2';
 const LEGACY_STREAMS_KEY = 'multiview.android.streams.v1';
@@ -542,19 +546,16 @@ export default function App() {
     });
   }, []);
 
-  const moveStreamTo = useCallback((index: number, target: number) => {
+  // 並び替えの確定(ドラッグを離した時に1回だけ呼ばれる)。index ではなく id で指定するので、
+  // ドラッグ中に他の配信が増減しても取り違えない。
+  const moveStream = useCallback((id: string, target: number) => {
     setStreams(current => {
-      if (index < 0 || index >= current.length) {
+      const index = current.findIndex(stream => stream.id === id);
+      if (index < 0) {
         return current;
       }
       const nextTarget = Math.max(0, Math.min(target, current.length - 1));
-      if (nextTarget === index) {
-        return current;
-      }
-      const next = current.slice();
-      const [item] = next.splice(index, 1);
-      next.splice(nextTarget, 0, item);
-      return next;
+      return nextTarget === index ? current : moveItem(current, index, nextTarget);
     });
   }, []);
 
@@ -585,7 +586,7 @@ export default function App() {
             volumes={volumes}
             onAdd={addStream}
             onRemove={removeStream}
-            onMove={moveStreamTo}
+            onMove={moveStream}
             onVolume={setStreamVolume}
             onSettings={updateSettings}
             auth={auth}
@@ -755,7 +756,7 @@ function ViewingScreen({
   volumes: Record<string, number>;
   onAdd: (platform: PlatformId, channel: string) => void;
   onRemove: (id: string) => void;
-  onMove: (index: number, target: number) => void;
+  onMove: (id: string, targetIndex: number) => void;
   onVolume: (stream: StreamItem, volume: number) => void;
   onSettings: (patch: Partial<AppSettings>) => void;
   auth: AuthState;
@@ -766,20 +767,56 @@ function ViewingScreen({
   // reloadKey をインクリメントするとプレイヤー(native/iframe/web)が再マウントされ
   // ソース解決もやり直す。更新ボタン(全体/セル別)の実体。
   const [reloadKeys, setReloadKeys] = useState<Record<string, number>>({});
+  const streamsRef = useRef(streams);
+  streamsRef.current = streams;
   const reloadStream = useCallback((id: string) => {
     setReloadKeys(current => ({...current, [id]: (current[id] ?? 0) + 1}));
   }, []);
   const reloadAll = useCallback(() => {
     setReloadKeys(current => {
       const next = {...current};
-      streams.forEach(stream => {
+      streamsRef.current.forEach(stream => {
         next[stream.id] = (next[stream.id] ?? 0) + 1;
       });
       return next;
     });
-  }, [streams]);
-  const columns = settings.layoutMode === 'grid' ? 2 : 1;
-  const slots = useMemo(() => gridSlots(streams, settings.layoutMode), [settings.layoutMode, streams]);
+  }, []);
+  const focusStream = useCallback((stream: StreamItem) => setFocused(stream), []);
+  const closeFocus = useCallback(() => setFocused(null), []);
+  const focusedId = focused?.id ?? null;
+  const streamCount = streams.length;
+
+  // 拡大中の配信が別経路(設定の「配信リストを空にする」等)で消えたら拡大表示も閉じる。
+  useEffect(() => {
+    if (focusedId && !streams.some(stream => stream.id === focusedId)) {
+      setFocused(null);
+    }
+  }, [focusedId, streams]);
+
+  // セル描画。依存が変わらない限り同一関数を返し、StreamGrid/GridCell/StreamCell の
+  // memo が効くようにする(ドラッグ中やチャット更新で全セルが再描画されないように)。
+  const renderCell = useCallback(
+    (stream: StreamItem, touchTargets: ReorderTouchTargets) => (
+      <StreamCell
+        stream={stream}
+        settings={settings}
+        streamCount={streamCount}
+        volume={volumes[stream.id] ?? 1}
+        paused={focusedId === stream.id}
+        muted={!settings.playAudio}
+        reloadKey={reloadKeys[stream.id] ?? 0}
+        canReorder={streamCount > 1}
+        reorderTouch={touchTargets}
+        onFocus={focusStream}
+        onReload={reloadStream}
+        onRemove={onRemove}
+        onVolume={onVolume}
+        auth={auth}
+        onAuth={onAuth}
+      />
+    ),
+    [auth, focusStream, focusedId, onAuth, onRemove, onVolume, reloadKeys, reloadStream, settings, streamCount, volumes],
+  );
 
   return (
     <View style={styles.screen}>
@@ -790,31 +827,7 @@ function ViewingScreen({
             <Text style={styles.emptyText}>追加ボタン、ランキング、フォロー画面から配信を追加できます。</Text>
           </View>
         ) : (
-          <ScrollView contentContainerStyle={styles.streamGrid}>
-            {slots.map(({stream, index, width}) => (
-              <View key={stream.id} style={[styles.streamCellWrap, {width}]}>
-                <StreamCell
-                  stream={stream}
-                  settings={settings}
-                  streamCount={streams.length}
-                  volume={volumes[stream.id] ?? 1}
-                  paused={focused?.id === stream.id}
-                  muted={!settings.playAudio}
-                  reloadKey={reloadKeys[stream.id] ?? 0}
-                  index={index}
-                  count={streams.length}
-                  columns={columns}
-                  onFocus={() => setFocused(stream)}
-                  onReload={() => reloadStream(stream.id)}
-                  onMove={onMove}
-                  onRemove={onRemove}
-                  onVolume={onVolume}
-                  auth={auth}
-                  onAuth={onAuth}
-                />
-              </View>
-            ))}
-          </ScrollView>
+          <StreamGrid streams={streams} layoutMode={settings.layoutMode} onMove={onMove} renderCell={renderCell} />
         )}
       </View>
 
@@ -855,9 +868,9 @@ function ViewingScreen({
         volume={focused ? volumes[focused.id] ?? 1 : 1}
         muted={!settings.playAudio}
         reloadKey={focused ? reloadKeys[focused.id] ?? 0 : 0}
-        onReload={() => focused && reloadStream(focused.id)}
+        onReload={reloadStream}
         onVolume={onVolume}
-        onClose={() => setFocused(null)}
+        onClose={closeFocus}
         onRemove={onRemove}
         auth={auth}
         onAuth={onAuth}
@@ -866,22 +879,10 @@ function ViewingScreen({
   );
 }
 
-function gridSlots(streams: StreamItem[], layoutMode: AppSettings['layoutMode']): Array<{stream: StreamItem; index: number; width: '50%' | '100%'}> {
-  if (layoutMode !== 'grid') {
-    return streams.map((stream, index) => ({stream, index, width: '100%'}));
-  }
-  // 2列で詰め、奇数のときだけ最後の1本を全幅にする。
-  // (旧実装は偶数だと末尾2本が全幅化し、2本=実質スタック表示になるバグがあった)
-  const bigCount = streams.length % 2 === 0 ? 0 : 1;
-  const pairedCount = Math.max(0, streams.length - bigCount);
-  return streams.map((stream, index) => ({
-    stream,
-    index,
-    width: index < pairedCount ? '50%' : '100%',
-  }));
-}
+const alwaysTrue = () => true;
+const alwaysFalse = () => false;
 
-function StreamCell({
+const StreamCell = memo(function StreamCell({
   stream,
   settings,
   streamCount,
@@ -889,12 +890,10 @@ function StreamCell({
   paused,
   muted,
   reloadKey,
-  index,
-  count,
-  columns,
+  canReorder,
+  reorderTouch,
   onFocus,
   onReload,
-  onMove,
   onRemove,
   onVolume,
   auth,
@@ -907,12 +906,10 @@ function StreamCell({
   paused: boolean;
   muted: boolean;
   reloadKey: number;
-  index: number;
-  count: number;
-  columns: number;
-  onFocus: () => void;
-  onReload: () => void;
-  onMove: (index: number, target: number) => void;
+  canReorder: boolean;
+  reorderTouch: ReorderTouchTargets;
+  onFocus: (stream: StreamItem) => void;
+  onReload: (id: string) => void;
   onRemove: (id: string) => void;
   onVolume: (stream: StreamItem, volume: number) => void;
   auth: AuthState;
@@ -922,43 +919,23 @@ function StreamCell({
   const [commentOpen, setCommentOpen] = useState(false);
   const [commentText, setCommentText] = useState('');
   const [commentStatus, setCommentStatus] = useState('');
-  const [cellLayout, setCellLayout] = useState({width: 0, height: 0});
   const [webViewerCount, setWebViewerCount] = useState<number | null>(null);
-  const dragOriginRef = useRef(index);
-  const dragCurrentRef = useRef(index);
+  // 音量スライダー操作中はセル内だけで反映し、指を離した時に App へ確定する
+  // (毎フレーム App 全体を再描画＋保存していたのを避ける)。
+  const [liveVolume, setLiveVolume] = useState<number | null>(null);
   const webCommentRef = useRef<((text: string) => void) | null>(null);
   const {chromeVisible, showChrome} = useAutoHidingChrome(stream.id);
-  const updateDragTarget = useCallback(
-    (dx: number, dy: number) => {
-      showChrome();
-      const rowHeight = Math.max(80, cellLayout.height || 0);
-      const colWidth = Math.max(80, cellLayout.width || 0);
-      const rowDelta = Math.round(dy / rowHeight);
-      const colDelta = columns > 1 ? Math.round(dx / colWidth) : 0;
-      const target = Math.max(0, Math.min(count - 1, dragOriginRef.current + rowDelta * columns + colDelta));
-      if (target !== dragCurrentRef.current) {
-        onMove(dragCurrentRef.current, target);
-        dragCurrentRef.current = target;
-      }
+  const effectiveVolume = liveVolume ?? volume;
+  const setWebCommentBridge = useCallback((send: ((text: string) => void) | null) => {
+    webCommentRef.current = send;
+  }, []);
+  const previewVolume = useCallback((_stream: StreamItem, next: number) => setLiveVolume(next), []);
+  const commitVolume = useCallback(
+    (target: StreamItem, next: number) => {
+      setLiveVolume(null);
+      onVolume(target, next);
     },
-    [cellLayout.height, cellLayout.width, columns, count, onMove, showChrome],
-  );
-  const reorderResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => true,
-        onMoveShouldSetPanResponder: () => true,
-        onPanResponderGrant: () => {
-          showChrome();
-          dragOriginRef.current = index;
-          dragCurrentRef.current = index;
-        },
-        onPanResponderMove: (_, gesture) => updateDragTarget(gesture.dx, gesture.dy),
-        onPanResponderRelease: (_, gesture) => {
-          updateDragTarget(gesture.dx, gesture.dy);
-        },
-      }),
-    [index, showChrome, updateDragTarget],
+    [onVolume],
   );
   const submitComment = useCallback(() => {
     const text = commentText.trim();
@@ -984,7 +961,7 @@ function StreamCell({
   }, [auth, commentText, onAuth, stream]);
 
   return (
-    <View style={styles.streamCell} onLayout={event => setCellLayout(event.nativeEvent.layout)}>
+    <View style={styles.streamCell}>
       <View style={styles.player} onTouchStart={showChrome}>
         {paused ? (
           <View style={styles.playerPlaceholder}>
@@ -996,12 +973,10 @@ function StreamCell({
             settings={settings}
             streamCount={streamCount}
             paused={paused}
-            muted={muted || volume <= 0}
-            volume={volume}
+            muted={muted || effectiveVolume <= 0}
+            volume={effectiveVolume}
             reloadKey={reloadKey}
-            onWebCommentBridge={send => {
-              webCommentRef.current = send;
-            }}
+            onWebCommentBridge={setWebCommentBridge}
             onViewerCount={setWebViewerCount}
           />
         )}
@@ -1011,27 +986,50 @@ function StreamCell({
           <View
             style={[styles.autoHideChrome, !chromeVisible && styles.autoHideChromeHidden]}
             pointerEvents={chromeVisible ? 'box-none' : 'none'}>
-            <View style={styles.cellTopControls} pointerEvents="box-none">
+            <View style={styles.cellTopControls} pointerEvents="box-none" onTouchStart={reorderTouch.markControlTouch}>
               <TouchableOpacity style={styles.overlayButton} onPress={() => setCommentOpen(current => !current)}>
                 <Text style={styles.overlayIcon}>□</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.overlayButton} onPress={onFocus}>
+              <TouchableOpacity style={styles.overlayButton} onPress={() => onFocus(stream)}>
                 <Text style={styles.overlayIcon}>↗</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.overlayButton} onPress={onReload}>
+              <TouchableOpacity style={styles.overlayButton} onPress={() => onReload(stream.id)}>
                 <Text style={styles.overlayIcon}>↻</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.overlayButton} onPress={() => onRemove(stream.id)}>
                 <Text style={styles.overlayIcon}>×</Text>
               </TouchableOpacity>
             </View>
-            <VolumeOverlay stream={stream} volume={volume} color={info.color} onVolume={onVolume} onInteract={showChrome} />
-            <View style={styles.reorderHandle} {...reorderResponder.panHandlers}>
-              <Text style={styles.reorderIcon}>≡</Text>
-            </View>
+            <VolumeOverlay
+              stream={stream}
+              volume={effectiveVolume}
+              color={info.color}
+              onVolume={previewVolume}
+              onVolumeEnd={commitVolume}
+              onInteract={showChrome}
+              onTouchStart={reorderTouch.markControlTouch}
+            />
+            {canReorder && (
+              // 触れた瞬間からドラッグ開始。JS レスポンダーを確保して手放さず(grant=true で
+              // ネイティブのスクロール横取りも禁止)、移動量は StreamGrid の外枠が受け取る。
+              <ReorderHandleBase
+                style={styles.reorderHandle}
+                hitSlop={8}
+                accessibilityLabel="並び替え"
+                accessibilityHint="ドラッグして表示順を変更"
+                onTouchStart={reorderTouch.markHandleTouch}
+                onStartShouldSetResponder={alwaysTrue}
+                onMoveShouldSetResponder={alwaysTrue}
+                onResponderGrant={alwaysTrue}
+                onResponderTerminationRequest={alwaysFalse}>
+                <Text style={styles.reorderIcon} pointerEvents="none">
+                  ≡
+                </Text>
+              </ReorderHandleBase>
+            )}
           </View>
           {commentOpen && (
-            <View style={styles.commentBar}>
+            <View style={styles.commentBar} onTouchStart={reorderTouch.markControlTouch}>
               <TextInput
                 value={commentText}
                 onChangeText={setCommentText}
@@ -1053,9 +1051,10 @@ function StreamCell({
       </View>
     </View>
   );
-}
+});
 
-function StreamPlayer({
+// 親(セル)のコントロール表示切替などで再描画されないよう memo。props が変わった時だけ描画する。
+const StreamPlayer = memo(function StreamPlayer({
   stream,
   settings,
   streamCount,
@@ -1077,7 +1076,6 @@ function StreamPlayer({
   onViewerCount?: (count: number) => void;
 }) {
   const [source, setSource] = useState<PlaybackSource | null>(null);
-  const [, setPlayerStatus] = useState('待機中');
   const webRef = useRef<WebView>(null);
   const streamRef = useRef(stream);
   const settingsRef = useRef(settings);
@@ -1087,21 +1085,61 @@ function StreamPlayer({
   streamRef.current = stream;
   settingsRef.current = settings;
   streamCountRef.current = streamCount;
+  const playbackStateRef = useRef({paused, muted, volume});
+  playbackStateRef.current = {paused, muted, volume};
   // ネイティブプレイヤーの error/ended を受けてのデバウンス自動復旧。
   // iOS の .multiViewPlaybackErrored と同じく 45 秒に 1 回までに制限してループを防ぐ。
   const [autoReloadTick, setAutoReloadTick] = useState(0);
   const lastAutoReloadRef = useRef(0);
+  const autoReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // YouTube が native HLS を取れず取得中/iframe に留まったとき、静かに再解決して HLS へ
   // 昇格させるための内部チック。retry 回数は youtubeRetryRef で上限管理する。
   const [youtubeUpgradeTick, setYoutubeUpgradeTick] = useState(0);
   const youtubeRetryRef = useRef(0);
   const scheduleAutoReload = useCallback(() => {
-    const now = Date.now();
-    if (now - lastAutoReloadRef.current < 45000) {
+    if (autoReloadTimerRef.current) {
+      // 既に復旧を予約済み(連続するエラー/終了通知はまとめる)。
       return;
     }
-    lastAutoReloadRef.current = now;
-    setTimeout(() => setAutoReloadTick(tick => tick + 1), 1500);
+    // 45秒以内の2回目以降は「捨てる」のではなく45秒後まで遅らせる。旧実装は捨てていたため、
+    // 復旧直後に再び失敗したプレイヤーが二度と復旧せず黒画面のままになっていた。
+    const now = Date.now();
+    const delay = Math.max(1500, lastAutoReloadRef.current + 45000 - now);
+    autoReloadTimerRef.current = setTimeout(() => {
+      autoReloadTimerRef.current = null;
+      lastAutoReloadRef.current = Date.now();
+      setAutoReloadTick(tick => tick + 1);
+    }, delay);
+  }, []);
+  useEffect(
+    () => () => {
+      if (autoReloadTimerRef.current) {
+        clearTimeout(autoReloadTimerRef.current);
+      }
+    },
+    [],
+  );
+
+  // Web/iframe プレイヤーへ音量・ミュート・再生状態を流し込む。ページ読込前に注入すると
+  // mvSetVolume 等が未定義で捨てられるため、変更時に加えて読込完了時(onLoadEnd)にも送る。
+  // (旧実装は読込完了後に送り直さず、YouTube iframe が無音のまま/ミュート設定が効かなかった)
+  const applyWebPlaybackState = useCallback(() => {
+    const state = playbackStateRef.current;
+    const effectiveVolume = state.muted ? 0 : Math.max(0, Math.min(1, state.volume));
+    webRef.current?.injectJavaScript(`
+      (function(){
+        try { window.mvSetVolume && window.mvSetVolume(${effectiveVolume}); } catch(e) {}
+        try { ${state.paused ? 'window.mvPause && window.mvPause();' : 'window.mvPlay && window.mvPlay();'} } catch(e) {}
+        try {
+          document.querySelectorAll('video,audio').forEach(function(media){
+            media.muted=${effectiveVolume <= 0};
+            media.volume=${effectiveVolume};
+            ${state.paused ? 'media.pause();' : 'var p=media.play&&media.play(); if(p&&p.catch)p.catch(function(){});'}
+          });
+        } catch(e) {}
+      })();
+      true;
+    `);
   }, []);
 
   const handleWebMessage = useCallback(
@@ -1127,12 +1165,10 @@ function StreamPlayer({
     }
     let cancelled = false;
     setSource(null);
-    setPlayerStatus('取得中');
     resolvePlaybackSource(currentStream, settingsRef.current, streamCountRef.current)
       .then(next => {
         if (!cancelled) {
           setSource(next);
-          setPlayerStatus(next.status);
         }
       })
       .catch(error => {
@@ -1145,7 +1181,6 @@ function StreamPlayer({
             // YouTube は Web ページへ落とさない(映像のみ優先・ユーザー要望)。他PFは従来どおり。
             fallbackUrl: currentStream.platform === 'youtube' ? undefined : webStreamURL(currentStream),
           });
-          setPlayerStatus('エラー');
         }
       });
     return () => {
@@ -1161,9 +1196,13 @@ function StreamPlayer({
     autoReloadTick,
   ]);
 
-  // 配信切替/手動更新で YouTube の再試行カウンタをリセット。
+  // 配信切替/手動更新で YouTube の再試行カウンタと予約済みの自動復旧をリセット。
   useEffect(() => {
     youtubeRetryRef.current = 0;
+    if (autoReloadTimerRef.current) {
+      clearTimeout(autoReloadTimerRef.current);
+      autoReloadTimerRef.current = null;
+    }
   }, [stream.id, reloadKey]);
 
   // YouTube は映像のみ HLS 抽出が最優先。ID 解決や HLS 抽出に失敗して取得中/iframe に
@@ -1172,6 +1211,11 @@ function StreamPlayer({
   useEffect(() => {
     if (stream.platform !== 'youtube' || !source || source.kind === 'native') {
       youtubeRetryRef.current = 0;
+      return;
+    }
+    // 「iframe優先」設定で意図どおり iframe になっている時は昇格させない
+    // (旧実装は iframe が返るたびに再解決を続け、/live ページを20秒ごとに取得し続けていた)。
+    if (source.kind === 'youtube-iframe' && settings.youtubePreferIframe) {
       return;
     }
     // Web ページへは絶対に落とさず、映像のみ(native HLS)が取れるまで粘る。
@@ -1187,7 +1231,6 @@ function StreamPlayer({
         }
         if (next.kind === 'native') {
           setSource(next);
-          setPlayerStatus(next.status);
         } else {
           setYoutubeUpgradeTick(tick => tick + 1);
         }
@@ -1201,7 +1244,7 @@ function StreamPlayer({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [source, stream.platform, youtubeUpgradeTick]);
+  }, [settings.youtubePreferIframe, source, stream.platform, youtubeUpgradeTick]);
 
   useEffect(() => {
     if (!onWebCommentBridge) {
@@ -1219,23 +1262,18 @@ function StreamPlayer({
     if (!source || source.kind === 'native') {
       return;
     }
-    const effectiveVolume = muted ? 0 : volume;
-    const command = `
-      (function(){
-        try { window.mvSetVolume && window.mvSetVolume(${effectiveVolume}); } catch(e) {}
-        try { ${paused ? 'window.mvPause && window.mvPause();' : 'window.mvPlay && window.mvPlay();'} } catch(e) {}
-        try {
-          document.querySelectorAll('video,audio').forEach(function(media){
-            media.muted=${effectiveVolume <= 0};
-            media.volume=${effectiveVolume};
-            ${paused ? 'media.pause();' : 'var p=media.play&&media.play(); if(p&&p.catch)p.catch(function(){});'}
-          });
-        } catch(e) {}
-      })();
-      true;
-    `;
-    webRef.current?.injectJavaScript(command);
-  }, [source, paused, muted, volume]);
+    applyWebPlaybackState();
+  }, [applyWebPlaybackState, source, paused, muted, volume]);
+
+  const onNativePlayerEvent = useCallback(
+    (event: {nativeEvent: {type: string; message: string}}) => {
+      const payload = event.nativeEvent;
+      if (payload.type === 'error' || payload.message === 'ended') {
+        scheduleAutoReload();
+      }
+    },
+    [scheduleAutoReload],
+  );
 
   if (stream.platform === 'niconico') {
     return (
@@ -1275,13 +1313,7 @@ function StreamPlayer({
           liveTargetOffsetMs={source.liveTargetOffsetMs}
           maxBitrate={playbackQuality === 'economy' ? 900000 : 0}
           resizeMode="contain"
-          onPlayerEvent={event => {
-            const payload = event.nativeEvent;
-            setPlayerStatus(payload.type === 'error' ? `エラー: ${payload.message}` : payload.message);
-            if (payload.type === 'error' || payload.message === 'ended') {
-              scheduleAutoReload();
-            }
-          }}
+          onPlayerEvent={onNativePlayerEvent}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
         <GiftOverlay stream={stream} settings={settings} />
@@ -1293,7 +1325,7 @@ function StreamPlayer({
     return (
       <>
         <WebView
-          key={`${source.videoId}:${reloadKey}`}
+          key={`${source.videoId}:${reloadKey}:${autoReloadTick}`}
           ref={webRef}
           source={{html: youtubeIframeHTML(source.videoId), baseUrl: 'https://tonton888115.github.io/MultiView/'}}
           javaScriptEnabled
@@ -1301,6 +1333,7 @@ function StreamPlayer({
           allowsInlineMediaPlayback
           mediaPlaybackRequiresUserAction={false}
           setSupportMultipleWindows={false}
+          onLoadEnd={applyWebPlaybackState}
           style={styles.webPlayer}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
@@ -1314,7 +1347,7 @@ function StreamPlayer({
     return (
       <>
         <WebView
-          key={`${url}:${reloadKey}`}
+          key={`${url}:${reloadKey}:${autoReloadTick}`}
           ref={webRef}
           source={{uri: url}}
           userAgent={mobileUserAgent}
@@ -1328,6 +1361,7 @@ function StreamPlayer({
           injectedJavaScript={webFallbackScript(settings.blockWebAds, stream.platform)}
           onShouldStartLoadWithRequest={request => !(settings.blockWebAds && isAdBlockedURL(request.url))}
           onMessage={handleWebMessage}
+          onLoadEnd={applyWebPlaybackState}
           style={styles.webPlayer}
         />
         <DanmakuOverlay stream={stream} settings={settings} />
@@ -1342,7 +1376,7 @@ function StreamPlayer({
       <Text style={styles.playerStatus}>{source.reason}</Text>
     </View>
   );
-}
+});
 
 function NiconicoNativePlayer({
   stream,
@@ -1368,6 +1402,9 @@ function NiconicoNativePlayer({
   const [sessionReloadTick, setSessionReloadTick] = useState(0);
   const networkType = useNetworkType();
   const playbackQuality = effectiveQuality(settings, streamCount, networkType);
+  // 起動直後は回線種別が未確定('none')で、確定すると画質が変わってセッションを張り直していた
+  // (視聴セッションの二重開始)。種別が分かってから1回だけ開始する。
+  const networkKnown = networkType !== 'none';
   const sessionKey = `${stream.channel}:${playbackQuality}:${settings.niconicoLowLatency}:${reloadKey}:${sessionReloadTick}`;
   const activeSessionKeyRef = useRef(sessionKey);
   const sessionRetryCountRef = useRef(0);
@@ -1379,6 +1416,13 @@ function NiconicoNativePlayer({
     setHls(null);
     setFailed(false);
   }, [stream.channel, playbackQuality, settings.niconicoLowLatency, reloadKey, sessionReloadTick]);
+
+  useEffect(() => {
+    // 手動更新・番組切替では自動リトライの回数制限/間隔もリセットする
+    // (リセットしないと、一度Web表示へ落ちた後の更新で即座に再びWebへ落ちていた)。
+    sessionRetryCountRef.current = 0;
+    lastSessionRetryAtRef.current = 0;
+  }, [stream.channel, reloadKey]);
 
   const retryNativeSession = useCallback(() => {
     const now = Date.now();
@@ -1469,7 +1513,7 @@ function NiconicoNativePlayer({
   // niconico は RN の直接 fetch/WS を拒否するため、視聴セッションは niconico オリジンを
   // 読み込んだ隠し WebView 内で実行し、HLS uri を postMessage で受け取る(keepSeatも内部で継続)。
   const sessionWebView =
-    !failed ? (
+    !failed && networkKnown ? (
       <WebView
         key={`niconico-session:${sessionKey}`}
         source={{uri: niconicoOriginURL}}
@@ -1579,49 +1623,80 @@ function VolumeOverlay({
   volume,
   color,
   onVolume,
+  onVolumeEnd,
   onInteract,
+  onTouchStart,
   mode = 'cell',
 }: {
   stream: StreamItem;
   volume: number;
   color: string;
+  // 操作中の値(毎フレーム)。
   onVolume: (stream: StreamItem, volume: number) => void;
+  // 指を離した時の確定値。省略時は onVolume だけを呼ぶ。
+  onVolumeEnd?: (stream: StreamItem, volume: number) => void;
   onInteract?: () => void;
+  onTouchStart?: () => void;
   mode?: 'cell' | 'focus';
 }) {
-  const [height, setHeight] = useState(0);
-  const updateFromY = useCallback(
-    (locationY: number) => {
+  // つまみ/トラックの子要素はタッチ対象にしない(pointerEvents="none")。こうしないと
+  // locationY が「触れた子要素」基準になり、つまみに触れた瞬間に音量が最大付近へ飛んでいた。
+  // 値はトラックの実際の位置(onLayout)を基準に計算し、見た目のつまみと指を一致させる。
+  const trackRef = useRef({top: 0, height: 0});
+  const lastValueRef = useRef(volume);
+  const changedRef = useRef(false);
+  const latestRef = useRef({stream, onVolume, onVolumeEnd, onInteract});
+  latestRef.current = {stream, onVolume, onVolumeEnd, onInteract};
+  const responder = useMemo(() => {
+    const update = (locationY: number) => {
+      const {top, height} = trackRef.current;
       if (height <= 0) {
         return;
       }
-      onInteract?.();
-      const next = 1 - Math.max(0, Math.min(height, locationY)) / height;
-      onVolume(stream, next);
-    },
-    [height, onInteract, onVolume, stream],
-  );
-  const responder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => true,
-        onMoveShouldSetPanResponder: () => true,
-        onPanResponderGrant: event => updateFromY(event.nativeEvent.locationY),
-        onPanResponderMove: event => updateFromY(event.nativeEvent.locationY),
-      }),
-    [updateFromY],
-  );
+      const latest = latestRef.current;
+      latest.onInteract?.();
+      const next = 1 - Math.max(0, Math.min(1, (locationY - top) / height));
+      lastValueRef.current = next;
+      changedRef.current = true;
+      latest.onVolume(latest.stream, next);
+    };
+    const finish = () => {
+      const latest = latestRef.current;
+      if (changedRef.current) {
+        changedRef.current = false;
+        latest.onVolumeEnd?.(latest.stream, lastValueRef.current);
+      }
+    };
+    return PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: event => update(event.nativeEvent.locationY),
+      onPanResponderMove: event => update(event.nativeEvent.locationY),
+      onPanResponderRelease: finish,
+      onPanResponderTerminate: finish,
+    });
+  }, []);
+  const percent = `${Math.round(Math.max(0, Math.min(1, volume)) * 100)}%` as const;
 
   return (
     <View
       style={[styles.volumeOverlay, mode === 'focus' ? styles.focusVolumeOverlay : styles.cellVolumeOverlay]}
-      onLayout={event => setHeight(event.nativeEvent.layout.height)}
+      onTouchStart={onTouchStart}
       {...responder.panHandlers}>
-      <View style={styles.volumeTrack}>
-        <View style={[styles.volumeLevel, {height: `${Math.round(volume * 100)}%`, backgroundColor: color}]} />
-        <View style={[styles.volumeThumb, {bottom: `${Math.round(volume * 100)}%`}]} />
+      <View
+        style={styles.volumeTrack}
+        pointerEvents="none"
+        onLayout={event => {
+          const {y, height} = event.nativeEvent.layout;
+          trackRef.current = {top: y, height};
+        }}>
+        <View style={[styles.volumeLevel, {height: percent, backgroundColor: color}]} />
+        <View style={[styles.volumeThumb, {bottom: percent}]} />
       </View>
-      <Text style={styles.volumeIcon}>♪</Text>
+      <Text style={styles.volumeIcon} pointerEvents="none">
+        ♪
+      </Text>
     </View>
   );
 }
@@ -2296,7 +2371,7 @@ function FocusModal({
   volume: number;
   muted: boolean;
   reloadKey: number;
-  onReload: () => void;
+  onReload: (id: string) => void;
   onVolume: (stream: StreamItem, volume: number) => void;
   onClose: () => void;
   onRemove: (id: string) => void;
@@ -2306,13 +2381,51 @@ function FocusModal({
   const chatRef = useRef<WebView>(null);
   const [commentText, setCommentText] = useState('');
   const [commentStatus, setCommentStatus] = useState('');
-  const chat = stream ? chatURL(stream) : null;
+  const directChat = stream ? chatURL(stream) : null;
+  // YouTube を @handle で追加した場合は動画IDが無く、拡大時の公式チャットが常に
+  // 「未対応」表示になっていた。ライブ動画IDを解決してチャットURLを作る。
+  const [resolvedChat, setResolvedChat] = useState<{streamId: string; url: string | null} | null>(null);
+  const chat = directChat ?? (resolvedChat && stream && resolvedChat.streamId === stream.id ? resolvedChat.url : null);
+  const resolvingChat = !!stream && stream.platform === 'youtube' && !directChat && resolvedChat?.streamId !== stream.id;
   const {chromeVisible, showChrome} = useAutoHidingChrome(stream?.id ?? 'closed');
+
+  useEffect(() => {
+    if (!stream || stream.platform !== 'youtube' || directChat || !settings.showChat) {
+      return;
+    }
+    let cancelled = false;
+    resolveLiveYouTubeVideoID(stream.channel)
+      .then(videoId => {
+        if (!cancelled) {
+          setResolvedChat({streamId: stream.id, url: videoId ? youtubeChatURL(videoId) : null});
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setResolvedChat({streamId: stream.id, url: null});
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [directChat, settings.showChat, stream]);
   const [webViewerCount, setWebViewerCount] = useState<number | null>(null);
+  const [liveVolume, setLiveVolume] = useState<number | null>(null);
+  const effectiveVolume = liveVolume ?? volume;
+  const previewVolume = useCallback((_stream: StreamItem, next: number) => setLiveVolume(next), []);
+  const commitVolume = useCallback(
+    (target: StreamItem, next: number) => {
+      setLiveVolume(null);
+      onVolume(target, next);
+    },
+    [onVolume],
+  );
 
   useEffect(() => {
     setCommentText('');
+    setCommentStatus('');
     setWebViewerCount(null);
+    setLiveVolume(null);
   }, [stream?.id]);
 
   const sendComment = useCallback(() => {
@@ -2365,7 +2478,13 @@ function FocusModal({
                 />
               ) : (
                 <View style={styles.focusUnavailable}>
-                  <Text style={styles.focusUnavailableText}>このサービスはチャット入力未対応です</Text>
+                  {settings.showChat && resolvingChat ? (
+                    <ActivityIndicator color="#7ab7ff" />
+                  ) : (
+                    <Text style={styles.focusUnavailableText}>
+                      {settings.showChat ? 'チャットを表示できません(ライブ配信中か確認してください)' : 'チャット表示はオフです'}
+                    </Text>
+                  )}
                 </View>
               )}
             </View>
@@ -2392,8 +2511,8 @@ function FocusModal({
                 settings={settings}
                 streamCount={streamCount}
                 paused={false}
-                muted={muted || volume <= 0}
-                volume={volume}
+                muted={muted || effectiveVolume <= 0}
+                volume={effectiveVolume}
                 reloadKey={reloadKey}
                 onViewerCount={setWebViewerCount}
               />
@@ -2406,7 +2525,7 @@ function FocusModal({
                   <TouchableOpacity style={[styles.overlayButton, styles.focusCloseButton]} onPress={onClose}>
                     <Text style={styles.overlayIcon}>‹</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity style={[styles.overlayButton, styles.focusReloadButton]} onPress={onReload}>
+                  <TouchableOpacity style={[styles.overlayButton, styles.focusReloadButton]} onPress={() => onReload(stream.id)}>
                     <Text style={styles.overlayIcon}>↻</Text>
                   </TouchableOpacity>
                   <TouchableOpacity style={[styles.overlayButton, styles.focusRemoveButton]} onPress={removeFocused}>
@@ -2414,9 +2533,10 @@ function FocusModal({
                   </TouchableOpacity>
                   <VolumeOverlay
                     stream={stream}
-                    volume={volume}
+                    volume={effectiveVolume}
                     color={platformInfo(stream.platform).color}
-                    onVolume={onVolume}
+                    onVolume={previewVolume}
+                    onVolumeEnd={commitVolume}
                     onInteract={showChrome}
                     mode="focus"
                   />
@@ -3303,16 +3423,8 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     textAlign: 'center',
   },
-  streamGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    padding: 8,
-    paddingBottom: 18,
-  },
-  streamCellWrap: {
-    padding: 6,
-  },
   streamCell: {
+    flex: 1,
     overflow: 'hidden',
     borderRadius: 18,
     borderWidth: 0.5,
@@ -3337,8 +3449,9 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '700',
   },
+  // セルの大きさは StreamGrid が 16:9 で決めるので、プレイヤーはセルいっぱいに広げる。
   player: {
-    aspectRatio: 16 / 9,
+    flex: 1,
     backgroundColor: '#000',
     position: 'relative',
   },

@@ -86,6 +86,11 @@ class NativeHlsPlayerManager : SimpleViewManager<NativeHlsPlayerView>() {
   override fun getExportedCustomDirectEventTypeConstants(): MutableMap<String, Any> =
     MapBuilder.of("onPlayerEvent", MapBuilder.of("registrationName", "onPlayerEvent"))
 
+  override fun onAfterUpdateTransaction(view: NativeHlsPlayerView) {
+    super.onAfterUpdateTransaction(view)
+    view.applyPendingChanges()
+  }
+
   override fun onDropViewInstance(view: NativeHlsPlayerView) {
     view.release()
     super.onDropViewInstance(view)

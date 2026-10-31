@@ -56,6 +56,10 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
   private var volume = 1f
   private var liveTargetOffsetMs = 2_000L
   private var maxBitrate = 0
+  // ソース/ヘッダー/遅延目標の変更は印だけ付け、props 1回分の適用後にまとめて prepare する。
+  private var pendingPrepare = false
+  private var liveWindowRecoveries = 0
+  private var liveWindowRecoveryWindowStart = 0L
 
   init {
     setBackgroundColor(android.graphics.Color.BLACK)
@@ -86,14 +90,27 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
       }
 
       override fun onPlayerError(error: PlaybackException) {
+        if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW && allowLiveWindowRecovery()) {
+          // 通信の詰まり等でライブ端から遅れすぎただけ。ライブ端へ戻して即座に再開する
+          // (JS 側の自動復旧は最大45秒待つので、その間黒画面になっていた)。
+          exoPlayer.seekToDefaultPosition()
+          exoPlayer.prepare()
+          return
+        }
         emit("error", error.localizedMessage ?: error.errorCodeName)
       }
     })
   }
 
   fun setSourceUrl(next: String?) {
-    sourceUrl = next?.trim()?.takeIf { it.isNotEmpty() }
-    prepareIfNeeded(force = true)
+    val normalized = next?.trim()?.takeIf { it.isNotEmpty() }
+    // 新アーキ(Fabric)では props が1つ変わるだけでも全 props が再送される。同じ URL で
+    // 毎回 prepare し直していたため、音量変更などのたびに配信が最初から読み込み直されていた。
+    if (normalized == sourceUrl) {
+      return
+    }
+    sourceUrl = normalized
+    schedulePrepare()
   }
 
   fun setHeaders(next: Map<String, String>) {
@@ -101,7 +118,9 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
       return
     }
     headers = next
-    prepareIfNeeded(force = sourceUrl != null)
+    if (sourceUrl != null) {
+      schedulePrepare()
+    }
   }
 
   fun setPaused(next: Boolean) {
@@ -130,7 +149,39 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
       return
     }
     liveTargetOffsetMs = clamped
-    prepareIfNeeded(force = sourceUrl != null)
+    if (sourceUrl != null) {
+      schedulePrepare()
+    }
+  }
+
+  // ViewManager.onAfterUpdateTransaction から props 1回分の適用後に呼ばれる。生成直後に
+  // sourceUrl / headers / liveTargetOffsetMs が順不同で届いても prepare は1回で済む
+  // (旧実装は最大3回 prepare し、ヘッダー無しの最初の要求が失敗することもあった)。
+  fun applyPendingChanges() {
+    if (!pendingPrepare) {
+      return
+    }
+    pendingPrepare = false
+    prepareIfNeeded(force = true)
+  }
+
+  private fun schedulePrepare() {
+    if (pendingPrepare) {
+      return
+    }
+    pendingPrepare = true
+    // 念のため、トランザクション完了通知が来ない経路でも次のループで確実に反映する。
+    post { applyPendingChanges() }
+  }
+
+  private fun allowLiveWindowRecovery(): Boolean {
+    val now = android.os.SystemClock.elapsedRealtime()
+    if (now - liveWindowRecoveryWindowStart > 60_000L) {
+      liveWindowRecoveryWindowStart = now
+      liveWindowRecoveries = 0
+    }
+    liveWindowRecoveries += 1
+    return liveWindowRecoveries <= 5
   }
 
   // iOS の NetworkQuality.effectivePeakBitRate(エコノミー≈900kbps、3本以上で自動)に相当。
@@ -178,10 +229,12 @@ class NativeHlsPlayerView(context: Context) : FrameLayout(context) {
   }
 
   fun reload() {
+    pendingPrepare = false
     prepareIfNeeded(force = true)
   }
 
   fun release() {
+    pendingPrepare = false
     exoPlayer.release()
   }
 

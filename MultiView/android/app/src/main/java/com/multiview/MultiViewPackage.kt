@@ -15,5 +15,5 @@ class MultiViewPackage : ReactPackage {
     )
 
   override fun createViewManagers(reactContext: ReactApplicationContext): MutableList<ViewManager<*, *>> =
-    mutableListOf(NativeHlsPlayerManager())
+    mutableListOf(NativeHlsPlayerManager(), ReorderHandleViewManager())
 }

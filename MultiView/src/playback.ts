@@ -66,14 +66,19 @@ export function webStreamURL(stream: StreamItem): string {
   }
 }
 
+export function youtubeChatURL(videoId: string): string {
+  return `https://www.youtube.com/live_chat?v=${encodeURIComponent(videoId)}&embed_domain=tonton888115.github.io`;
+}
+
 export function chatURL(stream: StreamItem): string | null {
   const channel = cleanChannel(stream.channel);
   switch (stream.platform) {
     case 'twitch':
       return `https://www.twitch.tv/popout/${encodeURIComponent(channel)}/chat?popout=`;
     case 'youtube': {
+      // @handle 等で動画IDが無い場合は null。呼び出し側でライブ動画IDを解決して youtubeChatURL を使う。
       const id = youtubeVideoId(channel);
-      return id ? `https://www.youtube.com/live_chat?v=${encodeURIComponent(id)}&embed_domain=tonton888115.github.io` : null;
+      return id ? youtubeChatURL(id) : null;
     }
     case 'kick':
       return `https://kick.com/${encodeURIComponent(channel)}/chatroom`;

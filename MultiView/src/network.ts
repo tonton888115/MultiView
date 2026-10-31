@@ -54,13 +54,18 @@ function startMonitoring() {
     return;
   }
 
+  const module = nativeNetworkInfo();
+  if (!module?.getConnectionType) {
+    // ネイティブモジュールが無い(古いAPK等)と種別が永遠に 'none' のままになり、
+    // 回線確定を待つ処理(ニコ生セッション開始など)が止まってしまう。種別不明として扱う。
+    applyType('other');
+    return;
+  }
+
   pollConnectionType();
 
   try {
-    const module = nativeNetworkInfo();
-    if (module) {
-      nativeSubscription = new NativeEventEmitter(module as any).addListener('networkChanged', applyType);
-    }
+    nativeSubscription = new NativeEventEmitter(module as any).addListener('networkChanged', applyType);
   } catch {
     nativeSubscription = undefined;
   }

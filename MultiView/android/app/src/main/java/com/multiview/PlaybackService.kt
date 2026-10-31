@@ -21,7 +21,9 @@ class PlaybackService : Service() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     startForegroundNotification()
-    return START_STICKY
+    // プレイヤーはアプリ(Activity)側にあるので、プロセスが落ちた後にサービスだけ
+    // 再起動されても音は出ない。START_STICKY だと「再生中」通知だけが残っていた。
+    return START_NOT_STICKY
   }
 
   private fun startForegroundNotification() {
