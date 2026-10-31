@@ -6,6 +6,15 @@
 ## 1行サマリ
 iOS(完全ネイティブSwift, `ios/MultiView/*.swift`, 約14,300行)を**リファレンス仕様**として、Android(React Native: `App.tsx` + `src/` + Kotlinネイティブモジュール)を**機能パリティ**へ引き上げる大規模リファクタ。iOSとAndroidは別実装。
 
+## 2026-10-31 全体監査（ブランチ `claude/serene-faraday-yc7i3z`、未ビルド・未実機検証）
+ユーザー報告「視聴タブをドラッグしても場所の移動ができない」＋全体監査。**APK 再ビルド(Kotlin 変更あり)と Codemagic iOS ビルド、ADB 実機確認が未実施。**
+- **並び替え(Android)**: 原因は `StreamCell` の PanResponder が `useMemo([index…])` で作り直され、並べ替えのたびに gestureState(dx/dy) が 0 に戻り元位置へ戻ること。`src/StreamGrid.tsx` に作り直し: セルは id 順で描画固定・位置は transform(ネイティブドライバ)、ドラッグ中は他セルをプレビュー移動し離した時に1回だけ `onMove(id, index)`。ハンドル(≡)は即ドラッグ、セル本体は長押し(320ms)。端で自動スクロール。ネイティブ `MultiViewReorderHandle`(ReorderHandleViewManager.kt)が ACTION_DOWN で ScrollView の横取りを禁止(旧 APK では View にフォールバック)。テスト: `streamGrid.test.tsx`/`gridLayout.test.ts`。
+- **並び替え(iOS)**: ドラッグ中の reload(レイド追加・設定変更・回線切替・エラー復旧)がセルを外してドラッグを中断していた → ドラッグ中は保留し指を離した後に実行。ニコ生のエラー通知は stream.id 付きにして**その配信だけ**作り直す(以前は全配信を作り直し)。グリッド偶数本も「2列詰め・奇数のみ末尾全幅」に統一(Android と同じ)。
+- **Fabric は props が1つ変わるだけで全 props を再送する**(enablePropsUpdateReconciliationAndroid=false)。`NativeHlsPlayerView.setSourceUrl` が毎回 prepare し直し、音量/ミュート変更のたびに配信が再読込されていた → URL 変化時のみ、`onAfterUpdateTransaction` で1回だけ prepare。BEHIND_LIVE_WINDOW はネイティブで即復旧。
+- 弾幕: レイアウト/設定変更のたびにチャット接続を張り直していた(起動直後に必ず1回、設定トグルで全配信) → ref 化し接続は配信と表示ON/OFFの変化時のみ。`danmakuOverlay.test.tsx` は旧実装で失敗することを確認済み。
+- その他: 音量スライダーの座標ずれ・操作中の App 全体再描画/保存、自動復旧の45秒窓内エラー破棄、Web/iframe の初期音量未反映、iframe優先時の無限再解決、YouTube @handle の /live 重複取得(共有+キャッシュ)、同接数の通信量削減(両PF)、Twitch トークン期限を1時間と誤推定、Helix の is_sent:false、注入スクリプトの全DOM走査の間引き、Android 15+ の画面端(safe-area)、PlaybackService を START_NOT_STICKY。
+- Kotlin は Android SDK を取得できない環境のため、実 android.jar(Robolectric android-all, API 35)＋RN/media3 のスタブで構文・型チェックのみ実施。
+
 ## いまの状態（2026-06-19 / HEAD=b645d86 まで全て push 済み＝Codemagic iOS ビルド実行中）
 - **エコノミー画質 360p 以下に統一(2026-06-19)**: ユーザー「エコノミーでも画質良く通信量すごい」。Android は 2C で既に 640×360 キャップ済み。iOS は **ビットレート上限(900kbps)のみで解像度キャップ無し**(YouTubeは何も未設定)だったため、`NetworkQuality.effectiveMaximumResolution`(640×360 when economy)を追加し全 AVPlayer プレイヤー＋YouTube に `preferredMaximumResolution` を適用(b645d86, push済→iOSビルド)。両PFでエコノミー=≤360p。
 
@@ -37,6 +46,8 @@ iOS(完全ネイティブSwift, `ios/MultiView/*.swift`, 約14,300行)を**リ�
 - 検証: 必ずADB実機（AGENTS.md準拠、エミュ不可）。jest=`npm test`(現状27件), 型=`npx tsc --noEmit`。
 
 ## 既知の落とし穴（再発防止）
+- **Fabric(新アーキ)では props 更新のたびに全 props が ViewManager の setter に再送される**。setter は冪等にし、重い処理(prepare 等)は値が変わった時だけ `onAfterUpdateTransaction` でまとめて行う。
+- **ジェスチャー処理(PanResponder 等)を変わりやすい値に依存して作り直さない**。ドラッグ中の状態は ref で持つ。リストの並べ替えで React の子要素順を入れ替えるとネイティブビューが付け替わり、TextureView/WebView の映像が瞬くので、描画順は固定して transform で位置を動かす。
 - react-native-webview の隠しWebViewは `style` だけだと外側コンテナの既定`flex:1`が残り、flex兄弟として領域を奪う。**必ず `containerStyle` も絶対配置に**(`hiddenBridgeWeb`に`flex:0`)。
 - RNでネイティブ動画ビューは **TextureView**（SurfaceViewはRN動的レイアウトでリサイズ失敗）。
 - ニコ生はRN直fetch/WSがanti-botで弾かれる→**niconicoオリジンを読み込んだ隠しWebView内**でfetch+WS+NDGRを実行(`src/niconico.ts`)。data-propsは`&#xHH;`16進エンティティ復号必須。NDGR fetchは`credentials`を付けない(CORS)。デスクトップUA必須(sp版回避)。
