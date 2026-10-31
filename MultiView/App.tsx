@@ -5,7 +5,6 @@ import {
   AppState,
   Animated,
   Modal,
-  SafeAreaView,
   ScrollView,
   PanResponder,
   Pressable,
@@ -19,6 +18,7 @@ import {
   Linking,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import {SafeAreaProvider, SafeAreaView, type Edge} from 'react-native-safe-area-context';
 import {WebView, type WebViewMessageEvent} from 'react-native-webview';
 import {DanmakuOverlay} from './src/DanmakuOverlay';
 import {GiftOverlay} from './src/GiftOverlay';
@@ -74,6 +74,8 @@ const SETTINGS_KEY = 'multiview.android.settings.v2';
 const LEGACY_SETTINGS_KEY = 'multiview.android.settings.v1';
 const VOLUMES_KEY = 'multiview.android.volumes.v1';
 const chromeAutoHideDelayMs = 2400;
+// Android 15+ (targetSdk 35+) は画面端まで描画が強制されるので、実際のシステムバー領域を避ける。
+const allEdges: Edge[] = ['top', 'right', 'bottom', 'left'];
 
 const platformIds: PlatformId[] = ['kick', 'twitch', 'youtube', 'niconico', 'twitcasting'];
 const youtubeViewerKeys = ['concurrentViewers', 'concurrent_viewers'];
@@ -577,69 +579,71 @@ export default function App() {
   }, []);
 
   return (
-    <SafeAreaView style={styles.app}>
-      <StatusBar barStyle="light-content" backgroundColor="#05070a" translucent={false} />
-      <View style={styles.content}>
-        {activeTab === 'following' && (
-          <SourceBrowser sources={orderedSources(followingSources, settings)} onAdd={addStream} />
-        )}
-        {activeTab === 'ranking' && (
-          <SourceBrowser sources={orderedSources(rankingSources, settings)} onAdd={addStream} />
-        )}
-        <View
-          style={[styles.tabPanel, activeTab !== 'viewing' && styles.hiddenViewingPanel]}
-          pointerEvents={activeTab === 'viewing' ? 'auto' : 'none'}>
-          <ViewingScreen
-            streams={streams}
-            settings={settings}
-            volumes={volumes}
-            onAdd={addStream}
-            onRemove={removeStream}
-            onMove={moveStream}
-            onVolume={setStreamVolume}
-            onSettings={updateSettings}
-            auth={auth}
-            onAuth={updateAuth}
-          />
+    <SafeAreaProvider>
+      <SafeAreaView style={styles.app} edges={allEdges}>
+        <StatusBar barStyle="light-content" backgroundColor="#05070a" translucent={false} />
+        <View style={styles.content}>
+          {activeTab === 'following' && (
+            <SourceBrowser sources={orderedSources(followingSources, settings)} onAdd={addStream} />
+          )}
+          {activeTab === 'ranking' && (
+            <SourceBrowser sources={orderedSources(rankingSources, settings)} onAdd={addStream} />
+          )}
+          <View
+            style={[styles.tabPanel, activeTab !== 'viewing' && styles.hiddenViewingPanel]}
+            pointerEvents={activeTab === 'viewing' ? 'auto' : 'none'}>
+            <ViewingScreen
+              streams={streams}
+              settings={settings}
+              volumes={volumes}
+              onAdd={addStream}
+              onRemove={removeStream}
+              onMove={moveStream}
+              onVolume={setStreamVolume}
+              onSettings={updateSettings}
+              auth={auth}
+              onAuth={updateAuth}
+            />
+          </View>
+          {activeTab === 'settings' && (
+            <SettingsScreen
+              streams={streams}
+              settings={settings}
+              onSettings={updateSettings}
+              onImport={(nextStreams, nextSettings) => {
+                setStreams(nextStreams);
+                setSettings(sanitizeSettings({...settings, ...nextSettings}));
+                setActiveTab('viewing');
+              }}
+              onMovePlatform={(index, delta) => {
+                const order = orderedPlatforms(settings.platformOrder);
+                const target = index + delta;
+                if (target < 0 || target >= order.length) {
+                  return;
+                }
+                const next = order.slice();
+                const [item] = next.splice(index, 1);
+                next.splice(target, 0, item);
+                updateSettings({platformOrder: next});
+              }}
+              onClear={() => setStreams([])}
+              auth={auth}
+              onAuth={updateAuth}
+              onLogin={startOAuthLogin}
+              onNiconicoLogin={() => setNiconicoLoginOpen(true)}
+            />
+          )}
         </View>
-        {activeTab === 'settings' && (
-          <SettingsScreen
-            streams={streams}
-            settings={settings}
-            onSettings={updateSettings}
-            onImport={(nextStreams, nextSettings) => {
-              setStreams(nextStreams);
-              setSettings(sanitizeSettings({...settings, ...nextSettings}));
-              setActiveTab('viewing');
-            }}
-            onMovePlatform={(index, delta) => {
-              const order = orderedPlatforms(settings.platformOrder);
-              const target = index + delta;
-              if (target < 0 || target >= order.length) {
-                return;
-              }
-              const next = order.slice();
-              const [item] = next.splice(index, 1);
-              next.splice(target, 0, item);
-              updateSettings({platformOrder: next});
-            }}
-            onClear={() => setStreams([])}
-            auth={auth}
-            onAuth={updateAuth}
-            onLogin={startOAuthLogin}
-            onNiconicoLogin={() => setNiconicoLoginOpen(true)}
-          />
-        )}
-      </View>
-      <NiconicoLoginModal visible={niconicoLoginOpen} onClose={() => setNiconicoLoginOpen(false)} />
+        <NiconicoLoginModal visible={niconicoLoginOpen} onClose={() => setNiconicoLoginOpen(false)} />
 
-      <View style={styles.tabBar}>
-        <TabButton active={activeTab === 'following'} label="フォロー" onPress={() => setActiveTab('following')} />
-        <TabButton active={activeTab === 'ranking'} label="ランキング" onPress={() => setActiveTab('ranking')} />
-        <TabButton active={activeTab === 'viewing'} label="視聴" onPress={() => setActiveTab('viewing')} />
-        <TabButton active={activeTab === 'settings'} label="設定" onPress={() => setActiveTab('settings')} />
-      </View>
-    </SafeAreaView>
+        <View style={styles.tabBar}>
+          <TabButton active={activeTab === 'following'} label="フォロー" onPress={() => setActiveTab('following')} />
+          <TabButton active={activeTab === 'ranking'} label="ランキング" onPress={() => setActiveTab('ranking')} />
+          <TabButton active={activeTab === 'viewing'} label="視聴" onPress={() => setActiveTab('viewing')} />
+          <TabButton active={activeTab === 'settings'} label="設定" onPress={() => setActiveTab('settings')} />
+        </View>
+      </SafeAreaView>
+    </SafeAreaProvider>
   );
 }
 
@@ -2304,40 +2308,42 @@ function AddStreamModal({
 
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
-      <SafeAreaView style={styles.modal}>
-        <View style={styles.modalHeader}>
-          <Text style={styles.modalTitle}>配信を追加</Text>
-          <TouchableOpacity onPress={onClose}>
-            <Text style={styles.closeText}>閉じる</Text>
+      <SafeAreaProvider>
+        <SafeAreaView style={styles.modal} edges={allEdges}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>配信を追加</Text>
+            <TouchableOpacity onPress={onClose}>
+              <Text style={styles.closeText}>閉じる</Text>
+            </TouchableOpacity>
+          </View>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.sourceTabs}>
+            {order.map(id => {
+              const item = platformInfo(id);
+              return (
+                <Pill
+                  key={item.id}
+                  active={platform === item.id}
+                  color={item.color}
+                  label={item.label}
+                  onPress={() => setPlatform(item.id)}
+                />
+              );
+            })}
+          </ScrollView>
+          <TextInput
+            value={text}
+            onChangeText={setText}
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder={info.hint}
+            placeholderTextColor="#7d8794"
+            style={styles.input}
+          />
+          <TouchableOpacity style={styles.fullButton} onPress={submit}>
+            <Text style={styles.fullButtonText}>追加</Text>
           </TouchableOpacity>
-        </View>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.sourceTabs}>
-          {order.map(id => {
-            const item = platformInfo(id);
-            return (
-              <Pill
-                key={item.id}
-                active={platform === item.id}
-                color={item.color}
-                label={item.label}
-                onPress={() => setPlatform(item.id)}
-              />
-            );
-          })}
-        </ScrollView>
-        <TextInput
-          value={text}
-          onChangeText={setText}
-          autoCapitalize="none"
-          autoCorrect={false}
-          placeholder={info.hint}
-          placeholderTextColor="#7d8794"
-          style={styles.input}
-        />
-        <TouchableOpacity style={styles.fullButton} onPress={submit}>
-          <Text style={styles.fullButtonText}>追加</Text>
-        </TouchableOpacity>
-      </SafeAreaView>
+        </SafeAreaView>
+      </SafeAreaProvider>
     </Modal>
   );
 }
@@ -2451,92 +2457,94 @@ function FocusModal({
 
   return (
     <Modal visible={!!stream} animationType="slide" onRequestClose={onClose}>
-      <SafeAreaView style={styles.modal}>
-        {stream && (
-          <View style={styles.focusSurface}>
-            <View style={styles.focusChatPanel}>
-              {settings.showChat && chat ? (
-                <WebView
-                  ref={chatRef}
-                  source={{uri: chat}}
-                  userAgent={stream.platform === 'youtube' ? desktopUserAgent : mobileUserAgent}
-                  javaScriptEnabled
-                  domStorageEnabled
-                  sharedCookiesEnabled
-                  thirdPartyCookiesEnabled
-                  setSupportMultipleWindows={false}
-                  style={styles.focusChatWeb}
-                />
-              ) : (
-                <View style={styles.focusUnavailable}>
-                  {settings.showChat && resolvingChat ? (
-                    <ActivityIndicator color="#7ab7ff" />
-                  ) : (
-                    <Text style={styles.focusUnavailableText}>
-                      {settings.showChat ? 'チャットを表示できません(ライブ配信中か確認してください)' : 'チャット表示はオフです'}
-                    </Text>
-                  )}
-                </View>
-              )}
-            </View>
-            <View style={styles.focusComposer}>
-              <TextInput
-                value={commentText}
-                onChangeText={setCommentText}
-                autoCapitalize="none"
-                autoCorrect={false}
-                placeholder="コメント"
-                placeholderTextColor="rgba(255,255,255,0.55)"
-                style={styles.focusInput}
-                returnKeyType="send"
-                onSubmitEditing={sendComment}
-              />
-              <TouchableOpacity style={styles.focusSend} onPress={sendComment}>
-                <Text style={styles.focusSendText}>送信</Text>
-              </TouchableOpacity>
-              {!!commentStatus && <Text style={styles.focusStatus} numberOfLines={1}>{commentStatus}</Text>}
-            </View>
-            <View style={styles.focusPlayer} onTouchStart={showChrome}>
-              <StreamPlayer
-                stream={stream}
-                settings={settings}
-                streamCount={streamCount}
-                paused={false}
-                muted={muted || effectiveVolume <= 0}
-                volume={effectiveVolume}
-                reloadKey={reloadKey}
-                onViewerCount={setWebViewerCount}
-              />
-              <View style={styles.playerChrome} pointerEvents="box-none">
-                {!chromeVisible && <Pressable style={styles.chromeRevealTouch} onPress={showChrome} />}
-                {settings.showViewerCount && <ViewerCountBadge stream={stream} externalCount={webViewerCount} visible={chromeVisible} />}
-                <View
-                  style={[styles.autoHideChrome, !chromeVisible && styles.autoHideChromeHidden]}
-                  pointerEvents={chromeVisible ? 'box-none' : 'none'}>
-                  <TouchableOpacity style={[styles.overlayButton, styles.focusCloseButton]} onPress={onClose}>
-                    <Text style={styles.overlayIcon}>‹</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={[styles.overlayButton, styles.focusReloadButton]} onPress={() => onReload(stream.id)}>
-                    <Text style={styles.overlayIcon}>↻</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={[styles.overlayButton, styles.focusRemoveButton]} onPress={removeFocused}>
-                    <Text style={styles.overlayIcon}>×</Text>
-                  </TouchableOpacity>
-                  <VolumeOverlay
-                    stream={stream}
-                    volume={effectiveVolume}
-                    color={platformInfo(stream.platform).color}
-                    onVolume={previewVolume}
-                    onVolumeEnd={commitVolume}
-                    onInteract={showChrome}
-                    mode="focus"
+      <SafeAreaProvider>
+        <SafeAreaView style={styles.modal} edges={allEdges}>
+          {stream && (
+            <View style={styles.focusSurface}>
+              <View style={styles.focusChatPanel}>
+                {settings.showChat && chat ? (
+                  <WebView
+                    ref={chatRef}
+                    source={{uri: chat}}
+                    userAgent={stream.platform === 'youtube' ? desktopUserAgent : mobileUserAgent}
+                    javaScriptEnabled
+                    domStorageEnabled
+                    sharedCookiesEnabled
+                    thirdPartyCookiesEnabled
+                    setSupportMultipleWindows={false}
+                    style={styles.focusChatWeb}
                   />
+                ) : (
+                  <View style={styles.focusUnavailable}>
+                    {settings.showChat && resolvingChat ? (
+                      <ActivityIndicator color="#7ab7ff" />
+                    ) : (
+                      <Text style={styles.focusUnavailableText}>
+                        {settings.showChat ? 'チャットを表示できません(ライブ配信中か確認してください)' : 'チャット表示はオフです'}
+                      </Text>
+                    )}
+                  </View>
+                )}
+              </View>
+              <View style={styles.focusComposer}>
+                <TextInput
+                  value={commentText}
+                  onChangeText={setCommentText}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  placeholder="コメント"
+                  placeholderTextColor="rgba(255,255,255,0.55)"
+                  style={styles.focusInput}
+                  returnKeyType="send"
+                  onSubmitEditing={sendComment}
+                />
+                <TouchableOpacity style={styles.focusSend} onPress={sendComment}>
+                  <Text style={styles.focusSendText}>送信</Text>
+                </TouchableOpacity>
+                {!!commentStatus && <Text style={styles.focusStatus} numberOfLines={1}>{commentStatus}</Text>}
+              </View>
+              <View style={styles.focusPlayer} onTouchStart={showChrome}>
+                <StreamPlayer
+                  stream={stream}
+                  settings={settings}
+                  streamCount={streamCount}
+                  paused={false}
+                  muted={muted || effectiveVolume <= 0}
+                  volume={effectiveVolume}
+                  reloadKey={reloadKey}
+                  onViewerCount={setWebViewerCount}
+                />
+                <View style={styles.playerChrome} pointerEvents="box-none">
+                  {!chromeVisible && <Pressable style={styles.chromeRevealTouch} onPress={showChrome} />}
+                  {settings.showViewerCount && <ViewerCountBadge stream={stream} externalCount={webViewerCount} visible={chromeVisible} />}
+                  <View
+                    style={[styles.autoHideChrome, !chromeVisible && styles.autoHideChromeHidden]}
+                    pointerEvents={chromeVisible ? 'box-none' : 'none'}>
+                    <TouchableOpacity style={[styles.overlayButton, styles.focusCloseButton]} onPress={onClose}>
+                      <Text style={styles.overlayIcon}>‹</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.overlayButton, styles.focusReloadButton]} onPress={() => onReload(stream.id)}>
+                      <Text style={styles.overlayIcon}>↻</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.overlayButton, styles.focusRemoveButton]} onPress={removeFocused}>
+                      <Text style={styles.overlayIcon}>×</Text>
+                    </TouchableOpacity>
+                    <VolumeOverlay
+                      stream={stream}
+                      volume={effectiveVolume}
+                      color={platformInfo(stream.platform).color}
+                      onVolume={previewVolume}
+                      onVolumeEnd={commitVolume}
+                      onInteract={showChrome}
+                      mode="focus"
+                    />
+                  </View>
                 </View>
               </View>
             </View>
-          </View>
-        )}
-      </SafeAreaView>
+          )}
+        </SafeAreaView>
+      </SafeAreaProvider>
     </Modal>
   );
 }
@@ -2954,24 +2962,26 @@ function NiconicoLoginPanel({onLogin}: {onLogin: () => void}) {
 function NiconicoLoginModal({visible, onClose}: {visible: boolean; onClose: () => void}) {
   return (
     <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
-      <SafeAreaView style={styles.modal}>
-        <View style={styles.loginHeader}>
-          <Text style={styles.loginTitle}>ニコ生ログイン</Text>
-          <TouchableOpacity style={styles.smallButton} onPress={onClose}>
-            <Text style={styles.smallButtonText}>完了</Text>
-          </TouchableOpacity>
-        </View>
-        <WebView
-          source={{uri: 'https://account.nicovideo.jp/login?site=niconico&next_url=%2F'}}
-          userAgent={mobileUserAgent}
-          javaScriptEnabled
-          domStorageEnabled
-          sharedCookiesEnabled
-          thirdPartyCookiesEnabled
-          setSupportMultipleWindows={false}
-          style={styles.loginWeb}
-        />
-      </SafeAreaView>
+      <SafeAreaProvider>
+        <SafeAreaView style={styles.modal} edges={allEdges}>
+          <View style={styles.loginHeader}>
+            <Text style={styles.loginTitle}>ニコ生ログイン</Text>
+            <TouchableOpacity style={styles.smallButton} onPress={onClose}>
+              <Text style={styles.smallButtonText}>完了</Text>
+            </TouchableOpacity>
+          </View>
+          <WebView
+            source={{uri: 'https://account.nicovideo.jp/login?site=niconico&next_url=%2F'}}
+            userAgent={mobileUserAgent}
+            javaScriptEnabled
+            domStorageEnabled
+            sharedCookiesEnabled
+            thirdPartyCookiesEnabled
+            setSupportMultipleWindows={false}
+            style={styles.loginWeb}
+          />
+        </SafeAreaView>
+      </SafeAreaProvider>
     </Modal>
   );
 }
@@ -3205,10 +3215,13 @@ function webFallbackScript(blockAds: boolean, platform: PlatformId) {
 }
 
 const styles = StyleSheet.create({
+  // 上下左右のシステムバー分は SafeAreaView(react-native-safe-area-context)が実際の余白で足す。
+  // 以前は StatusBar.currentHeight を手動で足しており、端まで描画しない旧Androidでは上が二重に空き、
+  // 端まで描画する Android 15+ では下部タブバーがナビゲーションバーに重なり得た。
   app: {
     flex: 1,
     backgroundColor: '#05070a',
-    paddingTop: (StatusBar.currentHeight ?? 0) + 4,
+    paddingTop: 4,
   },
   content: {
     flex: 1,
