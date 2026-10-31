@@ -67,7 +67,9 @@ export const adNetworkBlockerScript = `(function(){
     } catch(e) {}
   }
   strip();
-  new MutationObserver(strip).observe(document.documentElement, { childList: true, subtree: true });
+  // チャット等で DOM が頻繁に変わるページでも毎回全走査しないよう間引く。
+  function mvThrottle(fn, ms){ var pending = false; return function(){ if (pending) return; pending = true; setTimeout(function(){ pending = false; try { fn(); } catch(e) {} }, ms); }; }
+  new MutationObserver(mvThrottle(strip, 250)).observe(document.documentElement, { childList: true, subtree: true });
 })();`;
 
 // iOS AppDelegate.swift:386 niconicoPopupBlockerScript を移植。
@@ -86,7 +88,9 @@ export const niconicoPopupBlockerScript = `(function(){
     });
   }
   hideComfortPopup();
-  new MutationObserver(hideComfortPopup).observe(document.documentElement, { childList: true, subtree: true });
+  // innerText はレイアウト計算を伴うので、DOM 変更のたびではなく間引いて実行する。
+  function mvThrottle(fn, ms){ var pending = false; return function(){ if (pending) return; pending = true; setTimeout(function(){ pending = false; try { fn(); } catch(e) {} }, ms); }; }
+  new MutationObserver(mvThrottle(hideComfortPopup, 300)).observe(document.documentElement, { childList: true, subtree: true });
 })();`;
 
 // iOS AppDelegate.swift:405 embeddedPlayerTouchShieldScript を移植。
@@ -102,7 +106,8 @@ export const embeddedPlayerTouchShieldScript = `(function(){
     }
   }
   install();
-  new MutationObserver(install).observe(document.documentElement, { childList: true, subtree: true });
+  function mvThrottle(fn, ms){ var pending = false; return function(){ if (pending) return; pending = true; setTimeout(function(){ pending = false; try { fn(); } catch(e) {} }, ms); }; }
+  new MutationObserver(mvThrottle(install, 500)).observe(document.documentElement, { childList: true, subtree: true });
 })();`;
 
 // プラットフォーム固有の追加注入。iOSと同じ振り分けにする。

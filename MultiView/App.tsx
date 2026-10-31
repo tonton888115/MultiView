@@ -2998,7 +2998,7 @@ function QualityRow({
 
 const sourceBridgeScript = `
 (function(){
-  if (window.__multiViewURLBridge) true;
+  if (window.__multiViewURLBridge) return;
   window.__multiViewURLBridge = true;
   var last = '';
   var lastGestureAt = 0;
@@ -3176,9 +3176,17 @@ function webFallbackScript(blockAds: boolean, platform: PlatformId) {
     }
     tame();
     postYouTubeViewerCount();
+    // DOM 変更のたびに広告候補の innerText 読み取り(レイアウト計算)を全走査すると、チャットが
+    // 流れ続けるページで WebView が重くなる。変更通知は 300ms 単位にまとめて処理する。
+    var tamePending = false;
     new MutationObserver(function(){
-      tame();
-      postYouTubeViewerCount();
+      if (tamePending) return;
+      tamePending = true;
+      setTimeout(function(){
+        tamePending = false;
+        tame();
+        postYouTubeViewerCount();
+      }, 300);
     }).observe(document.documentElement, {childList:true, subtree:true});
     setInterval(postYouTubeViewerCount, 5000);
     window.mvPlay=function(){

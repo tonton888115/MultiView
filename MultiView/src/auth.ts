@@ -1,5 +1,5 @@
 import {Linking} from 'react-native';
-import {cleanChannel, desktopUserAgent, mobileUserAgent, youtubeVideoId} from './playback';
+import {cleanChannel, mobileUserAgent, resolveLiveYouTubeVideoID, youtubeVideoId} from './playback';
 import type {StreamItem} from './types';
 
 export const AUTH_STORAGE_KEY = 'multiview.android.auth.v1';
@@ -79,6 +79,10 @@ export function authStatus(auth: AuthState, service: OAuthService): string {
   const token = auth[service].token;
   if (!token) {
     return '未ログイン';
+  }
+  // Twitch はトークン有効期限の推定値で判断せず、送信時に validate で確認する。
+  if (service === 'twitch') {
+    return 'ログイン済み';
   }
   return token.expiresAt > Date.now() ? 'ログイン済み' : '期限切れ';
 }
@@ -166,11 +170,15 @@ export async function completeOAuthRedirect(auth: AuthState, pending: PendingOAu
     if (!accessToken) {
       throw new Error('Twitch access tokenを取得できません');
     }
-    const userID = await validateTwitch(accessToken);
+    const validated = await validateTwitch(accessToken);
+    // Twitch の implicit フローは expires_in を返さないことが多い。以前は既定1時間で期限切れ扱いに
+    // しており、1時間後からコメント送信で再ログインを求められていた。validate の expires_in を使い、
+    // それも無ければ iOS と同じく30日とみなす。
+    const expiresIn = numberValue(values.expires_in) ?? validated.expiresIn ?? twitchDefaultTokenLifetimeSeconds;
     return saveToken(auth, 'twitch', {
       accessToken,
-      userID,
-      expiresAt: Date.now() + Math.max(60, Number(values.expires_in ?? 3600) - 60) * 1000,
+      userID: validated.userID,
+      expiresAt: Date.now() + Math.max(60, expiresIn - 60) * 1000,
       scope: values.scope,
     });
   }
@@ -325,6 +333,14 @@ async function postTwitch(auth: AuthState, channel: string, content: string): Pr
     const body = await send.text().catch(() => '');
     throw new Error(body.trim() || `Twitchコメント送信に失敗しました HTTP ${send.status}`);
   }
+  // Helix は HTTP 200 でも is_sent:false(チャットルールやAutoModで破棄)を返す。
+  // 以前はこれも「送信しました」と表示していた。
+  const sendJson = await send.json().catch(() => ({}));
+  const result = sendJson?.data?.[0];
+  if (result && result.is_sent === false) {
+    const reason = stringValue(result?.drop_reason?.message) ?? stringValue(result?.drop_reason?.code);
+    throw new Error(reason ? `Twitchがコメントを破棄しました: ${reason}` : 'Twitchがコメントを破棄しました');
+  }
   return nextAuth;
 }
 
@@ -358,7 +374,7 @@ async function postTwitcasting(auth: AuthState, channel: string, content: string
 
 async function postYouTube(auth: AuthState, channel: string, content: string): Promise<AuthState> {
   const {auth: nextAuth, token} = await authorizedToken(auth, 'youtube');
-  const videoID = youtubeVideoId(channel) ?? (await resolveYouTubeVideoID(channel));
+  const videoID = youtubeVideoId(channel) ?? (await resolveLiveYouTubeVideoID(channel));
   if (!videoID) {
     throw new Error('YouTubeライブ動画IDを取得できません');
   }
@@ -396,6 +412,21 @@ async function authorizedToken(auth: AuthState, service: OAuthService): Promise<
   if (token.expiresAt > Date.now()) {
     return {auth, token};
   }
+  if (service === 'twitch') {
+    // 以前は期限を既定1時間と推定していたため、まだ有効なトークンも「期限切れ」になっていた。
+    // validate で実際に有効なら期限を更新して使い続ける(無効なら下の再ログイン案内へ)。
+    try {
+      const validated = await validateTwitch(token.accessToken);
+      const next: OAuthToken = {
+        ...token,
+        userID: token.userID ?? validated.userID,
+        expiresAt: Date.now() + Math.max(60, (validated.expiresIn ?? twitchDefaultTokenLifetimeSeconds) - 60) * 1000,
+      };
+      return {auth: saveToken(auth, 'twitch', next), token: next};
+    } catch {
+      // 失効済み。
+    }
+  }
   if (!token.refreshToken) {
     throw new Error(`${serviceLabel(service)}ログインの期限が切れました。再ログインしてください`);
   }
@@ -412,7 +443,9 @@ async function authorizedToken(auth: AuthState, service: OAuthService): Promise<
   throw new Error(`${serviceLabel(service)}ログインの期限が切れました。再ログインしてください`);
 }
 
-async function validateTwitch(accessToken: string): Promise<string> {
+const twitchDefaultTokenLifetimeSeconds = 3600 * 24 * 30;
+
+async function validateTwitch(accessToken: string): Promise<{userID: string; expiresIn?: number}> {
   const response = await fetch('https://id.twitch.tv/oauth2/validate', {
     headers: {Authorization: `OAuth ${accessToken}`},
   });
@@ -420,7 +453,9 @@ async function validateTwitch(accessToken: string): Promise<string> {
   if (!response.ok || !json.user_id) {
     throw new Error(errorDescription(json, 'TwitchユーザーIDを取得できません'));
   }
-  return json.user_id;
+  const expiresIn = numberValue(json.expires_in);
+  // expires_in が 0 の場合は「期限なし」を意味するので既定値に任せる。
+  return {userID: String(json.user_id), expiresIn: expiresIn && expiresIn > 0 ? expiresIn : undefined};
 }
 
 async function exchangeKickCode(config: ServiceAuthConfig, code: string, verifier: string, redirectURI: string): Promise<OAuthToken> {
@@ -489,24 +524,6 @@ async function refreshYouTubeToken(config: ServiceAuthConfig, refreshToken: stri
     expiresAt: Date.now() + Math.max(60, Number(json.expires_in ?? 3600) - 60) * 1000,
     scope: json.scope,
   };
-}
-
-async function resolveYouTubeVideoID(raw: string): Promise<string | null> {
-  const trimmed = raw.trim();
-  const target = trimmed.includes('youtube.com') || trimmed.includes('youtu.be')
-    ? trimmed
-    : `https://www.youtube.com/${trimmed.startsWith('@') ? trimmed : `@${trimmed}`}/live`;
-  const response = await fetch(target, {
-    headers: {'User-Agent': desktopUserAgent, 'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6'},
-  });
-  const finalID = youtubeVideoId(response.url);
-  if (finalID) {
-    return finalID;
-  }
-  const html = await response.text();
-  return html.match(/"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"/)?.[1]
-    ?? html.match(/watch\?v=([A-Za-z0-9_-]{11})/)?.[1]
-    ?? null;
 }
 
 function sanitizeService(raw: ServiceAuthState | undefined, fallback: ServiceAuthState): ServiceAuthState {
