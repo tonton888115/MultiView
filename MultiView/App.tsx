@@ -323,8 +323,11 @@ export default function App() {
   const authRef = useRef(auth);
   const pendingOAuthRef = useRef(pendingOAuth);
   const pendingHandoffURLRef = useRef<string | null>(null);
+  const hydratedRef = useRef(hydrated);
+  const initialURLCheckedRef = useRef(false);
   authRef.current = auth;
   pendingOAuthRef.current = pendingOAuth;
+  hydratedRef.current = hydrated;
 
   const applyHandoffURL = useCallback((url: string) => {
     const decoded = decodeHandoff(url);
@@ -415,7 +418,9 @@ export default function App() {
   useEffect(() => {
     const handleURL = ({url}: {url: string}) => {
       if (url.startsWith('multiview://handoff')) {
-        if (!hydrated) {
+        // 保存データの読み込み前に適用すると上書きされるので、読み込み完了まで保留する。
+        // (hydrated は ref で読む: 起動URLの取得が読み込み完了より遅れても取りこぼさない)
+        if (!hydratedRef.current) {
           pendingHandoffURLRef.current = url;
           return;
         }
@@ -442,13 +447,17 @@ export default function App() {
         });
     };
     const sub = Linking.addEventListener('url', handleURL);
-    Linking.getInitialURL().then(url => {
-      if (url) {
-        handleURL({url});
-      }
-    }).catch(() => undefined);
+    // 起動URLは1回だけ処理する。以前は読み込み完了時にもう一度取得して二重に適用していた。
+    if (!initialURLCheckedRef.current) {
+      initialURLCheckedRef.current = true;
+      Linking.getInitialURL().then(url => {
+        if (url) {
+          handleURL({url});
+        }
+      }).catch(() => undefined);
+    }
     return () => sub.remove();
-  }, [applyHandoffURL, hydrated]);
+  }, [applyHandoffURL]);
 
   const updateAuth = useCallback((next: AuthState) => {
     setAuth(sanitizeAuthState(next));
@@ -1854,12 +1863,16 @@ async function fetchYouTubeViewerCount(rawChannel: string): Promise<number | nul
     videoId = videoId ?? null;
   }
   if (videoId) {
-    const firstCount = await firstViewerCount([
-      fetchYouTubePlayerViewerCount(videoId),
-      fetchYouTubeWatchViewerCount(videoId),
-    ]);
-    if (firstCount != null) {
-      return firstCount;
+    // 軽い InnerTube /player(JSON) を先に試し、取れない時だけ重い watch ページ(HTML 約1MB)を取る
+    // (iOS ViewerCountProvider と同じ順序)。以前は両方を毎回並列に取得しており、30秒ごとに
+    // 配信1本あたり数MBを消費していた。
+    const playerCount = await fetchYouTubePlayerViewerCount(videoId);
+    if (playerCount != null) {
+      return playerCount;
+    }
+    const watchCount = await fetchYouTubeWatchViewerCount(videoId);
+    if (watchCount != null) {
+      return watchCount;
     }
   }
   const url = youtubeViewerURL(rawChannel);
@@ -1868,28 +1881,6 @@ async function fetchYouTubeViewerCount(rawChannel: string): Promise<number | nul
   }
   const response = await fetchWithTimeout(url, {headers: {'User-Agent': desktopUserAgent}}, youtubeViewerFetchTimeoutMs);
   return youtubeViewerCountFromText(await response.text());
-}
-
-async function firstViewerCount(promises: Array<Promise<number | null>>): Promise<number | null> {
-  return new Promise(resolve => {
-    let pending = promises.length;
-    let resolved = false;
-    const settle = (value: number | null) => {
-      if (!resolved && value != null) {
-        resolved = true;
-        resolve(value);
-        return;
-      }
-      pending -= 1;
-      if (!resolved && pending <= 0) {
-        resolved = true;
-        resolve(null);
-      }
-    };
-    for (const promise of promises) {
-      promise.then(settle).catch(() => settle(null));
-    }
-  });
 }
 
 async function fetchYouTubeWatchViewerCount(videoId: string): Promise<number | null> {

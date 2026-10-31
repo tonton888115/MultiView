@@ -1,4 +1,4 @@
-import React, {useEffect, useState} from 'react';
+import React, {memo, useEffect, useState} from 'react';
 import {StyleSheet} from 'react-native';
 import {WebView, type WebViewMessageEvent} from 'react-native-webview';
 import {makeChatEvent, textTokens} from './danmaku';
@@ -25,7 +25,8 @@ type BridgeMessage =
       superInfo?: string;
     };
 
-export function YouTubeOfficialChatBridge({stream, onEvent, onStatus}: Props) {
+// 弾幕が1件流れるたびに親(DanmakuOverlay)が再描画されるので memo しておく。
+export const YouTubeOfficialChatBridge = memo(function YouTubeOfficialChatBridge({stream, onEvent, onStatus}: Props) {
   const [videoId, setVideoId] = useState<string | null>(() => youtubeVideoId(stream.channel));
 
   useEffect(() => {
@@ -96,10 +97,12 @@ export function YouTubeOfficialChatBridge({stream, onEvent, onStatus}: Props) {
         ));
       }}
       onError={() => onStatus('YouTube公式チャット再接続中')}
+      // style だけだと外側コンテナの既定 flex:1 が残るため、コンテナも隠し位置に置く。
+      containerStyle={styles.hiddenContainer}
       style={styles.hiddenWebView}
     />
   );
-}
+});
 
 function parseBridgeMessage(raw: string): BridgeMessage | null {
   try {
@@ -340,6 +343,14 @@ export const youtubeOfficialChatObserverScript = `
 `;
 
 const styles = StyleSheet.create({
+  hiddenContainer: {
+    flex: 0,
+    position: 'absolute',
+    width: 1,
+    height: 1,
+    left: -2,
+    top: -2,
+  },
   hiddenWebView: {
     position: 'absolute',
     width: 1,

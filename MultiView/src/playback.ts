@@ -405,11 +405,47 @@ export function youtubeVideoId(raw: string): string | null {
   return null;
 }
 
+// @handle/live の解決結果は短時間だけ共有する。起動直後は映像・チャット・公式チャット・同接数が
+// 同時に同じ重い /live ページを取りに行き(1配信あたり3〜4本)、同接数は30秒ごとにも再取得して
+// いたため、同時実行は1本にまとめ、成功結果は少しの間使い回す。配信の切り替わりに追従できるよう
+// 失敗(null)は保存せず、成功結果も短めに失効させる。
+const liveVideoIdCacheMs = 60000;
+const liveVideoIdCache = new Map<string, {id: string; at: number}>();
+const liveVideoIdInFlight = new Map<string, Promise<string | null>>();
+
+export function clearLiveYouTubeVideoIDCache(): void {
+  liveVideoIdCache.clear();
+  liveVideoIdInFlight.clear();
+}
+
 export async function resolveLiveYouTubeVideoID(raw: string): Promise<string | null> {
   const url = liveResolutionURL(raw);
   if (!url) {
     return null;
   }
+  const cached = liveVideoIdCache.get(url);
+  if (cached && Date.now() - cached.at < liveVideoIdCacheMs) {
+    return cached.id;
+  }
+  const inFlight = liveVideoIdInFlight.get(url);
+  if (inFlight) {
+    return inFlight;
+  }
+  const request = fetchLiveYouTubeVideoID(url)
+    .then(id => {
+      if (id) {
+        liveVideoIdCache.set(url, {id, at: Date.now()});
+      }
+      return id;
+    })
+    .finally(() => {
+      liveVideoIdInFlight.delete(url);
+    });
+  liveVideoIdInFlight.set(url, request);
+  return request;
+}
+
+async function fetchLiveYouTubeVideoID(url: string): Promise<string | null> {
   // @handle/live ページからライブ動画IDを解決する。HTMLが重く失敗しやすいので、
   // タイムアウトでも throw せず(=フルWebページへ落とさず)、モバイル→デスクトップUAの
   // 2回まで試行する。最終的に解決できなければ null を返し、呼び出し側で扱う。

@@ -1,4 +1,4 @@
-import React, {useCallback, useEffect, useRef, useState} from 'react';
+import React, {memo, useCallback, useEffect, useRef, useState} from 'react';
 import {StyleSheet, Text, View} from 'react-native';
 import {subscribeGiftEvents, type GiftEvent} from './giftEvents';
 import type {AppSettings, PlatformId, StreamItem} from './types';
@@ -16,7 +16,8 @@ const platformAccent: Record<PlatformId, string> = {
 
 type ActiveGift = GiftEvent & {key: string};
 
-export function GiftOverlay({stream, settings}: {stream: StreamItem; settings: AppSettings}) {
+// プレイヤー(=弾幕の更新)と一緒に再描画されないよう memo。
+export const GiftOverlay = memo(function GiftOverlay({stream, settings}: {stream: StreamItem; settings: AppSettings}) {
   const [banners, setBanners] = useState<ActiveGift[]>([]);
   const timersRef = useRef<Array<ReturnType<typeof setTimeout>>>([]);
   const giftSoundEnabledRef = useRef(settings.giftSoundEnabled);
@@ -73,7 +74,7 @@ export function GiftOverlay({stream, settings}: {stream: StreamItem; settings: A
       })}
     </View>
   );
-}
+});
 
 export function playGiftCue(): void {
   // TODO(sound): no RN audio dep yet — do NOT add any npm/native dependency.

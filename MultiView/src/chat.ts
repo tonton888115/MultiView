@@ -292,6 +292,10 @@ function startYouTubeChat(stream: StreamItem, emit: Emit, status: Status): ChatC
   const videoId = youtubeVideoId(stream.channel);
 
   const run = async () => {
+    // 停止後に遅れて動き出した再接続で、通信を続けないようにする。
+    if (stopped) {
+      return;
+    }
     try {
       status('YouTubeチャット初期化中');
       const session = await withTimeout(
@@ -307,6 +311,9 @@ function startYouTubeChat(stream: StreamItem, emit: Emit, status: Status): ChatC
         }
         try {
           const page = await fetchYouTubeChatPage(session, continuation);
+          if (stopped) {
+            return;
+          }
           continuation = page.continuation ?? continuation;
           page.events.forEach(event => {
             if (!seen.has(event.id)) {
@@ -321,6 +328,9 @@ function startYouTubeChat(stream: StreamItem, emit: Emit, status: Status): ChatC
           }
           timer = setTimeout(poll, page.timeoutMs);
         } catch {
+          if (stopped) {
+            return;
+          }
           status('YouTubeコメント再接続中');
           timer = setTimeout(run, youtubeChatReconnectMs);
         }
@@ -628,6 +638,9 @@ function startTwitCastingChat(stream: StreamItem, emit: Emit, status: Status): C
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   const channel = cleanChannel(stream.channel);
   const connect = async () => {
+    if (stopped) {
+      return;
+    }
     try {
       status('ツイキャスコメント接続中');
       const movieId = await fetchTwitCastingMovieId(channel);
