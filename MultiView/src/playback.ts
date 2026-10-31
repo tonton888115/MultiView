@@ -418,13 +418,25 @@ export function clearLiveYouTubeVideoIDCache(): void {
   liveVideoIdInFlight.clear();
 }
 
-export async function resolveLiveYouTubeVideoID(raw: string): Promise<string | null> {
+// 使い回した動画IDが古かった(配信終了など)と分かった時に呼ぶ。次回は取り直す。
+export function forgetLiveYouTubeVideoID(raw: string): void {
+  const url = liveResolutionURL(raw);
+  if (url) {
+    liveVideoIdCache.delete(url);
+  }
+}
+
+export async function resolveLiveYouTubeVideoID(
+  raw: string,
+  options: {maxAgeMs?: number} = {},
+): Promise<string | null> {
   const url = liveResolutionURL(raw);
   if (!url) {
     return null;
   }
   const cached = liveVideoIdCache.get(url);
-  if (cached && Date.now() - cached.at < liveVideoIdCacheMs) {
+  const maxAgeMs = options.maxAgeMs ?? liveVideoIdCacheMs;
+  if (cached && Date.now() - cached.at < maxAgeMs) {
     return cached.id;
   }
   const inFlight = liveVideoIdInFlight.get(url);

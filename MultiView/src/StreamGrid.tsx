@@ -583,20 +583,6 @@ export function StreamGrid({streams, layoutMode, onMove, renderCell}: Props) {
         onScroll={onScroll}
         scrollEventThrottle={16}
         keyboardShouldPersistTaps="handled">
-        {placeholderFrame && (
-          <View
-            pointerEvents="none"
-            style={[
-              styles.placeholder,
-              {
-                left: placeholderFrame.x + gridCellGutter,
-                top: placeholderFrame.y + gridCellGutter,
-                width: Math.max(0, placeholderFrame.width - gridCellGutter * 2),
-                height: Math.max(0, placeholderFrame.height - gridCellGutter * 2),
-              },
-            ]}
-          />
-        )}
         {renderOrder.map(stream => {
           const index = orderIds.indexOf(stream.id);
           const frame = layout.frames[index];
@@ -619,6 +605,21 @@ export function StreamGrid({streams, layoutMode, onMove, renderCell}: Props) {
             />
           );
         })}
+        {/* 落下位置の枠。子要素の末尾に足して既存セルの並びをずらさず、zIndex で背面に描く。 */}
+        {placeholderFrame && (
+          <View
+            pointerEvents="none"
+            style={[
+              styles.placeholder,
+              {
+                left: placeholderFrame.x + gridCellGutter,
+                top: placeholderFrame.y + gridCellGutter,
+                width: Math.max(0, placeholderFrame.width - gridCellGutter * 2),
+                height: Math.max(0, placeholderFrame.height - gridCellGutter * 2),
+              },
+            ]}
+          />
+        )}
       </ScrollView>
     </View>
   );
@@ -706,6 +707,7 @@ const styles = StyleSheet.create({
   },
   placeholder: {
     position: 'absolute',
+    zIndex: -1,
     borderRadius: 18,
     borderWidth: 1.5,
     borderColor: 'rgba(103,168,255,0.75)',

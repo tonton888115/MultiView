@@ -49,6 +49,7 @@ import {
   makeStream,
   mobileUserAgent,
   resolvePlaybackSource,
+  forgetLiveYouTubeVideoID,
   resolveLiveYouTubeVideoID,
   webStreamURL,
   youtubeChatURL,
@@ -1859,10 +1860,15 @@ async function fetchTwitchViewerCount(rawChannel: string): Promise<number | null
   return toNumber(json?.data?.user?.stream?.viewersCount);
 }
 
+// 同接数の更新(30秒ごと)では、@handle の /live ページ(約1MB)を毎回取り直さず、解決済みの
+// 動画IDをしばらく使い回して軽い InnerTube /player だけで数える。
+const youtubeViewerVideoIdMaxAgeMs = 10 * 60 * 1000;
+
 async function fetchYouTubeViewerCount(rawChannel: string): Promise<number | null> {
-  let videoId = youtubeVideoId(rawChannel);
+  const directVideoId = youtubeVideoId(rawChannel);
+  let videoId = directVideoId;
   try {
-    videoId = videoId ?? await resolveLiveYouTubeVideoID(rawChannel);
+    videoId = videoId ?? await resolveLiveYouTubeVideoID(rawChannel, {maxAgeMs: youtubeViewerVideoIdMaxAgeMs});
   } catch {
     videoId = videoId ?? null;
   }
@@ -1873,6 +1879,10 @@ async function fetchYouTubeViewerCount(rawChannel: string): Promise<number | nul
     const playerCount = await fetchYouTubePlayerViewerCount(videoId);
     if (playerCount != null) {
       return playerCount;
+    }
+    if (!directVideoId) {
+      // 使い回した動画IDでは数えられなかった(配信終了・次の枠へ移動など)。次回は取り直す。
+      forgetLiveYouTubeVideoID(rawChannel);
     }
     const watchCount = await fetchYouTubeWatchViewerCount(videoId);
     if (watchCount != null) {

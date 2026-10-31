@@ -1,4 +1,4 @@
-import {clearLiveYouTubeVideoIDCache, resolveLiveYouTubeVideoID} from '../playback';
+import {clearLiveYouTubeVideoIDCache, forgetLiveYouTubeVideoID, resolveLiveYouTubeVideoID} from '../playback';
 
 type FetchMock = jest.Mock<Promise<{ok: boolean; url: string; text: () => Promise<string>}>, [string, unknown?]>;
 
@@ -51,5 +51,27 @@ describe('resolveLiveYouTubeVideoID sharing', () => {
     expect(await resolveLiveYouTubeVideoID('@channel')).toBeNull();
     expect(await resolveLiveYouTubeVideoID('@channel')).toBe('zyxwvutsrqp');
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('lets the viewer-count poll reuse an older id, and forget it when it turns stale', async () => {
+    const fetchMock = installFetch([
+      {url: 'https://www.youtube.com/watch?v=abcdefghijk'},
+      {url: 'https://www.youtube.com/watch?v=zyxwvutsrqp'},
+    ]);
+    const realNow = Date.now;
+    const start = realNow();
+    try {
+      Date.now = () => start;
+      expect(await resolveLiveYouTubeVideoID('@channel')).toBe('abcdefghijk');
+      // 5分後: 既定(60秒)では取り直すが、同接数用の長い許容時間なら使い回す。
+      Date.now = () => start + 5 * 60 * 1000;
+      expect(await resolveLiveYouTubeVideoID('@channel', {maxAgeMs: 10 * 60 * 1000})).toBe('abcdefghijk');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      forgetLiveYouTubeVideoID('@channel');
+      expect(await resolveLiveYouTubeVideoID('@channel', {maxAgeMs: 10 * 60 * 1000})).toBe('zyxwvutsrqp');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      Date.now = realNow;
+    }
   });
 });

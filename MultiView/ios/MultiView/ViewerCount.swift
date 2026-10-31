@@ -174,11 +174,51 @@ enum ViewerCountProvider {
     }
   }
 
+  // @handle の配信は 30 秒ごとに /live ページ(約1MB)を取り直していた(1配信で毎時100MB超)。
+  // 解決済みの動画IDをしばらく使い回し、軽い InnerTube /player だけで数える。数えられなければ
+  // (配信終了・次の枠など)使い回しをやめて /live から取り直す。
+  private static let youtubeVideoIDMaxAge: TimeInterval = 600
+  private static let youtubeVideoIDLock = NSLock()
+  private static var youtubeVideoIDCache: [String: (id: String, at: Date)] = [:]
+
+  private static func cachedYouTubeVideoID(for channel: String) -> String? {
+    youtubeVideoIDLock.lock()
+    defer { youtubeVideoIDLock.unlock() }
+    guard let entry = youtubeVideoIDCache[channel], Date().timeIntervalSince(entry.at) < youtubeVideoIDMaxAge else {
+      return nil
+    }
+    return entry.id
+  }
+
+  private static func rememberYouTubeVideoID(_ videoId: String?, for channel: String) {
+    youtubeVideoIDLock.lock()
+    defer { youtubeVideoIDLock.unlock() }
+    if let videoId {
+      youtubeVideoIDCache[channel] = (videoId, Date())
+    } else {
+      youtubeVideoIDCache.removeValue(forKey: channel)
+    }
+  }
+
   private static func fetchYouTube(channel rawChannel: String, completion: @escaping (Int?) -> Void) -> URLSessionDataTask? {
     let channel = rawChannel.trimmingCharacters(in: .whitespacesAndNewlines)
     if let videoId = extractYouTubeVideoID(from: channel) {
       return fetchYouTubePlayer(videoId: videoId, fallbackHTML: nil, fallbackURL: youtubeWatchURL(videoId: videoId), completion: completion)
     }
+    if let cachedVideoId = cachedYouTubeVideoID(for: channel) {
+      return fetchYouTubePlayer(videoId: cachedVideoId, fallbackHTML: nil, fallbackURL: nil) { count in
+        if let count {
+          completion(count)
+          return
+        }
+        rememberYouTubeVideoID(nil, for: channel)
+        _ = fetchYouTubeLive(channel: channel, completion: completion)
+      }
+    }
+    return fetchYouTubeLive(channel: channel, completion: completion)
+  }
+
+  private static func fetchYouTubeLive(channel: String, completion: @escaping (Int?) -> Void) -> URLSessionDataTask? {
     guard let liveURL = youtubeLiveURL(from: channel) else {
       completion(nil)
       return nil
@@ -191,6 +231,7 @@ enum ViewerCountProvider {
         completion(nil)
         return
       }
+      rememberYouTubeVideoID(videoId, for: channel)
       if let count = youtubeCount(inHTML: html) {
         completion(count)
         return
