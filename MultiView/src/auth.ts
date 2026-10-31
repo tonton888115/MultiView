@@ -569,14 +569,29 @@ function formBody(values: Record<string, string>): string {
     .join('&');
 }
 
+// OAuth の state / PKCE verifier は推測されにくい乱数で作る。安全な乱数源(crypto.getRandomValues)が
+// ある環境ではそれを使い、無い環境(古い Hermes 等)だけ Math.random に頼る。
+function randomIndexes(length: number, modulo: number): number[] {
+  const cryptoSource = (globalThis as {crypto?: {getRandomValues?: (array: Uint32Array) => Uint32Array}}).crypto;
+  if (typeof cryptoSource?.getRandomValues === 'function') {
+    try {
+      const values = cryptoSource.getRandomValues(new Uint32Array(length));
+      return Array.from(values, value => value % modulo);
+    } catch {
+      // 下の Math.random へ。
+    }
+  }
+  return Array.from({length}, () => Math.floor(Math.random() * modulo));
+}
+
 function randomString(length: number): string {
   const alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  return Array.from({length}, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
+  return randomIndexes(length, alphabet.length).map(index => alphabet[index]).join('');
 }
 
 function randomVerifier(): string {
   const alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~';
-  return Array.from({length: 64}, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
+  return randomIndexes(64, alphabet.length).map(index => alphabet[index]).join('');
 }
 
 function errorDescription(json: any, fallback: string): string {
