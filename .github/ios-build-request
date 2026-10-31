@@ -1,0 +1,14 @@
+# iOS 未署名 IPA のビルド要求ファイル
+#
+# このファイルを書き換えて push すると、GitHub Actions(.github/workflows/ios-ipa.yml)が
+# push したブランチをビルドし、成果物 MultiView-unsigned-ipa(中身は
+# MultiView-<版数>-b<ビルド番号>.ipa、保存1日)を作ります。
+# Claude のクラウドセッションは GitHub Actions の手動実行権限を持たないため、この方式で起動します。
+#
+# 注意:
+# - コミットメッセージに [skip ci] を含めないこと(含めると GitHub がビルドを起動しない)。
+# - 同じ版数での入れ直し事故を防ぐため、ビルド前に CURRENT_PROJECT_VERSION を上げておく。
+# - iCloud Drive への配置は PC で tools/github-ipa-download.ps1 を実行する。
+#
+# 下の行は要求ごとに更新する(内容は記録用)。
+requested: 2026-10-31 build 1.1.49 (71) branch claude/serene-faraday-yc7i3z

@@ -7,9 +7,14 @@ on:
   workflow_dispatch:
   repository_dispatch:
     types: [build-ios]
-  # Auto-build on push is DISABLED on purpose: builds run on Codemagic instead, to
-  # avoid consuming limited GitHub Actions (macOS) minutes. Trigger manually via
-  # workflow_dispatch or repository_dispatch(build-ios) only if ever needed.
+  # Build request from a Claude cloud session (or anyone without the "Actions:
+  # write" permission that workflow_dispatch needs): edit .github/ios-build-request
+  # and push. Only pushes that change that file start a build, so ordinary pushes
+  # still do not build. The pushed commit message must NOT contain [skip ci] (or
+  # [ci skip]/[no ci]/[skip actions]), or GitHub will skip push-triggered runs.
+  push:
+    paths:
+      - '.github/ios-build-request'
 
 concurrency:
   group: build-ios-${{ github.ref }}
@@ -63,16 +68,23 @@ jobs:
       - name: Package into .ipa
         working-directory: MultiView/ios/build/Build/Products/Release-iphoneos
         run: |
+          # Versioned file name (same as tools/codemagic-build.ps1) so a re-install is
+          # never mistaken for the previous build by name.
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' MultiView.app/Info.plist)
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' MultiView.app/Info.plist)
+          IPA_NAME="MultiView-${VERSION}-b${BUILD}.ipa"
           mkdir -p Payload
           cp -R MultiView.app Payload/
-          zip -qry MultiView.ipa Payload
-          ls -lh MultiView.ipa
+          zip -qry "$IPA_NAME" Payload
+          ls -lh "$IPA_NAME"
+          echo "IPA_NAME=$IPA_NAME" >> "$GITHUB_ENV"
+          echo "### $IPA_NAME ($GITHUB_REF_NAME @ ${GITHUB_SHA::7})" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: MultiView-unsigned-ipa
-          path: MultiView/ios/build/Build/Products/Release-iphoneos/MultiView.ipa
+          path: MultiView/ios/build/Build/Products/Release-iphoneos/${{ env.IPA_NAME }}
           if-no-files-found: error
           retention-days: 1
 
