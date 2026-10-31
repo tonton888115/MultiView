@@ -80,7 +80,8 @@ extension Notification.Name {
   // players at the quality for the new network.
   static let multiViewNetworkQualityChanged = Notification.Name("MultiViewNetworkQualityChanged")
   // Posted by a player when it hits a recoverable error so the viewing tab can
-  // auto-refresh (debounced) to clear it.
+  // auto-refresh (debounced) to clear it. `object` is the failing stream's id
+  // (String) so only that stream's player is rebuilt; nil rebuilds everything.
   static let multiViewPlaybackErrored = Notification.Name("MultiViewPlaybackErrored")
 }
 

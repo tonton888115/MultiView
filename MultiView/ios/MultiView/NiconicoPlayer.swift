@@ -294,8 +294,11 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     loadAttempts += 1
     guard loadAttempts <= 4 else {
       showStatus("\(reason)\n再読み込みします")
+      // 対象の配信 ID を付けて通知し、視聴タブはこの配信のプレイヤーだけを作り直す
+      // (以前は object: nil で全配信が作り直され、他の配信まで黒画面・再読み込みになっていた)。
+      let streamID = stream.id
       DispatchQueue.main.async {
-        NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
+        NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: streamID)
       }
       return
     }
@@ -862,8 +865,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         // idle timeout で切り、再接続開始から12秒/3連敗で早めに再読み込みへ上げる。
         if elapsedSinceSuccess > 20 || elapsedSinceReconnect > 12 || consecutiveFailures >= 3 {
           showStatus("ニコ生コメント取得失敗: 再読み込み")
+          let streamID = stream.id
           DispatchQueue.main.async {
-            NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: nil)
+            NotificationCenter.default.post(name: .multiViewPlaybackErrored, object: streamID)
           }
           return
         }

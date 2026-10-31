@@ -34,11 +34,24 @@ final class ViewingController: UIViewController {
   private var gridDragSlotFrames: [CGRect] = []
   private var gridDragOriginalFrames: [String: CGRect] = [:]
   private var gridDragCurrentStreams: [StreamItem] = []
+  private var dragIsStacked = true
   private var lastAutoReloadAt = Date.distantPast
+  // 配信ごとの自動復旧の間隔管理(stream.id -> 最後に作り直した時刻)。
+  private var lastStreamReloadAt: [String: Date] = [:]
   // 並び替え・追加・削除でプレイヤーを作り直さず使い回すためのセル再利用プール(stream.id -> cell)。
   private var cellPool: [String: StreamCellView] = [:]
   // 再利用セル/行に付けた高さ制約。reload のたびに貼り直すので、冒頭で必ず外す。
   private var cellLayoutConstraints: [NSLayoutConstraint] = []
+  // 並び替えドラッグ中に届いた再読み込み要求。ドラッグ中にセルを作り直すとタッチが切れて
+  // ドラッグが中断される(=場所を移動できない)ので、指を離してからまとめて実行する。
+  private struct PendingReload {
+    var rebuildPlayers = false
+    var resume = false
+    var animated = false
+    var streamIDs: Set<String> = []
+  }
+  private var pendingReload: PendingReload?
+  private var isReordering: Bool { dragSnapshot != nil }
 
   override func viewDidLoad() {
     super.viewDidLoad()
@@ -47,7 +60,7 @@ final class ViewingController: UIViewController {
     reload()
     NotificationCenter.default.addObserver(self, selector: #selector(reloadAndResume), name: .multiViewReloadAndResume, object: nil)
     NotificationCenter.default.addObserver(self, selector: #selector(networkQualityChanged), name: .multiViewNetworkQualityChanged, object: nil)
-    NotificationCenter.default.addObserver(self, selector: #selector(playbackErrored), name: .multiViewPlaybackErrored, object: nil)
+    NotificationCenter.default.addObserver(self, selector: #selector(playbackErrored(_:)), name: .multiViewPlaybackErrored, object: nil)
   }
 
   deinit {
@@ -55,8 +68,41 @@ final class ViewingController: UIViewController {
   }
 
   @objc private func reloadAndResume() {
+    if isReordering {
+      deferReload(rebuildPlayers: true, resume: true)
+      return
+    }
     reload()
     resumePlaybackAfterReload()
+  }
+
+  private func deferReload(rebuildPlayers: Bool = false, resume: Bool = false, animated: Bool = false, streamID: String? = nil) {
+    var pending = pendingReload ?? PendingReload()
+    pending.rebuildPlayers = pending.rebuildPlayers || rebuildPlayers
+    pending.resume = pending.resume || resume
+    pending.animated = pending.animated || animated
+    if let streamID {
+      pending.streamIDs.insert(streamID)
+    }
+    pendingReload = pending
+  }
+
+  private func flushPendingReload() {
+    guard !isReordering, let pending = pendingReload else { return }
+    pendingReload = nil
+    if pending.rebuildPlayers {
+      reload(rebuildPlayers: true)
+    } else {
+      pending.streamIDs.forEach { discardPooledCell(id: $0) }
+      if pending.animated {
+        reloadForStreamsChange()
+      } else {
+        reload(rebuildPlayers: false)
+      }
+    }
+    if pending.resume || pending.rebuildPlayers || !pending.streamIDs.isEmpty {
+      resumePlaybackAfterReload()
+    }
   }
 
   private func resumePlaybackAfterReload() {
@@ -75,14 +121,47 @@ final class ViewingController: UIViewController {
     reloadAndResume()
   }
 
-  @objc private func playbackErrored() {
-    // Debounced auto-refresh to clear a recoverable error. Capped at once per 45s
-    // and coalesced so a permanently-failing stream can't trigger a reload loop.
-    guard Date().timeIntervalSince(lastAutoReloadAt) > 45 else { return }
-    lastAutoReloadAt = Date()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-      self?.reloadAndResume()
+  @objc private func playbackErrored(_ notification: Notification) {
+    guard let streamID = notification.object as? String else {
+      // Debounced auto-refresh to clear a recoverable error. Capped at once per 45s
+      // and coalesced so a permanently-failing stream can't trigger a reload loop.
+      guard Date().timeIntervalSince(lastAutoReloadAt) > 45 else { return }
+      lastAutoReloadAt = Date()
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+        self?.reloadAndResume()
+      }
+      return
     }
+    // 1本の配信のエラーで全配信を作り直すと、正常な配信まで黒画面・再バッファになる。
+    // 失敗した配信のプレイヤーだけを作り直す(配信ごとに45秒に1回まで)。
+    let last = lastStreamReloadAt[streamID] ?? .distantPast
+    guard Date().timeIntervalSince(last) > 45 else { return }
+    lastStreamReloadAt[streamID] = Date()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+      self?.rebuildStream(id: streamID)
+    }
+  }
+
+  private func rebuildStream(id: String) {
+    guard isViewLoaded, AppState.shared.streams.contains(where: { $0.id == id }) else { return }
+    if isReordering {
+      deferReload(streamID: id)
+      return
+    }
+    if focused?.id == id {
+      // 展開表示中は展開ビュー(=この配信のプレイヤーだけ)を作り直す。
+      reload(rebuildPlayers: true)
+    } else {
+      discardPooledCell(id: id)
+      reload(rebuildPlayers: false)
+    }
+    resumePlaybackAfterReload()
+  }
+
+  private func discardPooledCell(id: String) {
+    guard let cell = cellPool.removeValue(forKey: id) else { return }
+    cell.stopPlayback()
+    cell.removeFromSuperview()
   }
 
   override func viewDidAppear(_ animated: Bool) {
@@ -97,6 +176,11 @@ final class ViewingController: UIViewController {
   // 生き残る配信のプレイヤーを破棄せず使い回す(黒画面/コールドスタートを避け、並び替えはアニメ可能)。
   func reload(rebuildPlayers: Bool = true) {
     guard isViewLoaded else { return }
+    if isReordering {
+      // ドラッグ中はセルを外さない(外すとタッチが切れて並び替えが中断される)。
+      deferReload(rebuildPlayers: rebuildPlayers)
+      return
+    }
     updateBottomControls()
     NSLayoutConstraint.deactivate(cellLayoutConstraints)
     cellLayoutConstraints.removeAll()
@@ -136,6 +220,11 @@ final class ViewingController: UIViewController {
   // 並び替え・追加・削除を、再利用セルを旧位置→新位置へ補間移動させてアニメ反映する
   // (iOSのホーム画面アイコン並べ替えのように、残るセルがスッと退いて新しい配置に収まる)。
   func reloadForStreamsChange() {
+    if isReordering {
+      // レイド自動追加などがドラッグ中に起きても、並び替えを壊さないよう後回しにする。
+      deferReload(animated: true)
+      return
+    }
     reload(rebuildPlayers: false)
     view.setNeedsLayout()
     UIView.animate(
@@ -305,11 +394,11 @@ final class ViewingController: UIViewController {
   }
 
   private func addGrid(_ streams: [StreamItem]) {
-    // Pairs go two-up; the trailing stream(s) get their own full-width row so they
-    // read as the "main" view and no empty space is left beside a cell.
-    //   - odd count : the last 1 stream is full-width (大きい表示 末尾1つ)
-    //   - even count: the last 2 streams are full-width, stacked (大きい表示 2つ)
-    let bigCount = streams.count % 2 == 0 ? 2 : 1
+    // 2列で詰め、奇数本のときだけ最後の1本を全幅にする(横に空きを作らない)。
+    //   2本 → 横2列 / 3本 → 2列+全幅1 / 4本 → 2×2
+    // 以前は偶数本だと末尾2本も全幅にしていたため、2本のグリッドがスタック表示と同じ見た目に
+    // なり、4本も 2列+全幅2段 になっていた(ユーザー報告の「偶数グリッドのバグ」。Android と同じ規則に統一)。
+    let bigCount = streams.count % 2 == 0 ? 0 : 1
     let pairedCount = streams.count - bigCount
     var index = 0
     while index + 1 < pairedCount {
@@ -333,18 +422,22 @@ final class ViewingController: UIViewController {
   }
 
   private func handleReorder(cell: StreamCellView, event: StreamReorderEvent) {
-    guard focused == nil, AppState.shared.streams.count > 1 else { return }
-    let isStacked = AppState.shared.settings.layoutMode == .stacked
     let location = view.convert(event.windowLocation, from: nil)
     switch event.phase {
     case .began:
-      if isStacked { beginLiveReorder(cell: cell, at: location) } else { beginGridLiveReorder(cell: cell, at: location) }
+      guard focused == nil, AppState.shared.streams.count > 1, !isReordering else { return }
+      // 開始時のレイアウトで最後まで処理する(途中で設定が変わっても混在させない)。
+      dragIsStacked = AppState.shared.settings.layoutMode == .stacked
+      if dragIsStacked { beginLiveReorder(cell: cell, at: location) } else { beginGridLiveReorder(cell: cell, at: location) }
     case .changed:
-      if isStacked { updateLiveReorder(at: location) } else { updateGridLiveReorder(at: location) }
-    case .ended:
-      if isStacked { finishLiveReorder(commit: true) } else { finishGridLiveReorder(commit: true) }
-    case .cancelled:
-      if isStacked { finishLiveReorder(commit: false) } else { finishGridLiveReorder(commit: false) }
+      guard isReordering, dragSourceCell === cell else { return }
+      if dragIsStacked { updateLiveReorder(at: location) } else { updateGridLiveReorder(at: location) }
+    case .ended, .cancelled:
+      // 終了は開始時の条件(本数など)に関係なく必ず処理する。以前は本数が途中で1本に
+      // なると終了が無視され、スクロール禁止のまま固まることがあった。
+      guard isReordering, dragSourceCell == nil || dragSourceCell === cell else { return }
+      let commit = event.phase == .ended
+      if dragIsStacked { finishLiveReorder(commit: commit) } else { finishGridLiveReorder(commit: commit) }
     }
   }
 
@@ -356,7 +449,10 @@ final class ViewingController: UIViewController {
     scrollView.isScrollEnabled = false
 
     let sourceFrame = cell.convert(cell.bounds, to: view)
-    let snapshot = cell.snapshotView(afterScreenUpdates: false) ?? UIView(frame: cell.bounds)
+    // スナップショットが取れない(未描画の WebView 等)と透明な View になり、ソースセルも
+    // alpha=0 になるため「掴んだ瞬間にセルが消えて何も動かない」ように見えていた。
+    // 取れない時は見える代替カードを使う。
+    let snapshot = cell.snapshotView(afterScreenUpdates: false) ?? makeDragPlaceholder(for: cell)
     snapshot.frame = sourceFrame
     dragSnapshotCenterOffset = CGPoint(x: sourceFrame.midX - location.x, y: sourceFrame.midY - location.y)
     snapshot.layer.shadowColor = UIColor.black.cgColor
@@ -370,6 +466,24 @@ final class ViewingController: UIViewController {
 
     // ソースセルは階層に残して touch を維持し、見た目だけスナップショットへ移す。
     cell.alpha = 0
+  }
+
+  private func makeDragPlaceholder(for cell: StreamCellView) -> UIView {
+    let placeholder = UIView(frame: cell.bounds)
+    placeholder.backgroundColor = UIColor(white: 0.08, alpha: 0.96)
+    placeholder.layer.cornerRadius = 18
+    placeholder.layer.borderWidth = 2
+    placeholder.layer.borderColor = cell.stream.platform.tint.cgColor
+    let label = UILabel()
+    label.text = cell.stream.channel
+    label.textColor = .white
+    label.font = .systemFont(ofSize: 15, weight: .semibold)
+    label.textAlignment = .center
+    label.numberOfLines = 2
+    label.frame = placeholder.bounds.insetBy(dx: 12, dy: 12)
+    label.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    placeholder.addSubview(label)
+    return placeholder
   }
 
   @discardableResult
@@ -460,6 +574,7 @@ final class ViewingController: UIViewController {
     }
 
     fadeOutDragSnapshot(snapshot, finalFrame: finalSnapshotFrame)
+    flushPendingReload()
   }
 
   private func currentGridSlotFrames(for streams: [StreamItem]) -> [CGRect] {
@@ -574,6 +689,7 @@ final class ViewingController: UIViewController {
       // キャンセル / 変化なし: ドラッグ中に動かした並びを streams 順(元の並び)へ戻す。
       reload(rebuildPlayers: false)
     }
+    flushPendingReload()
   }
 
   // ドラッグ中の stack の並び(ソースセルも含む)から、確定後の streams 配列を作る。

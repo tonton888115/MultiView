@@ -13,7 +13,11 @@ final class FocusedStreamView: UIView {
   init(stream: StreamItem, onClose: (() -> Void)?) {
     self.stream = stream
     let chatURL = FocusedStreamView.chatURL(for: stream)
-    if let chatURL {
+    // YouTube を @handle 等で追加した場合は動画IDが無く、以前は live_chat?v=@handle という
+    // 無効なURLを開いてチャットが出なかった。チャット用 WebView は作っておき、ライブ動画IDを
+    // 解決してから読み込む。
+    let resolvesYouTubeChat = chatURL == nil && stream.platform == .youtube
+    if chatURL != nil || resolvesYouTubeChat {
       let config = WKWebViewConfiguration()
       config.allowsInlineMediaPlayback = true
       config.websiteDataStore = .default()
@@ -40,6 +44,8 @@ final class FocusedStreamView: UIView {
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
         self?.chatWeb?.load(request)
       }
+    } else if resolvesYouTubeChat {
+      resolveYouTubeChat()
     }
     // 高さは ViewingController 側で可視領域いっぱいに設定する。ここでは最低限のフロアだけ
     // （必須より低い優先度なので、全画面表示の equalTo 制約と衝突しない）。
@@ -253,13 +259,39 @@ final class FocusedStreamView: UIView {
     input.text = ""
   }
 
+  private static func youtubeChatURL(videoID: String) -> URL? {
+    var components = URLComponents(string: "https://www.youtube.com/live_chat")
+    components?.queryItems = [
+      URLQueryItem(name: "v", value: videoID),
+      URLQueryItem(name: "embed_domain", value: "tonton888115.github.io")
+    ]
+    return components?.url
+  }
+
+  private func resolveYouTubeChat() {
+    guard let url = YouTubeNativePlayerView.liveResolutionURL(from: stream.channel) else { return }
+    var request = URLRequest(url: url)
+    request.setValue(YouTubeNativePlayerView.userAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+    request.setValue("ja-JP,ja;q=0.9,en-US;q=0.7,en;q=0.6", forHTTPHeaderField: "Accept-Language")
+    URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+      let videoID = response?.url.flatMap { YouTubeNativePlayerView.videoID(from: $0.absoluteString) }
+        ?? data.flatMap { String(data: $0, encoding: .utf8) }.flatMap { YouTubeNativePlayerView.extractVideoID(fromHTML: $0) }
+      DispatchQueue.main.async {
+        guard let self, let videoID, let chatURL = Self.youtubeChatURL(videoID: videoID) else { return }
+        self.chatWeb?.load(URLRequest(url: chatURL))
+      }
+    }.resume()
+  }
+
   private static func chatURL(for stream: StreamItem) -> URL? {
     let channel = stream.channel.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? stream.channel
     switch stream.platform {
     case .twitch:
       return URL(string: "https://www.twitch.tv/popout/\(channel)/chat?popout=")
     case .youtube:
-      return URL(string: "https://www.youtube.com/live_chat?v=\(channel)&embed_domain=tonton888115.github.io")
+      guard let videoID = YouTubeNativePlayerView.videoID(from: stream.channel) else { return nil }
+      return youtubeChatURL(videoID: videoID)
     case .kick:
       return URL(string: "https://kick.com/\(channel)")
     case .twitcasting:
