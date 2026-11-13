@@ -73,15 +73,22 @@ $sizeMB = [math]::Round((Get-Item $Output).Length / 1MB, 2)
 Write-Host "Saved: $Output ($sizeMB MB)"
 
 # iCloud の Downloads は再起動等で日本語ローカライズ名 'ダウンロード' に化けることがあり、
-# しかも NFD(分解形)で保存されるため 'ダウンロード'(NFC)直書きでは一致しない。実体を列挙し
+# NFD(分解形)で保存されることもあるため 'ダウンロード'(NFC)直書きでは一致しない。実体を列挙し
 # Unicode 正規化して照合する。
+# 実機の「ダウンロード」に出るのは日本語名の方(2021年からある本来のフォルダ)。英語名 'Downloads' は
+# 2026-10-25 に別のツールが作った別フォルダで、両方あるときに 'Downloads' へ置くと実機の
+# 「ダウンロード」に出なかった(2026-11-14)。日本語名を優先し、無いときだけ 'Downloads' を使う。
 $icloudRoot = Join-Path $env:USERPROFILE 'iCloudDrive'
 $icloudDir = $null
 if (Test-Path $icloudRoot) {
     $dlName = [string]'ダウンロード'
-    $dl = Get-ChildItem $icloudRoot -Directory -Force -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -eq 'Downloads' -or $_.Name.Normalize([Text.NormalizationForm]::FormC) -eq $dlName.Normalize([Text.NormalizationForm]::FormC)
+    $dirs = Get-ChildItem $icloudRoot -Directory -Force -ErrorAction SilentlyContinue
+    $dl = $dirs | Where-Object {
+        $_.Name.Normalize([Text.NormalizationForm]::FormC) -eq $dlName.Normalize([Text.NormalizationForm]::FormC)
     } | Select-Object -First 1
+    if (-not $dl) {
+        $dl = $dirs | Where-Object { $_.Name -eq 'Downloads' } | Select-Object -First 1
+    }
     if ($dl) { $icloudDir = $dl.FullName }
 }
 if ($icloudDir) {
