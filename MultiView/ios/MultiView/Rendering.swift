@@ -179,6 +179,24 @@ final class NativeDanmakuRenderer {
     return container
   }
 
+  /// PiP 用: 共有キャッシュから絵文字画像を取り、無ければ読み込む(completion はメインスレッド)。
+  static func fetchImage(_ url: URL, completion: @escaping (UIImage?) -> Void) {
+    let key = url as NSURL
+    if let cached = imageCache.object(forKey: key) {
+      completion(cached)
+      return
+    }
+    URLSession.shared.dataTask(with: url) { data, _, _ in
+      let image = data.flatMap { NativeAnimatedImageDecoder.image(from: $0) }
+      if let image {
+        imageCache.setObject(image, forKey: key)
+      }
+      DispatchQueue.main.async {
+        completion(image)
+      }
+    }.resume()
+  }
+
   private static func loadImage(_ url: URL, into imageView: UIImageView) {
     let key = url as NSURL
     if let cached = imageCache.object(forKey: key) {

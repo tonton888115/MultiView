@@ -1,7 +1,6 @@
 import UIKit
 import WebKit
 import AVFoundation
-import AVKit
 
 final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, WKNavigationDelegate, PlaybackRecoverable {
   private let stream: StreamItem
@@ -576,13 +575,13 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
   private static let userAgent = BrowserUserAgent.mobileSafari
 }
 
-// ピクチャ・イン・ピクチャ(PictureInPicture.swift)。ネイティブ再生中だけ AVPlayerLayer から PiP を作る
-// (Web表示へ切り替わっている間は映像レイヤーが無いので不可)。
+// ピクチャ・イン・ピクチャ(PictureInPicture.swift)。ネイティブ再生中の AVPlayer から映像フレームを取り、
+// コメントを描き込んで PiP に流す(Web表示へ切り替わっている間は映像が無いので不可)。
 extension TwitcastingNativePlayerView: PictureInPictureCapable {
   var pictureInPictureDanmakuView: UIView { danmakuView }
 
-  func makePictureInPictureController() -> AVPictureInPictureController? {
+  func preparePictureInPicturePlayer() -> AVPlayer? {
     guard !isStopped, fallbackWebView == nil, player.currentItem != nil else { return nil }
-    return AVPictureInPictureController(playerLayer: playerLayer)
+    return player
   }
 }

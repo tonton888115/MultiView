@@ -146,7 +146,9 @@ final class StallWatchdog {
 
   private func tick() {
     guard let player, let item = player.currentItem else { return }
-    if PlaybackCoordinator.shared.isSuspended || !NetworkQuality.shared.isReachable || Self.reachedEnd(item) {
+    // PiP の一時停止ボタンで止めたものは意図的な停止なので、押し直さない。
+    if PlaybackCoordinator.shared.isSuspended || !NetworkQuality.shared.isReachable || Self.reachedEnd(item)
+        || PictureInPictureCoordinator.shared.isPausedFromPictureInPicture(player) {
       lastProgressAt = Date()
       return
     }

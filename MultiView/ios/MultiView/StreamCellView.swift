@@ -91,7 +91,7 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     pipSource = video as? PictureInPictureCapable
     video.translatesAutoresizingMaskIntoConstraints = false
     addSubview(video)
-    // 「PiPで再生中」などの表示。映像の上・操作ボタンの下に置く。
+    // PiP を開始できない理由などの一時表示。映像の上・操作ボタンの下に置く。
     addSubview(pipNotice)
 
     let focus = UIButton(type: .system)
@@ -238,7 +238,8 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     PictureInPictureCoordinator.shared.toggle(
       streamID: stream.id,
       label: "\(stream.platform.rawValue) \(stream.channel)",
-      source: pipSource
+      source: pipSource,
+      host: self
     ) { [weak self] message in
       self?.showPictureInPictureMessage(message)
     }
@@ -253,9 +254,10 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     pipButton.setImage(UIImage(systemName: active ? "pip.exit" : "pip.enter"), for: .normal)
     pipButton.tintColor = active ? .systemYellow : .white
     pipButton.accessibilityLabel = active ? "ピクチャ・イン・ピクチャを終了" : "ピクチャ・イン・ピクチャ"
-    // 一時メッセージの表示中はそれを優先し、消える時に状態表示へ戻す。
+    // PiP 中もセルの映像はそのまま映るので、常時の表示は出さない(黄色のボタンで分かる)。
+    // 一時メッセージ(開始できない理由など)の表示中はそれを優先する。
     if pipMessageWork == nil {
-      setPictureInPictureNotice(active ? "ピクチャ・イン・ピクチャで再生中" : nil, symbol: "pip")
+      setPictureInPictureNotice(nil, symbol: "pip")
     }
   }
 

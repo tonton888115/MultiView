@@ -1,7 +1,6 @@
 import UIKit
 import WebKit
 import AVFoundation
-import AVKit
 import AmazonIVSPlayer
 
 // Native Twitch playback: fetch a PlaybackAccessToken over GraphQL, build the
@@ -42,6 +41,8 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   private var ivsStallWatchdog: IvsStallWatchdog?
   var usingIvsPlayback = false
   private var forceLegacyPlayback = false
+  // PiP のために IVS→AVPlayer へ切り替える前の forceLegacyPlayback(PiP を閉じたら戻す)。
+  private var pipSavedForceLegacy: Bool?
   private var isLoading = false
   private var isStopped = false
   private var streamBlocked = false
@@ -882,19 +883,36 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
   }
 }
 
-// ピクチャ・イン・ピクチャ(PictureInPicture.swift)。Amazon IVS 再生中は IVS SDK の PiP 対応
-// (IVSPlayerLayer から作る)、旧ネイティブ(AVPlayer)再生中は AVPlayerLayer から作る。
-// Web表示へ切り替わっている間・配信終了表示中は映像レイヤーが無いので不可。
+// ピクチャ・イン・ピクチャ(PictureInPicture.swift)。ネイティブ再生中の AVPlayer から映像フレームを取り、
+// コメントを描き込んで PiP に流す。Amazon IVS SDK からは映像フレームを取り出せないので、PiP の間だけ
+// 旧ネイティブ(AVPlayer)再生へ切り替え(再接続も AVPlayer のまま)、閉じたら IVS 再生へ戻す。
+// Web表示へ切り替わっている間・配信終了表示中は映像が無いので不可。
 extension TwitchNativePlayerView: PictureInPictureCapable {
   var pictureInPictureDanmakuView: UIView { danmakuView }
 
-  func makePictureInPictureController() -> AVPictureInPictureController? {
+  func preparePictureInPicturePlayer() -> AVPlayer? {
     guard !isStopped, !streamBlocked, fallbackWebView == nil else { return nil }
     if usingIvsPlayback {
-      guard ivsPlayer != nil, let layer = ivsPlayerLayer else { return nil }
-      return AVPictureInPictureController(ivsPlayerLayer: layer)
+      guard let url = currentHLSURL else { return nil }
+      if pipSavedForceLegacy == nil {
+        pipSavedForceLegacy = forceLegacyPlayback
+      }
+      forceLegacyPlayback = true
+      PlaybackDiagnostics.log("\(stream.platform.rawValue) \(stream.channel): PiPのためIVS→AVPlayer再生へ切替")
+      playWithAVPlayer(hlsURL: url, requestGeneration: playbackGeneration)
+      return player
     }
     guard player.currentItem != nil else { return nil }
-    return AVPictureInPictureController(playerLayer: playerLayer)
+    return player
+  }
+
+  func pictureInPictureDidEnd() {
+    guard let saved = pipSavedForceLegacy else { return }
+    pipSavedForceLegacy = nil
+    forceLegacyPlayback = saved
+    guard !saved, !isStopped, !streamBlocked, fallbackWebView == nil, !usingIvsPlayback,
+          let url = currentHLSURL else { return }
+    PlaybackDiagnostics.log("\(stream.platform.rawValue) \(stream.channel): PiP終了→IVS再生へ戻す")
+    play(hlsURL: url, requestGeneration: playbackGeneration)
   }
 }
