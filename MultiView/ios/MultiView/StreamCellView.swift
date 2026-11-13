@@ -28,6 +28,36 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
   private weak var playbackView: PlaybackStoppable?
   private weak var recoverable: PlaybackRecoverable?
   private var reorderGesture: UILongPressGestureRecognizer?
+  // ピクチャ・イン・ピクチャ(PiP)。ボタンはコメントボタンの横。セルが狭く1列に並ばない時だけ
+  // コメントボタンの真下へ回す(左上の音量バーと重ならないように)。
+  private let pipButton = UIButton(type: .system)
+  private weak var pipSource: PictureInPictureCapable?
+  private var pipRowConstraints: [NSLayoutConstraint] = []
+  private var pipBelowCommentConstraints: [NSLayoutConstraint] = []
+  private var pipBelowComment: Bool?
+  private var pipMessageWork: DispatchWorkItem?
+  private let pipNotice: UIButton = {
+    var config = UIButton.Configuration.filled()
+    config.baseBackgroundColor = UIColor.black.withAlphaComponent(0.62)
+    config.baseForegroundColor = .white
+    config.cornerStyle = .capsule
+    config.imagePadding = 6
+    config.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 10, bottom: 6, trailing: 12)
+    config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+    config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+      var outgoing = incoming
+      outgoing.font = UIFont.systemFont(ofSize: 12, weight: .semibold)
+      return outgoing
+    }
+    let notice = UIButton(configuration: config)
+    notice.isUserInteractionEnabled = false
+    notice.isHidden = true
+    notice.translatesAutoresizingMaskIntoConstraints = false
+    return notice
+  }()
+  // PiP ボタン・コメント・拡大・削除の4つが横1列に収まる最小のセル幅
+  // (右余白8 + ボタン32×4 + 間隔8×3 + 左上の音量バーの右端52 + 隙間6)。
+  private static let pipSingleRowMinWidth: CGFloat = 220
 
   init(stream: StreamItem, onFocus: @escaping () -> Void, onReorder: @escaping (StreamCellView, StreamReorderEvent) -> Void) {
     self.stream = stream
@@ -58,8 +88,11 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     commentEchoer = video as? CommentEchoDisplay
     playbackView = video as? PlaybackStoppable
     recoverable = video as? PlaybackRecoverable
+    pipSource = video as? PictureInPictureCapable
     video.translatesAutoresizingMaskIntoConstraints = false
     addSubview(video)
+    // 「PiPで再生中」などの表示。映像の上・操作ボタンの下に置く。
+    addSubview(pipNotice)
 
     let focus = UIButton(type: .system)
     focus.setImage(UIImage(systemName: "arrow.up.left.and.arrow.down.right"), for: .normal)
@@ -100,6 +133,23 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     comment.translatesAutoresizingMaskIntoConstraints = false
     addSubview(comment)
 
+    pipButton.setImage(UIImage(systemName: "pip.enter"), for: .normal)
+    pipButton.tintColor = .white
+    pipButton.backgroundColor = UIColor.black.withAlphaComponent(0.38)
+    pipButton.layer.cornerRadius = 16
+    pipButton.accessibilityLabel = "ピクチャ・イン・ピクチャ"
+    pipButton.addAction(UIAction { [weak self] _ in self?.togglePictureInPicture() }, for: .touchUpInside)
+    pipButton.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(pipButton)
+    pipRowConstraints = [
+      pipButton.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+      pipButton.trailingAnchor.constraint(equalTo: comment.leadingAnchor, constant: -8)
+    ]
+    pipBelowCommentConstraints = [
+      pipButton.topAnchor.constraint(equalTo: comment.bottomAnchor, constant: 8),
+      pipButton.centerXAnchor.constraint(equalTo: comment.centerXAnchor)
+    ]
+
     buildCommentBar()
     configureReorderHandle()
 
@@ -120,6 +170,12 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
       comment.trailingAnchor.constraint(equalTo: focus.leadingAnchor, constant: -8),
       comment.widthAnchor.constraint(equalToConstant: 32),
       comment.heightAnchor.constraint(equalToConstant: 32),
+      pipButton.widthAnchor.constraint(equalToConstant: 32),
+      pipButton.heightAnchor.constraint(equalToConstant: 32),
+      pipNotice.centerXAnchor.constraint(equalTo: centerXAnchor),
+      pipNotice.centerYAnchor.constraint(equalTo: centerYAnchor),
+      pipNotice.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 12),
+      pipNotice.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
       volume.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
       volume.topAnchor.constraint(equalTo: topAnchor, constant: 8),
       volume.widthAnchor.constraint(equalToConstant: 42),
@@ -135,7 +191,9 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
         viewerCountOverlay.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10)
       ])
     }
-    var autoHideControls: [UIView] = [focus, remove, comment, volume, reorderHandle]
+    NSLayoutConstraint.activate(pipRowConstraints)
+    pipBelowComment = false
+    var autoHideControls: [UIView] = [focus, remove, comment, pipButton, volume, reorderHandle]
     if let viewerCountOverlay {
       autoHideControls.append(viewerCountOverlay)
     }
@@ -154,6 +212,73 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
     reorder.delegate = self
     addGestureRecognizer(reorder)
     reorderGesture = reorder
+
+    NotificationCenter.default.addObserver(self, selector: #selector(pictureInPictureStateChanged), name: .multiViewPictureInPictureChanged, object: nil)
+    updatePictureInPictureState()
+  }
+
+  override func layoutSubviews() {
+    updatePictureInPictureButtonPlacement()
+    super.layoutSubviews()
+  }
+
+  // MARK: - ピクチャ・イン・ピクチャ
+
+  private func updatePictureInPictureButtonPlacement() {
+    guard bounds.width > 0 else { return }
+    let below = bounds.width < Self.pipSingleRowMinWidth
+    guard below != pipBelowComment else { return }
+    pipBelowComment = below
+    NSLayoutConstraint.deactivate(below ? pipRowConstraints : pipBelowCommentConstraints)
+    NSLayoutConstraint.activate(below ? pipBelowCommentConstraints : pipRowConstraints)
+  }
+
+  private func togglePictureInPicture() {
+    autoHider?.showTemporarily()
+    PictureInPictureCoordinator.shared.toggle(
+      streamID: stream.id,
+      label: "\(stream.platform.rawValue) \(stream.channel)",
+      source: pipSource
+    ) { [weak self] message in
+      self?.showPictureInPictureMessage(message)
+    }
+  }
+
+  @objc private func pictureInPictureStateChanged() {
+    updatePictureInPictureState()
+  }
+
+  private func updatePictureInPictureState() {
+    let active = PictureInPictureCoordinator.shared.isActive(streamID: stream.id)
+    pipButton.setImage(UIImage(systemName: active ? "pip.exit" : "pip.enter"), for: .normal)
+    pipButton.tintColor = active ? .systemYellow : .white
+    pipButton.accessibilityLabel = active ? "ピクチャ・イン・ピクチャを終了" : "ピクチャ・イン・ピクチャ"
+    // 一時メッセージの表示中はそれを優先し、消える時に状態表示へ戻す。
+    if pipMessageWork == nil {
+      setPictureInPictureNotice(active ? "ピクチャ・イン・ピクチャで再生中" : nil, symbol: "pip")
+    }
+  }
+
+  private func showPictureInPictureMessage(_ text: String) {
+    pipMessageWork?.cancel()
+    setPictureInPictureNotice(text, symbol: "exclamationmark.circle")
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.pipMessageWork = nil
+      self.updatePictureInPictureState()
+    }
+    pipMessageWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.8, execute: work)
+  }
+
+  private func setPictureInPictureNotice(_ text: String?, symbol: String) {
+    guard let text else {
+      pipNotice.isHidden = true
+      return
+    }
+    pipNotice.configuration?.title = text
+    pipNotice.configuration?.image = UIImage(systemName: symbol)
+    pipNotice.isHidden = false
   }
 
   // 回線復帰時に作り直すべき状態(回線待ち・Webフォールバック中)か。
@@ -329,7 +454,9 @@ final class StreamCellView: UIView, UIGestureRecognizerDelegate, UITextFieldDele
   }
 
   // 再利用プールから外れる(配信が消える/全体を作り直す)ときに内部プレイヤーを停止する。
+  // この配信が PiP 中なら PiP も閉じる(止めたプレイヤーの PiP が残らないように)。
   func stopPlayback() {
+    PictureInPictureCoordinator.shared.stopIfActive(streamID: stream.id)
     playbackView?.stopPlayback()
   }
 

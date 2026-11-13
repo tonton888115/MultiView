@@ -1,6 +1,7 @@
 import UIKit
 import WebKit
 import AVFoundation
+import AVKit
 import CryptoKit
 
 // Per-cell YouTube playback first tries native HLS via InnerTube, then falls back
@@ -2129,5 +2130,16 @@ private enum YouTubeInnerTubeChatClient {
 
   private static func finish<T>(_ completion: @escaping (Result<T, Error>) -> Void, _ result: Result<T, Error>) {
     DispatchQueue.main.async { completion(result) }
+  }
+}
+
+// ピクチャ・イン・ピクチャ(PictureInPicture.swift)。ネイティブ再生中だけ AVPlayerLayer から PiP を作る
+// (Web表示へ切り替わっている間は映像レイヤーが無いので不可)。
+extension YouTubeNativePlayerView: PictureInPictureCapable {
+  var pictureInPictureDanmakuView: UIView { danmakuView }
+
+  func makePictureInPictureController() -> AVPictureInPictureController? {
+    guard !isStopped, fallbackWebView == nil, player.currentItem != nil else { return nil }
+    return AVPictureInPictureController(playerLayer: playerLayer)
   }
 }

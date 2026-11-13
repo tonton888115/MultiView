@@ -1,6 +1,7 @@
 import UIKit
 import WebKit
 import AVFoundation
+import AVKit
 
 final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable, AudioControllable, CommentPostable, CommentEchoDisplay, PlaybackRecoverable {
   private let stream: StreamItem
@@ -1661,4 +1662,15 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   }
 
   static let userAgent = BrowserUserAgent.mobileSafari
+}
+
+// ピクチャ・イン・ピクチャ(PictureInPicture.swift)。ネイティブ再生中だけ AVPlayerLayer から PiP を作る
+// (Web表示へ切り替わっている間は映像レイヤーが無いので不可)。
+extension NiconicoNativePlayerView: PictureInPictureCapable {
+  var pictureInPictureDanmakuView: UIView { danmakuView }
+
+  func makePictureInPictureController() -> AVPictureInPictureController? {
+    guard !isStopped, fallbackWebView == nil, player.currentItem != nil else { return nil }
+    return AVPictureInPictureController(playerLayer: playerLayer)
+  }
 }

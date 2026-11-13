@@ -1,6 +1,7 @@
 import UIKit
 import WebKit
 import AVFoundation
+import AVKit
 import AmazonIVSPlayer
 
 // Kick=Amazon IVS の標準HLSは実セグメント2秒なのに TARGETDURATION=6 で、AVPlayer は
@@ -1462,5 +1463,22 @@ final class KickRealtimeClient {
       let json = ok ? data.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } : nil
       DispatchQueue.main.async { completion(json) }
     }.resume()
+  }
+}
+
+// ピクチャ・イン・ピクチャ(PictureInPicture.swift)。Amazon IVS 再生中は IVS SDK の PiP 対応
+// (IVSPlayerLayer から作る)、旧ネイティブ(AVPlayer)再生中は AVPlayerLayer から作る。
+// Web表示へ切り替わっている間・配信終了表示中は映像レイヤーが無いので不可。
+extension KickNativePlayerView: PictureInPictureCapable {
+  var pictureInPictureDanmakuView: UIView { danmakuView }
+
+  func makePictureInPictureController() -> AVPictureInPictureController? {
+    guard !isStopped, !streamBlocked, fallbackWebView == nil else { return nil }
+    if usingIvsPlayback {
+      guard ivsPlayer != nil, let layer = ivsPlayerLayer else { return nil }
+      return AVPictureInPictureController(ivsPlayerLayer: layer)
+    }
+    guard player.currentItem != nil else { return nil }
+    return AVPictureInPictureController(playerLayer: playerLayer)
   }
 }

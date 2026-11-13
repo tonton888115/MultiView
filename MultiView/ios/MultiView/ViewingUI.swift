@@ -94,7 +94,9 @@ final class ViewingController: UIViewController {
 
   @objc private func reloadAndResume() {
     PlaybackDiagnostics.log("全体を作り直して再開")
-    reload()
+    // Wi-Fi⇄モバイルの切替や音声割り込みからの復帰はアプリを離れて PiP で見ている間にも起きる。
+    // PiP 中の配信まで作り直すと PiP が閉じてしまうので、その配信のセルだけは残して再開させる。
+    reload(rebuildPlayers: true, preservingStreamID: PictureInPictureCoordinator.shared.activeStreamID)
     resumePlaybackAfterReload()
   }
 
@@ -210,14 +212,15 @@ final class ViewingController: UIViewController {
 
   // 既定では作り直す(rebuildPlayers:true)。並び替え/追加/削除/レイアウト切替のときだけ false を渡し、
   // 生き残る配信のプレイヤーを破棄せず使い回す(黒画面/コールドスタートを避け、並び替えはアニメ可能)。
-  func reload(rebuildPlayers: Bool = true) {
+  // preservingStreamID: 作り直しから外す配信(PiP 表示中の配信)。
+  func reload(rebuildPlayers: Bool = true, preservingStreamID: String? = nil) {
     guard isViewLoaded else { return }
     updateBottomControls()
     NSLayoutConstraint.deactivate(cellLayoutConstraints)
     cellLayoutConstraints.removeAll()
     detachArrangedSubviews()
     if rebuildPlayers {
-      discardAllPooledCells()
+      discardAllPooledCells(except: preservingStreamID)
     }
 
     let streams = AppState.shared.streams
@@ -296,12 +299,12 @@ final class ViewingController: UIViewController {
     }
   }
 
-  private func discardAllPooledCells() {
-    cellPool.values.forEach { cell in
+  private func discardAllPooledCells(except preservedID: String? = nil) {
+    for (id, cell) in cellPool where id != preservedID {
       cell.stopPlayback()
       cell.removeFromSuperview()
+      cellPool.removeValue(forKey: id)
     }
-    cellPool.removeAll()
   }
 
   private func configureScroll() {

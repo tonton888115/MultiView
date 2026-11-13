@@ -36,6 +36,14 @@ final class NativeDanmakuRenderer {
     if settings.danmakuMaxLength > 0, trimmed.count > settings.danmakuMaxLength {
       return laneCursor
     }
+    // PiP 中の配信なら PiP の窓にも同じコメントを流す(元のセルの表示とは独立に流れる)。
+    PictureInPictureCoordinator.shared.mirrorDanmaku(
+      tokens: tokens,
+      filterText: trimmed,
+      from: root,
+      settings: settings,
+      highlighted: highlighted
+    )
     guard root.bounds.height > 0, root.bounds.width > 0 else { return laneCursor }
 
     let fontSize = scaledFontSize(base: settings.danmakuFontSize, in: root)

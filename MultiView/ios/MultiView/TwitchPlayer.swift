@@ -1,6 +1,7 @@
 import UIKit
 import WebKit
 import AVFoundation
+import AVKit
 import AmazonIVSPlayer
 
 // Native Twitch playback: fetch a PlaybackAccessToken over GraphQL, build the
@@ -878,5 +879,22 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
     }
     value = value.components(separatedBy: CharacterSet(charactersIn: "/?# ")).first ?? value
     return value
+  }
+}
+
+// ピクチャ・イン・ピクチャ(PictureInPicture.swift)。Amazon IVS 再生中は IVS SDK の PiP 対応
+// (IVSPlayerLayer から作る)、旧ネイティブ(AVPlayer)再生中は AVPlayerLayer から作る。
+// Web表示へ切り替わっている間・配信終了表示中は映像レイヤーが無いので不可。
+extension TwitchNativePlayerView: PictureInPictureCapable {
+  var pictureInPictureDanmakuView: UIView { danmakuView }
+
+  func makePictureInPictureController() -> AVPictureInPictureController? {
+    guard !isStopped, !streamBlocked, fallbackWebView == nil else { return nil }
+    if usingIvsPlayback {
+      guard ivsPlayer != nil, let layer = ivsPlayerLayer else { return nil }
+      return AVPictureInPictureController(ivsPlayerLayer: layer)
+    }
+    guard player.currentItem != nil else { return nil }
+    return AVPictureInPictureController(playerLayer: playerLayer)
   }
 }
