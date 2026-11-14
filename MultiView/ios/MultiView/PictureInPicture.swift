@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import AVKit
 import CoreMedia
@@ -12,8 +13,9 @@ import UIKit
 // 流し、そのレイヤーを PiP の中身にする(AVPictureInPictureController.ContentSource)。
 // PiP に映るのは自分で作ったフレームそのものなので、PiP の窓の上に何かを重ねる方式(非公開の窓頼み・
 // iOS によっては表示されない)と違い、確実にコメントが映る。
-// バックグラウンドでは GPU を使えないため、描き込みは CPU(CoreGraphics)で、変化するコメント部分だけ
-// 行う。Amazon IVS(Kick/Twitch)からは映像フレームを取り出せないので、PiP の間だけ AVPlayer 再生へ
+// フレームは 60fps の一定間隔で、表示時刻を付けて渡す(なめらかに流れる)。出力は PiP の窓の実ピクセルの
+// 大きさで作り、コメントも等倍で描く(文字がくっきり)。バックグラウンドでは GPU を使えないため CPU で描く。
+// Amazon IVS(Kick/Twitch)からは映像フレームを取り出せないので、PiP の間だけ AVPlayer 再生へ
 // 切り替える(閉じたら IVS へ戻す)。
 
 /// PiP にできるプレイヤー(各ネイティブプレイヤーが準拠)。
@@ -396,55 +398,60 @@ private final class PictureInPictureDisplayView: UIView {
 
 // MARK: - フレーム合成
 
-// 1 コメント分の描画済み画像と、それを描いた時の基準寸法。
+// コメント画像を描いた時の基準寸法。
 private struct PictureInPictureCommentGeometry {
-  let rasterWidth: CGFloat        // コメント画像を描いた時の基準フレーム幅(px)
-  let rasterHeight: CGFloat       // 同・高さ(px)。フレームの縦横比から決める
+  let outputWidth: CGFloat        // 描いた時の出力フレーム幅(px)。PiP の窓の実ピクセル幅に合わせてある
+  let outputHeight: CGFloat
   let pipWidthPoints: CGFloat     // その時の PiP 窓の幅(pt)
   let pixelsPerPoint: CGFloat
   let fontSize: CGFloat           // px
   let lineHeight: CGFloat         // px
-  let speed: CGFloat              // 1秒あたりに進むフレーム幅の割合
+  let speed: CGFloat              // 1秒あたりに進む幅(出力フレーム幅に対する割合)
   let maxLinesSetting: Int
 }
 
 private struct PictureInPictureCommentRaster {
   let image: CGImage
-  let size: CGSize                // px
   let geometry: PictureInPictureCommentGeometry
 }
 
-// 流れているコメント。位置はフレームに対する割合(0〜1)で持ち、画質切替でフレーム寸法が変わっても崩れない。
+// 流れているコメント。位置は出力フレームに対する割合(0〜1)で持つ。
 private struct PictureInPictureComment {
   let image: CGImage
+  let rasterWidth: CGFloat        // 描いた時の出力幅(px)。今の出力幅と同じなら等倍(くっきり)で描く
   let lane: Int
   let top: CGFloat
   let width: CGFloat
-  let height: CGFloat
-  let startClock: CFTimeInterval
+  let startTime: CFTimeInterval
   let startX: CGFloat
   let speed: CGFloat
 
-  func x(at clock: CFTimeInterval) -> CGFloat {
-    startX - speed * CGFloat(clock - startClock)
+  func x(at time: CFTimeInterval) -> CGFloat {
+    startX - speed * CGFloat(time - startTime)
   }
 
-  func rightEdge(at clock: CFTimeInterval) -> CGFloat {
-    x(at: clock) + width
+  func rightEdge(at time: CFTimeInterval) -> CGFloat {
+    x(at: time) + width
   }
 }
 
 // AVPlayer の映像フレームを受け取り、コメントを描き込んで PiP のレイヤーへ流す。
+//
+// なめらかさ: 60fps の一定間隔でフレームを作り、各フレームに「この時刻に表示」(表示時刻)を付けて
+// 少し先(50ms)まで渡しておく。表示側(AVSampleBufferDisplayLayer＋ホスト時計の controlTimebase)が
+// その時刻ちょうどに出すので、こちらの処理時間のばらつきがガタつきにならない。コメントの位置も
+// その表示時刻で計算する。映像が 30fps でもコメントは 60fps で動く。
+// くっきりさ: 出力フレームは PiP の窓の実ピクセル(長辺640〜1280px)。映像は AVPlayerItemVideoOutput に
+// その大きさで出させ(元が 360p でも)、コメントは同じ解像度で等倍・整数位置に描く。
 // メインスレッド: attach/stop/addComment/updateRenderSize/setPaused。それ以外の状態は queue 上だけで触る。
 private final class PictureInPictureFrameRenderer {
-  private static let outputAttributes: [String: Any] = [
-    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-    kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
-  ]
+  private static let frameInterval: CFTimeInterval = 1.0 / 60.0
+  private static let presentationLead: CFTimeInterval = 0.05
   // 同時に描くコメントの上限(大量の時に CPU と発熱を抑える。古いものから消す)。
-  private static let maxComments = 120
-  // 合成の最大フレームレート。PiP は小窓なので 30fps で十分。
-  private static let minFrameInterval: CFTimeInterval = 1.0 / 31.0
+  private static let maxComments = 150
+  private static let defaultLongSide: CGFloat = 960
+  private static let minLongSide: CGFloat = 640
+  private static let maxLongSide: CGFloat = 1280
 
   private let queue = DispatchQueue(label: "app.multiview.pip.render", qos: .userInteractive)
   private let displayLayer: AVSampleBufferDisplayLayer
@@ -452,41 +459,61 @@ private final class PictureInPictureFrameRenderer {
   private let screenScale: CGFloat
   private let colorSpace = CGColorSpaceCreateDeviceRGB()
   private let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+  private let placeholderText: CGImage?
 
   // メインスレッド専用
   private weak var player: AVPlayer?
   private var itemObservation: NSKeyValueObservation?
+  private var presentationSizeObservation: NSKeyValueObservation?
   private weak var attachedItem: AVPlayerItem?
   private var attachedOutput: AVPlayerItemVideoOutput?
-  private var pipWidthPoints: CGFloat = 300
-  private var frameAspect: CGFloat = 9.0 / 16.0
+  private var renderLongSidePixels: CGFloat = 0
+  private var renderWidthPoints: CGFloat = 0
+  private var videoAspect: CGFloat = 9.0 / 16.0   // 高さ/幅
+  private var outputSizeMain: CGSize
   private var loggedRenderSize = false
 
   // queue 専用
   private var timer: DispatchSourceTimer?
   private var output: AVPlayerItemVideoOutput?
+  private var outputSize: CGSize
+  private var latestVideoFrame: CVPixelBuffer?
   private var comments: [PictureInPictureComment] = []
   private var laneCursor = 0
-  private var clock: CFTimeInterval = 0
-  private var lastRenderAt: CFTimeInterval = 0
-  private var lastFrameAt: CFTimeInterval = 0
-  private var lastPlaceholderAt: CFTimeInterval = 0
+  private var lastPresentationTime: CFTimeInterval = 0
+  private var pausedAt: CFTimeInterval?
+  private var pausedTotal: CFTimeInterval = 0
+  private var needsFrame = true
   private var lastVideoAt: CFTimeInterval = 0
   private var outputAttachedAt: CFTimeInterval = 0
   private var receivedVideo = false
   private var stallLogged = false
-  private var paused = false
-  private var frameSize = CGSize.zero
+  private var framePool: CVPixelBufferPool?
+  private var framePoolSize = CGSize.zero
+  private var scalePool: CVPixelBufferPool?
+  private var scalePoolSize = CGSize.zero
   private var formatDescription: CMVideoFormatDescription?
-  private var placeholderPool: CVPixelBufferPool?
-  private var placeholderPoolSize = CGSize.zero
-  private let placeholderText: CGImage?
 
   init(displayLayer: AVSampleBufferDisplayLayer, label: String, screenScale: CGFloat) {
     self.displayLayer = displayLayer
     self.label = label
     self.screenScale = max(1, screenScale)
     placeholderText = Self.makePlaceholderText()
+    let initialSize = Self.makeOutputSize(longSide: Self.defaultLongSide, aspect: 9.0 / 16.0)
+    outputSizeMain = initialSize
+    outputSize = initialSize
+    // 表示側の時計をホスト時刻(CACurrentMediaTime と同じ)にする。
+    var timebase: CMTimebase?
+    CMTimebaseCreateWithSourceClock(
+      allocator: kCFAllocatorDefault,
+      sourceClock: CMClockGetHostTimeClock(),
+      timebaseOut: &timebase
+    )
+    if let timebase {
+      CMTimebaseSetTime(timebase, time: CMClockGetTime(CMClockGetHostTimeClock()))
+      CMTimebaseSetRate(timebase, rate: 1)
+      displayLayer.controlTimebase = timebase
+    }
   }
 
   // MARK: メインスレッド
@@ -505,7 +532,7 @@ private final class PictureInPictureFrameRenderer {
   func start() {
     queue.async {
       let timer = DispatchSource.makeTimerSource(queue: self.queue)
-      timer.schedule(deadline: .now(), repeating: .milliseconds(16), leeway: .milliseconds(4))
+      timer.schedule(deadline: .now(), repeating: .nanoseconds(16_666_667), leeway: .milliseconds(1))
       timer.setEventHandler { [weak self] in
         self?.tick()
       }
@@ -516,6 +543,7 @@ private final class PictureInPictureFrameRenderer {
 
   func stop() {
     itemObservation = nil
+    presentationSizeObservation = nil
     if let attachedItem, let attachedOutput {
       attachedItem.remove(attachedOutput)
     }
@@ -526,29 +554,44 @@ private final class PictureInPictureFrameRenderer {
       self.timer?.cancel()
       self.timer = nil
       self.output = nil
+      self.latestVideoFrame = nil
       self.comments.removeAll()
       layer.flushAndRemoveImage()
     }
   }
 
+  // PiP の一時停止。止めている間はフレームを作らず(最後の絵のまま)、コメントの時計も止める。
   func setPaused(_ paused: Bool) {
     queue.async {
-      self.paused = paused
+      let now = CACurrentMediaTime()
+      if paused {
+        if self.pausedAt == nil {
+          self.pausedAt = now
+        }
+      } else if let pausedAt = self.pausedAt {
+        self.pausedTotal += now - pausedAt
+        self.pausedAt = nil
+        self.needsFrame = true
+      }
     }
   }
 
   func updateRenderSize(width: CGFloat, height: CGFloat) {
-    guard width > 0 else { return }
-    var points = width / screenScale
+    guard width > 0, height > 0 else { return }
+    var longSide = max(width, height)
+    var widthPoints = width / screenScale
     // 単位がポイントで来た場合の保険(PiP の窓が 120pt 未満になることはない)。
-    if points < 120 {
-      points = width
+    if longSide / screenScale < 120 {
+      longSide *= screenScale
+      widthPoints = width
     }
-    pipWidthPoints = max(120, points)
+    renderLongSidePixels = longSide
+    renderWidthPoints = widthPoints
     if !loggedRenderSize {
       loggedRenderSize = true
       PlaybackDiagnostics.log("PiP: 窓サイズ \(Int(width))x\(Int(height))")
     }
+    updateOutputSize()
   }
 
   func addComment(tokens: [NativeDanmakuToken], settings: AppSettings, highlighted: Bool) {
@@ -568,34 +611,76 @@ private final class PictureInPictureFrameRenderer {
 
   // セルの弾幕と同じ見た目の比率(フォント・行高・速さ)を、PiP の窓の大きさに合わせて求める。
   private func makeGeometry(settings: AppSettings) -> PictureInPictureCommentGeometry {
-    let pipWidth = max(120, pipWidthPoints)
-    // コメント画像は PiP の窓の実ピクセル程度で描けば十分(大きすぎると大量コメント時にメモリを食う)。
-    let rasterWidth = min(960, max(480, pipWidth * screenScale))
-    let pixelsPerPoint = rasterWidth / pipWidth
+    let size = outputSizeMain
+    let pipWidth = max(120, renderWidthPoints > 0 ? renderWidthPoints : size.width / screenScale)
+    let pixelsPerPoint = size.width / pipWidth
     let fontPoints = (CGFloat(settings.danmakuFontSize) * min(1.8, max(0.55, pipWidth / 340))).rounded()
     let speedPoints = max(35, pipWidth * CGFloat(settings.danmakuSpeed))
     return PictureInPictureCommentGeometry(
-      rasterWidth: rasterWidth,
-      rasterHeight: rasterWidth * frameAspect,
+      outputWidth: size.width,
+      outputHeight: size.height,
       pipWidthPoints: pipWidth,
       pixelsPerPoint: pixelsPerPoint,
-      fontSize: fontPoints * pixelsPerPoint,
-      lineHeight: (fontPoints + 8) * pixelsPerPoint,
+      fontSize: (fontPoints * pixelsPerPoint).rounded(),
+      lineHeight: ((fontPoints + 8) * pixelsPerPoint).rounded(),
       speed: speedPoints / pipWidth,
       maxLinesSetting: settings.danmakuMaxLines
     )
   }
 
-  private func attachOutput(to item: AVPlayerItem?) {
-    guard itemObservation != nil, item !== attachedItem else { return }
+  // 出力フレームの大きさ = PiP の窓の実ピクセル(不明な間は長辺960px)× 映像の縦横比。
+  private func updateOutputSize() {
+    let longSide = renderLongSidePixels > 0 ? renderLongSidePixels : Self.defaultLongSide
+    let size = Self.makeOutputSize(longSide: longSide, aspect: videoAspect)
+    guard size != outputSizeMain else { return }
+    outputSizeMain = size
+    queue.async {
+      self.outputSize = size
+      self.needsFrame = true
+    }
+    if let attachedItem {
+      attachOutput(to: attachedItem, force: true)
+    }
+  }
+
+  private func videoSizeChanged(_ size: CGSize, item: AVPlayerItem) {
+    guard item === attachedItem, size.width > 0, size.height > 0 else { return }
+    let aspect = size.height / size.width
+    guard abs(aspect - videoAspect) > 0.01 else { return }
+    videoAspect = aspect
+    updateOutputSize()
+  }
+
+  private func attachOutput(to item: AVPlayerItem?, force: Bool = false) {
+    guard itemObservation != nil else { return }
+    if !force, item === attachedItem { return }
     if let attachedItem, let attachedOutput {
       attachedItem.remove(attachedOutput)
+    }
+    if item !== attachedItem {
+      presentationSizeObservation = nil
+      if let item {
+        // 映像の縦横比(ツイキャスの縦長配信など)に出力フレームを合わせる。
+        presentationSizeObservation = item.observe(\.presentationSize, options: [.initial, .new]) { [weak self] item, _ in
+          let size = item.presentationSize
+          DispatchQueue.main.async {
+            self?.videoSizeChanged(size, item: item)
+          }
+        }
+      }
     }
     attachedItem = item
     attachedOutput = nil
     var newOutput: AVPlayerItemVideoOutput?
     if let item {
-      let videoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: Self.outputAttributes)
+      // 映像はこの大きさ・BGRA で出させる(縮小/拡大は AVFoundation 側。元が 360p でも PiP の解像度で受け取る)。
+      let size = outputSizeMain
+      let videoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        kCVPixelBufferWidthKey as String: Int(size.width),
+        kCVPixelBufferHeightKey as String: Int(size.height),
+        kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
+      ])
       item.add(videoOutput)
       attachedOutput = videoOutput
       newOutput = videoOutput
@@ -614,7 +699,7 @@ private final class PictureInPictureFrameRenderer {
       guard let self, let item, let output, item === self.attachedItem, output === self.attachedOutput else { return }
       self.queue.async {
         let gotFrames = self.lastVideoAt >= self.outputAttachedAt
-        guard !gotFrames, !self.paused else { return }
+        guard !gotFrames, self.pausedAt == nil else { return }
         DispatchQueue.main.async {
           guard item === self.attachedItem, self.player?.timeControlStatus == .playing else { return }
           PlaybackDiagnostics.log("PiP: \(self.label) 映像フレームが来ないため再生位置を合わせ直し")
@@ -627,80 +712,99 @@ private final class PictureInPictureFrameRenderer {
   // MARK: queue
 
   private func tick() {
+    guard pausedAt == nil else { return }
     let now = CACurrentMediaTime()
-    if let output {
-      let itemTime = output.itemTime(forHostTime: now)
-      if output.hasNewPixelBuffer(forItemTime: itemTime) {
-        guard now - lastFrameAt >= Self.minFrameInterval else { return }
-        if let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) {
-          lastFrameAt = now
-          noteVideoFrame(pixelBuffer, now: now)
-          advanceClock(now)
-          drawComments(onto: pixelBuffer, clearFirst: false)
-          enqueue(pixelBuffer)
-          return
-        }
+    let interval = Self.frameInterval
+    // 次に作るフレームの表示時刻。60fps の格子にそろえ、少し先にしておく。
+    let target = ceil((now + Self.presentationLead) / interval) * interval
+    guard target > lastPresentationTime + interval * 0.5 else { return }
+    pullVideoFrame(for: target, now: now)
+    let commentTime = target - pausedTotal
+    comments.removeAll { $0.rightEdge(at: commentTime) < -0.02 }
+    if !needsFrame, comments.isEmpty {
+      // 新しい映像もコメントも無ければ作らない(省電力)。読み込み中のつなぎ画面だけは時々出す。
+      let placeholderDue = latestVideoFrame == nil && target - lastPresentationTime >= 1.0 / 15.0
+      if !placeholderDue {
+        logStallIfNeeded(now: now)
+        return
       }
     }
-    if !receivedVideo {
-      // 映像がまだ来ていない間(読み込み中・IVS→AVPlayer 切替中)は、黒地のつなぎ画面にコメントだけ流す。
-      if now - lastPlaceholderAt >= 1.0 / 15.0 {
-        lastPlaceholderAt = now
-        renderPlaceholder(now: now)
-      }
-      return
+    guard let frame = Self.makeBuffer(pool: &framePool, poolSize: &framePoolSize, size: outputSize) else { return }
+    compose(into: frame, commentTime: commentTime)
+    enqueue(frame, presentationTime: target)
+    lastPresentationTime = target
+    needsFrame = false
+    logStallIfNeeded(now: now)
+  }
+
+  private func pullVideoFrame(for target: CFTimeInterval, now: CFTimeInterval) {
+    guard let output else { return }
+    let itemTime = output.itemTime(forHostTime: target)
+    guard output.hasNewPixelBuffer(forItemTime: itemTime),
+          let pixelBuffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else { return }
+    noteVideoFrame(pixelBuffer, now: now)
+    latestVideoFrame = conformedToOutputSize(pixelBuffer)
+    needsFrame = true
+  }
+
+  // 映像出力が指定の大きさで出してこなかった時だけ、こちらで縮尺を合わせる(普段は何もしない)。
+  private func conformedToOutputSize(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer {
+    let width = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
+    let height = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+    guard width != outputSize.width || height != outputSize.height,
+          CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA,
+          let scaled = Self.makeBuffer(pool: &scalePool, poolSize: &scalePoolSize, size: outputSize) else {
+      return pixelBuffer
     }
-    if !paused, !stallLogged, now - lastVideoAt > 4 {
-      stallLogged = true
-      let label = self.label
-      DispatchQueue.main.async {
-        let background = UIApplication.shared.applicationState == .background
-        PlaybackDiagnostics.log("PiP: \(label) 映像フレームが4秒以上届いていません(\(background ? "バックグラウンド" : "前面"))")
-      }
-    }
+    CVPixelBufferLockBaseAddress(scaled, [])
+    defer { CVPixelBufferUnlockBaseAddress(scaled, []) }
+    guard let base = CVPixelBufferGetBaseAddress(scaled) else { return pixelBuffer }
+    Self.copy(
+      pixelBuffer,
+      into: base,
+      width: CVPixelBufferGetWidth(scaled),
+      height: CVPixelBufferGetHeight(scaled),
+      bytesPerRow: CVPixelBufferGetBytesPerRow(scaled)
+    )
+    return scaled
   }
 
   private func noteVideoFrame(_ pixelBuffer: CVPixelBuffer, now: CFTimeInterval) {
-    let size = CGSize(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
     if !receivedVideo {
       receivedVideo = true
-      PlaybackDiagnostics.log("PiP: \(label) 映像フレーム受信 \(Int(size.width))x\(Int(size.height))")
+      PlaybackDiagnostics.log("PiP: \(label) 映像フレーム受信 \(CVPixelBufferGetWidth(pixelBuffer))x\(CVPixelBufferGetHeight(pixelBuffer))")
     }
     if stallLogged {
       stallLogged = false
       PlaybackDiagnostics.log("PiP: \(label) 映像フレーム再開")
     }
     lastVideoAt = now
-    if size != frameSize, size.width > 0, size.height > 0 {
-      frameSize = size
-      let aspect = size.height / size.width
-      DispatchQueue.main.async { [weak self] in
-        self?.frameAspect = aspect
-      }
-    }
   }
 
-  // コメントの時計は「描いたフレーム」ごとにだけ進める(最大0.1秒)。一時停止や映像の停止中は
-  // コメントも止まり、再開時にまとめて飛ばない。
-  private func advanceClock(_ now: CFTimeInterval) {
-    if lastRenderAt > 0 {
-      clock += min(max(now - lastRenderAt, 0), 0.1)
+  private func logStallIfNeeded(now: CFTimeInterval) {
+    guard receivedVideo, pausedAt == nil, !stallLogged, now - lastVideoAt > 4 else { return }
+    stallLogged = true
+    let label = self.label
+    DispatchQueue.main.async {
+      let background = UIApplication.shared.applicationState == .background
+      PlaybackDiagnostics.log("PiP: \(label) 映像フレームが4秒以上届いていません(\(background ? "バックグラウンド" : "前面"))")
     }
-    lastRenderAt = now
   }
 
   private func insert(_ raster: PictureInPictureCommentRaster) {
     let geometry = raster.geometry
-    let laneHeight = geometry.lineHeight / geometry.rasterHeight
-    let topMargin = 6 * geometry.pixelsPerPoint / geometry.rasterHeight
+    let laneHeight = geometry.lineHeight / geometry.outputHeight
+    let topMargin = 6 * geometry.pixelsPerPoint / geometry.outputHeight
     let fittingLines = max(1, Int((1 - topMargin) / laneHeight))
     let maxLines = geometry.maxLinesSetting > 0 ? min(geometry.maxLinesSetting, fittingLines) : fittingLines
+    // 次に作るフレームから入ってくるように、そのフレームのコメント時刻で置く。
+    let commentTime = (pausedAt ?? CACurrentMediaTime()) + Self.presentationLead - pausedTotal
     // セルの弾幕と同じく、先頭のコメントが十分入ってきたレーンを選ぶ。全レーンが詰まっていても
     // 捨てずに、先頭が一番左にあるレーンへ流す。
     let clearThreshold = 1 - 36 / geometry.pipWidthPoints
     var laneFront: [Int: CGFloat] = [:]
     for comment in comments where comment.lane < maxLines {
-      laneFront[comment.lane] = max(laneFront[comment.lane] ?? -1, comment.rightEdge(at: clock))
+      laneFront[comment.lane] = max(laneFront[comment.lane] ?? -1, comment.rightEdge(at: commentTime))
     }
     var chosen: Int?
     for offset in 0..<maxLines {
@@ -714,11 +818,11 @@ private final class PictureInPictureFrameRenderer {
     laneCursor += 1
     comments.append(PictureInPictureComment(
       image: raster.image,
+      rasterWidth: geometry.outputWidth,
       lane: lane,
       top: topMargin + CGFloat(lane) * laneHeight,
-      width: raster.size.width / geometry.rasterWidth,
-      height: raster.size.height / geometry.rasterHeight,
-      startClock: clock,
+      width: CGFloat(raster.image.width) / geometry.outputWidth,
+      startTime: commentTime,
       startX: 1 + 12 / geometry.pipWidthPoints,
       speed: geometry.speed
     ))
@@ -727,36 +831,38 @@ private final class PictureInPictureFrameRenderer {
     }
   }
 
-  // フレームにコメントを直接描き込む(CPU。バックグラウンドでは GPU を使えないため)。
-  private func drawComments(onto pixelBuffer: CVPixelBuffer, clearFirst: Bool) {
-    comments.removeAll { $0.rightEdge(at: clock) < -0.02 }
-    guard clearFirst || !comments.isEmpty,
-          CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_32BGRA else { return }
-    CVPixelBufferLockBaseAddress(pixelBuffer, [])
-    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
-    guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
-    let width = CVPixelBufferGetWidth(pixelBuffer)
-    let height = CVPixelBufferGetHeight(pixelBuffer)
+  // 出力フレーム = 最新の映像(無ければ黒地＋「映像を準備中」)＋その表示時刻の位置のコメント。
+  // バックグラウンドでは GPU を使えないので CPU(memcpy＋CoreGraphics)で描く。
+  private func compose(into frame: CVPixelBuffer, commentTime: CFTimeInterval) {
+    CVPixelBufferLockBaseAddress(frame, [])
+    defer { CVPixelBufferUnlockBaseAddress(frame, []) }
+    guard let base = CVPixelBufferGetBaseAddress(frame) else { return }
+    let width = CVPixelBufferGetWidth(frame)
+    let height = CVPixelBufferGetHeight(frame)
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(frame)
+    if let latestVideoFrame {
+      Self.copy(latestVideoFrame, into: base, width: width, height: height, bytesPerRow: bytesPerRow)
+    }
     guard let context = CGContext(
       data: base,
       width: width,
       height: height,
       bitsPerComponent: 8,
-      bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+      bytesPerRow: bytesPerRow,
       space: colorSpace,
       bitmapInfo: bitmapInfo
     ) else { return }
     let frameWidth = CGFloat(width)
     let frameHeight = CGFloat(height)
-    if clearFirst {
+    if latestVideoFrame == nil {
       context.setFillColor(UIColor.black.cgColor)
       context.fill(CGRect(x: 0, y: 0, width: frameWidth, height: frameHeight))
       if let placeholderText {
-        let textWidth = min(frameWidth * 0.6, CGFloat(placeholderText.width))
+        let textWidth = min(frameWidth * 0.5, CGFloat(placeholderText.width))
         let textHeight = textWidth * CGFloat(placeholderText.height) / CGFloat(max(1, placeholderText.width))
         context.draw(placeholderText, in: CGRect(
-          x: (frameWidth - textWidth) / 2,
-          y: (frameHeight - textHeight) / 2,
+          x: ((frameWidth - textWidth) / 2).rounded(),
+          y: ((frameHeight - textHeight) / 2).rounded(),
           width: textWidth,
           height: textHeight
         ))
@@ -764,44 +870,73 @@ private final class PictureInPictureFrameRenderer {
     }
     context.interpolationQuality = .medium
     for comment in comments {
-      let x = comment.x(at: clock) * frameWidth
-      let w = comment.width * frameWidth
-      guard x < frameWidth, x + w > 0 else { continue }
-      let h = comment.height * frameHeight
-      let top = comment.top * frameHeight
+      // 描いた時と出力幅が同じなら等倍。整数位置に置いて文字をぼかさない。
+      let scale = frameWidth / comment.rasterWidth
+      let drawWidth = CGFloat(comment.image.width) * scale
+      let drawHeight = CGFloat(comment.image.height) * scale
+      let x = (comment.x(at: commentTime) * frameWidth).rounded()
+      guard x < frameWidth, x + drawWidth > 0 else { continue }
+      let top = (comment.top * frameHeight).rounded()
       // CGContext は左下原点。ピクセルバッファの先頭行は映像の上端。
-      context.draw(comment.image, in: CGRect(x: x, y: frameHeight - top - h, width: w, height: h))
+      context.draw(comment.image, in: CGRect(x: x, y: frameHeight - top - drawHeight, width: drawWidth, height: drawHeight))
     }
   }
 
-  private func renderPlaceholder(now: CFTimeInterval) {
-    let size = frameSize.width > 0 ? frameSize : CGSize(width: 1280, height: 720)
-    guard let pixelBuffer = makePlaceholderBuffer(size: size) else { return }
-    advanceClock(now)
-    drawComments(onto: pixelBuffer, clearFirst: true)
-    enqueue(pixelBuffer)
+  // BGRA の映像をフレームのメモリへ写す。同じ大きさなら memcpy、違えば vImage で縮尺を合わせる。
+  private static func copy(_ source: CVPixelBuffer, into destination: UnsafeMutableRawPointer, width: Int, height: Int, bytesPerRow: Int) {
+    guard CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_32BGRA else { return }
+    CVPixelBufferLockBaseAddress(source, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
+    guard let sourceBase = CVPixelBufferGetBaseAddress(source) else { return }
+    let sourceWidth = CVPixelBufferGetWidth(source)
+    let sourceHeight = CVPixelBufferGetHeight(source)
+    let sourceBytesPerRow = CVPixelBufferGetBytesPerRow(source)
+    if sourceWidth == width, sourceHeight == height {
+      if sourceBytesPerRow == bytesPerRow {
+        memcpy(destination, sourceBase, bytesPerRow * height)
+      } else {
+        let rowBytes = min(sourceBytesPerRow, bytesPerRow)
+        for row in 0..<height {
+          memcpy(destination + row * bytesPerRow, sourceBase + row * sourceBytesPerRow, rowBytes)
+        }
+      }
+      return
+    }
+    var sourceBuffer = vImage_Buffer(
+      data: sourceBase,
+      height: vImagePixelCount(sourceHeight),
+      width: vImagePixelCount(sourceWidth),
+      rowBytes: sourceBytesPerRow
+    )
+    var destinationBuffer = vImage_Buffer(
+      data: destination,
+      height: vImagePixelCount(height),
+      width: vImagePixelCount(width),
+      rowBytes: bytesPerRow
+    )
+    vImageScale_ARGB8888(&sourceBuffer, &destinationBuffer, nil, vImage_Flags(kvImageNoFlags))
   }
 
-  private func makePlaceholderBuffer(size: CGSize) -> CVPixelBuffer? {
-    if placeholderPool == nil || placeholderPoolSize != size {
+  private static func makeBuffer(pool: inout CVPixelBufferPool?, poolSize: inout CGSize, size: CGSize) -> CVPixelBuffer? {
+    if pool == nil || poolSize != size {
       let attributes: [String: Any] = [
         kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
         kCVPixelBufferWidthKey as String: Int(size.width),
         kCVPixelBufferHeightKey as String: Int(size.height),
         kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()
       ]
-      var pool: CVPixelBufferPool?
-      CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attributes as CFDictionary, &pool)
-      placeholderPool = pool
-      placeholderPoolSize = size
+      var newPool: CVPixelBufferPool?
+      CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attributes as CFDictionary, &newPool)
+      pool = newPool
+      poolSize = size
     }
-    guard let placeholderPool else { return nil }
-    var pixelBuffer: CVPixelBuffer?
-    CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, placeholderPool, &pixelBuffer)
-    return pixelBuffer
+    guard let readyPool = pool else { return nil }
+    var buffer: CVPixelBuffer?
+    CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, readyPool, &buffer)
+    return buffer
   }
 
-  private func enqueue(_ pixelBuffer: CVPixelBuffer) {
+  private func enqueue(_ pixelBuffer: CVPixelBuffer, presentationTime: CFTimeInterval) {
     if let current = formatDescription, CMVideoFormatDescriptionMatchesImageBuffer(current, imageBuffer: pixelBuffer) {
       // 同じ形式のフレーム。作り直さない。
     } else {
@@ -814,9 +949,10 @@ private final class PictureInPictureFrameRenderer {
       formatDescription = description
     }
     guard let formatDescription else { return }
+    // 表示時刻つきで渡す(controlTimebase がホスト時刻なので、この時刻ちょうどに表示される)。
     var timing = CMSampleTimingInfo(
-      duration: .invalid,
-      presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
+      duration: CMTime(value: 1, timescale: 60),
+      presentationTimeStamp: CMTime(seconds: presentationTime, preferredTimescale: 1_000_000_000),
       decodeTimeStamp: .invalid
     )
     var sampleBuffer: CMSampleBuffer?
@@ -828,22 +964,30 @@ private final class PictureInPictureFrameRenderer {
       sampleBufferOut: &sampleBuffer
     )
     guard status == noErr, let sampleBuffer else { return }
-    // ライブの映像は届いた順にすぐ出す(再生時刻の管理はしない)。
-    if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true),
-       CFArrayGetCount(attachments) > 0 {
-      let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-      CFDictionarySetValue(
-        dictionary,
-        Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-        Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
-      )
-    }
     if displayLayer.status == .failed {
       // バックグラウンドからの復帰などで failed になると、flush するまで受け付けない。
       displayLayer.flush()
     }
     guard displayLayer.isReadyForMoreMediaData else { return }
     displayLayer.enqueue(sampleBuffer)
+  }
+
+  private static func makeOutputSize(longSide: CGFloat, aspect: CGFloat) -> CGSize {
+    let side = min(maxLongSide, max(minLongSide, longSide))
+    let width: CGFloat
+    let height: CGFloat
+    if aspect <= 1 {
+      width = side
+      height = side * aspect
+    } else {
+      height = side
+      width = side / aspect
+    }
+    return CGSize(width: even(width), height: even(height))
+  }
+
+  private static func even(_ value: CGFloat) -> CGFloat {
+    max(2, (value / 2).rounded() * 2)
   }
 
   private static func makePlaceholderText() -> CGImage? {
@@ -868,7 +1012,7 @@ private final class PictureInPictureFrameRenderer {
 }
 
 // コメント 1 件を画像にする(メインスレッド)。見た目はセルの弾幕(NativeDanmakuRenderer)に合わせる:
-// 太字の白文字＋黒い影、絵文字は画像、自分のコメントは黄色の枠。
+// 太字の白文字＋黒い影、絵文字は画像、自分のコメントは黄色の枠。出力フレームと同じピクセル密度で描く。
 private enum PictureInPictureCommentRasterizer {
   static func render(
     tokens: [NativeDanmakuToken],
@@ -931,10 +1075,10 @@ private enum PictureInPictureCommentRasterizer {
       .foregroundColor: UIColor.white.withAlphaComponent(opacity),
       .shadow: shadow
     ]
-    let imageSide = max(18 * ppp, geometry.fontSize * 1.4)
+    let imageSide = max(18 * ppp, geometry.fontSize * 1.4).rounded()
     // 影がはみ出す分と、自分のコメントの枠の分の余白。
-    let padding = (highlighted ? 8 : 3) * ppp
-    let inset = (highlighted ? 2 : 0) * ppp
+    let padding = ((highlighted ? 8 : 3) * ppp).rounded()
+    let inset = ((highlighted ? 2 : 0) * ppp).rounded()
 
     enum Piece {
       case text(NSString, CGFloat)
@@ -951,8 +1095,8 @@ private enum PictureInPictureCommentRasterizer {
         x += ceil(string.size(withAttributes: attributes).width)
       case .image(let url):
         guard let image = images[url] else { continue }
-        pieces.append(.image(image.images?.first ?? image, x + 3 * ppp))
-        x += imageSide + 6 * ppp
+        pieces.append(.image(image.images?.first ?? image, (x + 3 * ppp).rounded()))
+        x += imageSide + (6 * ppp).rounded()
       }
     }
     guard !pieces.isEmpty else { return nil }
@@ -976,12 +1120,12 @@ private enum PictureInPictureCommentRasterizer {
         case .text(let string, let originX):
           string.draw(at: CGPoint(x: originX, y: inset), withAttributes: attributes)
         case .image(let image, let originX):
-          let originY = max(inset, (geometry.lineHeight - imageSide) / 2)
+          let originY = max(inset, ((geometry.lineHeight - imageSide) / 2).rounded())
           image.draw(in: CGRect(x: originX, y: originY, width: imageSide, height: imageSide), blendMode: .normal, alpha: opacity)
         }
       }
     }
     guard let cgImage = image.cgImage else { return nil }
-    return PictureInPictureCommentRaster(image: cgImage, size: size, geometry: geometry)
+    return PictureInPictureCommentRaster(image: cgImage, geometry: geometry)
   }
 }
