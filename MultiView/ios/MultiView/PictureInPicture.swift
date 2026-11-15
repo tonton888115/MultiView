@@ -17,6 +17,11 @@ import UIKit
 // 大きさで作り、コメントも等倍で描く(文字がくっきり)。バックグラウンドでは GPU を使えないため CPU で描く。
 // Amazon IVS(Kick/Twitch)からは映像フレームを取り出せないので、PiP の間だけ AVPlayer 再生へ
 // 切り替える(閉じたら IVS へ戻す)。
+//
+// ニコ生公式アプリ(6.19.0)を解析して確認した対応関係: 公式も同じ構成
+// (AVPlayerItemVideoOutput → コメント合成 → CMSampleBuffer → AVSampleBufferDisplayLayer →
+// AVPictureInPictureController.ContentSource)。違いは合成の手段だけ(公式は Metal、こちらは CPU)。
+// コメントの大きさ・流れ方・行の決め方は公式の式に合わせてある(PictureInPictureCommentLayout)。
 
 /// PiP にできるプレイヤー(各ネイティブプレイヤーが準拠)。
 protocol PictureInPictureCapable: AnyObject {
@@ -398,15 +403,34 @@ private final class PictureInPictureDisplayView: UIView {
 
 // MARK: - フレーム合成
 
+// PiP のコメント配置。ニコ生公式アプリ(6.19.0)のコメント描画の式に合わせた値。
+private enum PictureInPictureCommentLayout {
+  // 行の高さ = 画面の高さ ÷ この行数(公式の「中」サイズ: 横長の映像 11.3 行、縦長の映像 18.8 行)。
+  static let linesPerHeightLandscape: CGFloat = 11.3
+  static let linesPerHeightPortrait: CGFloat = 18.8
+  // 文字の大きさ = 行の高さ × 0.8(切り捨て)。
+  static let fontPerLineHeight: CGFloat = 0.8
+  // 流れる速さは 4:3 の「舞台」の幅で決める(16:9 の画面では舞台は中央の 3/4 幅)。
+  static let stageAspect: CGFloat = 4.0 / 3.0
+  // 舞台の幅＋自分の幅を 4 秒で横切る(公式: 表示 6 秒 − 前後 1 秒ずつ)。長いコメントほど速い。
+  static let stageCrossSeconds: CGFloat = 4
+  // 舞台の右端に着く 1 秒前から流し始める(画面の右外から入ってくる)。
+  static let leadSeconds: CGFloat = 1
+  // 一番上の行の上に空ける余白(行の高さに対する割合)。
+  static let topMarginLines: CGFloat = 0.1
+  // アプリの設定の初期値(文字サイズ 20・速度 100%)を公式相当とし、設定値はその比率で効かせる。
+  static let defaultFontSetting: CGFloat = 20
+  static let defaultSpeedSetting: CGFloat = 0.13
+}
+
 // コメント画像を描いた時の基準寸法。
 private struct PictureInPictureCommentGeometry {
   let outputWidth: CGFloat        // 描いた時の出力フレーム幅(px)。PiP の窓の実ピクセル幅に合わせてある
   let outputHeight: CGFloat
-  let pipWidthPoints: CGFloat     // その時の PiP 窓の幅(pt)
-  let pixelsPerPoint: CGFloat
   let fontSize: CGFloat           // px
   let lineHeight: CGFloat         // px
-  let speed: CGFloat              // 1秒あたりに進む幅(出力フレーム幅に対する割合)
+  let crossSeconds: CGFloat       // 舞台の幅＋自分の幅を横切る秒数(速度の設定を反映)
+  let leadSeconds: CGFloat        // 舞台の右端に着くまでの助走の秒数
   let maxLinesSetting: Int
 }
 
@@ -419,12 +443,11 @@ private struct PictureInPictureCommentRaster {
 private struct PictureInPictureComment {
   let image: CGImage
   let rasterWidth: CGFloat        // 描いた時の出力幅(px)。今の出力幅と同じなら等倍(くっきり)で描く
-  let lane: Int
   let top: CGFloat
   let width: CGFloat
   let startTime: CFTimeInterval
   let startX: CGFloat
-  let speed: CGFloat
+  let speed: CGFloat              // 1 秒に進む量(出力幅に対する割合)
 
   func x(at time: CFTimeInterval) -> CGFloat {
     startX - speed * CGFloat(time - startTime)
@@ -432,6 +455,11 @@ private struct PictureInPictureComment {
 
   func rightEdge(at time: CFTimeInterval) -> CGFloat {
     x(at: time) + width
+  }
+
+  // 右端が画面の左端に着く(画面から出きる)時刻。
+  var exitTime: CFTimeInterval {
+    startTime + CFTimeInterval((startX + width) / speed)
   }
 }
 
@@ -443,6 +471,8 @@ private struct PictureInPictureComment {
 // その表示時刻で計算する。映像が 30fps でもコメントは 60fps で動く。
 // くっきりさ: 出力フレームは PiP の窓の実ピクセル(長辺640〜1280px)。映像は AVPlayerItemVideoOutput に
 // その大きさで出させ(元が 360p でも)、コメントは同じ解像度で等倍・整数位置に描く。
+// コメントの配置: 公式アプリと同じ(PictureInPictureCommentLayout)。大きさは画面の高さに対する比率、
+// 流れる速さはコメントの長さで変わり、行は上から詰めて追いつかない行を選ぶ。
 // メインスレッド: attach/stop/addComment/updateRenderSize/setPaused。それ以外の状態は queue 上だけで触る。
 private final class PictureInPictureFrameRenderer {
   private static let frameInterval: CFTimeInterval = 1.0 / 60.0
@@ -468,7 +498,6 @@ private final class PictureInPictureFrameRenderer {
   private weak var attachedItem: AVPlayerItem?
   private var attachedOutput: AVPlayerItemVideoOutput?
   private var renderLongSidePixels: CGFloat = 0
-  private var renderWidthPoints: CGFloat = 0
   private var videoAspect: CGFloat = 9.0 / 16.0   // 高さ/幅
   private var outputSizeMain: CGSize
   private var loggedRenderSize = false
@@ -479,7 +508,8 @@ private final class PictureInPictureFrameRenderer {
   private var outputSize: CGSize
   private var latestVideoFrame: CVPixelBuffer?
   private var comments: [PictureInPictureComment] = []
-  private var laneCursor = 0
+  // 各行に最後に流したコメント(次のコメントがぶつからないかの判定に使う)。
+  private var laneTails: [Int: PictureInPictureComment] = [:]
   private var lastPresentationTime: CFTimeInterval = 0
   private var pausedAt: CFTimeInterval?
   private var pausedTotal: CFTimeInterval = 0
@@ -556,6 +586,7 @@ private final class PictureInPictureFrameRenderer {
       self.output = nil
       self.latestVideoFrame = nil
       self.comments.removeAll()
+      self.laneTails.removeAll()
       layer.flushAndRemoveImage()
     }
   }
@@ -579,14 +610,11 @@ private final class PictureInPictureFrameRenderer {
   func updateRenderSize(width: CGFloat, height: CGFloat) {
     guard width > 0, height > 0 else { return }
     var longSide = max(width, height)
-    var widthPoints = width / screenScale
     // 単位がポイントで来た場合の保険(PiP の窓が 120pt 未満になることはない)。
     if longSide / screenScale < 120 {
       longSide *= screenScale
-      widthPoints = width
     }
     renderLongSidePixels = longSide
-    renderWidthPoints = widthPoints
     if !loggedRenderSize {
       loggedRenderSize = true
       PlaybackDiagnostics.log("PiP: 窓サイズ \(Int(width))x\(Int(height))")
@@ -609,21 +637,24 @@ private final class PictureInPictureFrameRenderer {
     }
   }
 
-  // セルの弾幕と同じ見た目の比率(フォント・行高・速さ)を、PiP の窓の大きさに合わせて求める。
+  // コメントの大きさ・速さを、公式アプリと同じ比率で出力フレーム(=PiP の窓)の大きさから決める。
+  // アプリの設定(文字サイズ・速度・最大行数)は、初期値を公式相当として、その比率で効かせる。
   private func makeGeometry(settings: AppSettings) -> PictureInPictureCommentGeometry {
     let size = outputSizeMain
-    let pipWidth = max(120, renderWidthPoints > 0 ? renderWidthPoints : size.width / screenScale)
-    let pixelsPerPoint = size.width / pipWidth
-    let fontPoints = (CGFloat(settings.danmakuFontSize) * min(1.8, max(0.55, pipWidth / 340))).rounded()
-    let speedPoints = max(35, pipWidth * CGFloat(settings.danmakuSpeed))
+    let lines = size.width >= size.height
+      ? PictureInPictureCommentLayout.linesPerHeightLandscape
+      : PictureInPictureCommentLayout.linesPerHeightPortrait
+    let fontScale = min(2, max(0.6, CGFloat(settings.danmakuFontSize) / PictureInPictureCommentLayout.defaultFontSetting))
+    let lineHeight = (size.height / lines * fontScale).rounded()
+    let fontSize = max(8, (lineHeight * PictureInPictureCommentLayout.fontPerLineHeight).rounded(.down))
+    let speedScale = min(3, max(0.2, CGFloat(settings.danmakuSpeed) / PictureInPictureCommentLayout.defaultSpeedSetting))
     return PictureInPictureCommentGeometry(
       outputWidth: size.width,
       outputHeight: size.height,
-      pipWidthPoints: pipWidth,
-      pixelsPerPoint: pixelsPerPoint,
-      fontSize: (fontPoints * pixelsPerPoint).rounded(),
-      lineHeight: ((fontPoints + 8) * pixelsPerPoint).rounded(),
-      speed: speedPoints / pipWidth,
+      fontSize: fontSize,
+      lineHeight: max(lineHeight, fontSize),
+      crossSeconds: PictureInPictureCommentLayout.stageCrossSeconds / speedScale,
+      leadSeconds: PictureInPictureCommentLayout.leadSeconds / speedScale,
       maxLinesSetting: settings.danmakuMaxLines
     )
   }
@@ -791,41 +822,70 @@ private final class PictureInPictureFrameRenderer {
     }
   }
 
+  // コメントを流し始める。速さと行の決め方は公式アプリと同じ:
+  //  - 4:3 の舞台の幅＋自分の幅を crossSeconds で横切る(長いコメントほど速い)。舞台の右端に着く
+  //    leadSeconds 前から流すので、画面の右外から入ってくる。
+  //  - 行は上から順に見て、前のコメントと入り口で重ならず、画面を出るまで追いつかない行を選ぶ。
+  //  - 空いた行が無い時も捨てず、ランダムな高さに重ねて流す。
   private func insert(_ raster: PictureInPictureCommentRaster) {
     let geometry = raster.geometry
-    let laneHeight = geometry.lineHeight / geometry.outputHeight
-    let topMargin = 6 * geometry.pixelsPerPoint / geometry.outputHeight
-    let fittingLines = max(1, Int((1 - topMargin) / laneHeight))
-    let maxLines = geometry.maxLinesSetting > 0 ? min(geometry.maxLinesSetting, fittingLines) : fittingLines
-    // 次に作るフレームから入ってくるように、そのフレームのコメント時刻で置く。
-    let commentTime = (pausedAt ?? CACurrentMediaTime()) + Self.presentationLead - pausedTotal
-    // セルの弾幕と同じく、先頭のコメントが十分入ってきたレーンを選ぶ。全レーンが詰まっていても
-    // 捨てずに、先頭が一番左にあるレーンへ流す。
-    let clearThreshold = 1 - 36 / geometry.pipWidthPoints
-    var laneFront: [Int: CGFloat] = [:]
-    for comment in comments where comment.lane < maxLines {
-      laneFront[comment.lane] = max(laneFront[comment.lane] ?? -1, comment.rightEdge(at: commentTime))
-    }
-    var chosen: Int?
-    for offset in 0..<maxLines {
-      let candidate = (laneCursor + offset) % maxLines
-      if (laneFront[candidate] ?? -1) < clearThreshold {
-        chosen = candidate
+    let frameWidth = geometry.outputWidth
+    let frameHeight = geometry.outputHeight
+    let width = CGFloat(raster.image.width) / frameWidth
+    let stageWidth = min(frameWidth, frameHeight * PictureInPictureCommentLayout.stageAspect) / frameWidth
+    let stageRight = (1 + stageWidth) / 2
+    let speed = (stageWidth + width) / geometry.crossSeconds
+    let startX = max(stageRight + speed * geometry.leadSeconds, 1 + 2 / frameWidth)
+    // 次に作るフレームから動き出すように、そのフレームのコメント時刻で置く。
+    let now = (pausedAt ?? CACurrentMediaTime()) + Self.presentationLead - pausedTotal
+
+    let laneHeight = geometry.lineHeight / frameHeight
+    let topMargin = laneHeight * PictureInPictureCommentLayout.topMarginLines
+    let fittingLanes = max(1, Int((1 - topMargin) / laneHeight))
+    let laneCount = geometry.maxLinesSetting > 0 ? min(geometry.maxLinesSetting, fittingLanes) : fittingLanes
+    // 同じ行の前後のコメントの間に空ける最小の間隔。
+    let gap = geometry.fontSize * 0.5 / frameWidth
+
+    var lane: Int?
+    for candidate in 0..<laneCount {
+      guard let previous = laneTails[candidate], previous.rightEdge(at: now) > 0 else {
+        // この行は空(前のコメントはもう画面を出た)。
+        lane = candidate
         break
       }
+      if previous.rightEdge(at: now) + gap > startX {
+        // 前のコメントの後ろがまだ入り口にかかっている。
+        continue
+      }
+      if speed > previous.speed {
+        // 自分の方が速い。前のコメントが画面を出きる時点で追いついてしまうなら、この行は使わない。
+        let leftWhenPreviousExits = startX - speed * CGFloat(previous.exitTime - now)
+        if leftWhenPreviousExits < gap {
+          continue
+        }
+      }
+      lane = candidate
+      break
     }
-    let lane = chosen ?? (0..<maxLines).min { (laneFront[$0] ?? -1) < (laneFront[$1] ?? -1) } ?? 0
-    laneCursor += 1
-    comments.append(PictureInPictureComment(
+    let top: CGFloat
+    if let lane {
+      top = topMargin + CGFloat(lane) * laneHeight
+    } else {
+      top = topMargin + CGFloat.random(in: 0...max(0, CGFloat(laneCount - 1) * laneHeight))
+    }
+    let comment = PictureInPictureComment(
       image: raster.image,
-      rasterWidth: geometry.outputWidth,
-      lane: lane,
-      top: topMargin + CGFloat(lane) * laneHeight,
-      width: CGFloat(raster.image.width) / geometry.outputWidth,
-      startTime: commentTime,
-      startX: 1 + 12 / geometry.pipWidthPoints,
-      speed: geometry.speed
-    ))
+      rasterWidth: frameWidth,
+      top: top,
+      width: width,
+      startTime: now,
+      startX: startX,
+      speed: speed
+    )
+    if let lane {
+      laneTails[lane] = comment
+    }
+    comments.append(comment)
     if comments.count > Self.maxComments {
       comments.removeFirst(comments.count - Self.maxComments)
     }
@@ -964,8 +1024,9 @@ private final class PictureInPictureFrameRenderer {
       sampleBufferOut: &sampleBuffer
     )
     guard status == noErr, let sampleBuffer else { return }
-    if displayLayer.status == .failed {
-      // バックグラウンドからの復帰などで failed になると、flush するまで受け付けない。
+    if displayLayer.status == .failed || displayLayer.requiresFlushToResumeDecoding {
+      // バックグラウンドからの復帰や端末ロックの後は、flush するまでフレームを受け付けない
+      // (公式アプリも requiresFlushToResumeDecoding を見て flush している)。
       displayLayer.flush()
     }
     guard displayLayer.isReadyForMoreMediaData else { return }
@@ -1012,7 +1073,8 @@ private final class PictureInPictureFrameRenderer {
 }
 
 // コメント 1 件を画像にする(メインスレッド)。見た目はセルの弾幕(NativeDanmakuRenderer)に合わせる:
-// 太字の白文字＋黒い影、絵文字は画像、自分のコメントは黄色の枠。出力フレームと同じピクセル密度で描く。
+// 太字の白文字＋黒い影、絵文字は画像、自分のコメントは黄色の枠。出力フレームと同じピクセル密度で描き、
+// 影や余白は文字の大きさに比例させる。
 private enum PictureInPictureCommentRasterizer {
   static func render(
     tokens: [NativeDanmakuToken],
@@ -1064,21 +1126,33 @@ private enum PictureInPictureCommentRasterizer {
     highlighted: Bool,
     images: [URL: UIImage]
   ) -> PictureInPictureCommentRaster? {
-    let ppp = geometry.pixelsPerPoint
-    let font = UIFont.systemFont(ofSize: geometry.fontSize, weight: .bold)
+    let fontSize = geometry.fontSize
+    let lineHeight = geometry.lineHeight
+    // セルの弾幕の 1pt に当たる長さ(セルは 20pt の文字が基準)。影・余白・枠を文字の大きさに比例させる。
+    let unit = fontSize / 20
+    let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
+    let shadowBlur = max(1, (2 * unit).rounded())
+    let shadowOffset = max(1, unit.rounded())
     let shadow = NSShadow()
     shadow.shadowColor = UIColor.black
-    shadow.shadowBlurRadius = 2 * ppp
-    shadow.shadowOffset = CGSize(width: ppp, height: ppp)
+    shadow.shadowBlurRadius = shadowBlur
+    shadow.shadowOffset = CGSize(width: shadowOffset, height: shadowOffset)
     let attributes: [NSAttributedString.Key: Any] = [
       .font: font,
       .foregroundColor: UIColor.white.withAlphaComponent(opacity),
       .shadow: shadow
     ]
-    let imageSide = max(18 * ppp, geometry.fontSize * 1.4).rounded()
-    // 影がはみ出す分と、自分のコメントの枠の分の余白。
-    let padding = ((highlighted ? 8 : 3) * ppp).rounded()
-    let inset = ((highlighted ? 2 : 0) * ppp).rounded()
+    // 絵文字は行の高さに収める。
+    let imageSide = lineHeight
+    let imageGap = max(1, (3 * unit).rounded())
+    // 自分のコメントの枠の太さと、枠の内側の上下の余白。
+    let borderWidth = highlighted ? max(1, (2 * unit).rounded()) : 0
+    let verticalInset = highlighted ? borderWidth + max(1, unit.rounded()) : 0
+    // 左右の余白: 影がはみ出す分(自分のコメントは枠の内側の余白も)。
+    let padding = shadowBlur + shadowOffset + 1 + (highlighted ? borderWidth + (5 * unit).rounded() : 0)
+    let textHeight = ceil(font.lineHeight)
+    let contentHeight = max(lineHeight, textHeight)
+    let textTop = verticalInset + ((contentHeight - textHeight) / 2).rounded()
 
     enum Piece {
       case text(NSString, CGFloat)
@@ -1095,33 +1169,35 @@ private enum PictureInPictureCommentRasterizer {
         x += ceil(string.size(withAttributes: attributes).width)
       case .image(let url):
         guard let image = images[url] else { continue }
-        pieces.append(.image(image.images?.first ?? image, (x + 3 * ppp).rounded()))
-        x += imageSide + (6 * ppp).rounded()
+        pieces.append(.image(image.images?.first ?? image, x + imageGap))
+        x += imageSide + imageGap * 2
       }
     }
     guard !pieces.isEmpty else { return nil }
-    let size = CGSize(width: ceil(x + padding), height: ceil(geometry.lineHeight + inset * 2))
+    // 影は行の下へ少しはみ出す(次の行の上端に薄くかかるだけ)。枠つきは枠の中に収める。
+    let height = highlighted ? contentHeight + verticalInset * 2 : contentHeight + shadowBlur + shadowOffset
+    let size = CGSize(width: ceil(x + padding), height: ceil(height))
     let format = UIGraphicsImageRendererFormat()
     format.scale = 1
     format.opaque = false
     format.preferredRange = .standard
     let image = UIGraphicsImageRenderer(size: size, format: format).image { _ in
       if highlighted {
-        let rect = CGRect(x: ppp, y: ppp, width: size.width - 2 * ppp, height: size.height - 2 * ppp)
-        let path = UIBezierPath(roundedRect: rect, cornerRadius: 4 * ppp)
+        let half = borderWidth / 2
+        let rect = CGRect(x: half, y: half, width: size.width - borderWidth, height: size.height - borderWidth)
+        let path = UIBezierPath(roundedRect: rect, cornerRadius: max(2, (4 * unit).rounded()))
         UIColor.systemYellow.withAlphaComponent(0.12).setFill()
         path.fill()
-        path.lineWidth = 2 * ppp
+        path.lineWidth = borderWidth
         UIColor.systemYellow.setStroke()
         path.stroke()
       }
       for piece in pieces {
         switch piece {
         case .text(let string, let originX):
-          string.draw(at: CGPoint(x: originX, y: inset), withAttributes: attributes)
+          string.draw(at: CGPoint(x: originX, y: textTop), withAttributes: attributes)
         case .image(let image, let originX):
-          let originY = max(inset, ((geometry.lineHeight - imageSide) / 2).rounded())
-          image.draw(in: CGRect(x: originX, y: originY, width: imageSide, height: imageSide), blendMode: .normal, alpha: opacity)
+          image.draw(in: CGRect(x: originX, y: verticalInset, width: imageSide, height: imageSide), blendMode: .normal, alpha: opacity)
         }
       }
     }

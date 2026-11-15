@@ -30,6 +30,11 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   private var streamOpenedAt: Date?
   private var lastSupportAlert: (text: String, at: Date)?
   private var seenSupportEventIDs = Set<String>()
+  // 流したコメントのメッセージ ID。コメント区間の取り直し(区間の再試行・VIEW の再接続)で同じ
+  // コメントが二重に流れないようにする。区間のタスクは並行に動くのでロックで守る。
+  private let seenChatLock = NSLock()
+  private var seenChatIDs = Set<String>()
+  private var seenChatIDOrder: [String] = []
   // NDGR コメントが最後に成功した時刻。VIEW/SEGMENT 両方のループから更新され、
   // 60 秒成功なしでフル再読み込みへ escalation する閾値判定に使う。
   private var ndgrLastSuccessAt = Date()
@@ -877,7 +882,10 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         for try await message in protobufMessages(from: url) {
           var handled = false
           if let text = parseNDGRCommentText(fromChunkedMessage: message) {
-            emitDanmaku(text)
+            // 区間を取り直した時は同じコメントがもう一度届くので、初めて見るものだけ流す。
+            if isFirstSightingOfChat(message) {
+              emitDanmaku(text)
+            }
             handled = true
           }
           if let event = parseNDGRSupportEvent(fromChunkedMessage: message) {
@@ -978,6 +986,25 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       }
     }
     return nil
+  }
+
+  // 初めて見るコメントか。判定にはメッセージ ID(ChunkedMessage.meta.id)だけを使う。ID が取れない
+  // メッセージは判定せずに流す(誤って落とさない)。
+  private func isFirstSightingOfChat(_ data: Data) -> Bool {
+    guard let metaData = firstFieldData(protobufFields(data), number: 1),
+          let id = stringField(protobufFields(metaData), 1), id.count >= 8 else { return true }
+    seenChatLock.lock()
+    defer { seenChatLock.unlock() }
+    if seenChatIDs.contains(id) {
+      return false
+    }
+    seenChatIDs.insert(id)
+    seenChatIDOrder.append(id)
+    if seenChatIDOrder.count > 6000 {
+      seenChatIDs.subtract(seenChatIDOrder.prefix(2000))
+      seenChatIDOrder.removeFirst(2000)
+    }
+    return true
   }
 
   private func parseNDGRSupportEvent(fromChunkedMessage data: Data) -> NiconicoSupportEvent? {
