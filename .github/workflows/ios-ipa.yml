@@ -29,6 +29,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # コメント(弾幕)の配置エンジンの検証。数秒で終わる。失敗したらビルドへ進まない。
+      - name: Check danmaku layout engine
+        working-directory: MultiView/ios
+        run: |
+          swiftc -O MultiView/DanmakuEngine.swift DanmakuEngineChecks/main.swift -o "$RUNNER_TEMP/danmaku-checks"
+          "$RUNNER_TEMP/danmaku-checks"
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:

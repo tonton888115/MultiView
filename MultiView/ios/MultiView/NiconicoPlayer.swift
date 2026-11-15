@@ -881,10 +881,10 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
       do {
         for try await message in protobufMessages(from: url) {
           var handled = false
-          if let text = parseNDGRCommentText(fromChunkedMessage: message) {
+          if let comment = parseNDGRComment(fromChunkedMessage: message) {
             // 区間を取り直した時は同じコメントがもう一度届くので、初めて見るものだけ流す。
             if isFirstSightingOfChat(message) {
-              emitDanmaku(text)
+              emitDanmaku(comment.text, style: comment.style)
             }
             handled = true
           }
@@ -977,16 +977,60 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     return nil
   }
 
-  private func parseNDGRCommentText(fromChunkedMessage data: Data) -> String? {
+  // コメントの本文と、ニコ生のコマンド(位置・大きさ・色・書体・半透明。Chat.modifier)。
+  private func parseNDGRComment(fromChunkedMessage data: Data) -> (text: String, style: DanmakuStyle)? {
     for field in protobufFields(data) where field.number == 2 {
       for messageField in protobufFields(field.data) where messageField.number == 1 || messageField.number == 20 {
-        for chatField in protobufFields(messageField.data) where chatField.number == 1 {
-          return String(data: chatField.data, encoding: .utf8)
-        }
+        let chatFields = protobufFields(messageField.data)
+        guard let textData = firstFieldData(chatFields, number: 1),
+              let text = String(data: textData, encoding: .utf8) else { continue }
+        let modifier = firstFieldData(chatFields, number: 7).map { protobufFields($0) } ?? []
+        return (text, danmakuStyle(fromModifier: modifier))
       }
     }
     return nil
   }
+
+  // Chat.modifier の各項目(番号と値)。何も無ければ「白・中サイズ・流れる」。
+  //   1: 位置(0 naka=流れる, 1 shita=下に固定, 2 ue=上に固定)   2: 大きさ(0 medium, 1 small, 2 big)
+  //   3: 名前つきの色   4: RGB で指定した色 {1: r, 2: g, 3: b}   5: 書体(0 defont, 1 mincho, 2 gothic)
+  //   6: 不透明度(1 = 半透明)
+  private func danmakuStyle(fromModifier fields: [ProtobufField]) -> DanmakuStyle {
+    var style = DanmakuStyle()
+    for field in fields {
+      switch field.number {
+      case 1:
+        style.position = field.varint == 1 ? .bottom : (field.varint == 2 ? .top : .flow)
+      case 2:
+        style.size = field.varint == 1 ? .small : (field.varint == 2 ? .big : .medium)
+      case 3:
+        let index = Int(truncatingIfNeeded: field.varint)
+        if Self.niconicoNamedColors.indices.contains(index) {
+          style.color = UIColor(niconicoRGB: Self.niconicoNamedColors[index])
+        }
+      case 4:
+        let components = protobufFields(field.data)
+        let component: (Int) -> CGFloat = { number in
+          CGFloat(min(255, components.first(where: { $0.number == number })?.varint ?? 0)) / 255
+        }
+        style.color = UIColor(red: component(1), green: component(2), blue: component(3), alpha: 1)
+      case 5:
+        style.fontFace = field.varint == 1 ? .mincho : (field.varint == 2 ? .gothic : .standard)
+      case 6:
+        style.translucent = field.varint == 1
+      default:
+        break
+      }
+    }
+    return style
+  }
+
+  // ニコ生の名前つきの色(white, red, pink, orange, yellow, green, cyan, blue, purple, black と、
+  // プレミアム会員用の white2 〜 black2)。並びは Chat.modifier の番号順。
+  private static let niconicoNamedColors: [UInt32] = [
+    0xFFFFFF, 0xFF0000, 0xFF8080, 0xFFC000, 0xFFFF00, 0x00FF00, 0x00FFFF, 0x0000FF, 0xC000FF, 0x000000,
+    0xCCCC99, 0xCC0033, 0xFF33CC, 0xFF6600, 0x999900, 0x00CC66, 0x00CCCC, 0x3399FF, 0x6633CC, 0x666666
+  ]
 
   // 初めて見るコメントか。判定にはメッセージ ID(ChunkedMessage.meta.id)だけを使う。ID が取れない
   // メッセージは判定せずに流す(誤って落とさない)。
@@ -1559,10 +1603,9 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
     }
   }
 
-  // 共通の lane-occupancy レンダラへ統一。旧独自実装は round-robin(laneCursor%maxLines)で
-  // 重なりやすく、CALayer shadow で off-screen render も重かった。NativeDanmakuRenderer.emit は
-  // 空きレーン選択＋属性文字列影でそれらを解決済み(maxLength/フォント/不透明度も内部で処理)。
-  private func emitDanmaku(_ text: String) {
+  // 表示は共通の NativeDanmakuRenderer.emit に任せる(何段目に出すか・大きさ・速さは共通エンジン、
+  // maxLength/フォント/不透明度も内部で処理)。style はニコ生のコマンド(色・大きさ・上下固定など)。
+  private func emitDanmaku(_ text: String, style: DanmakuStyle = DanmakuStyle()) {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return }
     DispatchQueue.main.async {
@@ -1571,7 +1614,8 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         filterText: trimmed,
         in: self.danmakuView,
         laneCursor: self.laneCursor,
-        settings: self.settings
+        settings: self.settings,
+        style: style
       )
     }
   }
@@ -1688,6 +1732,18 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
   }
 
   static let userAgent = BrowserUserAgent.mobileSafari
+}
+
+private extension UIColor {
+  // 0xRRGGBB の色。
+  convenience init(niconicoRGB value: UInt32) {
+    self.init(
+      red: CGFloat((value >> 16) & 0xFF) / 255,
+      green: CGFloat((value >> 8) & 0xFF) / 255,
+      blue: CGFloat(value & 0xFF) / 255,
+      alpha: 1
+    )
+  }
 }
 
 // ピクチャ・イン・ピクチャ(PictureInPicture.swift)。ネイティブ再生中の AVPlayer から映像フレームを取り、

@@ -8,96 +8,191 @@ import Security
 import CryptoKit
 
 // Danmaku (scrolling comments) + Niconico gift overlay rendering: tokenization, the
-// lane renderer, gift effect styles, sound mixer, effect cache, animated-image decoder.
-// Extracted from AppDelegate.swift.
+// comment views (layout comes from DanmakuEngine.swift), gift effect styles, sound mixer,
+// effect cache, animated-image decoder. Extracted from AppDelegate.swift.
 
 enum NativeDanmakuToken {
   case text(String)
   case image(URL)
 }
 
+/// コメントの書体(ニコ生のコマンド defont / mincho / gothic)。
+enum DanmakuFontFace: Equatable {
+  case standard
+  case mincho
+  case gothic
+}
+
+/// コメント 1 件の見た目と出し方。何も指定しなければ「白・中サイズ・右から左へ流れる」。
+struct DanmakuStyle {
+  var size: DanmakuSize = .medium
+  var position: DanmakuPosition = .flow
+  /// 文字色。nil は白。
+  var color: UIColor?
+  var fontFace: DanmakuFontFace = .standard
+  /// 半透明(ニコ生のコマンド translucent)。
+  var translucent = false
+  /// 自分が送ったコメント(黄色の枠で囲む)。
+  var highlighted = false
+}
+
+/// コメントの見た目の寸法。タイルの弾幕(UIView)と PiP の弾幕(画像に描く)で同じものを使う。
+struct DanmakuAppearance {
+  let font: UIFont
+  /// 1 行の高さ(コメントを積む 1 段の高さ)。
+  let lineHeight: CGFloat
+  let textColor: UIColor
+  let shadow: NSShadow
+  /// 影が文字の外へはみ出す量。
+  let shadowReach: CGFloat
+  /// 絵文字画像の一辺(行の高さに収める)と、その左右の隙間。
+  let imageSide: CGFloat
+  let imageGap: CGFloat
+  /// 絵文字画像の不透明度。
+  let imageAlpha: CGFloat
+  /// 自分のコメントの枠(枠なしは 0)と、枠の内側の左右の余白・角の丸み。
+  let borderWidth: CGFloat
+  let horizontalPadding: CGFloat
+  let cornerRadius: CGFloat
+
+  /// scale: 画面より広い固定コメントを収めるための縮小率(通常は 1)。
+  init(metrics: DanmakuMetrics, style: DanmakuStyle, opacity: Double, scale: CGFloat = 1) {
+    let fontSize = max(6, (metrics.fontSize(style.size) * scale).rounded(.down))
+    lineHeight = max(fontSize, metrics.lineHeight(style.size) * scale)
+    // 設定の文字サイズ 20 の時の 1pt に当たる長さ。影・余白・枠を文字の大きさに比例させる。
+    let unit = fontSize / 20
+    switch style.fontFace {
+    case .standard:
+      font = .systemFont(ofSize: fontSize, weight: .bold)
+    case .mincho:
+      font = UIFont(name: "HiraMinProN-W6", size: fontSize) ?? .systemFont(ofSize: fontSize, weight: .bold)
+    case .gothic:
+      font = UIFont(name: "HiraginoSans-W6", size: fontSize) ?? .systemFont(ofSize: fontSize, weight: .bold)
+    }
+    let alpha = CGFloat(min(1, max(0, opacity))) * (style.translucent ? 0.5 : 1)
+    let base = style.color ?? .white
+    textColor = base.withAlphaComponent(alpha)
+    imageAlpha = alpha
+    // 影は文字の縁取りの役目。黒い文字は白い影にして読めるようにする。
+    var red: CGFloat = 1
+    var green: CGFloat = 1
+    var blue: CGFloat = 1
+    var baseAlpha: CGFloat = 1
+    _ = base.getRed(&red, green: &green, blue: &blue, alpha: &baseAlpha)
+    let isDark = red * 0.299 + green * 0.587 + blue * 0.114 < 0.2
+    let blur = max(1, fontSize * 0.1)
+    let offset = max(0.5, fontSize * 0.05)
+    let textShadow = NSShadow()
+    textShadow.shadowColor = isDark ? UIColor.white : UIColor.black
+    textShadow.shadowBlurRadius = blur
+    textShadow.shadowOffset = CGSize(width: offset, height: offset)
+    shadow = textShadow
+    shadowReach = (blur + offset).rounded(.up)
+    imageSide = lineHeight
+    imageGap = max(1, (3 * unit).rounded())
+    if style.highlighted {
+      borderWidth = max(1, (2 * unit).rounded())
+      horizontalPadding = borderWidth + (6 * unit).rounded()
+      cornerRadius = max(2, (4 * unit).rounded())
+    } else {
+      borderWidth = 0
+      horizontalPadding = 0
+      cornerRadius = 0
+    }
+  }
+
+  var textAttributes: [NSAttributedString.Key: Any] {
+    [.font: font, .foregroundColor: textColor, .shadow: shadow]
+  }
+}
+
+// タイル 1 枚(弾幕を出すビュー)ごとの、表示中のコメントの状態。
+private final class DanmakuStageState {
+  var stage: DanmakuStage
+  private var views: [Int: UIView] = [:]
+
+  init(metrics: DanmakuMetrics) {
+    stage = DanmakuStage(metrics: metrics)
+  }
+
+  func track(_ view: UIView, id: Int) {
+    views[id] = view
+  }
+
+  // 表示が終わった(または上限を超えた)コメントを外す。
+  func discard(id: Int) {
+    stage.remove(id: id)
+    guard let view = views.removeValue(forKey: id) else { return }
+    view.layer.removeAllAnimations()
+    view.removeFromSuperview()
+  }
+}
+
+// タイルの弾幕(動画の上を流れるコメント)。大きさ・速さ・何段目に出すかは DanmakuEngine.swift の
+// 共通エンジン(ニコ生公式アプリと同じ規則)で決め、ここは UIView として表示するだけ。
+// 公式アプリのアプリ内プレイヤーも、コメント 1 件を 1 つの UIView にして等速のアニメーションで流している。
 final class NativeDanmakuRenderer {
   private static let imageCache: NSCache<NSURL, UIImage> = {
     let cache = NSCache<NSURL, UIImage>()
     cache.countLimit = 240
     return cache
   }()
+  private static var stageStateKey: UInt8 = 0
 
+  // laneCursor は以前の「行を順番に使う」方式の名残。段は共通エンジンが決めるので、流した件数として
+  // 返しているだけ(呼び出し側はそのまま保持してよい)。
   static func emit(
     tokens: [NativeDanmakuToken],
     filterText: String,
     in root: UIView,
     laneCursor: Int,
     settings: AppSettings,
-    highlighted: Bool = false
+    highlighted: Bool = false,
+    style: DanmakuStyle = DanmakuStyle()
   ) -> Int {
     let trimmed = filterText.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return laneCursor }
     if settings.danmakuMaxLength > 0, trimmed.count > settings.danmakuMaxLength {
       return laneCursor
     }
-    // PiP 中の配信なら PiP の窓にも同じコメントを流す(元のセルの表示とは独立に流れる)。
-    PictureInPictureCoordinator.shared.mirrorDanmaku(
-      tokens: tokens,
-      filterText: trimmed,
-      from: root,
-      settings: settings,
-      highlighted: highlighted
-    )
+    var style = style
+    style.highlighted = style.highlighted || highlighted
+    // PiP 中の配信なら PiP の映像にも同じコメントを流す(配置は PiP の窓の大きさで同じ規則で決まる)。
+    PictureInPictureCoordinator.shared.mirrorDanmaku(tokens: tokens, from: root, settings: settings, style: style)
     guard root.bounds.height > 0, root.bounds.width > 0 else { return laneCursor }
 
-    let fontSize = scaledFontSize(base: settings.danmakuFontSize, in: root)
-    let lineHeight = fontSize + 8
-    let maxLines = settings.danmakuMaxLines > 0
-      ? settings.danmakuMaxLines
-      : max(1, Int(root.bounds.height / lineHeight))
-    // Pick a lane whose frontmost comment has already entered far enough that a new one
-    // (which starts off the right edge) won't overlap it. Uses the presentation layer
-    // because UIView.animate sets `frame` to the END position immediately, so the model
-    // frame can't tell us where a comment currently is on screen.
-    let lane: Int = {
-      let clearThreshold = root.bounds.width - 36
-      var laneFront = [Int: CGFloat]()
-      for sub in root.subviews {
-        let f = sub.layer.presentation()?.frame ?? sub.frame
-        let subLane = Int((f.minY - 6) / lineHeight)
-        guard subLane >= 0, subLane < maxLines else { continue }
-        laneFront[subLane] = max(laneFront[subLane] ?? -.greatestFiniteMagnitude, f.maxX)
-      }
-      for offset in 0..<maxLines {
-        let candidate = (laneCursor + offset) % maxLines
-        if (laneFront[candidate] ?? -.greatestFiniteMagnitude) < clearThreshold {
-          return candidate
-        }
-      }
-      // Every lane still has a comment near the entry edge. Do not drop chat:
-      // choose the lane whose leading comment is furthest left so high-volume
-      // streams still show the full flow instead of silently losing messages.
-      return (0..<maxLines).min { lhs, rhs in
-        (laneFront[lhs] ?? -.greatestFiniteMagnitude) < (laneFront[rhs] ?? -.greatestFiniteMagnitude)
-      } ?? (laneCursor % maxLines)
-    }()
-    let comment = makeCommentView(
-      tokens: tokens,
-      fontSize: fontSize,
-      opacity: settings.danmakuOpacity,
-      lineHeight: lineHeight,
-      highlighted: highlighted
+    let metrics = DanmakuMetrics(
+      stageSize: root.bounds.size,
+      fontSetting: settings.danmakuFontSize,
+      speedSetting: settings.danmakuSpeed,
+      maxLines: settings.danmakuMaxLines
     )
+    let state = stageState(for: root, metrics: metrics)
+    let comment = makeCommentView(tokens: tokens, metrics: metrics, style: style, opacity: settings.danmakuOpacity)
     guard comment.bounds.width > 0 else { return laneCursor }
 
-    let y = CGFloat(lane) * lineHeight + 6
-    let startX = root.bounds.width + 12
-    comment.frame.origin = CGPoint(x: startX, y: y)
+    let now = CACurrentMediaTime()
+    let placement = state.stage.add(position: style.position, size: comment.bounds.size, now: now)
+    placement.evictedIDs.forEach { state.discard(id: $0) }
+    let item = placement.item
+    // 文字がにじまないよう、縦位置は画面のピクセルに合わせる。
+    let displayScale = max(1, root.traitCollection.displayScale)
+    comment.frame.origin = CGPoint(x: item.x(at: now), y: (item.y * displayScale).rounded() / displayScale)
     root.addSubview(comment)
+    state.track(comment, id: item.id)
 
-    let travel = startX + comment.bounds.width + 24
-    let pixelsPerSecond = max(35, root.bounds.width * CGFloat(settings.danmakuSpeed))
-    let duration = TimeInterval(travel / pixelsPerSecond)
-    UIView.animate(withDuration: duration, delay: 0, options: [.curveLinear]) {
-      comment.frame.origin.x = -comment.bounds.width - 12
-    } completion: { _ in
-      comment.removeFromSuperview()
+    let remaining = max(0.05, item.endTime - now)
+    if item.position == .flow {
+      // 等速で左へ。アプリが裏へ回るなどでアニメーションが打ち切られた時も completion で外れる。
+      UIView.animate(withDuration: remaining, delay: 0, options: [.curveLinear]) {
+        comment.frame.origin.x = item.x(at: item.endTime)
+      } completion: { [weak state] _ in
+        state?.discard(id: item.id)
+      }
+    } else {
+      DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak state] in
+        state?.discard(id: item.id)
+      }
     }
     return laneCursor + 1
   }
@@ -106,74 +201,76 @@ final class NativeDanmakuRenderer {
     [.text(text)]
   }
 
-  // Scale the configured comment size to the cell so text keeps a consistent
-  // proportion: bigger in a single-column (wide) cell, smaller in a packed grid
-  // (narrow) cell. Reference width ~= a phone single-column cell.
-  static func scaledFontSize(base: Double, in view: UIView) -> CGFloat {
-    let referenceWidth: CGFloat = 340
-    let width = view.bounds.width
-    guard width > 0 else { return CGFloat(base) }
-    let scale = min(1.8, max(0.55, width / referenceWidth))
-    return (CGFloat(base) * scale).rounded()
+  private static func stageState(for root: UIView, metrics: DanmakuMetrics) -> DanmakuStageState {
+    if let existing = objc_getAssociatedObject(root, &stageStateKey) as? DanmakuStageState {
+      if existing.stage.metrics != metrics {
+        existing.stage.update(metrics: metrics)
+      }
+      return existing
+    }
+    let created = DanmakuStageState(metrics: metrics)
+    objc_setAssociatedObject(root, &stageStateKey, created, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    return created
   }
 
   private static func makeCommentView(
     tokens: [NativeDanmakuToken],
-    fontSize: CGFloat,
-    opacity: Double,
-    lineHeight: CGFloat,
-    highlighted: Bool
+    metrics: DanmakuMetrics,
+    style: DanmakuStyle,
+    opacity: Double
   ) -> UIView {
-    let container = UIView()
-    let horizontalPadding: CGFloat = highlighted ? 8 : 0
-    let verticalInset: CGFloat = highlighted ? 2 : 0
-    var x: CGFloat = horizontalPadding
-    let imageSide = max(18, fontSize * 1.4)
+    let view = buildCommentView(tokens: tokens, appearance: DanmakuAppearance(metrics: metrics, style: style, opacity: opacity))
+    let stageWidth = metrics.stageSize.width
+    guard style.position != .flow, stageWidth > 0, view.bounds.width > stageWidth else { return view }
+    // 上/下に固定するコメントが画面より広い時は、収まる大きさまで縮める(公式と同じ)。
+    let scale = stageWidth / view.bounds.width
+    return buildCommentView(
+      tokens: tokens,
+      appearance: DanmakuAppearance(metrics: metrics, style: style, opacity: opacity, scale: scale)
+    )
+  }
 
-    // UILabel.layer.shadow* は off-screen render を発生させ、複数セル × 多コメントで
-     // GPU 負荷と発熱が増える。視認性に必要な「黒い縁取り」は NSAttributedString の
-     // NSShadowAttributeName で実現すれば、フォントレンダラ内部で完結し off-screen
-     // pass が起きない。
-    let textShadow = NSShadow()
-    textShadow.shadowColor = UIColor.black
-    textShadow.shadowBlurRadius = 2
-    textShadow.shadowOffset = CGSize(width: 1, height: 1)
+  // コメント 1 件のビュー。大きさは「幅 = 中身の幅、高さ = 1 行の高さ」で、これがそのまま配置の箱になる。
+  private static func buildCommentView(tokens: [NativeDanmakuToken], appearance: DanmakuAppearance) -> UIView {
+    let container = UIView()
+    let lineHeight = appearance.lineHeight
+    var x = appearance.horizontalPadding
+    // UILabel.layer.shadow* は off-screen render を発生させ、複数セル × 多コメントで GPU 負荷と発熱が
+    // 増える。縁取りの影は NSAttributedString の影にすれば文字の描画の中で完結する。
+    let attributes = appearance.textAttributes
     for token in tokens {
       switch token {
       case .text(let text):
         guard !text.isEmpty else { continue }
         let label = UILabel()
-        label.font = .systemFont(ofSize: fontSize, weight: .bold)
-        label.attributedText = NSAttributedString(string: text, attributes: [
-          .foregroundColor: UIColor.white.withAlphaComponent(CGFloat(opacity)),
-          .shadow: textShadow
-        ])
+        label.attributedText = NSAttributedString(string: text, attributes: attributes)
         label.sizeToFit()
-        label.frame.origin = CGPoint(x: x, y: verticalInset)
+        label.frame.origin = CGPoint(x: x, y: ((lineHeight - label.bounds.height) / 2).rounded())
         container.addSubview(label)
         x += label.bounds.width
       case .image(let url):
-        let imageView = UIImageView(frame: CGRect(x: x + 3, y: max(verticalInset, (lineHeight - imageSide) / 2), width: imageSide, height: imageSide))
+        let side = appearance.imageSide
+        let imageView = UIImageView(frame: CGRect(x: x + appearance.imageGap, y: 0, width: side, height: side))
         imageView.contentMode = .scaleAspectFit
-        imageView.alpha = CGFloat(opacity)
+        imageView.alpha = appearance.imageAlpha
         // 画像はテキストと違い attributed shadow が使えないので CALayer shadow のまま。
         // Animated emotes must not be rasterized; otherwise some GIF/WebP frames freeze.
         imageView.layer.shadowColor = UIColor.black.cgColor
-        imageView.layer.shadowRadius = 2
+        imageView.layer.shadowRadius = appearance.shadow.shadowBlurRadius
         imageView.layer.shadowOpacity = 1
-        imageView.layer.shadowOffset = CGSize(width: 1, height: 1)
+        imageView.layer.shadowOffset = appearance.shadow.shadowOffset
         container.addSubview(imageView)
         loadImage(url, into: imageView)
-        x += imageSide + 6
+        x += side + appearance.imageGap * 2
       }
     }
-
-    let width = x + horizontalPadding
-    container.frame = CGRect(x: 0, y: 0, width: width, height: lineHeight + verticalInset * 2)
-    if highlighted {
+    // 中身が無ければ幅 0 のまま返す(呼び出し側で流さない)。
+    guard !container.subviews.isEmpty else { return container }
+    container.frame = CGRect(x: 0, y: 0, width: x + appearance.horizontalPadding, height: lineHeight)
+    if appearance.borderWidth > 0 {
       container.layer.borderColor = UIColor.systemYellow.cgColor
-      container.layer.borderWidth = 2
-      container.layer.cornerRadius = 4
+      container.layer.borderWidth = appearance.borderWidth
+      container.layer.cornerRadius = appearance.cornerRadius
       container.backgroundColor = UIColor.systemYellow.withAlphaComponent(0.12)
     }
     return container

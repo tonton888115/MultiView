@@ -21,7 +21,8 @@ import UIKit
 // ニコ生公式アプリ(6.19.0)を解析して確認した対応関係: 公式も同じ構成
 // (AVPlayerItemVideoOutput → コメント合成 → CMSampleBuffer → AVSampleBufferDisplayLayer →
 // AVPictureInPictureController.ContentSource)。違いは合成の手段だけ(公式は Metal、こちらは CPU)。
-// コメントの大きさ・流れ方・行の決め方は公式の式に合わせてある(PictureInPictureCommentLayout)。
+// コメントの大きさ・流れ方・段の決め方は、タイルの弾幕と共通のエンジン(DanmakuEngine.swift)で
+// 公式と同じ規則にしてある。
 
 /// PiP にできるプレイヤー(各ネイティブプレイヤーが準拠)。
 protocol PictureInPictureCapable: AnyObject {
@@ -139,9 +140,9 @@ final class PictureInPictureCoordinator: NSObject, AVPictureInPictureControllerD
   }
 
   /// NativeDanmakuRenderer.emit から呼ばれる。PiP 中の配信のコメントなら PiP の映像にも描く。
-  func mirrorDanmaku(tokens: [NativeDanmakuToken], filterText: String, from root: UIView, settings: AppSettings, highlighted: Bool) {
+  func mirrorDanmaku(tokens: [NativeDanmakuToken], from root: UIView, settings: AppSettings, style: DanmakuStyle) {
     guard let renderer, root === sourceDanmakuView else { return }
-    renderer.addComment(tokens: tokens, settings: settings, highlighted: highlighted)
+    renderer.addComment(tokens: tokens, settings: settings, style: style)
   }
 
   private func start(
@@ -403,64 +404,24 @@ private final class PictureInPictureDisplayView: UIView {
 
 // MARK: - フレーム合成
 
-// PiP のコメント配置。ニコ生公式アプリ(6.19.0)のコメント描画の式に合わせた値。
-private enum PictureInPictureCommentLayout {
-  // 行の高さ = 画面の高さ ÷ この行数(公式の「中」サイズ: 横長の映像 11.3 行、縦長の映像 18.8 行)。
-  static let linesPerHeightLandscape: CGFloat = 11.3
-  static let linesPerHeightPortrait: CGFloat = 18.8
-  // 文字の大きさ = 行の高さ × 0.8(切り捨て)。
-  static let fontPerLineHeight: CGFloat = 0.8
-  // 流れる速さは 4:3 の「舞台」の幅で決める(16:9 の画面では舞台は中央の 3/4 幅)。
-  static let stageAspect: CGFloat = 4.0 / 3.0
-  // 舞台の幅＋自分の幅を 4 秒で横切る(公式: 表示 6 秒 − 前後 1 秒ずつ)。長いコメントほど速い。
-  static let stageCrossSeconds: CGFloat = 4
-  // 舞台の右端に着く 1 秒前から流し始める(画面の右外から入ってくる)。
-  static let leadSeconds: CGFloat = 1
-  // 一番上の行の上に空ける余白(行の高さに対する割合)。
-  static let topMarginLines: CGFloat = 0.1
-  // アプリの設定の初期値(文字サイズ 20・速度 100%)を公式相当とし、設定値はその比率で効かせる。
-  static let defaultFontSetting: CGFloat = 20
-  static let defaultSpeedSetting: CGFloat = 0.13
-}
-
-// コメント画像を描いた時の基準寸法。
-private struct PictureInPictureCommentGeometry {
-  let outputWidth: CGFloat        // 描いた時の出力フレーム幅(px)。PiP の窓の実ピクセル幅に合わせてある
-  let outputHeight: CGFloat
-  let fontSize: CGFloat           // px
-  let lineHeight: CGFloat         // px
-  let crossSeconds: CGFloat       // 舞台の幅＋自分の幅を横切る秒数(速度の設定を反映)
-  let leadSeconds: CGFloat        // 舞台の右端に着くまでの助走の秒数
-  let maxLinesSetting: Int
-}
-
+// コメント 1 件を描いた画像と、配置に使う情報。
 private struct PictureInPictureCommentRaster {
   let image: CGImage
-  let geometry: PictureInPictureCommentGeometry
+  /// 配置に使う大きさ(幅 = 中身の幅、高さ = 1 行の高さ)。px。
+  let layoutSize: CGSize
+  /// 画像の左上から配置の箱の左上までのずれ(影がはみ出す分の余白)。px。
+  let inset: CGFloat
+  let position: DanmakuPosition
+  /// 描いた時の寸法(出力フレームの大きさと設定)。
+  let metrics: DanmakuMetrics
 }
 
-// 流れているコメント。位置は出力フレームに対する割合(0〜1)で持つ。
-private struct PictureInPictureComment {
+// 表示中のコメントの画像。どこに出すかは共通エンジン(DanmakuStage)が持つ。
+private struct PictureInPictureCommentImage {
   let image: CGImage
-  let rasterWidth: CGFloat        // 描いた時の出力幅(px)。今の出力幅と同じなら等倍(くっきり)で描く
-  let top: CGFloat
-  let width: CGFloat
-  let startTime: CFTimeInterval
-  let startX: CGFloat
-  let speed: CGFloat              // 1 秒に進む量(出力幅に対する割合)
-
-  func x(at time: CFTimeInterval) -> CGFloat {
-    startX - speed * CGFloat(time - startTime)
-  }
-
-  func rightEdge(at time: CFTimeInterval) -> CGFloat {
-    x(at: time) + width
-  }
-
-  // 右端が画面の左端に着く(画面から出きる)時刻。
-  var exitTime: CFTimeInterval {
-    startTime + CFTimeInterval((startX + width) / speed)
-  }
+  let inset: CGFloat
+  /// 描いた時の出力幅(px)。今の出力幅と同じなら等倍(くっきり)で描く。
+  let rasterStageWidth: CGFloat
 }
 
 // AVPlayer の映像フレームを受け取り、コメントを描き込んで PiP のレイヤーへ流す。
@@ -471,14 +432,12 @@ private struct PictureInPictureComment {
 // その表示時刻で計算する。映像が 30fps でもコメントは 60fps で動く。
 // くっきりさ: 出力フレームは PiP の窓の実ピクセル(長辺640〜1280px)。映像は AVPlayerItemVideoOutput に
 // その大きさで出させ(元が 360p でも)、コメントは同じ解像度で等倍・整数位置に描く。
-// コメントの配置: 公式アプリと同じ(PictureInPictureCommentLayout)。大きさは画面の高さに対する比率、
-// 流れる速さはコメントの長さで変わり、行は上から詰めて追いつかない行を選ぶ。
+// コメントの配置: タイルの弾幕と同じ共通エンジン(DanmakuEngine.swift。ニコ生公式アプリと同じ規則)。
+// 大きさは画面の高さに対する比率なので、タイルでも PiP でも同じ見え方になる。
 // メインスレッド: attach/stop/addComment/updateRenderSize/setPaused。それ以外の状態は queue 上だけで触る。
 private final class PictureInPictureFrameRenderer {
   private static let frameInterval: CFTimeInterval = 1.0 / 60.0
   private static let presentationLead: CFTimeInterval = 0.05
-  // 同時に描くコメントの上限(大量の時に CPU と発熱を抑える。古いものから消す)。
-  private static let maxComments = 150
   private static let defaultLongSide: CGFloat = 960
   private static let minLongSide: CGFloat = 640
   private static let maxLongSide: CGFloat = 1280
@@ -507,9 +466,9 @@ private final class PictureInPictureFrameRenderer {
   private var output: AVPlayerItemVideoOutput?
   private var outputSize: CGSize
   private var latestVideoFrame: CVPixelBuffer?
-  private var comments: [PictureInPictureComment] = []
-  // 各行に最後に流したコメント(次のコメントがぶつからないかの判定に使う)。
-  private var laneTails: [Int: PictureInPictureComment] = [:]
+  // 表示中のコメントの配置(タイルの弾幕と同じ共通エンジン)と、その画像。
+  private var stage: DanmakuStage
+  private var commentImages: [Int: PictureInPictureCommentImage] = [:]
   private var lastPresentationTime: CFTimeInterval = 0
   private var pausedAt: CFTimeInterval?
   private var pausedTotal: CFTimeInterval = 0
@@ -532,6 +491,12 @@ private final class PictureInPictureFrameRenderer {
     let initialSize = Self.makeOutputSize(longSide: Self.defaultLongSide, aspect: 9.0 / 16.0)
     outputSizeMain = initialSize
     outputSize = initialSize
+    stage = DanmakuStage(metrics: DanmakuMetrics(
+      stageSize: initialSize,
+      fontSetting: DanmakuMetrics.defaultFontSetting,
+      speedSetting: DanmakuMetrics.defaultSpeedSetting,
+      maxLines: 0
+    ))
     // 表示側の時計をホスト時刻(CACurrentMediaTime と同じ)にする。
     var timebase: CMTimebase?
     CMTimebaseCreateWithSourceClock(
@@ -585,8 +550,7 @@ private final class PictureInPictureFrameRenderer {
       self.timer = nil
       self.output = nil
       self.latestVideoFrame = nil
-      self.comments.removeAll()
-      self.laneTails.removeAll()
+      self.commentImages.removeAll()
       layer.flushAndRemoveImage()
     }
   }
@@ -622,41 +586,25 @@ private final class PictureInPictureFrameRenderer {
     updateOutputSize()
   }
 
-  func addComment(tokens: [NativeDanmakuToken], settings: AppSettings, highlighted: Bool) {
-    let geometry = makeGeometry(settings: settings)
+  func addComment(tokens: [NativeDanmakuToken], settings: AppSettings, style: DanmakuStyle) {
+    // 大きさ・速さは、出力フレーム(=PiP の窓)の大きさと設定から共通エンジンの規則で決まる。
+    let metrics = DanmakuMetrics(
+      stageSize: outputSizeMain,
+      fontSetting: settings.danmakuFontSize,
+      speedSetting: settings.danmakuSpeed,
+      maxLines: settings.danmakuMaxLines
+    )
     PictureInPictureCommentRasterizer.render(
       tokens: tokens,
-      geometry: geometry,
-      opacity: CGFloat(settings.danmakuOpacity),
-      highlighted: highlighted
+      metrics: metrics,
+      style: style,
+      opacity: settings.danmakuOpacity
     ) { [weak self] raster in
       guard let self, let raster else { return }
       self.queue.async {
         self.insert(raster)
       }
     }
-  }
-
-  // コメントの大きさ・速さを、公式アプリと同じ比率で出力フレーム(=PiP の窓)の大きさから決める。
-  // アプリの設定(文字サイズ・速度・最大行数)は、初期値を公式相当として、その比率で効かせる。
-  private func makeGeometry(settings: AppSettings) -> PictureInPictureCommentGeometry {
-    let size = outputSizeMain
-    let lines = size.width >= size.height
-      ? PictureInPictureCommentLayout.linesPerHeightLandscape
-      : PictureInPictureCommentLayout.linesPerHeightPortrait
-    let fontScale = min(2, max(0.6, CGFloat(settings.danmakuFontSize) / PictureInPictureCommentLayout.defaultFontSetting))
-    let lineHeight = (size.height / lines * fontScale).rounded()
-    let fontSize = max(8, (lineHeight * PictureInPictureCommentLayout.fontPerLineHeight).rounded(.down))
-    let speedScale = min(3, max(0.2, CGFloat(settings.danmakuSpeed) / PictureInPictureCommentLayout.defaultSpeedSetting))
-    return PictureInPictureCommentGeometry(
-      outputWidth: size.width,
-      outputHeight: size.height,
-      fontSize: fontSize,
-      lineHeight: max(lineHeight, fontSize),
-      crossSeconds: PictureInPictureCommentLayout.stageCrossSeconds / speedScale,
-      leadSeconds: PictureInPictureCommentLayout.leadSeconds / speedScale,
-      maxLinesSetting: settings.danmakuMaxLines
-    )
   }
 
   // 出力フレームの大きさ = PiP の窓の実ピクセル(不明な間は長辺960px)× 映像の縦横比。
@@ -667,6 +615,8 @@ private final class PictureInPictureFrameRenderer {
     outputSizeMain = size
     queue.async {
       self.outputSize = size
+      // 表示中のコメントも新しい大きさへ比例で合わせる。
+      self.stage.rescale(to: self.stage.metrics.resized(to: size))
       self.needsFrame = true
     }
     if let attachedItem {
@@ -751,8 +701,10 @@ private final class PictureInPictureFrameRenderer {
     guard target > lastPresentationTime + interval * 0.5 else { return }
     pullVideoFrame(for: target, now: now)
     let commentTime = target - pausedTotal
-    comments.removeAll { $0.rightEdge(at: commentTime) < -0.02 }
-    if !needsFrame, comments.isEmpty {
+    for id in stage.removeFinished(now: commentTime) {
+      commentImages[id] = nil
+    }
+    if !needsFrame, stage.items.isEmpty {
       // 新しい映像もコメントも無ければ作らない(省電力)。読み込み中のつなぎ画面だけは時々出す。
       let placeholderDue = latestVideoFrame == nil && target - lastPresentationTime >= 1.0 / 15.0
       if !placeholderDue {
@@ -822,73 +774,28 @@ private final class PictureInPictureFrameRenderer {
     }
   }
 
-  // コメントを流し始める。速さと行の決め方は公式アプリと同じ:
-  //  - 4:3 の舞台の幅＋自分の幅を crossSeconds で横切る(長いコメントほど速い)。舞台の右端に着く
-  //    leadSeconds 前から流すので、画面の右外から入ってくる。
-  //  - 行は上から順に見て、前のコメントと入り口で重ならず、画面を出るまで追いつかない行を選ぶ。
-  //  - 空いた行が無い時も捨てず、ランダムな高さに重ねて流す。
+  // コメントを流し始める。何段目に出すか・どの速さで流すかは共通エンジン(DanmakuStage)が決める。
   private func insert(_ raster: PictureInPictureCommentRaster) {
-    let geometry = raster.geometry
-    let frameWidth = geometry.outputWidth
-    let frameHeight = geometry.outputHeight
-    let width = CGFloat(raster.image.width) / frameWidth
-    let stageWidth = min(frameWidth, frameHeight * PictureInPictureCommentLayout.stageAspect) / frameWidth
-    let stageRight = (1 + stageWidth) / 2
-    let speed = (stageWidth + width) / geometry.crossSeconds
-    let startX = max(stageRight + speed * geometry.leadSeconds, 1 + 2 / frameWidth)
+    var metrics = raster.metrics
+    var layoutSize = raster.layoutSize
+    if metrics.stageSize != outputSize, metrics.stageSize.width > 0 {
+      // 描いている間に出力の大きさが変わった。今の大きさに合わせて置く(画像は描く時に拡大縮小される)。
+      let factor = outputSize.width / metrics.stageSize.width
+      layoutSize = CGSize(width: layoutSize.width * factor, height: layoutSize.height * factor)
+      metrics = metrics.resized(to: outputSize)
+    }
+    stage.rescale(to: metrics)
     // 次に作るフレームから動き出すように、そのフレームのコメント時刻で置く。
     let now = (pausedAt ?? CACurrentMediaTime()) + Self.presentationLead - pausedTotal
-
-    let laneHeight = geometry.lineHeight / frameHeight
-    let topMargin = laneHeight * PictureInPictureCommentLayout.topMarginLines
-    let fittingLanes = max(1, Int((1 - topMargin) / laneHeight))
-    let laneCount = geometry.maxLinesSetting > 0 ? min(geometry.maxLinesSetting, fittingLanes) : fittingLanes
-    // 同じ行の前後のコメントの間に空ける最小の間隔。
-    let gap = geometry.fontSize * 0.5 / frameWidth
-
-    var lane: Int?
-    for candidate in 0..<laneCount {
-      guard let previous = laneTails[candidate], previous.rightEdge(at: now) > 0 else {
-        // この行は空(前のコメントはもう画面を出た)。
-        lane = candidate
-        break
-      }
-      if previous.rightEdge(at: now) + gap > startX {
-        // 前のコメントの後ろがまだ入り口にかかっている。
-        continue
-      }
-      if speed > previous.speed {
-        // 自分の方が速い。前のコメントが画面を出きる時点で追いついてしまうなら、この行は使わない。
-        let leftWhenPreviousExits = startX - speed * CGFloat(previous.exitTime - now)
-        if leftWhenPreviousExits < gap {
-          continue
-        }
-      }
-      lane = candidate
-      break
+    let placement = stage.add(position: raster.position, size: layoutSize, now: now)
+    for id in placement.evictedIDs {
+      commentImages[id] = nil
     }
-    let top: CGFloat
-    if let lane {
-      top = topMargin + CGFloat(lane) * laneHeight
-    } else {
-      top = topMargin + CGFloat.random(in: 0...max(0, CGFloat(laneCount - 1) * laneHeight))
-    }
-    let comment = PictureInPictureComment(
+    commentImages[placement.item.id] = PictureInPictureCommentImage(
       image: raster.image,
-      rasterWidth: frameWidth,
-      top: top,
-      width: width,
-      startTime: now,
-      startX: startX,
-      speed: speed
+      inset: raster.inset,
+      rasterStageWidth: raster.metrics.stageSize.width
     )
-    if let lane {
-      laneTails[lane] = comment
-    }
-    comments.append(comment)
-    if comments.count > Self.maxComments {
-      comments.removeFirst(comments.count - Self.maxComments)
-    }
   }
 
   // 出力フレーム = 最新の映像(無ければ黒地＋「映像を準備中」)＋その表示時刻の位置のコメント。
@@ -929,14 +836,15 @@ private final class PictureInPictureFrameRenderer {
       }
     }
     context.interpolationQuality = .medium
-    for comment in comments {
+    for item in stage.items {
+      guard let comment = commentImages[item.id] else { continue }
       // 描いた時と出力幅が同じなら等倍。整数位置に置いて文字をぼかさない。
-      let scale = frameWidth / comment.rasterWidth
+      let scale = frameWidth / comment.rasterStageWidth
       let drawWidth = CGFloat(comment.image.width) * scale
       let drawHeight = CGFloat(comment.image.height) * scale
-      let x = (comment.x(at: commentTime) * frameWidth).rounded()
+      let x = (item.x(at: commentTime) - comment.inset * scale).rounded()
       guard x < frameWidth, x + drawWidth > 0 else { continue }
-      let top = (comment.top * frameHeight).rounded()
+      let top = (item.y - comment.inset * scale).rounded()
       // CGContext は左下原点。ピクセルバッファの先頭行は映像の上端。
       context.draw(comment.image, in: CGRect(x: x, y: frameHeight - top - drawHeight, width: drawWidth, height: drawHeight))
     }
@@ -1072,15 +980,14 @@ private final class PictureInPictureFrameRenderer {
   }
 }
 
-// コメント 1 件を画像にする(メインスレッド)。見た目はセルの弾幕(NativeDanmakuRenderer)に合わせる:
-// 太字の白文字＋黒い影、絵文字は画像、自分のコメントは黄色の枠。出力フレームと同じピクセル密度で描き、
-// 影や余白は文字の大きさに比例させる。
+// コメント 1 件を画像にする(メインスレッド)。見た目の寸法はタイルの弾幕と同じ DanmakuAppearance:
+// 太字の文字＋影、絵文字は画像、自分のコメントは黄色の枠。出力フレームと同じピクセル密度で描く。
 private enum PictureInPictureCommentRasterizer {
   static func render(
     tokens: [NativeDanmakuToken],
-    geometry: PictureInPictureCommentGeometry,
-    opacity: CGFloat,
-    highlighted: Bool,
+    metrics: DanmakuMetrics,
+    style: DanmakuStyle,
+    opacity: Double,
     completion: @escaping (PictureInPictureCommentRaster?) -> Void
   ) {
     var urls: [URL] = []
@@ -1090,7 +997,7 @@ private enum PictureInPictureCommentRasterizer {
       }
     }
     if urls.isEmpty {
-      completion(draw(tokens: tokens, geometry: geometry, opacity: opacity, highlighted: highlighted, images: [:]))
+      completion(draw(tokens: tokens, metrics: metrics, style: style, opacity: opacity, images: [:]))
       return
     }
     // 絵文字画像を待ってから描く。読み込みが遅い時は、来ていない絵文字を省いて流す。
@@ -1099,7 +1006,7 @@ private enum PictureInPictureCommentRasterizer {
     let finish = {
       guard !finished else { return }
       finished = true
-      completion(draw(tokens: tokens, geometry: geometry, opacity: opacity, highlighted: highlighted, images: images))
+      completion(draw(tokens: tokens, metrics: metrics, style: style, opacity: opacity, images: images))
     }
     let group = DispatchGroup()
     for url in urls {
@@ -1121,45 +1028,41 @@ private enum PictureInPictureCommentRasterizer {
 
   private static func draw(
     tokens: [NativeDanmakuToken],
-    geometry: PictureInPictureCommentGeometry,
-    opacity: CGFloat,
-    highlighted: Bool,
+    metrics: DanmakuMetrics,
+    style: DanmakuStyle,
+    opacity: Double,
     images: [URL: UIImage]
   ) -> PictureInPictureCommentRaster? {
-    let fontSize = geometry.fontSize
-    let lineHeight = geometry.lineHeight
-    // セルの弾幕の 1pt に当たる長さ(セルは 20pt の文字が基準)。影・余白・枠を文字の大きさに比例させる。
-    let unit = fontSize / 20
-    let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
-    let shadowBlur = max(1, (2 * unit).rounded())
-    let shadowOffset = max(1, unit.rounded())
-    let shadow = NSShadow()
-    shadow.shadowColor = UIColor.black
-    shadow.shadowBlurRadius = shadowBlur
-    shadow.shadowOffset = CGSize(width: shadowOffset, height: shadowOffset)
-    let attributes: [NSAttributedString.Key: Any] = [
-      .font: font,
-      .foregroundColor: UIColor.white.withAlphaComponent(opacity),
-      .shadow: shadow
-    ]
-    // 絵文字は行の高さに収める。
-    let imageSide = lineHeight
-    let imageGap = max(1, (3 * unit).rounded())
-    // 自分のコメントの枠の太さと、枠の内側の上下の余白。
-    let borderWidth = highlighted ? max(1, (2 * unit).rounded()) : 0
-    let verticalInset = highlighted ? borderWidth + max(1, unit.rounded()) : 0
-    // 左右の余白: 影がはみ出す分(自分のコメントは枠の内側の余白も)。
-    let padding = shadowBlur + shadowOffset + 1 + (highlighted ? borderWidth + (5 * unit).rounded() : 0)
-    let textHeight = ceil(font.lineHeight)
-    let contentHeight = max(lineHeight, textHeight)
-    let textTop = verticalInset + ((contentHeight - textHeight) / 2).rounded()
+    let normal = DanmakuAppearance(metrics: metrics, style: style, opacity: opacity)
+    guard let raster = draw(tokens: tokens, appearance: normal, position: style.position, metrics: metrics, images: images) else {
+      return nil
+    }
+    let stageWidth = metrics.stageSize.width
+    guard style.position != .flow, stageWidth > 0, raster.layoutSize.width > stageWidth else { return raster }
+    // 上/下に固定するコメントが画面より広い時は、収まる大きさまで縮める(公式と同じ)。
+    let fitted = DanmakuAppearance(metrics: metrics, style: style, opacity: opacity, scale: stageWidth / raster.layoutSize.width)
+    return draw(tokens: tokens, appearance: fitted, position: style.position, metrics: metrics, images: images) ?? raster
+  }
+
+  private static func draw(
+    tokens: [NativeDanmakuToken],
+    appearance: DanmakuAppearance,
+    position: DanmakuPosition,
+    metrics: DanmakuMetrics,
+    images: [URL: UIImage]
+  ) -> PictureInPictureCommentRaster? {
+    let lineHeight = appearance.lineHeight
+    let attributes = appearance.textAttributes
+    // 影がはみ出す分の余白を、配置の箱の外側に取る。
+    let inset = appearance.shadowReach + 1
+    let textHeight = ceil(appearance.font.lineHeight)
 
     enum Piece {
       case text(NSString, CGFloat)
       case image(UIImage, CGFloat)
     }
     var pieces: [Piece] = []
-    var x = padding
+    var x = appearance.horizontalPadding
     for token in tokens {
       switch token {
       case .text(let text):
@@ -1169,39 +1072,49 @@ private enum PictureInPictureCommentRasterizer {
         x += ceil(string.size(withAttributes: attributes).width)
       case .image(let url):
         guard let image = images[url] else { continue }
-        pieces.append(.image(image.images?.first ?? image, x + imageGap))
-        x += imageSide + imageGap * 2
+        pieces.append(.image(image.images?.first ?? image, x + appearance.imageGap))
+        x += appearance.imageSide + appearance.imageGap * 2
       }
     }
     guard !pieces.isEmpty else { return nil }
-    // 影は行の下へ少しはみ出す(次の行の上端に薄くかかるだけ)。枠つきは枠の中に収める。
-    let height = highlighted ? contentHeight + verticalInset * 2 : contentHeight + shadowBlur + shadowOffset
-    let size = CGSize(width: ceil(x + padding), height: ceil(height))
+    // 配置の箱(幅 = 中身の幅、高さ = 1 行の高さ)。タイルの弾幕のビューと同じ決め方。
+    let layoutSize = CGSize(width: ceil(x + appearance.horizontalPadding), height: lineHeight)
+    let size = CGSize(width: layoutSize.width + inset * 2, height: ceil(lineHeight) + inset * 2)
     let format = UIGraphicsImageRendererFormat()
     format.scale = 1
     format.opaque = false
     format.preferredRange = .standard
     let image = UIGraphicsImageRenderer(size: size, format: format).image { _ in
-      if highlighted {
-        let half = borderWidth / 2
-        let rect = CGRect(x: half, y: half, width: size.width - borderWidth, height: size.height - borderWidth)
-        let path = UIBezierPath(roundedRect: rect, cornerRadius: max(2, (4 * unit).rounded()))
+      if appearance.borderWidth > 0 {
+        let half = appearance.borderWidth / 2
+        let rect = CGRect(
+          x: inset + half,
+          y: inset + half,
+          width: layoutSize.width - appearance.borderWidth,
+          height: lineHeight - appearance.borderWidth
+        )
+        let path = UIBezierPath(roundedRect: rect, cornerRadius: appearance.cornerRadius)
         UIColor.systemYellow.withAlphaComponent(0.12).setFill()
         path.fill()
-        path.lineWidth = borderWidth
+        path.lineWidth = appearance.borderWidth
         UIColor.systemYellow.setStroke()
         path.stroke()
       }
+      let textTop = inset + ((lineHeight - textHeight) / 2).rounded()
       for piece in pieces {
         switch piece {
         case .text(let string, let originX):
-          string.draw(at: CGPoint(x: originX, y: textTop), withAttributes: attributes)
+          string.draw(at: CGPoint(x: inset + originX, y: textTop), withAttributes: attributes)
         case .image(let image, let originX):
-          image.draw(in: CGRect(x: originX, y: verticalInset, width: imageSide, height: imageSide), blendMode: .normal, alpha: opacity)
+          image.draw(
+            in: CGRect(x: inset + originX, y: inset, width: appearance.imageSide, height: appearance.imageSide),
+            blendMode: .normal,
+            alpha: appearance.imageAlpha
+          )
         }
       }
     }
     guard let cgImage = image.cgImage else { return nil }
-    return PictureInPictureCommentRaster(image: cgImage, geometry: geometry)
+    return PictureInPictureCommentRaster(image: cgImage, layoutSize: layoutSize, inset: inset, position: position, metrics: metrics)
   }
 }
