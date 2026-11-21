@@ -482,7 +482,7 @@ final class SettingsController: UITableViewController {
     switch sec {
     case .playback: return 3
     case .quality: return 4
-    case .danmaku: return 6
+    case .danmaku: return 2
     case .gifts: return 4
     case .order: return platforms.count
     case .kick: return 5
@@ -501,7 +501,7 @@ final class SettingsController: UITableViewController {
     switch sec {
     case .playback: return "再生"
     case .quality: return "画質"
-    case .danmaku: return "弾幕"
+    case .danmaku: return "コメント(弾幕)"
     case .gifts: return "ギフト・通知"
     case .order: return "サービス順"
     case .kick: return "Kick 連携"
@@ -610,7 +610,18 @@ final class SettingsController: UITableViewController {
           var s = AppState.shared.settings; s.showChat = v; AppState.shared.settings = s
         }
       } else {
-        cell.textLabel?.text = danmakuTitle(field: indexPath.row - 1)
+        let text = NSMutableAttributedString(
+          string: "速さ・大きさ・絵文字を調整",
+          attributes: [.font: UIFont.preferredFont(forTextStyle: .body), .foregroundColor: UIColor.white]
+        )
+        text.append(NSAttributedString(
+          string: "\n" + AppState.shared.settings.danmakuAppearanceSummary,
+          attributes: [
+            .font: UIFont.preferredFont(forTextStyle: .footnote),
+            .foregroundColor: UIColor.white.withAlphaComponent(0.6)
+          ]
+        ))
+        cell.textLabel?.attributedText = text
         cell.accessoryType = .disclosureIndicator
         cell.selectionStyle = .default
       }
@@ -728,7 +739,7 @@ final class SettingsController: UITableViewController {
     guard let sec = Sec(rawValue: indexPath.section) else { return }
     switch sec {
     case .danmaku:
-      if indexPath.row >= 1 { editDanmakuValue(field: indexPath.row - 1) }
+      if indexPath.row == 1 { presentDanmakuSettings() }
     case .kick:
       handleKickOAuthRow(indexPath.row)
     case .twitch:
@@ -750,20 +761,15 @@ final class SettingsController: UITableViewController {
     }
   }
 
-  private func danmakuTitle(field: Int) -> String {
-    let settings = AppState.shared.settings
-    switch field {
-    case 0:
-      return "文字サイズ \(Int(settings.danmakuFontSize))"
-    case 1:
-      return "速度 \(Int((settings.danmakuSpeed / 0.13) * 100))%"
-    case 2:
-      return "透過度 \(Int(settings.danmakuOpacity * 100))%"
-    case 3:
-      return "最大行数 \(settings.danmakuMaxLines == 0 ? "自動" : String(settings.danmakuMaxLines))"
-    default:
-      return "最大文字数 \(settings.danmakuMaxLength == 0 ? "無制限" : String(settings.danmakuMaxLength))"
+  private func presentDanmakuSettings() {
+    let controller = DanmakuSettingsController()
+    controller.onDismiss = { [weak self] in
+      // 一覧の「速さ 70%・大きさ 100%…」を今の値にする。
+      self?.tableView.reloadRows(at: [IndexPath(row: 1, section: Sec.danmaku.rawValue)], with: .none)
     }
+    let navigation = UINavigationController(rootViewController: controller)
+    navigation.overrideUserInterfaceStyle = .dark
+    present(navigation, animated: true)
   }
 
   private func qualityControl(selected: PlaybackQuality, onChange: @escaping (PlaybackQuality) -> Void) -> UISegmentedControl {
@@ -774,62 +780,6 @@ final class SettingsController: UITableViewController {
       onChange(control.selectedSegmentIndex == 0 ? .high : .economy)
     }, for: .valueChanged)
     return control
-  }
-
-  private func editDanmakuValue(field: Int) {
-    let settings = AppState.shared.settings
-    let current: String
-    let title: String
-    let message: String
-    switch field {
-    case 0:
-      title = "文字サイズ"
-      current = String(Int(settings.danmakuFontSize))
-      message = "12〜40"
-    case 1:
-      title = "速度"
-      current = String(Int((settings.danmakuSpeed / 0.13) * 100))
-      message = "100が標準"
-    case 2:
-      title = "透過度"
-      current = String(Int(settings.danmakuOpacity * 100))
-      message = "30〜100"
-    case 3:
-      title = "最大行数"
-      current = String(settings.danmakuMaxLines)
-      message = "0で自動"
-    default:
-      title = "最大文字数"
-      current = String(settings.danmakuMaxLength)
-      message = "0で無制限"
-    }
-
-    let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
-    alert.addTextField { field in
-      field.text = current
-      field.keyboardType = .numberPad
-      field.clearButtonMode = .whileEditing
-    }
-    alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
-    alert.addAction(UIAlertAction(title: "保存", style: .default) { [weak self] _ in
-      guard let raw = alert.textFields?.first?.text, let value = Double(raw) else { return }
-      var settings = AppState.shared.settings
-      switch field {
-      case 0:
-        settings.danmakuFontSize = min(40, max(12, value.rounded()))
-      case 1:
-        settings.danmakuSpeed = min(300, max(20, value)) / 100 * 0.13
-      case 2:
-        settings.danmakuOpacity = min(100, max(30, value)) / 100
-      case 3:
-        settings.danmakuMaxLines = min(20, max(0, Int(value.rounded())))
-      default:
-        settings.danmakuMaxLength = min(500, max(0, Int(value.rounded())))
-      }
-      AppState.shared.settings = settings
-      self?.tableView.reloadRows(at: [IndexPath(row: field + 1, section: Sec.danmaku.rawValue)], with: .automatic)
-    })
-    present(alert, animated: true)
   }
 
   private func handleKickOAuthRow(_ row: Int) {
@@ -1266,5 +1216,418 @@ final class PlaybackLogController: UIViewController {
   @objc private func copyLog() {
     UIPasteboard.general.string = PlaybackDiagnostics.text
     navigationItem.rightBarButtonItem?.title = "コピーしました"
+  }
+}
+
+// 設定画面での表し方。速さ・大きさは 100% = ニコ生公式アプリと同じ。
+private extension AppSettings {
+  var danmakuSpeedPercent: Double {
+    danmakuSpeed / DanmakuMetrics.officialSpeedSetting * 100
+  }
+
+  var danmakuSizePercent: Double {
+    danmakuFontSize / DanmakuMetrics.officialFontSetting * 100
+  }
+
+  /// 設定一覧に出す今の値の要約。
+  var danmakuAppearanceSummary: String {
+    let emoji = danmakuShowEmoji ? "\(Int((danmakuEmojiScale * 100).rounded()))%" : "オフ"
+    return "速さ \(Int(danmakuSpeedPercent.rounded()))%・大きさ \(Int(danmakuSizePercent.rounded()))%・絵文字 \(emoji)"
+  }
+}
+
+// コメント(弾幕)の見た目の設定。上のプレビューに見本のコメントを流し、スライダーを動かすとすぐ反映する。
+// 設定はコメントを出すたびに読まれる(NativeDanmakuRenderer.emit)ので、再生中の配信と PiP にもすぐ効く。
+final class DanmakuSettingsController: UIViewController {
+  /// 画面を閉じる時に呼ぶ(設定一覧の要約を今の値にする)。
+  var onDismiss: (() -> Void)?
+
+  private let previewStage = UIView()
+  private let rows = UIStackView()
+  private var refreshers: [() -> Void] = []
+  private var previewTimer: Timer?
+  private var sampleCount = 0
+  private var laneCursor = 0
+  private lazy var sampleEmojiURLs: [URL] = DanmakuSettingsController.makeSampleEmojiURLs()
+
+  deinit {
+    previewTimer?.invalidate()
+  }
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    title = "コメントの表示"
+    view.backgroundColor = UIColor(red: 0.02, green: 0.03, blue: 0.04, alpha: 1)
+    navigationItem.leftBarButtonItem = UIBarButtonItem(title: "閉じる", style: .done, target: self, action: #selector(close))
+    navigationItem.rightBarButtonItem = UIBarButtonItem(title: "初期値に戻す", style: .plain, target: self, action: #selector(confirmReset))
+
+    let preview = makePreview()
+    let scrollView = UIScrollView()
+    scrollView.translatesAutoresizingMaskIntoConstraints = false
+    scrollView.alwaysBounceVertical = true
+    rows.axis = .vertical
+    rows.spacing = 22
+    rows.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(preview)
+    view.addSubview(scrollView)
+    scrollView.addSubview(rows)
+
+    let guide = view.safeAreaLayoutGuide
+    // プレビューはタイルと同じ 16:9。できるだけ横いっぱいにし、縦は画面の 4 割まで(横向きでも操作部を残す)。
+    let fullWidth = preview.widthAnchor.constraint(equalTo: guide.widthAnchor, constant: -32)
+    fullWidth.priority = .defaultHigh
+    NSLayoutConstraint.activate([
+      preview.topAnchor.constraint(equalTo: guide.topAnchor, constant: 12),
+      preview.centerXAnchor.constraint(equalTo: guide.centerXAnchor),
+      preview.widthAnchor.constraint(lessThanOrEqualTo: guide.widthAnchor, constant: -32),
+      preview.widthAnchor.constraint(lessThanOrEqualToConstant: 640),
+      preview.heightAnchor.constraint(equalTo: preview.widthAnchor, multiplier: 9.0 / 16.0),
+      preview.heightAnchor.constraint(lessThanOrEqualTo: guide.heightAnchor, multiplier: 0.4),
+      fullWidth,
+      scrollView.topAnchor.constraint(equalTo: preview.bottomAnchor, constant: 8),
+      scrollView.leadingAnchor.constraint(equalTo: guide.leadingAnchor),
+      scrollView.trailingAnchor.constraint(equalTo: guide.trailingAnchor),
+      scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      rows.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 16),
+      rows.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -32),
+      rows.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor, constant: 20),
+      rows.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor, constant: -20),
+      rows.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor, constant: -40)
+    ])
+    buildRows()
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    startPreview()
+  }
+
+  override func viewWillDisappear(_ animated: Bool) {
+    super.viewWillDisappear(animated)
+    previewTimer?.invalidate()
+    previewTimer = nil
+    onDismiss?()
+  }
+
+  @objc private func close() {
+    dismiss(animated: true)
+  }
+
+  @objc private func confirmReset() {
+    let alert = UIAlertController(title: "初期値に戻す", message: "コメントの表示の設定をすべて初期値に戻します。", preferredStyle: .alert)
+    alert.addAction(UIAlertAction(title: "キャンセル", style: .cancel))
+    alert.addAction(UIAlertAction(title: "戻す", style: .destructive) { [weak self] _ in
+      let defaults = AppSettings()
+      var settings = AppState.shared.settings
+      settings.danmakuFontSize = defaults.danmakuFontSize
+      settings.danmakuSpeed = defaults.danmakuSpeed
+      settings.danmakuOpacity = defaults.danmakuOpacity
+      settings.danmakuMaxLines = defaults.danmakuMaxLines
+      settings.danmakuMaxLength = defaults.danmakuMaxLength
+      settings.danmakuShowEmoji = defaults.danmakuShowEmoji
+      settings.danmakuEmojiScale = defaults.danmakuEmojiScale
+      AppState.shared.settings = settings
+      self?.refreshRows()
+    })
+    present(alert, animated: true)
+  }
+
+  // MARK: 設定の行
+
+  private func buildRows() {
+    addSlider(
+      title: "速さ",
+      hint: "100% がニコ生公式アプリと同じ速さです。小さくするほどゆっくり流れます。",
+      range: 30...200,
+      step: 5,
+      read: { Float($0.danmakuSpeedPercent) },
+      write: { $0.danmakuSpeed = DanmakuMetrics.officialSpeedSetting * Double($1) / 100 },
+      format: { "\(Int($0.rounded()))%" }
+    )
+    addSlider(
+      title: "文字の大きさ",
+      hint: "100% がニコ生公式アプリと同じ大きさです(配信の画面の高さに合わせて変わります)。",
+      range: 60...200,
+      step: 5,
+      read: { Float($0.danmakuSizePercent) },
+      write: { $0.danmakuFontSize = DanmakuMetrics.officialFontSetting * Double($1) / 100 },
+      format: { "\(Int($0.rounded()))%" }
+    )
+    addSlider(
+      title: "不透明度",
+      hint: nil,
+      range: 30...100,
+      step: 5,
+      read: { Float($0.danmakuOpacity * 100) },
+      write: { $0.danmakuOpacity = Double($1) / 100 },
+      format: { "\(Int($0.rounded()))%" }
+    )
+    addSwitch(
+      title: "絵文字・スタンプを表示",
+      hint: "オフにすると、絵文字だけのコメントは流しません。",
+      read: { $0.danmakuShowEmoji },
+      write: { $0.danmakuShowEmoji = $1 }
+    )
+    addSlider(
+      title: "絵文字の大きさ",
+      hint: "100% = 文字の行の高さ。大きくすると、絵文字の入ったコメントだけ背が高くなります。",
+      range: 50...200,
+      step: 10,
+      read: { Float($0.danmakuEmojiScale * 100) },
+      write: { $0.danmakuEmojiScale = Double($1) / 100 },
+      format: { "\(Int($0.rounded()))%" },
+      isEnabled: { $0.danmakuShowEmoji }
+    )
+    addSlider(
+      title: "最大行数",
+      hint: "上から何行までにコメントを出すか。自動は画面の高さいっぱい。",
+      range: 0...20,
+      step: 1,
+      read: { Float($0.danmakuMaxLines) },
+      write: { $0.danmakuMaxLines = Int($1.rounded()) },
+      format: { $0 < 0.5 ? "自動" : "\(Int($0.rounded()))行" }
+    )
+    addSlider(
+      title: "最大文字数",
+      hint: "これより長いコメントは流しません。",
+      range: 0...200,
+      step: 5,
+      read: { Float($0.danmakuMaxLength) },
+      write: { $0.danmakuMaxLength = Int($1.rounded()) },
+      format: { $0 < 0.5 ? "無制限" : "\(Int($0.rounded()))文字" }
+    )
+    rows.addArrangedSubview(makeHintLabel("変更はすぐに、再生中の配信のコメントと PiP に反映されます。"))
+    refreshRows()
+  }
+
+  private func refreshRows() {
+    refreshers.forEach { $0() }
+  }
+
+  private func addSlider(
+    title: String,
+    hint: String?,
+    range: ClosedRange<Float>,
+    step: Float,
+    read: @escaping (AppSettings) -> Float,
+    write: @escaping (inout AppSettings, Float) -> Void,
+    format: @escaping (Float) -> String,
+    isEnabled: ((AppSettings) -> Bool)? = nil
+  ) {
+    let valueLabel = UILabel()
+    valueLabel.textColor = .white
+    valueLabel.font = .monospacedDigitSystemFont(ofSize: 16, weight: .semibold)
+    valueLabel.textAlignment = .right
+    valueLabel.setContentHuggingPriority(.required, for: .horizontal)
+    valueLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+    let header = UIStackView(arrangedSubviews: [makeTitleLabel(title), valueLabel])
+    header.axis = .horizontal
+    header.spacing = 8
+    let slider = UISlider()
+    slider.minimumValue = range.lowerBound
+    slider.maximumValue = range.upperBound
+    slider.accessibilityLabel = title
+    let row = UIStackView(arrangedSubviews: [header, slider])
+    row.axis = .vertical
+    row.spacing = 8
+    if let hint {
+      row.addArrangedSubview(makeHintLabel(hint))
+    }
+    rows.addArrangedSubview(row)
+
+    // 動かしている間も保存して、プレビュー(と再生中の配信)の次のコメントから効かせる。
+    slider.addAction(UIAction { [weak self] action in
+      guard let slider = action.sender as? UISlider else { return }
+      let value = (slider.value / step).rounded() * step
+      slider.value = value
+      var settings = AppState.shared.settings
+      guard abs(read(settings) - value) > 0.001 else { return }
+      write(&settings, value)
+      AppState.shared.settings = settings
+      self?.refreshRows()
+    }, for: .valueChanged)
+    refreshers.append {
+      let settings = AppState.shared.settings
+      let stored = read(settings)
+      slider.value = min(range.upperBound, max(range.lowerBound, stored))
+      // 表示は保存されている値そのもの(以前の数値入力でスライダーの範囲外にした値もそのまま見せる)。
+      valueLabel.text = format(stored)
+      slider.accessibilityValue = format(stored)
+      let enabled = isEnabled?(settings) ?? true
+      slider.isEnabled = enabled
+      row.alpha = enabled ? 1 : 0.4
+    }
+  }
+
+  private func addSwitch(
+    title: String,
+    hint: String?,
+    read: @escaping (AppSettings) -> Bool,
+    write: @escaping (inout AppSettings, Bool) -> Void
+  ) {
+    let toggle = UISwitch()
+    toggle.setContentHuggingPriority(.required, for: .horizontal)
+    let header = UIStackView(arrangedSubviews: [makeTitleLabel(title), toggle])
+    header.axis = .horizontal
+    header.alignment = .center
+    header.spacing = 8
+    let row = UIStackView(arrangedSubviews: [header])
+    row.axis = .vertical
+    row.spacing = 8
+    if let hint {
+      row.addArrangedSubview(makeHintLabel(hint))
+    }
+    rows.addArrangedSubview(row)
+
+    toggle.addAction(UIAction { [weak self] action in
+      guard let toggle = action.sender as? UISwitch else { return }
+      var settings = AppState.shared.settings
+      write(&settings, toggle.isOn)
+      AppState.shared.settings = settings
+      self?.refreshRows()
+    }, for: .valueChanged)
+    refreshers.append {
+      toggle.isOn = read(AppState.shared.settings)
+    }
+  }
+
+  private func makeTitleLabel(_ text: String) -> UILabel {
+    let label = UILabel()
+    label.text = text
+    label.textColor = .white
+    label.font = .systemFont(ofSize: 16, weight: .semibold)
+    label.numberOfLines = 0
+    label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    return label
+  }
+
+  private func makeHintLabel(_ text: String) -> UILabel {
+    let label = UILabel()
+    label.text = text
+    label.textColor = UIColor.white.withAlphaComponent(0.55)
+    label.font = .systemFont(ofSize: 12)
+    label.numberOfLines = 0
+    return label
+  }
+
+  // MARK: プレビュー
+
+  private func makePreview() -> UIView {
+    let backdrop = DanmakuPreviewBackdrop()
+    backdrop.translatesAutoresizingMaskIntoConstraints = false
+    backdrop.layer.cornerRadius = 10
+    backdrop.clipsToBounds = true
+    let caption = UILabel()
+    caption.text = "プレビュー"
+    caption.font = .systemFont(ofSize: 11, weight: .semibold)
+    caption.textColor = UIColor.white.withAlphaComponent(0.45)
+    caption.translatesAutoresizingMaskIntoConstraints = false
+    previewStage.translatesAutoresizingMaskIntoConstraints = false
+    previewStage.clipsToBounds = true
+    previewStage.isUserInteractionEnabled = false
+    backdrop.addSubview(caption)
+    backdrop.addSubview(previewStage)
+    NSLayoutConstraint.activate([
+      caption.leadingAnchor.constraint(equalTo: backdrop.leadingAnchor, constant: 8),
+      caption.bottomAnchor.constraint(equalTo: backdrop.bottomAnchor, constant: -6),
+      previewStage.topAnchor.constraint(equalTo: backdrop.topAnchor),
+      previewStage.bottomAnchor.constraint(equalTo: backdrop.bottomAnchor),
+      previewStage.leadingAnchor.constraint(equalTo: backdrop.leadingAnchor),
+      previewStage.trailingAnchor.constraint(equalTo: backdrop.trailingAnchor)
+    ])
+    return backdrop
+  }
+
+  private func startPreview() {
+    guard previewTimer == nil else { return }
+    let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+      self?.emitSample()
+    }
+    // スライダーを動かしている間(RunLoop の tracking モード)も流し続ける。
+    RunLoop.main.add(timer, forMode: .common)
+    previewTimer = timer
+    emitSample()
+  }
+
+  // 見本のコメント。配信と同じ NativeDanmakuRenderer で流すので、見た目・速さ・段の決め方は本番と同じ。
+  // 普通の短いコメントを中心に、ときどき絵文字入り・長めのものを混ぜる。
+  private func emitSample() {
+    sampleCount += 1
+    // 間隔に少しむらをつける(毎回同じ間隔だと不自然)。
+    if sampleCount % 6 == 4 { return }
+    let emoji = sampleEmojiURLs
+    let tokens: [NativeDanmakuToken]
+    let text: String
+    if emoji.count >= 2, sampleCount % 4 == 1 {
+      let index = sampleCount / 4
+      let word = Self.sampleEmojiWords[index % Self.sampleEmojiWords.count]
+      if word.isEmpty {
+        text = "絵文字"
+        tokens = [.image(emoji[index % emoji.count]), .image(emoji[(index + 1) % emoji.count])]
+      } else {
+        text = word
+        tokens = [.text(word), .image(emoji[index % emoji.count])]
+      }
+    } else {
+      text = Self.sampleLines[sampleCount % Self.sampleLines.count]
+      tokens = [.text(text)]
+    }
+    laneCursor = NativeDanmakuRenderer.emit(tokens: tokens, filterText: text, in: previewStage, laneCursor: laneCursor)
+  }
+
+  private static let sampleLines = [
+    "わこつ", "こんばんは！", "8888888", "かわいい", "草", "うおおおおお", "それはそう", "ナイス！",
+    "初見です", "きたああああ", "えぐい", "おつかれさま〜", "神回", "いまのすごくない？", "ｗｗｗｗｗ",
+    "がんばれー！", "長めのコメントはこのくらいの速さで流れていきます"
+  ]
+
+  // 絵文字入りの見本の文字(空は絵文字だけのコメント)。
+  private static let sampleEmojiWords = ["かわいい", "", "ナイス", "おめでとう", ""]
+
+  // 見本の絵文字画像。配信の絵文字と同じく URL から読む形にするため、一時フォルダに PNG で置く。
+  private static func makeSampleEmojiURLs() -> [URL] {
+    let folder = FileManager.default.temporaryDirectory
+    var urls: [URL] = []
+    for (index, emoji) in ["😊", "👏", "🎉", "😂"].enumerated() {
+      let url = folder.appendingPathComponent("danmaku-preview-emoji-\(index).png")
+      if !FileManager.default.fileExists(atPath: url.path) {
+        let side: CGFloat = 96
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = false
+        let image = UIGraphicsImageRenderer(size: CGSize(width: side, height: side), format: format).image { _ in
+          let string = emoji as NSString
+          let attributes: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: side * 0.78)]
+          let size = string.size(withAttributes: attributes)
+          string.draw(at: CGPoint(x: (side - size.width) / 2, y: (side - size.height) / 2), withAttributes: attributes)
+        }
+        guard let data = image.pngData(), (try? data.write(to: url, options: .atomic)) != nil else { continue }
+      }
+      urls.append(url)
+    }
+    return urls
+  }
+}
+
+// プレビューの背景(映像の代わり)。明るい所と暗い所があるので、文字の縁取りの見え方も分かる。
+private final class DanmakuPreviewBackdrop: UIView {
+  override class var layerClass: AnyClass {
+    CAGradientLayer.self
+  }
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    guard let gradient = layer as? CAGradientLayer else { return }
+    gradient.colors = [
+      UIColor(red: 0.42, green: 0.55, blue: 0.68, alpha: 1).cgColor,
+      UIColor(red: 0.16, green: 0.20, blue: 0.28, alpha: 1).cgColor,
+      UIColor(red: 0.05, green: 0.06, blue: 0.09, alpha: 1).cgColor
+    ]
+    gradient.startPoint = CGPoint(x: 0, y: 0)
+    gradient.endPoint = CGPoint(x: 1, y: 1)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
   }
 }

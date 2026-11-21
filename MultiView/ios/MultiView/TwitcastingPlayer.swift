@@ -490,8 +490,7 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
         tokens: NativeDanmakuRenderer.textTokens(text),
         filterText: text,
         in: self.danmakuView,
-        laneCursor: self.laneCursor,
-        settings: self.settings
+        laneCursor: self.laneCursor
       )
     }
   }
@@ -505,7 +504,6 @@ final class TwitcastingNativePlayerView: UIView, PlaybackResumable, PlaybackStop
         filterText: trimmed,
         in: self.danmakuView,
         laneCursor: self.laneCursor,
-        settings: self.settings,
         highlighted: true
       )
     }

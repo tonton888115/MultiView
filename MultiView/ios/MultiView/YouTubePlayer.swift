@@ -195,7 +195,6 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
         filterText: trimmed,
         in: self.danmakuView,
         laneCursor: self.laneCursor,
-        settings: self.settings,
         highlighted: true
       )
     }
@@ -522,8 +521,7 @@ final class YouTubeNativePlayerView: UIView, PlaybackResumable, PlaybackStoppabl
       tokens: message.tokens,
       filterText: message.text,
       in: danmakuView,
-      laneCursor: laneCursor,
-      settings: settings
+      laneCursor: laneCursor
     )
     let remaining = pendingChatMessages.count - pendingChatHead
     guard remaining > 0 else {

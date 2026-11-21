@@ -1614,7 +1614,6 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         filterText: trimmed,
         in: self.danmakuView,
         laneCursor: self.laneCursor,
-        settings: self.settings,
         style: style
       )
     }
@@ -1629,7 +1628,6 @@ final class NiconicoNativePlayerView: UIView, PlaybackResumable, PlaybackStoppab
         filterText: trimmed,
         in: self.danmakuView,
         laneCursor: self.laneCursor,
-        settings: self.settings,
         highlighted: true
       )
     }

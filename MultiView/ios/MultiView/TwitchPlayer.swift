@@ -799,8 +799,7 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
         tokens: tokens,
         filterText: filterText,
         in: self.danmakuView,
-        laneCursor: self.laneCursor,
-        settings: self.settings
+        laneCursor: self.laneCursor
       )
     }
   }
@@ -814,7 +813,6 @@ final class TwitchNativePlayerView: UIView, PlaybackResumable, PlaybackStoppable
         filterText: trimmed,
         in: self.danmakuView,
         laneCursor: self.laneCursor,
-        settings: self.settings,
         highlighted: true
       )
     }

@@ -14,7 +14,8 @@ import Foundation
 //    (後から来た方が舞台に入る時点か、先に終わる方が舞台を出る時点で重なる)ものがあれば、その下
 //    (下固定はその上)へずらす。領域に収まらなくなったらランダムな高さに置く(捨てない)。
 //  - 同時に表示するのは 50 件まで。超えたら一番古いものから消す。
-// アプリの設定は、初期値(文字サイズ 20・速度 100%)を公式相当として、その比率で効かせる。
+// アプリの設定は、文字サイズ 20・速度 0.13 を公式相当(100%)として、その比率で効かせる
+// (アプリの速度の初期値は 70%。AppSettings.defaultDanmakuSpeed)。
 
 /// コメントの大きさ(ニコ生のコマンド big / small)。
 enum DanmakuSize: Equatable {
@@ -32,14 +33,15 @@ enum DanmakuPosition: Equatable {
 
 /// 表示領域の大きさと設定から決まる寸法。
 struct DanmakuMetrics: Equatable {
-  static let defaultFontSetting = 20.0
-  static let defaultSpeedSetting = 0.13
+  /// 100% に当たる設定値(ニコ生公式アプリと同じ大きさ・速さ)。
+  static let officialFontSetting = 20.0
+  static let officialSpeedSetting = 0.13
 
   /// コメントを出す領域の大きさ(タイルは pt、PiP は出力フレームの px)。
   let stageSize: CGSize
-  /// 設定の文字サイズ ÷ 初期値。
+  /// 設定の文字サイズ ÷ 公式相当の値。
   let fontScale: CGFloat
-  /// 設定の速度 ÷ 初期値。
+  /// 設定の速度 ÷ 公式相当の値。
   let speedScale: Double
   /// 設定の最大行数(0 = 制限なし)。
   let maxLines: Int
@@ -47,8 +49,8 @@ struct DanmakuMetrics: Equatable {
   init(stageSize: CGSize, fontSetting: Double, speedSetting: Double, maxLines: Int) {
     self.init(
       stageSize: stageSize,
-      fontScale: CGFloat(min(2.0, max(0.6, fontSetting / Self.defaultFontSetting))),
-      speedScale: min(3.0, max(0.2, speedSetting / Self.defaultSpeedSetting)),
+      fontScale: CGFloat(min(2.0, max(0.6, fontSetting / Self.officialFontSetting))),
+      speedScale: min(3.0, max(0.2, speedSetting / Self.officialSpeedSetting)),
       maxLines: max(0, maxLines)
     )
   }
@@ -69,7 +71,7 @@ struct DanmakuMetrics: Equatable {
     stageSize.width >= stageSize.height
   }
 
-  /// 画面の高さに入る行数(設定の文字サイズが初期値の時)。
+  /// 画面の高さに入る行数(設定の文字サイズが公式相当の時)。
   static func linesPerHeight(landscape: Bool, size: DanmakuSize) -> CGFloat {
     switch size {
     case .medium:
@@ -132,7 +134,7 @@ struct DanmakuMetrics: Equatable {
 struct DanmakuItem: Equatable {
   let id: Int
   let position: DanmakuPosition
-  /// 配置に使う大きさ(幅 = 文字の幅、高さ = 1 行の高さ)。
+  /// 配置に使う大きさ(幅 = 文字の幅、高さ = 1 行の高さ。絵文字を大きくしたコメントはその高さ)。
   let size: CGSize
   let startTime: Double
   let endTime: Double
@@ -221,7 +223,7 @@ struct DanmakuStage {
     items.removeAll { $0.id == id }
   }
 
-  /// コメントを 1 件出す。size は配置に使う大きさ(幅 = 文字の幅、高さ = 1 行の高さ)。
+  /// コメントを 1 件出す。size は配置に使う大きさ(幅 = 文字の幅、高さ = 1 行の高さ。絵文字を大きくしたコメントはその高さ)。
   mutating func add(position: DanmakuPosition, size: CGSize, now: Double) -> DanmakuPlacement {
     removeFinished(now: now)
     let duration = position == .flow ? metrics.flowDuration : metrics.fixedDuration

@@ -98,6 +98,30 @@ do {
   check(near(item.x(at: 0.5), 560), "0.5 秒後に舞台の右端")
 }
 
+do {
+  // アプリの速度の初期値 70%(0.13 × 0.7): 表示 6÷0.7 ≈ 8.6 秒・前後 1÷0.7 ≈ 1.4 秒。
+  let slow = metrics(640, 360, speed: 0.13 * 0.7)
+  check(abs(slow.flowDuration - 6 / 0.7) < 0.0001 && abs(slow.flowLead - 1 / 0.7) < 0.0001, "速度 70% は表示 6÷0.7 秒・前後 1÷0.7 秒")
+  var stage = DanmakuStage(metrics: slow)
+  let item = stage.add(position: .flow, size: CGSize(width: 100, height: 30), now: 0).item
+  check(near(item.speed, 145 * 0.7), "速度 70% の速さは 0.7 倍、実際 \(item.speed)")
+  check(near(item.x(at: 1 / 0.7), 560), "前の 1÷0.7 秒で舞台の右端に着く")
+  // 16:9 の画面に見えている時間 = 右端(640)から入って、左端(0)を右端が抜けるまで。
+  let visible = Double((640 + 100) / item.speed)
+  check(abs(visible - 740 / 101.5) < 0.001, "幅 100 のコメントが 640x360 の画面に見える時間 = 740÷101.5 秒、実際 \(visible)")
+  print("  速度 70%: 幅 100 のコメントが 16:9 の画面に見えている時間 \(String(format: "%.2f", visible)) 秒(100% は \(String(format: "%.2f", 740 / 145.0)) 秒)")
+}
+
+do {
+  // 絵文字を大きくしたコメント(背が高い)も、同じ規則で上から積む。
+  var stage = DanmakuStage(metrics: landscape)
+  let lineHeight = landscape.lineHeight(.medium)
+  let tall = stage.add(position: .flow, size: CGSize(width: 200, height: lineHeight * 1.5), now: 0).item
+  let normal = stage.add(position: .flow, size: CGSize(width: 200, height: lineHeight), now: 0).item
+  check(tall.y == 0, "背の高いコメントも一番上から")
+  check(near(normal.y, lineHeight * 1.5 + DanmakuStage.rowMargin), "次のコメントは背の高いコメントのすぐ下、実際 \(normal.y)")
+}
+
 // MARK: 段の決め方
 
 do {
@@ -226,53 +250,68 @@ do {
 
 // MARK: 流し続けた時にぶつからないこと
 
-do {
-  var generator = Generator(state: 20261116)
-  for stageSize in [CGSize(width: 640, height: 360), CGSize(width: 180, height: 150), CGSize(width: 360, height: 640)] {
-    let current = DanmakuMetrics(stageSize: stageSize, fontSetting: 20, speedSetting: 0.13, maxLines: 0)
-    var stage = DanmakuStage(metrics: current)
-    stage.randomUnit = { 0.3 }
-    let lineHeight = current.lineHeight(.medium)
-    var placed: [(item: DanmakuItem, overflowed: Bool)] = []
-    var time = 0.0
-    // 1 秒に 3 件ほどのコメントを 60 秒流す(幅はばらばら)。
-    while time < 60 {
-      time += generator.next() * 0.66
-      let width = stageSize.width * CGFloat(0.05 + generator.next() * 1.4)
-      let result = stage.add(position: .flow, size: CGSize(width: width, height: lineHeight), now: time)
-      placed.append((result.item, result.overflowed))
+// tallEvery: その件数に 1 件、絵文字を 150% にしたコメント(背が 1.5 倍)を混ぜる(0 なら混ぜない)。
+func stressFlow(_ stageSize: CGSize, speed: Double, tallEvery: Int, generator: inout Generator) {
+  let current = DanmakuMetrics(stageSize: stageSize, fontSetting: 20, speedSetting: speed, maxLines: 0)
+  var stage = DanmakuStage(metrics: current)
+  stage.randomUnit = { 0.3 }
+  let lineHeight = current.lineHeight(.medium)
+  var placed: [(item: DanmakuItem, overflowed: Bool)] = []
+  var time = 0.0
+  // 1 秒に 3 件ほどのコメントを 60 秒流す(幅はばらばら)。
+  while time < 60 {
+    time += generator.next() * 0.66
+    let width = stageSize.width * CGFloat(0.05 + generator.next() * 1.4)
+    let height = tallEvery > 0 && (placed.count + 1) % tallEvery == 0 ? lineHeight * 1.5 : lineHeight
+    let result = stage.add(position: .flow, size: CGSize(width: width, height: height), now: time)
+    placed.append((result.item, result.overflowed))
+  }
+  let lead = current.flowLead
+  var collisions = 0
+  var overflowed = 0
+  for index in placed.indices {
+    if placed[index].overflowed {
+      overflowed += 1
+      continue
     }
-    let lead = current.flowLead
-    var collisions = 0
-    var overflowed = 0
-    for index in placed.indices {
-      if placed[index].overflowed {
-        overflowed += 1
-        continue
-      }
-      let a = placed[index].item
-      for other in placed[..<index] where !other.overflowed {
-        let b = other.item
-        // 縦に重なる(同じ段の)組だけ見る。
-        guard a.y < b.y + b.size.height, b.y < a.y + a.size.height else { continue }
-        let from = max(a.startTime, b.startTime) + lead
-        let to = min(a.endTime, b.endTime) - lead
-        guard from <= to else { continue }
-        // 舞台の中にいる間(from〜to)に横に重なる時刻が無いこと。
-        for stepIndex in 0...20 {
-          let moment = from + (to - from) * Double(stepIndex) / 20
-          let ax = a.x(at: moment)
-          let bx = b.x(at: moment)
-          if ax < bx + b.size.width - 0.0001, bx < ax + a.size.width - 0.0001 {
-            collisions += 1
-            break
-          }
+    let a = placed[index].item
+    for other in placed[..<index] where !other.overflowed {
+      let b = other.item
+      // 縦に重なる(同じ段の)組だけ見る。
+      guard a.y < b.y + b.size.height, b.y < a.y + a.size.height else { continue }
+      let from = max(a.startTime, b.startTime) + lead
+      let to = min(a.endTime, b.endTime) - lead
+      guard from <= to else { continue }
+      // 舞台の中にいる間(from〜to)に横に重なる時刻が無いこと。
+      for stepIndex in 0...20 {
+        let moment = from + (to - from) * Double(stepIndex) / 20
+        let ax = a.x(at: moment)
+        let bx = b.x(at: moment)
+        if ax < bx + b.size.width - 0.0001, bx < ax + a.size.width - 0.0001 {
+          collisions += 1
+          break
         }
       }
     }
-    check(collisions == 0, "\(Int(stageSize.width))x\(Int(stageSize.height)): 同じ段で重なる組が \(collisions) 個")
-    check(placed.allSatisfy { $0.item.y >= -0.0001 && $0.item.y + lineHeight <= stageSize.height + 0.0001 }, "\(Int(stageSize.width))x\(Int(stageSize.height)): 全部画面の中")
-    print("  \(Int(stageSize.width))x\(Int(stageSize.height)): \(placed.count) 件を流して、同じ段で重なった組 \(collisions)、空きが無くランダムに置いた件 \(overflowed)")
+  }
+  let label = "\(Int(stageSize.width))x\(Int(stageSize.height)) 速度 \(Int((speed / 0.13 * 100).rounded()))%"
+    + (tallEvery > 0 ? " 背の高いコメント混じり" : "")
+  check(collisions == 0, "\(label): 同じ段で重なる組が \(collisions) 個")
+  check(
+    placed.allSatisfy { $0.item.y >= -0.0001 && $0.item.y + $0.item.size.height <= stageSize.height + 0.0001 },
+    "\(label): 全部画面の中"
+  )
+  print("  \(label): \(placed.count) 件を流して、同じ段で重なった組 \(collisions)、空きが無くランダムに置いた件 \(overflowed)")
+}
+
+do {
+  var generator = Generator(state: 20261116)
+  for stageSize in [CGSize(width: 640, height: 360), CGSize(width: 180, height: 150), CGSize(width: 360, height: 640)] {
+    stressFlow(stageSize, speed: 0.13, tallEvery: 0, generator: &generator)
+  }
+  // アプリの初期値(速度 70%)と、絵文字を大きくしたコメントが混じる場合。
+  for stageSize in [CGSize(width: 640, height: 360), CGSize(width: 180, height: 150)] {
+    stressFlow(stageSize, speed: 0.13 * 0.7, tallEvery: 4, generator: &generator)
   }
 }
 

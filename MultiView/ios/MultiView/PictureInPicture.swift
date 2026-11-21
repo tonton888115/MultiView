@@ -407,7 +407,7 @@ private final class PictureInPictureDisplayView: UIView {
 // コメント 1 件を描いた画像と、配置に使う情報。
 private struct PictureInPictureCommentRaster {
   let image: CGImage
-  /// 配置に使う大きさ(幅 = 中身の幅、高さ = 1 行の高さ)。px。
+  /// 配置に使う大きさ(幅 = 中身の幅、高さ = 1 行の高さ。絵文字を大きくした時はその高さ)。px。
   let layoutSize: CGSize
   /// 画像の左上から配置の箱の左上までのずれ(影がはみ出す分の余白)。px。
   let inset: CGFloat
@@ -493,8 +493,8 @@ private final class PictureInPictureFrameRenderer {
     outputSize = initialSize
     stage = DanmakuStage(metrics: DanmakuMetrics(
       stageSize: initialSize,
-      fontSetting: DanmakuMetrics.defaultFontSetting,
-      speedSetting: DanmakuMetrics.defaultSpeedSetting,
+      fontSetting: DanmakuMetrics.officialFontSetting,
+      speedSetting: AppSettings.defaultDanmakuSpeed,
       maxLines: 0
     ))
     // 表示側の時計をホスト時刻(CACurrentMediaTime と同じ)にする。
@@ -598,7 +598,8 @@ private final class PictureInPictureFrameRenderer {
       tokens: tokens,
       metrics: metrics,
       style: style,
-      opacity: settings.danmakuOpacity
+      opacity: settings.danmakuOpacity,
+      emojiScale: settings.danmakuEmojiScale
     ) { [weak self] raster in
       guard let self, let raster else { return }
       self.queue.async {
@@ -988,6 +989,7 @@ private enum PictureInPictureCommentRasterizer {
     metrics: DanmakuMetrics,
     style: DanmakuStyle,
     opacity: Double,
+    emojiScale: Double,
     completion: @escaping (PictureInPictureCommentRaster?) -> Void
   ) {
     var urls: [URL] = []
@@ -997,7 +999,7 @@ private enum PictureInPictureCommentRasterizer {
       }
     }
     if urls.isEmpty {
-      completion(draw(tokens: tokens, metrics: metrics, style: style, opacity: opacity, images: [:]))
+      completion(draw(tokens: tokens, metrics: metrics, style: style, opacity: opacity, emojiScale: emojiScale, images: [:]))
       return
     }
     // 絵文字画像を待ってから描く。読み込みが遅い時は、来ていない絵文字を省いて流す。
@@ -1006,7 +1008,7 @@ private enum PictureInPictureCommentRasterizer {
     let finish = {
       guard !finished else { return }
       finished = true
-      completion(draw(tokens: tokens, metrics: metrics, style: style, opacity: opacity, images: images))
+      completion(draw(tokens: tokens, metrics: metrics, style: style, opacity: opacity, emojiScale: emojiScale, images: images))
     }
     let group = DispatchGroup()
     for url in urls {
@@ -1031,16 +1033,23 @@ private enum PictureInPictureCommentRasterizer {
     metrics: DanmakuMetrics,
     style: DanmakuStyle,
     opacity: Double,
+    emojiScale: Double,
     images: [URL: UIImage]
   ) -> PictureInPictureCommentRaster? {
-    let normal = DanmakuAppearance(metrics: metrics, style: style, opacity: opacity)
+    let normal = DanmakuAppearance(metrics: metrics, style: style, opacity: opacity, emojiScale: emojiScale)
     guard let raster = draw(tokens: tokens, appearance: normal, position: style.position, metrics: metrics, images: images) else {
       return nil
     }
     let stageWidth = metrics.stageSize.width
     guard style.position != .flow, stageWidth > 0, raster.layoutSize.width > stageWidth else { return raster }
     // 上/下に固定するコメントが画面より広い時は、収まる大きさまで縮める(公式と同じ)。
-    let fitted = DanmakuAppearance(metrics: metrics, style: style, opacity: opacity, scale: stageWidth / raster.layoutSize.width)
+    let fitted = DanmakuAppearance(
+      metrics: metrics,
+      style: style,
+      opacity: opacity,
+      emojiScale: emojiScale,
+      scale: stageWidth / raster.layoutSize.width
+    )
     return draw(tokens: tokens, appearance: fitted, position: style.position, metrics: metrics, images: images) ?? raster
   }
 
@@ -1051,7 +1060,6 @@ private enum PictureInPictureCommentRasterizer {
     metrics: DanmakuMetrics,
     images: [URL: UIImage]
   ) -> PictureInPictureCommentRaster? {
-    let lineHeight = appearance.lineHeight
     let attributes = appearance.textAttributes
     // 影がはみ出す分の余白を、配置の箱の外側に取る。
     let inset = appearance.shadowReach + 1
@@ -1077,9 +1085,14 @@ private enum PictureInPictureCommentRasterizer {
       }
     }
     guard !pieces.isEmpty else { return nil }
-    // 配置の箱(幅 = 中身の幅、高さ = 1 行の高さ)。タイルの弾幕のビューと同じ決め方。
-    let layoutSize = CGSize(width: ceil(x + appearance.horizontalPadding), height: lineHeight)
-    let size = CGSize(width: layoutSize.width + inset * 2, height: ceil(lineHeight) + inset * 2)
+    let containsImage = pieces.contains { piece in
+      if case .image = piece { return true }
+      return false
+    }
+    // 配置の箱(幅 = 中身の幅、高さ = 1 行の高さ。絵文字を大きくした時はその高さ)。タイルの弾幕のビューと同じ決め方。
+    let boxHeight = appearance.boxHeight(containsImage: containsImage)
+    let layoutSize = CGSize(width: ceil(x + appearance.horizontalPadding), height: boxHeight)
+    let size = CGSize(width: layoutSize.width + inset * 2, height: ceil(boxHeight) + inset * 2)
     let format = UIGraphicsImageRendererFormat()
     format.scale = 1
     format.opaque = false
@@ -1091,7 +1104,7 @@ private enum PictureInPictureCommentRasterizer {
           x: inset + half,
           y: inset + half,
           width: layoutSize.width - appearance.borderWidth,
-          height: lineHeight - appearance.borderWidth
+          height: boxHeight - appearance.borderWidth
         )
         let path = UIBezierPath(roundedRect: rect, cornerRadius: appearance.cornerRadius)
         UIColor.systemYellow.withAlphaComponent(0.12).setFill()
@@ -1100,14 +1113,15 @@ private enum PictureInPictureCommentRasterizer {
         UIColor.systemYellow.setStroke()
         path.stroke()
       }
-      let textTop = inset + ((lineHeight - textHeight) / 2).rounded()
+      let textTop = inset + ((boxHeight - textHeight) / 2).rounded()
+      let imageTop = inset + ((boxHeight - appearance.imageSide) / 2).rounded()
       for piece in pieces {
         switch piece {
         case .text(let string, let originX):
           string.draw(at: CGPoint(x: inset + originX, y: textTop), withAttributes: attributes)
         case .image(let image, let originX):
           image.draw(
-            in: CGRect(x: inset + originX, y: inset, width: appearance.imageSide, height: appearance.imageSide),
+            in: CGRect(x: inset + originX, y: imageTop, width: appearance.imageSide, height: appearance.imageSide),
             blendMode: .normal,
             alpha: appearance.imageAlpha
           )
